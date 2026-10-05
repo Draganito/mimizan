@@ -15,6 +15,27 @@ watching the surf. Fittingly, the method is about separating waves, the
 chroma carriers riding on the Bayer mosaic from the luminance underneath.
 *Lab* is the darkroom: the program develops negatives, nothing else.
 
+## What it is for
+
+Mimizan Lab was built to make the best monochrome negative the measurements
+support from a Nikon Z f RAW. The way there does not demosaic. Luminance is
+separated straight from the mosaic. On pictures a lens can take, that
+unconventional path lands among the strongest demosaicers, and with
+`--reconstruct` it has the highest mean of the photographic tests.
+
+AMaZE, RCD, DCB and LMMSE are in the desktop app beside it, so anyone can
+switch and see the difference, not only read a table. They are there so
+Mimizan can be compared. The separation stays the default and is unchanged.
+
+The program is a gift to the community: GPL-3.0-or-later, free to use and
+to check.
+
+The published limit remains. On the pixel-sharp test the literature uses,
+LMMSE leads. Against a real monochrome sensor the curves match through
+0.30 c/px, and the last octave stays open. For the Z f negative, shot the
+way these files were shot, the aim is met. The numbers are under
+[Where it stands](#where-it-stands).
+
 ![Mimizan Lab GUI](docs/gui.png)
 
 Documents: [`docs/SPEC.md`](docs/SPEC.md) (the contract: every formula and
