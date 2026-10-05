@@ -541,8 +541,8 @@ Kein Prozentwert ohne eine dieser Messungen.
 
 ## 9. Ausgang (Druck und Bildschirm)
 
-Reihenfolge: Mischung → Größe → Kurve → USM *oder* Bildschirmkompensation →
-Datei.
+Reihenfolge: Mischung → Größe → Kurve → [Entfaltung →] USM *oder*
+Bildschirmkompensation → Datei.
 
 - **Orientierung**: Das Negativ trägt die RAW-Orientierung nur als Tag
   (§7). Der Druck dreht zuerst Pixel und Sidecar-Maske aufrecht
@@ -578,6 +578,20 @@ Datei.
   USM mit Warnung überall angewendet. Gauß-Kern mit σ = r_px, Länge
   2·⌈3σ⌉+1, Rand reflect-101. Die USM arbeitet auf dem kodierten Wert
   (nach der Kurve), weil der Schärfeeindruck wahrnehmungsbezogen ist.
+- **Entfaltung [Ergänzung]** (`--deconv <N>`, N ∈ [1; 10], aus ohne Flag):
+  Richardson–Lucy mit Gauß-PSF, σ = r_px (derselbe Radius wie die USM),
+
+      e_{k+1} = e_k · G ⊛ ( b / (G ⊛ e_k) ),   e_0 = max(b, 0)
+
+  N Durchgänge, auf dem kodierten Wert vor der USM, auf **jedem** Pixel —
+  die Sidecar-Maske greift hier nicht, weil die Inverse keinen Halo
+  aufbaut, sondern die Unschärfe zurückrechnet; dafür bringt sie das
+  Rauschen zurück, das die Unschärfe genommen hat. Die PSF ist nicht
+  gemessen, sondern die Annahme „Betrachter-Unschärfe = USM-Radius“;
+  der Schritt ist damit eine Schärfung durch Inversion, keine Restaurierung.
+  Eine USM kann danach noch folgen (`--usm-amount`). Schließt
+  `--screen` aus. Die Dateibeschreibung nennt `deconvolution_iterations`,
+  solange > 0.
 - **Bildschirmkompensation [Ergänzung]** (`--screen <amount>`, ersetzt die
   USM): Für ein Bild, das 1:1 auf einem Bildschirm steht, sind die
   Verluste bekannt und nicht vom Betrachter abhängig: die Lanczos-3-

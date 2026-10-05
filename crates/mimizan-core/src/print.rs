@@ -4,6 +4,7 @@
 
 use crate::calib::LookFile;
 use crate::curve::Curve;
+use crate::deconv::{richardson_lucy, DECONV_ITERATIONS};
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
 use crate::plane::Plane;
@@ -94,6 +95,11 @@ pub struct PrintParams {
     pub proof_jpeg: Option<PathBuf>,
     /// Screen compensation instead of USM (see `screen.rs`).
     pub screen: Option<ScreenSharpen>,
+    /// Richardson–Lucy instead of USM, on every pixel, no mask.
+    /// Screen compensation still wins when `screen` is set.
+    pub deconvolution: bool,
+    /// Passes when `deconvolution` is set (1..10). Zero skips it.
+    pub deconv_iterations: u32,
 }
 
 impl Default for PrintParams {
@@ -108,12 +114,15 @@ impl Default for PrintParams {
             use_mask: true,
             proof_jpeg: None,
             screen: None,
+            deconvolution: false,
+            deconv_iterations: 0,
         }
     }
 }
 
 impl PrintParams {
-    /// Any sharpening at all (USM or screen compensation)?
+    /// USM or screen compensation, both of which consult the mask.
+    /// Deconvolution does not: it runs on the whole picture, and USM may follow it.
     pub fn sharpens(&self) -> bool {
         match self.screen {
             Some(s) => s.amount > 0.0,
@@ -137,6 +146,9 @@ pub struct PrintInfo {
     pub usm_amount: f64,
     pub usm_radius_px: f64,
     pub usm_masked: bool,
+    /// Richardson–Lucy iterations when that path ran; omitted when it did not.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub deconvolution_iterations: u32,
     /// Screen compensation, when used: amount, gain cap, the 7 taps and
     /// the resulting response at 0.25 and 0.4 c/px.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -152,6 +164,10 @@ pub struct ScreenInfo {
     pub taps: Vec<f64>,
     pub response_025: f64,
     pub response_040: f64,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Apply a TIFF orientation (1..8) to the pixels so the result is upright.
@@ -353,18 +369,29 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
             });
         }
         Some(_) => {}
-        None if p.usm_amount > 0.0 => {
-            info!(
-                "usm amount {:.2}, radius {:.2} px (d = {:.0} mm), masked: {}",
-                p.usm_amount,
-                r_px,
-                d_mm,
-                mask.is_some()
-            );
-            plane = unsharp(&plane, r_px, p.usm_amount, mask.as_ref());
+        None => {
+            if p.deconvolution && p.deconv_iterations > 0 && r_px > 0.0 {
+                let n = (p.deconv_iterations as usize).clamp(1, DECONV_ITERATIONS);
+                info!("richardson-lucy {n} iterations, sigma {r_px:.2} px, no mask");
+                plane = richardson_lucy(&plane, r_px, n);
+            }
+            if p.usm_amount > 0.0 {
+                info!(
+                    "usm amount {:.2}, radius {:.2} px (d = {:.0} mm), masked: {}",
+                    p.usm_amount,
+                    r_px,
+                    d_mm,
+                    mask.is_some()
+                );
+                plane = unsharp(&plane, r_px, p.usm_amount, mask.as_ref());
+            }
         }
-        None => {}
     }
+    let deconv_n = if p.screen.is_none() && p.deconvolution && p.deconv_iterations > 0 && r_px > 0.0 {
+        (p.deconv_iterations as usize).clamp(1, DECONV_ITERATIONS)
+    } else {
+        0
+    };
     let usm_amount = if p.screen.is_some() { 0.0 } else { p.usm_amount };
 
     let info = PrintInfo {
@@ -381,6 +408,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         usm_amount,
         usm_radius_px: r_px,
         usm_masked: mask.is_some(),
+        deconvolution_iterations: deconv_n as u32,
         screen: screen_info,
         ms: t.elapsed().as_millis(),
     };
@@ -453,6 +481,47 @@ mod tests {
         assert_eq!(px.pixels(300.0), (2048, 2048));
         assert!(PrintSize::parse("0px").is_err());
         assert!(PrintSize::parse("2048.5px").is_err());
+    }
+
+    #[test]
+    fn deconvolution_runs_everywhere_the_mask_would_block_usm() {
+        let (w, h) = (64, 32);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, if x < 32 { 0.2 } else { 0.8 });
+            }
+        }
+        let mask = Plane::from_vec(w, h, vec![0.0; w * h]);
+        let src = PrintSource {
+            plane: &plane,
+            mask: Some(&mask),
+            orientation: 1,
+            name: "step".into(),
+            description: None,
+        };
+        // 400 mm at 300 DPI is the spec's 1.4 px USM radius.
+        let plain = PrintParams { viewing_distance_mm: Some(400.0), ..Default::default() };
+        let base = render_planes(&src, &plain);
+        let deconv = PrintParams {
+            deconvolution: true,
+            deconv_iterations: crate::deconv::DECONV_ITERATIONS as u32,
+            viewing_distance_mm: Some(400.0),
+            ..Default::default()
+        };
+        let out = render_planes(&src, &deconv);
+        assert_eq!(out.info.deconvolution_iterations, crate::deconv::DECONV_ITERATIONS as u32);
+        assert!(!out.info.usm_masked);
+        let contrast = |p: &Plane| p.at(32, 16) - p.at(31, 16);
+        assert!(
+            contrast(&out.plane) > contrast(&base.plane),
+            "deconv {:.4} base {:.4}",
+            contrast(&out.plane),
+            contrast(&base.plane)
+        );
+        let usm = PrintParams { usm_amount: 1.0, viewing_distance_mm: Some(400.0), ..Default::default() };
+        let masked = render_planes(&src, &usm);
+        assert_eq!(masked.plane.data, base.plane.data);
     }
 
     #[test]

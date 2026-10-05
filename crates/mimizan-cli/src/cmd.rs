@@ -178,6 +178,7 @@ pub struct PrintArgs {
     pub usm_k: f64,
     pub distance_mm: Option<f64>,
     pub use_mask: bool,
+    pub deconv: Option<u32>,
     pub cameras: PathBuf,
     pub proof: Option<PathBuf>,
 }
@@ -225,6 +226,14 @@ pub fn print(a: &PrintArgs) -> Result<()> {
         }
         None => None,
     };
+    if let Some(n) = a.deconv {
+        if !(1..=mimizan_core::deconv::DECONV_ITERATIONS as u32).contains(&n) {
+            bail!("deconv passes must be within 1..{}", mimizan_core::deconv::DECONV_ITERATIONS);
+        }
+        if screen.is_some() {
+            bail!("--deconv and --screen exclude each other");
+        }
+    }
     let p = PrintParams {
         size,
         dpi: a.dpi,
@@ -235,10 +244,18 @@ pub fn print(a: &PrintArgs) -> Result<()> {
         use_mask: a.use_mask,
         proof_jpeg: a.proof.clone(),
         screen,
+        deconvolution: a.deconv.is_some(),
+        deconv_iterations: a.deconv.unwrap_or(0),
     };
     let out = pr::render(&a.negative, &p).with_context(|| format!("rendering {}", a.negative.display()))?;
     let t = Instant::now();
     pr::write(&out, &a.out, &p)?;
+    if out.info.deconvolution_iterations > 0 {
+        info!(
+            "richardson-lucy: {} passes, sigma {:.2} px, every pixel",
+            out.info.deconvolution_iterations, out.info.usm_radius_px
+        );
+    }
     if let Some(s) = &out.info.screen {
         info!(
             "screen compensation: amount {:.2}, gain cap {:.1}, {} taps, response {:.2} @ 0.25 c/px, {:.2} @ 0.40 c/px{}",

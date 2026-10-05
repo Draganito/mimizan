@@ -126,6 +126,10 @@ enum Cmd {
         /// Ignore the .mask.tif sidecar (USM everywhere)
         #[arg(long)]
         no_mask: bool,
+        /// Richardson-Lucy passes (1..10) before the USM: inverts a Gaussian of
+        /// the USM radius on every pixel, mask ignored. Off without the flag.
+        #[arg(long, value_name = "PASSES")]
+        deconv: Option<u32>,
         /// Directory with cameras/*.json for the USM default
         #[arg(long, default_value = "cameras")]
         cameras: PathBuf,
@@ -217,6 +221,7 @@ fn main() -> Result<()> {
             usm_k,
             distance_mm,
             no_mask,
+            deconv,
             cameras,
             proof,
         } => cmd::print(&cmd::PrintArgs {
@@ -231,6 +236,7 @@ fn main() -> Result<()> {
             usm_k,
             distance_mm,
             use_mask: !no_mask,
+            deconv,
             cameras,
             proof,
         }),

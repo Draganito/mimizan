@@ -10,6 +10,7 @@ pub mod calibrate;
 pub mod cfa;
 pub mod curve;
 pub mod decode;
+pub mod deconv;
 pub mod dubois;
 pub mod error;
 pub mod filter;

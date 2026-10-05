@@ -276,7 +276,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.4.0-1_amd64.deb
+sudo apt install ./mimizan_0.5.0-1_amd64.deb
 mimizan --version
 ```
 
@@ -314,6 +314,9 @@ mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --usm-amount 0.5 -
 # Negative -> JPEG for the web, 2048 px long edge, exact screen compensation instead of USM
 mimizan print photo_neg.tif -o photo_2048.jpg --size 2048px --screen 1.0 --look look/reference.json
 
+# Richardson-Lucy instead of a halo: 5 passes invert a Gaussian of the USM radius on every pixel
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --deconv 5
+
 # The benchmark of the section above (writes docs/KODAK.md and docs/kodak/*.png)
 mimizan bench kodak --images testdata/kodak
 mimizan bench kodak --images testdata/kodak --scale 2 --report docs/KODAK_2X.md --strips docs/kodak2x --out out/kodak2x
@@ -329,6 +332,12 @@ least squares against the Wiener inverse (gain capped at 2× near Nyquist),
 so the result is neither over- nor under-sharpened for a 1:1 view; `1.0` is
 the full compensation, less leaves part of the loss in. What it cannot know
 is a browser that rescales the image itself (SPEC §9).
+
+`--deconv N` is the other way to sharpen a print: Richardson–Lucy with a
+Gaussian PSF of the USM radius, N passes (1..10), on every pixel, no mask. It
+undoes blur instead of drawing a halo around it, and it brings back the
+noise the blur had hidden; the PSF is an assumption, not a measurement, so
+this is sharpening by inversion, not restoration (SPEC §9). USM may follow it.
 
 `mimizan negative` picks `cameras/<make>_<model>.json` by the camera in the
 file (noise model, default mix weights, default USM amount). Without a camera
