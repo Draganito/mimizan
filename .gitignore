@@ -1,0 +1,10 @@
+/target
+/testdata/*
+!/testdata/README.md
+/out
+*.tif
+*.tiff
+*.jpg
+# build artefacts of dist/make_release.sh
+dist/*.deb
+dist/*.tar.gz

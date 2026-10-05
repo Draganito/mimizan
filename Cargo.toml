@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = ["crates/mimizan-core", "crates/mimizan-cli", "crates/mimizan-gui", "crates/mimizan-demosaic"]
+
+[workspace.package]
+version = "0.4.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Draganito/mimizan"
+authors = ["Dragan Bojovic"]
+
+[workspace.dependencies]
+rawler = "0.8"
+rayon = "1.12"
+rustfft = "6"
+tiff = "0.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.6", features = ["derive"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+approx = "0.5"
+proptest = "1"
+criterion = "0.7"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+debug = 1
+
+[profile.bench]
+inherits = "release"
+
+# Release artefacts (dist/make_release.sh): no debug info, stripped, fat LTO.
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true
+lto = "fat"
+codegen-units = 1

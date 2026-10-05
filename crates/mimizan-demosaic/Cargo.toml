@@ -1,0 +1,17 @@
+[package]
+name = "mimizan-demosaic"
+description = "AMaZE, RCD, DCB and LMMSE via librtprocess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
+
+[lints.clippy]
+all = "warn"

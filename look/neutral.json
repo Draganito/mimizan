@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "name": "neutral",
+  "points": [[0.0, 0.0], [1.0, 1.0]],
+  "encoding": "gamma22",
+  "fitted_against": null
+}

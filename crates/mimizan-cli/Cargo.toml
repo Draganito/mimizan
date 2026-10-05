@@ -1,0 +1,56 @@
+[package]
+name = "mimizan-cli"
+description = "Command line front end for mimizan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mimizan"
+path = "src/main.rs"
+
+[dependencies]
+mimizan-core = { path = "../mimizan-core" }
+clap.workspace = true
+anyhow.workspace = true
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mimalloc = "0.1.52"
+
+[lints.clippy]
+all = "warn"
+
+# `cargo deb -p mimizan-cli` builds the one Debian package for both binaries
+# (dist/make_release.sh). Paths are relative to this manifest.
+[package.metadata.deb]
+name = "mimizan"
+maintainer = "Dragan Bojovic"
+copyright = "2026, Dragan Bojovic"
+license-file = ["../../LICENSE", "0"]
+section = "graphics"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+Bayer RAW to linear monochrome negative without demosaicing: luminance is
+estimated directly from the mosaic (pixel-adaptive frequency separation),
+written as 16-bit linear TIFF with a mask sidecar, and
+rendered to print size with look curve and USM. Includes the mimizan CLI
+and the mimizan-gui desktop app."""
+assets = [
+    ["target/release/mimizan", "usr/bin/", "755"],
+    ["target/release/mimizan-gui", "usr/bin/", "755"],
+    ["../../cameras/*.json", "usr/share/mimizan/cameras/", "644"],
+    ["../../look/*.json", "usr/share/mimizan/look/", "644"],
+    ["../../dist/mimizan-gui.desktop", "usr/share/applications/", "644"],
+    ["../../README.md", "usr/share/doc/mimizan/", "644"],
+    ["../../LICENSE", "usr/share/doc/mimizan/LICENSE.txt", "644"],
+    ["../../third_party/librtprocess/LICENSE.txt", "usr/share/doc/mimizan/LICENSE-librtprocess.txt", "644"],
+    ["../../docs/SPEC.md", "usr/share/doc/mimizan/docs/", "644"],
+    ["../../docs/RESULTS.md", "usr/share/doc/mimizan/docs/", "644"],
+    ["../../docs/gui.png", "usr/share/doc/mimizan/docs/", "644"],
+]

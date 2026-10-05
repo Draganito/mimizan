@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "make": "Nikon",
+  "model": "Z f",
+  "bayer_phase": "RGGB",
+  "noise_a": 0.005,
+  "noise_b": 0.0002,
+  "weights_rgb": [
+    0.284,
+    0.404,
+    0.312
+  ],
+  "weights_space": "raw",
+  "usm_amount": 0.0,
+  "matrix_fallback": false,
+  "fitted": {
+    "noise": false,
+    "weights": true
+  },
+  "weights_fitted_against": "MonoRef.dng (monochrome reference camera, linear) ColorChecker 24 patches, same scene, RMSE 2.2 %; raw-channel space"
+}

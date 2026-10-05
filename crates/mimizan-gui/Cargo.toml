@@ -1,0 +1,32 @@
+[package]
+name = "mimizan-gui"
+description = "Desktop front end for mimizan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mimizan-gui"
+path = "src/main.rs"
+
+[dependencies]
+mimizan-core = { path = "../mimizan-core" }
+mimizan-demosaic = { path = "../mimizan-demosaic" }
+anyhow.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mimalloc = "0.1.52"
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+egui = "0.36"
+egui-file-dialog = "0.15"
+# GNOME Wayland draws no server-side frame: let winit draw the Adwaita-style
+# client-side decorations itself, with the window title centred in the bar.
+winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
+rayon.workspace = true
+image.workspace = true
+
+[lints.clippy]
+all = "warn"

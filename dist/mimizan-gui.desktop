@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Mimizan Lab
+Comment=Bayer RAW to linear monochrome negative, no demosaic
+Exec=mimizan-gui %f
+Terminal=false
+Categories=Graphics;Photography;
+MimeType=image/x-nikon-nef;image/x-adobe-dng;image/x-canon-cr2;image/x-canon-cr3;image/x-sony-arw;image/x-fuji-raf;image/x-panasonic-rw2;image/x-olympus-orf;image/x-pentax-pef;
+Keywords=raw;monochrome;negative;bayer;darkroom;

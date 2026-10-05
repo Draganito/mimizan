@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo-deb
+        run: cargo install cargo-deb --locked
+      - name: Build artefacts
+        run: dist/make_release.sh
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/mimizan_*.deb
+            dist/mimizan-*-x86_64-linux.tar.gz
+          generate_release_notes: true
