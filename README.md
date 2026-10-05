@@ -38,7 +38,9 @@ way these files were shot, the aim is met. The numbers are under
 
 ![Mimizan Lab GUI](docs/gui.png)
 
-Documents: [`docs/SPEC.md`](docs/SPEC.md) (the contract: every formula and
+Documents: [`docs/PAPER.md`](docs/PAPER.md) (the method as a paper: signal
+model, every formula and constant of the core, evaluation; English),
+[`docs/SPEC.md`](docs/SPEC.md) (the contract: every formula and
 default, German), [`docs/RESULTS.md`](docs/RESULTS.md) (measurements per
 phase), [`docs/KODAK.md`](docs/KODAK.md), [`docs/KODAK_2X.md`](docs/KODAK_2X.md),
 [`docs/KODAK_LENS.md`](docs/KODAK_LENS.md), [`docs/KODAK_ZF.md`](docs/KODAK_ZF.md)
