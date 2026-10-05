@@ -276,7 +276,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.5.0-1_amd64.deb
+sudo apt install ./mimizan_0.6.0-1_amd64.deb
 mimizan --version
 ```
 
