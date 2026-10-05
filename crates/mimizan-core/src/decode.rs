@@ -5,7 +5,7 @@ use crate::cfa::BayerPhase;
 #[cfg(feature = "decode-rawler")]
 use crate::error::Error;
 use crate::error::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -49,7 +49,7 @@ impl RawData {
 
 /// Exposure data from EXIF, informational only (nothing in the pipeline
 /// depends on it).
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Exposure {
     pub iso: Option<u32>,
     /// Exposure time as the file's rational (numerator, denominator).
@@ -57,6 +57,9 @@ pub struct Exposure {
     pub fnumber: Option<f64>,
     pub focal_mm: Option<f64>,
     pub lens: Option<String>,
+    /// Capture time as the file writes it (EXIF `DateTimeOriginal`,
+    /// `YYYY:MM:DD HH:MM:SS`), if present.
+    pub captured: Option<String>,
 }
 
 impl Exposure {
@@ -125,6 +128,22 @@ pub trait RawDecoder {
 pub struct RawlerDecoder;
 
 #[cfg(feature = "decode-rawler")]
+pub(crate) fn exposure_from(md: &rawler::decoders::RawMetadata) -> Exposure {
+    let e = &md.exif;
+    let rat = |r: &Option<rawler::formats::tiff::Rational>| {
+        r.as_ref().filter(|r| r.d != 0).map(|r| f64::from(r.n) / f64::from(r.d))
+    };
+    Exposure {
+        iso: e.iso_speed_ratings.map(u32::from).or(e.iso_speed),
+        time: e.exposure_time.as_ref().map(|r| (r.n, r.d)),
+        fnumber: rat(&e.fnumber),
+        focal_mm: rat(&e.focal_length),
+        lens: md.lens.as_ref().map(|l| l.lens_model.clone()).or_else(|| e.lens_model.clone()),
+        captured: e.date_time_original.clone().or_else(|| e.create_date.clone()),
+    }
+}
+
+#[cfg(feature = "decode-rawler")]
 impl RawDecoder for RawlerDecoder {
     fn decode(&self, path: &Path) -> Result<RawFrame> {
         use rawler::rawimage::RawPhotometricInterpretation as P;
@@ -133,23 +152,11 @@ impl RawDecoder for RawlerDecoder {
         let params = rawler::decoders::RawDecodeParams::default();
         let img = decoder.raw_image(&source, &params, false).map_err(|e| Error::Decode(e.to_string()))?;
         // Metadata is informational; a file without usable EXIF still decodes.
-        let exposure = match decoder.raw_metadata(&source, &params) {
-            Ok(md) => {
-                let e = &md.exif;
-                let rat = |r: &Option<rawler::formats::tiff::Rational>| {
-                    r.as_ref().filter(|r| r.d != 0).map(|r| f64::from(r.n) / f64::from(r.d))
-                };
-                Exposure {
-                    iso: e.iso_speed_ratings.map(u32::from).or(e.iso_speed),
-                    time: e.exposure_time.as_ref().map(|r| (r.n, r.d)),
-                    fnumber: rat(&e.fnumber),
-                    focal_mm: rat(&e.focal_length),
-                    lens: md.lens.as_ref().map(|l| l.lens_model.clone()).or_else(|| e.lens_model.clone()),
-                }
-            }
+        let (exposure, exif_orientation) = match decoder.raw_metadata(&source, &params) {
+            Ok(md) => (exposure_from(&md), md.exif.orientation.filter(|o| (1..=8).contains(o))),
             Err(err) => {
                 tracing::debug!("no exif metadata: {err}");
-                Exposure::default()
+                (Exposure::default(), None)
             }
         };
         if img.cpp != 1 {
@@ -202,10 +209,15 @@ impl RawDecoder for RawlerDecoder {
             .filter(|r| r.w > 0 && r.h > 0 && r.x + r.w <= img.width && r.y + r.h <= img.height)
             .unwrap_or(full);
 
+        // rawler's own orientation comes from the raw IFD; some cameras (the
+        // Z f among them) write it only into EXIF, so that is the fallback
+        // when rawler reports nothing turned.
         let orientation = {
             use rawler::Orientation as O;
             match img.orientation {
-                O::Normal => 1,
+                O::Normal | O::Unknown => {
+                    exif_orientation.unwrap_or(if img.orientation == O::Normal { 1 } else { 0 })
+                }
                 O::HorizontalFlip => 2,
                 O::Rotate180 => 3,
                 O::VerticalFlip => 4,
@@ -213,7 +225,6 @@ impl RawDecoder for RawlerDecoder {
                 O::Rotate90 => 6,
                 O::Transverse => 7,
                 O::Rotate270 => 8,
-                O::Unknown => 0,
             }
         };
 

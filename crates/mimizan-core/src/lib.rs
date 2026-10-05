@@ -29,6 +29,7 @@ pub mod resize;
 pub mod screen;
 pub mod separate;
 pub mod synth;
+pub mod thumb;
 pub mod tiffin;
 pub mod tiffout;
 pub mod usm;

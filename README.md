@@ -393,6 +393,21 @@ own clipping. Exports run in a background thread; the preview (a downscaled
 copy of the separation) updates in milliseconds. `Reset` returns the
 controls to the camera-file defaults and keeps the negative.
 
+The strip at the bottom is the folder browser: *Folder…* (or dropping a
+folder, or opening any file) lists the folder's RAW files as grey
+thumbnails, sorted by name or file date, with a breadcrumb to walk up.
+Each thumbnail is the mosaic binned to grey with the file's balance and
+the camera file's weights — the same mix the development would produce,
+not the camera's embedded JPEG, which carries the camera's tone curve and
+was measured to take as long to decode (250–430 ms against 340–420 ms for
+the mosaic on a Z f file). Thumbnails are made for the visible tiles first
+on a third worker thread and cached in `~/.cache/mimizan/thumbs`
+(8-bit PNG keyed by path, size and modification time). A click opens the
+file, `←`/`→` open the neighbours, `B` hides and shows the strip; hovering
+shows camera, exposure and capture time. The last folder, the sort order
+and the strip state are kept in `~/.config/mimizan/gui.json`. Nothing is
+rated, deleted or written next to the RAWs.
+
 ## Calibration
 
 The pipeline has no hidden tuning; the three things that depend on the camera

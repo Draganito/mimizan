@@ -508,7 +508,10 @@ D50-Weißpunkt, `kTRC` = Gamma 1,0 (lineares Grau). `ImageDescription` enthält
 JSON mit Kamera, Phase, Abgleich (`wb`), Gewichten in beiden Räumen
 (`weights` abgeglichen, `weights_raw` roh, §6), Maskenmodus, Rundenzahl,
 Rauschparametern, Programmversion. Orientierung aus dem RAW wird als TIFF-`Orientation`
-übernommen, die Pixel werden nicht gedreht.
+übernommen, die Pixel werden nicht gedreht. Quelle ist das Raw-IFD; meldet
+es nichts Gedrehtes, gilt die EXIF-`Orientation` (die Z f schreibt sie nur
+dort). Die Aufnahmezeit (`DateTimeOriginal`) steht als `captured` bei der
+Belichtung.
 
 Sidecar `<name>.mask.tif`: 8-Bit, `round(255·max(M_1, M_2a, M_2b))`,
 gesättigte Photosites (dilatiert) überschreiben mit 255. Wird vom Druck für

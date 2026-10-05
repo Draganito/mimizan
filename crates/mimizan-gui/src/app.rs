@@ -2,6 +2,7 @@
 //! (right). Nothing here changes pixels; it only chooses parameters and hands
 //! them to the workers.
 
+use crate::browser::{Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::curve_editor::curve_editor;
 use crate::histogram::histogram_widget;
 use crate::session::{Converter, DetailRect, DevelopParams, Histogram, Session, ViewParams};
@@ -40,6 +41,7 @@ enum HistSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogPurpose {
     Open,
+    Folder,
     Export,
     SaveLook,
     LoadLook,
@@ -48,7 +50,21 @@ enum DialogPurpose {
 pub struct App {
     heavy: Heavy,
     preview: Preview,
+    thumbs: Thumbs,
     session: Option<Arc<Session>>,
+
+    // Folder strip
+    folder: Option<Folder>,
+    folder_generation: u64,
+    sort: Sort,
+    show_strip: bool,
+    /// Priority list last sent to the thumbnail worker.
+    last_wanted: Vec<PathBuf>,
+    /// Keyboard moved the selection: bring the tile into view once.
+    scroll_to_selected: bool,
+    /// Picture the strip should treat as current (the one opening or open).
+    current_path: Option<PathBuf>,
+
     busy: Option<String>,
     log: Vec<String>,
 
@@ -166,10 +182,19 @@ impl App {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let look_dir = resource_dir("look");
         let cameras_dir = resource_dir("cameras");
+        let persisted = Persisted::load();
         let mut app = Self {
             heavy: Heavy::spawn(cc.egui_ctx.clone()),
             preview: Preview::spawn(cc.egui_ctx.clone()),
+            thumbs: Thumbs::spawn(cc.egui_ctx.clone(), cameras_dir.clone()),
             session: None,
+            folder: None,
+            folder_generation: 0,
+            sort: persisted.sort,
+            show_strip: persisted.strip.unwrap_or(true),
+            last_wanted: Vec::new(),
+            scroll_to_selected: false,
+            current_path: None,
             busy: None,
             log: Vec::new(),
             w_r: 0.25,
@@ -214,10 +239,74 @@ impl App {
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
         };
-        if let Some(p) = initial {
-            app.open(p);
+        match initial {
+            Some(p) if p.is_dir() => app.set_folder(&p),
+            Some(p) => app.open(p),
+            None => {
+                if let Some(f) = persisted.folder.filter(|f| f.is_dir()) {
+                    app.set_folder(&f);
+                }
+            }
         }
         app
+    }
+
+    fn persist(&self) {
+        Persisted {
+            folder: self.folder.as_ref().map(|f| f.path.clone()),
+            sort: self.sort,
+            strip: Some(self.show_strip),
+        }
+        .save();
+    }
+
+    /// List a folder's RAW files in the strip. The thumbnails follow as the
+    /// tiles become visible.
+    fn set_folder(&mut self, path: &Path) {
+        self.folder_generation += 1;
+        // Absolute, so the breadcrumb shows the whole way and a relative
+        // CLI argument survives a restart from another directory.
+        let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        match Folder::scan(path, self.sort, self.folder_generation) {
+            Ok(f) => {
+                self.log(format!("{}: {} RAW files", f.path.display(), f.entries.len()));
+                self.folder = Some(f);
+            }
+            Err(e) => {
+                self.log(format!("folder {}: {e}", path.display()));
+                self.folder = None;
+            }
+        }
+        self.last_wanted.clear();
+        self.persist();
+    }
+
+    fn toggle_strip(&mut self) {
+        self.show_strip = !self.show_strip;
+        self.persist();
+    }
+
+    /// Open the strip's neighbour of the current picture (`step` = ±1).
+    fn open_neighbour(&mut self, step: isize) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(f) = &self.folder else { return };
+        if f.entries.is_empty() {
+            return;
+        }
+        let i = self.current_path.as_ref().and_then(|p| f.index_of(p));
+        let next = match i {
+            Some(i) => i as isize + step,
+            None if step > 0 => 0,
+            None => f.entries.len() as isize - 1,
+        };
+        if next < 0 || next >= f.entries.len() as isize {
+            return;
+        }
+        let path = f.entries[next as usize].path.clone();
+        self.scroll_to_selected = true;
+        self.open(path);
     }
 
     fn log(&mut self, s: impl Into<String>) {
@@ -305,7 +394,15 @@ impl App {
     }
 
     fn open(&mut self, path: PathBuf) {
+        // Absolute like the strip's entries, so the tile lights up.
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         self.busy = Some(format!("opening {}", path.display()));
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if self.folder.as_ref().is_none_or(|f| f.path != parent) {
+                self.set_folder(parent);
+            }
+        }
+        self.current_path = Some(path.clone());
         self.heavy.send(Job::Open {
             path,
             develop: self.develop_params(),
@@ -374,6 +471,27 @@ impl App {
                 }
             }
         }
+        for r in self.thumbs.poll() {
+            let Some(f) = &mut self.folder else { continue };
+            if r.generation != f.generation {
+                continue;
+            }
+            if let Some(e) = f.entries.iter_mut().find(|e| e.path == r.path) {
+                match r.result {
+                    Ok((thumb, meta)) => {
+                        tracing::debug!("thumbnail {} in {} ms", e.name, r.ms);
+                        e.thumb = Some(thumb);
+                        e.meta = Some(meta);
+                        e.state = ThumbState::Ready;
+                        e.texture = None;
+                    }
+                    Err(msg) => {
+                        tracing::warn!("thumbnail {}: {msg}", e.name);
+                        e.state = ThumbState::Failed;
+                    }
+                }
+            }
+        }
         for r in self.preview.poll() {
             if r.generation < self.shown_generation {
                 continue;
@@ -421,7 +539,10 @@ impl App {
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if let Some(p) = dropped.into_iter().next() {
-            if self.busy.is_none() {
+            if p.is_dir() {
+                self.set_folder(&p);
+                self.show_strip = true;
+            } else if self.busy.is_none() {
                 self.open(p);
             }
         }
@@ -529,6 +650,7 @@ impl App {
         }
         match purpose {
             DialogPurpose::Open | DialogPurpose::LoadLook => self.dialog.pick_file(),
+            DialogPurpose::Folder => self.dialog.pick_directory(),
             _ => self.dialog.save_file(),
         }
     }
@@ -538,6 +660,11 @@ impl App {
         let Some(path) = self.dialog.take_picked() else { return };
         match self.dialog_purpose {
             DialogPurpose::Open => self.open(path),
+            DialogPurpose::Folder => {
+                self.set_folder(&path);
+                self.show_strip = true;
+                self.persist();
+            }
             DialogPurpose::Export => {
                 if let Some(s) = &self.session {
                     let path = with_ext(path, "tif");
@@ -583,6 +710,20 @@ impl App {
             let idle = self.busy.is_none();
             if ui.add_enabled(idle, egui::Button::new("Open RAW…")).clicked() {
                 self.start_dialog(DialogPurpose::Open, None);
+            }
+            if ui
+                .button("Folder…")
+                .on_hover_text("Show a folder's RAW files as thumbnails in the strip below")
+                .clicked()
+            {
+                self.start_dialog(DialogPurpose::Folder, None);
+            }
+            if ui
+                .selectable_label(self.show_strip, "Strip")
+                .on_hover_text("Show or hide the folder strip (B). ←/→ open the neighbouring file.")
+                .clicked()
+            {
+                self.toggle_strip();
             }
             let has = self.session.is_some();
             let export_hover = self.export_hover_text();
@@ -1174,6 +1315,274 @@ fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
     }
 }
 
+/// Strip: folder bar, tiles, horizontal scrollbar.
+const STRIP_HEIGHT: f32 = 196.0;
+const TILE_W: f32 = 150.0;
+const TILE_IMG_H: f32 = 112.0;
+const TILE_H: f32 = TILE_IMG_H + 20.0;
+
+impl App {
+    /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
+    /// keyboard is not in a text field.
+    fn strip_keys(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (b, left, right) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::B) && i.modifiers.is_none(),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+            )
+        });
+        if b {
+            self.toggle_strip();
+        }
+        if self.show_strip && left {
+            self.open_neighbour(-1);
+        }
+        if self.show_strip && right {
+            self.open_neighbour(1);
+        }
+    }
+
+    fn strip_bar(&mut self, ui: &mut egui::Ui) {
+        let mut go_to: Option<PathBuf> = None;
+        let mut rescan = false;
+        ui.horizontal(|ui| {
+            match &self.folder {
+                None => {
+                    ui.label(RichText::new("No folder. Folder… above, or drop a folder here.").weak());
+                }
+                Some(f) => {
+                    // Breadcrumb: every ancestor is a button.
+                    let comps: Vec<PathBuf> = f.path.ancestors().map(Path::to_path_buf).collect();
+                    for (i, anc) in comps.iter().rev().enumerate() {
+                        let name = if i == 0 {
+                            "/".to_string()
+                        } else {
+                            anc.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                        };
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let last = anc == &f.path;
+                        let text = if last { RichText::new(name).strong() } else { RichText::new(name) };
+                        if ui.add(egui::Button::new(text).frame(false)).clicked() && !last {
+                            go_to = Some(anc.clone());
+                        }
+                        if !last {
+                            ui.label(RichText::new("›").weak());
+                        }
+                    }
+                    ui.label(RichText::new(format!("{} RAW", f.entries.len())).weak());
+                    if ui.small_button("↻").on_hover_text("Read the folder again").clicked() {
+                        rescan = true;
+                    }
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("×").on_hover_text("Hide the strip (B)").clicked() {
+                    self.toggle_strip();
+                }
+                let mut sort = self.sort;
+                egui::ComboBox::from_id_salt("strip-sort").selected_text(sort.label()).width(70.0).show_ui(
+                    ui,
+                    |ui| {
+                        for s in Sort::ALL {
+                            ui.selectable_value(&mut sort, s, s.label());
+                        }
+                    },
+                );
+                if sort != self.sort {
+                    self.sort = sort;
+                    if let Some(f) = &mut self.folder {
+                        f.resort(sort);
+                    }
+                    self.last_wanted.clear();
+                    self.scroll_to_selected = true;
+                    self.persist();
+                }
+                ui.label(RichText::new("sort").weak());
+            });
+        });
+        if let Some(p) = go_to {
+            self.set_folder(&p);
+        } else if rescan {
+            if let Some(p) = self.folder.as_ref().map(|f| f.path.clone()) {
+                self.set_folder(&p);
+            }
+        }
+    }
+
+    fn strip_panel(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(2.0);
+        self.strip_bar(ui);
+        ui.add_space(2.0);
+        let Some(folder) = &mut self.folder else { return };
+        if folder.entries.is_empty() {
+            ui.label(RichText::new("No RAW files in this folder.").weak());
+            return;
+        }
+        let idle = self.busy.is_none();
+        let current = self.current_path.clone();
+        let generation = folder.generation;
+        let scroll_to = std::mem::take(&mut self.scroll_to_selected);
+        let mut clicked: Option<PathBuf> = None;
+        // (distance from the viewport centre, index) of tiles that still
+        // need a thumbnail; visible ones first, then two screens around.
+        let mut wanted: Vec<(f32, usize)> = Vec::new();
+        let ctx = ui.ctx().clone();
+        egui::ScrollArea::horizontal().id_salt("strip-scroll").show(ui, |ui| {
+            let clip = ui.clip_rect();
+            let centre = clip.center().x;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for (i, e) in folder.entries.iter_mut().enumerate() {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(TILE_W, TILE_H), Sense::click());
+                    let is_current = current.as_deref() == Some(e.path.as_path());
+                    if is_current && scroll_to {
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                    let visible = clip.intersects(rect);
+                    let dist = (rect.center().x - centre).abs();
+                    if e.state == ThumbState::Pending && dist < clip.width() * 2.5 {
+                        wanted.push((dist, i));
+                    }
+                    if !visible {
+                        e.texture = None;
+                        continue;
+                    }
+                    if e.texture.is_none() {
+                        if let Some(t) = &e.thumb {
+                            let img = ColorImage::from_gray([t.width, t.height], &t.gray);
+                            e.texture = Some(ctx.load_texture(
+                                format!("thumb-{generation}-{i}"),
+                                img,
+                                TextureOptions::LINEAR,
+                            ));
+                        }
+                    }
+                    let painter = ui.painter();
+                    let vis = ui.visuals();
+                    let bg = if is_current {
+                        vis.selection.bg_fill.gamma_multiply(0.35)
+                    } else if resp.hovered() {
+                        vis.widgets.hovered.bg_fill
+                    } else {
+                        vis.widgets.noninteractive.bg_fill
+                    };
+                    painter.rect_filled(rect, 4.0, bg);
+                    let img_rect = Rect::from_min_size(rect.min, Vec2::new(TILE_W, TILE_IMG_H)).shrink(3.0);
+                    match &e.texture {
+                        Some(tex) => {
+                            let [w, h] = tex.size();
+                            let scale = (img_rect.width() / w as f32).min(img_rect.height() / h as f32);
+                            let size = Vec2::new(w as f32 * scale, h as f32 * scale);
+                            let r = Rect::from_center_size(img_rect.center(), size);
+                            painter.image(
+                                tex.id(),
+                                r,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        }
+                        None => {
+                            let (txt, col) = match e.state {
+                                ThumbState::Failed => ("?", vis.warn_fg_color),
+                                _ => ("…", vis.weak_text_color()),
+                            };
+                            painter.text(
+                                img_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                txt,
+                                egui::FontId::proportional(22.0),
+                                col,
+                            );
+                        }
+                    }
+                    if is_current {
+                        painter.rect_stroke(
+                            rect,
+                            4.0,
+                            egui::Stroke::new(2.0, vis.selection.stroke.color),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let label_pos = Pos2::new(rect.center().x, rect.max.y - 10.0);
+                    let name = truncate_middle(&e.name, 20);
+                    painter.text(
+                        label_pos,
+                        egui::Align2::CENTER_CENTER,
+                        name,
+                        egui::FontId::proportional(11.5),
+                        if is_current { vis.strong_text_color() } else { vis.text_color() },
+                    );
+                    let resp = resp.on_hover_ui(|ui| {
+                        ui.label(RichText::new(&e.name).strong());
+                        if let Some(m) = &e.meta {
+                            ui.label(format!("{} {}", m.make.trim(), m.model.trim()));
+                            let ex = m.exposure.summary();
+                            if !ex.is_empty() {
+                                ui.label(ex);
+                            }
+                            if let Some(d) = &m.exposure.captured {
+                                ui.label(d.replacen(':', "-", 2));
+                            }
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} x {} px, {:.1} MB",
+                                    m.width,
+                                    m.height,
+                                    e.size as f64 / 1e6
+                                ))
+                                .weak(),
+                            );
+                        } else {
+                            ui.label(RichText::new(format!("{:.1} MB", e.size as f64 / 1e6)).weak());
+                        }
+                        if !idle {
+                            ui.label(RichText::new("busy — wait for the current file").weak());
+                        }
+                    });
+                    if resp.clicked() && idle && !is_current {
+                        clicked = Some(e.path.clone());
+                    }
+                }
+            });
+        });
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let paths: Vec<PathBuf> = wanted.iter().map(|(_, i)| folder.entries[*i].path.clone()).collect();
+        if paths != self.last_wanted {
+            let jobs: Vec<ThumbJob> = wanted
+                .iter()
+                .map(|(_, i)| {
+                    let e = &folder.entries[*i];
+                    ThumbJob { generation, path: e.path.clone(), size: e.size, modified: e.modified }
+                })
+                .collect();
+            self.thumbs.want(jobs);
+            self.last_wanted = paths;
+        }
+        if let Some(p) = clicked {
+            self.open(p);
+        }
+    }
+}
+
+/// `DSC_0001_very_long_name.NEF` -> `DSC_0001_…name.NEF` within `max` chars.
+fn truncate_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let keep_end = 8.min(max / 2);
+    let keep_start = max.saturating_sub(keep_end + 1);
+    let start: String = s.chars().take(keep_start).collect();
+    let end: String = s.chars().skip(n - keep_end).collect();
+    format!("{start}…{end}")
+}
+
 impl eframe::App for App {
     /// Worker results are collected here: eframe calls `logic` even while the
     /// window is hidden or covered, so an export finishes and logs regardless.
@@ -1190,6 +1599,12 @@ impl eframe::App for App {
             self.toolbar(ui);
             ui.add_space(2.0);
         });
+        if self.show_strip {
+            egui::Panel::bottom("strip")
+                .resizable(false)
+                .exact_size(STRIP_HEIGHT)
+                .show(ui, |ui| self.strip_panel(ui));
+        }
         egui::Panel::left("file").resizable(true).default_size(310.0).min_size(240.0).show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.file_column(ui));
         });
@@ -1200,5 +1615,6 @@ impl eframe::App for App {
 
         self.request_preview_if_needed();
         self.flush_converter_redevelop();
+        self.strip_keys(&ctx);
     }
 }

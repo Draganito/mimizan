@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod browser;
 mod convert;
 mod curve_editor;
 mod histogram;
