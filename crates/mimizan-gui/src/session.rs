@@ -3,7 +3,6 @@
 //! weights can be re-mixed without separating again) and a downscaled,
 //! upright copy of the separation for the interactive preview.
 
-use mimizan_core::burn::{self, Burn};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::cfa::Color;
 use mimizan_core::decode::{RawFrame, SensorKind};
@@ -11,7 +10,7 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
-use mimizan_core::print::{orient, rotate_gray8_cw, rotated, upright_pixel};
+use mimizan_core::print::{orient, rotate_gray8_cw, rotated};
 use mimizan_core::resize::{fit_dims, resize};
 use mimizan_core::separate::{MaskMode, Separation};
 use mimizan_core::tone::{self, Tone, ToneMap};
@@ -264,16 +263,14 @@ pub fn preview_planes(neg: &Negative) -> PreviewPlanes {
 }
 
 /// Everything the preview depends on besides the session. The preview is the
-/// negative: mix, placing, dodge & burn and curve in the recipe's order,
-/// never any sharpening or resampling.
+/// negative: mix, placing and tone in the recipe's order, never any
+/// sharpening or resampling.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewParams {
     pub weights: Weights,
     pub tone: Tone,
     /// Placing in stops before the tone (`Recipe::place`).
     pub place: f64,
-    /// Local placing, in the coordinates of the upright, rotated picture.
-    pub dodge_burn: Vec<Burn>,
     pub show_mask: bool,
     /// Extra clockwise quarter turns on top of the file's orientation.
     pub rotation: u8,
@@ -281,12 +278,13 @@ pub struct ViewParams {
     pub hover_zone: Option<u8>,
 }
 
-/// The parts of a view the full-resolution histograms depend on.
-type HistKey = (Weights, Tone, f64, Vec<Burn>, u8);
+/// The parts of a view the full-resolution histograms depend on (the
+/// orientation is not one of them: a histogram does not turn).
+type HistKey = (Weights, Tone, f64);
 
 impl ViewParams {
     fn hist_key(&self) -> HistKey {
-        (self.weights, self.tone.clone(), self.place, self.dodge_burn.clone(), self.rotation)
+        (self.weights, self.tone.clone(), self.place)
     }
 }
 
@@ -339,8 +337,8 @@ fn crop(p: &Plane, r: DetailRect) -> Plane {
 }
 
 /// Render `rect` of the negative at full resolution: crop the separation in
-/// the sensor frame, mix, orient the small crop, then place, dodge & burn
-/// (in whole-picture coordinates) and curve (or the mask).
+/// the sensor frame, mix, orient the small crop, then place and tone (or
+/// the mask).
 /// The rectangle is clamped to the image; the returned `rect` is the one
 /// actually rendered.
 pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<DetailImage> {
@@ -380,14 +378,7 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
             computed: sep.computed,
         };
         let mut mixed = orient(&mix(&small, &v.weights), orientation);
-        tone::render_in_place(
-            &mut mixed,
-            v.place,
-            &v.dodge_burn,
-            &v.tone.compile(),
-            (uw, uh),
-            (rect.x, rect.y),
-        );
+        tone::render(&mut mixed, v.place, &v.tone.compile());
         mixed
     };
     debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
@@ -463,19 +454,12 @@ impl Histogram {
 
     /// Histograms of the full-resolution negative in one pass: the linear mix
     /// on a gamma-2.2 axis (the scan, before any placing), and the mix after
-    /// placing, dodge & burn and `tone` (what the TIFF gets). `local` is
-    /// (place, shapes, orientation of the picture the shapes refer to).
-    /// Values are quantised to 16 bits first, so the clipping counts are the
-    /// TIFF's own 0 and 65535 pixels. Nothing is downscaled: a resampled copy
-    /// rings at edges (false black and white) and averages isolated clipped
-    /// pixels away, so its histogram ends are wrong by an order of magnitude.
-    pub fn of_separation(
-        sep: &Separation,
-        w: &Weights,
-        tone: &ToneMap,
-        local: (f64, &[Burn], u16),
-    ) -> (Self, Self) {
-        let (place, burns, orientation) = local;
+    /// `place` stops and `tone` (what the TIFF gets). Values are quantised
+    /// to 16 bits first, so the clipping counts are the TIFF's own 0 and
+    /// 65535 pixels. Nothing is downscaled: a resampled copy rings at edges
+    /// (false black and white) and averages isolated clipped pixels away, so
+    /// its histogram ends are wrong by an order of magnitude.
+    pub fn of_separation(sep: &Separation, w: &Weights, tone: &ToneMap, place: f64) -> (Self, Self) {
         // 16-bit input -> 8-bit bin, for both encodings.
         let lut_neg: Vec<u8> =
             (0..65536).map(|i| ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
@@ -483,17 +467,11 @@ impl Histogram {
             (0..65536).map(|i| (tone.eval(i as f64 / 65535.0) * 255.0).round() as u8).collect();
         let view_clips: Vec<bool> =
             (0..65536).map(|i| matches!(q16(tone.eval(i as f64 / 65535.0)), 0 | 65535)).collect();
-        // Shapes through one filter: the two passes differ per pixel, no LUT.
-        let split = tone.splits(burns);
         let k1 = w.g - w.r - w.b;
         let k2 = 2.0 * (w.r - w.b);
         let width = sep.lum.width;
         let height = sep.lum.height;
-        let active: Vec<Burn> = burns.iter().copied().filter(|b| b.ev() != 0.0).collect();
         let global = 2f64.powf(place);
-        let (uw, uh) = if matches!(orientation, 5..=8) { (height, width) } else { (width, height) };
-        let (uwf, uhf) = (uw as f64, uh as f64);
-        let long = uwf.max(uhf);
         // Row-ordered partial counts, merged deterministically.
         let parts: Vec<Counts> = (0..height)
             .into_par_iter()
@@ -506,24 +484,8 @@ impl Histogram {
                     c.neg[lut_neg[q] as usize] += 1;
                     c.neg_low += (q == 0) as usize;
                     c.neg_high += (q == 65535) as usize;
-                    let (bin, clips) = if active.is_empty() {
-                        let qv = q16(m * global);
-                        (lut_view[qv], view_clips[qv])
-                    } else {
-                        let (ux, uy) = upright_pixel(orientation, width, height, x, y);
-                        let (nx, ny) = ((ux as f64 + 0.5) / uwf, (uy as f64 + 0.5) / uhf);
-                        if split {
-                            let (es, eh) = burn::exponents_at(place, &active, nx, ny, uwf, uhf, long);
-                            let v = tone.eval_split(m * 2f64.powf(es), m * 2f64.powf(eh));
-                            ((v * 255.0).round() as u8, matches!(q16(v), 0 | 65535))
-                        } else {
-                            let e = active
-                                .iter()
-                                .fold(place, |e, b| e + b.ev() * b.weight(nx, ny, uwf, uhf, long));
-                            let qv = q16(m * 2f64.powf(e));
-                            (lut_view[qv], view_clips[qv])
-                        }
-                    };
+                    let qv = q16(m * global);
+                    let (bin, clips) = (lut_view[qv], view_clips[qv]);
                     c.view[bin as usize] += 1;
                     if clips {
                         if bin == 0 {
@@ -632,21 +594,15 @@ impl HistCache {
     fn get(&mut self, s: &Session, v: &ViewParams, tone: &ToneMap) -> (Histogram, Histogram) {
         let key = (s as *const Session, v.hist_key());
         if self.key.as_ref() != Some(&key) {
-            let orientation = rotated(s.negative.orientation, v.rotation);
-            self.hists = Histogram::of_separation(
-                s.separation(),
-                &v.weights,
-                tone,
-                (v.place, &v.dodge_burn, orientation),
-            );
+            self.hists = Histogram::of_separation(s.separation(), &v.weights, tone, v.place);
             self.key = Some(key);
         }
         self.hists.clone()
     }
 }
 
-/// 8-bit grey preview of the whole negative: mix, place, dodge & burn and
-/// curve (or the mask), in the picture's final orientation.
+/// 8-bit grey preview of the whole negative: mix, place and tone (or the
+/// mask), in the picture's final orientation.
 pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> PreviewImage {
     let pp = &s.preview;
     let (w, h) = (pp.sep.lum.width, pp.sep.lum.height);
@@ -668,18 +624,15 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
     let tone_map = v.tone.compile();
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.get(s, v, &tone_map);
-    // The shapes live in the rotated picture, so turn first, then place.
     let mut mixed = orient(&mix(&pp.sep, &v.weights), rotated(1, v.rotation));
     let zone_mask = v.hover_zone.map(|k| {
-        // The scene zone after placing and the shapes (every shape counted).
-        let mut placed = mixed.clone();
-        burn::apply(&mut placed, v.place, &v.dodge_burn);
+        // The scene zone after placing.
         let (lo, hi) = (k as f64 - 5.5, k as f64 - 4.5);
-        placed
+        mixed
             .data
             .par_iter()
             .map(|&l| {
-                let st = zone::stops(l);
+                let st = zone::stops(l * 2f64.powf(v.place));
                 // The outer zones take everything beyond them.
                 let inside = (st >= lo || k == 0) && (st < hi || k as usize == zone::ZONES - 1);
                 if inside {
@@ -690,7 +643,7 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
             })
             .collect()
     });
-    tone::render(&mut mixed, v.place, &v.dodge_burn, &tone_map);
+    tone::render(&mut mixed, v.place, &tone_map);
     let plane = mixed;
     let gray: Vec<u8> = plane.data.par_iter().map(|&x| to_u8(x)).collect();
     PreviewImage {
@@ -768,7 +721,7 @@ mod histogram_tests {
         )))
         .unwrap();
         let curve = Tone::Look(look).compile();
-        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve, (0.0, &[], 1));
+        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve, 0.0);
 
         let mixed = mix(&sep, &wts);
         let mut en = [0u32; 256];
@@ -809,47 +762,24 @@ mod histogram_tests {
         }
     }
 
-    /// With shapes, the view histogram must equal the histogram of the
-    /// picture the export renders: orient, place, dodge & burn, curve.
+    /// The view histogram must equal the histogram of the picture the
+    /// export renders: place, then the look or the paper, 16-bit first.
     #[test]
-    fn of_separation_with_shapes_matches_the_rendered_picture() {
+    fn of_separation_matches_the_rendered_picture() {
         let sep = sweep(40, 24);
         let wts = Weights::default();
-        let curve = Tone::Look(LookFile::neutral()).compile();
-        let burns = [Burn::radial(0.7, 0.3, 0.3, 0.5, 1.0)];
-        for o in [1u16, 6, 8] {
-            let (_, view) = Histogram::of_separation(&sep, &wts, &curve, (-0.4, &burns, o));
-            let mut pic = orient(&mix(&sep, &wts), o);
-            burn::apply(&mut pic, -0.4, &burns);
+        for (tone, place) in
+            [(Tone::Look(LookFile::neutral()).compile(), -0.4), (Tone::paper().compile(), 0.2)]
+        {
+            let (_, view) = Histogram::of_separation(&sep, &wts, &tone, place);
+            let mut pic = mix(&sep, &wts);
+            tone::place(&mut pic, place);
             let mut ev = [0u32; 256];
             for &l in &pic.data {
                 let lin = q16(l) as f64 / 65535.0;
-                ev[(curve.eval(lin) * 255.0).round() as usize] += 1;
+                ev[(tone.eval(lin) * 255.0).round() as usize] += 1;
             }
-            assert_eq!(view.bins, ev, "orientation {o}");
-        }
-    }
-
-    /// On paper with a shape through one filter the histogram is taken per
-    /// pixel and must equal the rendered picture's.
-    #[test]
-    fn of_separation_with_a_filtered_shape_matches_the_paper_render() {
-        use mimizan_core::burn::Filter;
-        let sep = sweep(40, 24);
-        let wts = Weights::default();
-        let paper = Tone::paper().compile();
-        let mut hard = Burn::radial(0.4, 0.5, 0.4, 0.5, -1.0);
-        hard.set_filter(Filter::Hard);
-        let burns = [hard, Burn::gradient(0.0, 0.0, 1.0, 0.0, 0.3)];
-        for o in [1u16, 6] {
-            let (_, view) = Histogram::of_separation(&sep, &wts, &paper, (0.2, &burns, o));
-            let mut pic = orient(&mix(&sep, &wts), o);
-            tone::render(&mut pic, 0.2, &burns, &paper);
-            let mut ev = [0u32; 256];
-            for &v in &pic.data {
-                ev[(v * 255.0).round() as usize] += 1;
-            }
-            assert_eq!(view.bins, ev, "orientation {o}");
+            assert_eq!(view.bins, ev);
         }
     }
 }

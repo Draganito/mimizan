@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.8.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.9.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -593,10 +593,9 @@ stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$.
 ### 7.3 Output stage (for completeness)
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
-carries as JSON): mix → orientation → size → placing, dodge & burn and
-tone in one step (multiplicative exposure, $L' = L\cdot 2^{p + \sum_i e_i m_i}$
-with soft masks $m_i \in [0,1]$, so a local exposure change keeps its
-meaning) → paper border → [deconvolution →] USM *or* screen compensation →
+carries as JSON): mix → orientation → size → placing and tone in one
+step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
+paper border → [deconvolution →] USM *or* screen compensation →
 file. Resizing is separable in f64 with the kernel stretched by the scale
 factor when shrinking; the kernel is a parameter (Lanczos-3 default,
 Mitchell, Catmull-Rom, cubic B-spline) and the screen compensation below
@@ -611,7 +610,7 @@ $\gamma_n = 0.6$, so $\log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L)$
 for a scene value $L$ and an exposure time of $t$ stops. The print value
 is the reflectance $10^{-D}$ relative to the base with $D_{\max} = 2.0$
 taken to black, encoded $x^{1/2.2}$. The two times are the only tone
-parameters (a dodge or burn may act through one filter), the base
+parameters (there is no local exposure: no dodging or burning), the base
 exposure is the pair that puts the grey card at $D = 0.67$ and the clip
 at $D = 0.10$, and a look (monotone PCHIP through points in $[0,1]^2$
 after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a

@@ -35,8 +35,7 @@
 //! `t = 0` for both passes is the paper's *base exposure*: the pair that
 //! puts the grey card at [`GREY_DENSITY`] and the clip at [`CLIP_DENSITY`]
 //! (a textured white, Zone VIII), solved once from the constants. The user
-//! only ever moves the two times from there, globally with the sliders, or
-//! locally with dodge & burn through one filter or both.
+//! only ever moves the two times from there.
 
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -251,20 +250,6 @@ impl PaperCurve {
         self.paper.encode(self.paper.fraction_at(l, self.soft, self.hard))
     }
 
-    /// Print value when dodge & burn gave the two passes different scene
-    /// values (a shape through one filter): `l_soft` for the soft pass,
-    /// `l_hard` for the hard one.
-    #[inline]
-    pub fn eval_split(&self, l_soft: f64, l_hard: f64) -> f64 {
-        let p = &self.paper;
-        if l_soft <= 0.0 || l_hard <= 0.0 {
-            return p.encode(1.0);
-        }
-        let a = p.soft.fraction(log_exposure(l_soft.min(1.0), self.soft));
-        let b = p.hard.fraction(log_exposure(l_hard.min(1.0), self.hard));
-        p.encode(1.0 - (1.0 - a) * (1.0 - b))
-    }
-
     /// Unexposed paper: what the border is made of. (A scene value of 0 is
     /// the other end: a clear negative, the paper's black.)
     pub fn white(&self) -> f64 {
@@ -373,8 +358,6 @@ mod tests {
         assert_eq!(c.white(), 1.0);
         assert_eq!(c.eval(0.0), 0.0);
         assert!(c.eval(1.0) < 1.0 && c.eval(1.0) > 0.85);
-        assert_eq!(c.eval_split(0.0, 0.5), 0.0);
-        assert_eq!(c.eval_split(0.3, 0.3), c.eval(0.3));
         // One pass alone at its speed-matched time: speed point and ISO R.
         let soft_only = PaperCurve { paper: *p, soft: 0.0, hard: -60.0 };
         let hard_only = PaperCurve { paper: *p, soft: -60.0, hard: 0.0 };

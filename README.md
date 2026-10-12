@@ -256,7 +256,7 @@ the same, so there the estimator, not the detector, is the limit).
 | binary          | purpose |
 |-----------------|---------|
 | `mimizan`      | CLI: `info`, `dump`, `negative`, `print`, `calibrate`, `synth`, `measure`, `bench` |
-| `mimizan-gui`  | Desktop darkroom: open a RAW, judge mix, split-grade exposures and dodge & burn interactively, export the print recipe as TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
+| `mimizan-gui`  | Desktop darkroom: walk the folder as a film strip, judge mix, placing and the two split-grade exposures interactively, export the print recipe as TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
 
 Supported input: Bayer RAWs that [rawler](https://crates.io/crates/rawler)
 decodes (verified: Nikon Z f NEF). Monochrome sensors (DNG without a colour
@@ -278,7 +278,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.8.0-1_amd64.deb
+sudo apt install ./mimizan_0.9.0-1_amd64.deb
 mimizan --version
 ```
 
@@ -319,12 +319,11 @@ mimizan print photo_neg.tif -o photo_2048.jpg --size 2048px --screen 1.0 --look 
 # Richardson-Lucy instead of a halo: 5 passes invert a Gaussian of the USM radius on every pixel
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --deconv 5
 
-# A split-grade print: half a stop less hard light (open shadows), a disc
-# dodged half a stop at (0.3, 0.6), a gradient burning the top edge through the
-# hard filter, 20 mm paper-white border, B-spline resampling; the recipe is written too
+# A split-grade print: half a stop less hard light (open shadows), a third of a
+# stop more exposure overall, 20 mm paper-white border, B-spline resampling; the
+# recipe is written too
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --paper 0,-0.5 \
-  --burn radial:0.3,0.6,0.2,0.5,0.5 --burn gradient:0.5,0.4,0.5,0.0,-0.7,hard \
-  --border-mm 20 --resample b-spline --write-recipe photo.recipe.json
+  --place -0.33 --border-mm 20 --resample b-spline --write-recipe photo.recipe.json
 # ... and the same print again, from the recipe alone
 mimizan print photo_neg.tif -o photo_print.tif --recipe photo.recipe.json
 
@@ -355,12 +354,7 @@ A print is a **recipe**, not a stack of edits: one parameter set (JSON,
 that `mimizan print` renders in one pass against the negative, so there is
 exactly one quantisation and the same recipe gives the same bytes. The
 recipe holds, in the order the pipeline applies them: the **placing**
-(`--place`, stops; `L ← L·2^place`, the darkroom's exposure), **dodge &
-burn** shapes (`--burn radial:x,y,radius,feather,ev[,filter]` and
-`--burn gradient:x0,y0,x1,y1,ev[,filter]`; local exposure by a geometric
-mask, positive ev brighter, negative darker, through both filters or only
-the soft or the hard one, coordinates as fractions of the upright picture
-so a recipe means the same place at any size), the **paper** (`--paper
+(`--place`, stops; `L ← L·2^place`, the darkroom's exposure), the **paper** (`--paper
 SOFT,HARD`: there is no tone curve; the print is what a multigrade paper
 gives after a soft exposure (filter 00) and a hard one (filter 5) through
 a gamma-0.6 negative of the scene, each pass a normal CDF in log exposure
@@ -414,8 +408,8 @@ without a GPU driver. *Negative* is the judging step: the file's exposure
 from EXIF, the histograms and the *Development* fold. *Enlarger* is the
 editing step: the mix from one row of presets (*Native*, *Panchromatic* =
 the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
-47* in front of it) or the R/B sliders, the zone bar, the two exposures
-*soft* and *hard*, and *dodge & burn*. *Print* is the output step
+47* in front of it) or the R/B sliders, the zone bar and the two exposures
+*soft* and *hard*. *Print* is the output step
 and nothing else: native size, a paper size at a dpi or a long edge, the
 border, the resampling kernel and the sharpening, the output size it adds
 up to, and the *Export…* button.
@@ -434,13 +428,10 @@ highlights; a drag on the bar moves both so that the tone under the
 pointer follows the pointer — one more or less second under the
 enlarger. The line under the sliders names the single grade this pair
 equals and the scene stops the paper holds; *base* goes back. Hover a
-zone and its pixels light up in the preview. Dodge & burn shapes are
-placed in the picture (*+ disc* then click, *+ gradient* then drag from
-no effect to full effect), moved by their centre, resized by the ring or
-the end points, set in EV in the Enlarger, and each one acts through
-*both* filters, only the *soft* one (highlights) or only the *hard* one
-(shadows); `Delete` removes the selected one. *fit*, *1:1*, the mask and
-the shape overlay sit in the toolbar.
+zone and its pixels light up in the preview. There is no local work:
+no dodging, no burning, no shape in the picture — the print is the
+negative, one placing and two exposures, as a straight print is. *fit*,
+*1:1* and the mask sit in the toolbar.
 
 Everything the panels set is one **development** (weights, turns and the
 recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole
@@ -454,17 +445,17 @@ description, size, border and sharpening as set — the print) and
 saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
 back when the file is opened again) or anywhere else, and loads one; the
 same JSON drives `mimizan print --recipe`. The preview is the picture before
-size, border and sharpening — mix, placing, shapes and curve exactly as the
+size, border and sharpening — mix, placing and the paper exactly as the
 TIFF gets them — and once you zoom past the fit-to-window preview (scroll,
 `1:1`, or a double click) the visible window is rendered from the
-full-resolution separation, pixel for pixel, shapes included, so the
+full-resolution separation, pixel for pixel, so the
 negative can be judged, carrier residue included. The *Development* fold
 defaults to Mimizan with the Dubois separation (`mask: Dubois`); the fixed
 estimator, the block mask and reconstruction stay one click away. The same
 fold can switch to AMaZE, RCD, DCB or LMMSE; that recomputes the picture
 at once and leaves the Mimizan path untouched. Three histograms (256 bins,
 linear or log), all from the full-resolution data, never from the preview
-copy: *print* (after placing, shapes and the curve: what the TIFF gets),
+copy: *print* (after placing and the paper: what the TIFF gets),
 *negative* (the linear mix on a gamma-2.2 axis) and *raw* (the four sensor
 channels R, G1, G2, B as shot, each against its own black and white level,
 with the fraction at the white level per channel). The black/white readout
@@ -473,8 +464,11 @@ own clipping. Exports run in a background thread; the preview (a downscaled
 copy of the separation) updates in milliseconds. `Reset` returns the
 development to the camera-file defaults and keeps the negative.
 
-The strip at the bottom is the folder browser, drawn as film: *Folder…*
-(or dropping a folder, or opening any file) lists the folder's RAW files
+The strip at the bottom is the folder browser, drawn as film, and the
+only way in: there is no open button. It starts in the last folder (on a
+first start in the pictures folder, else home), and a folder or a RAW
+file dropped on the window or given on the command line takes it there.
+It lists the folder's RAW files
 as frames with perforation, sorted by name or file date, with a breadcrumb
 to walk up. Subfolders come first, as folder tiles the size of a frame with
 the number of RAW files inside (counted in the background, as a file

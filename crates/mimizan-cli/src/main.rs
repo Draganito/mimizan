@@ -92,8 +92,7 @@ enum Cmd {
         #[arg(long)]
         crop: Option<String>,
     },
-    /// Negative TIFF -> print file in one pass: size, place and dodge & burn,
-    /// curve, border, USM or screen compensation; 16-bit TIFF (gamma 2.2 grey
+    /// Negative TIFF -> print file in one pass: size, place, curve, border, USM or screen compensation; 16-bit TIFF (gamma 2.2 grey
     /// ICC) or JPEG (-o *.jpg). Every print decision can come from a recipe
     /// file (--recipe); explicit flags override its fields.
     Print {
@@ -117,13 +116,6 @@ enum Cmd {
         /// Placing in stops before the curve: L * 2^place (0 = untouched)
         #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
         place: Option<f64>,
-        /// Dodge & burn shape, repeatable: "radial:x,y,radius,feather,ev[,filter]"
-        /// or "gradient:x0,y0,x1,y1,ev[,filter]" (coordinates in 0..1 of the
-        /// upright picture, radius as a fraction of the long edge, ev in stops
-        /// like --place: positive = dodge (brighter), negative = burn (darker);
-        /// filter both (default), soft or hard on paper)
-        #[arg(long, value_name = "SHAPE")]
-        burn: Vec<String>,
         /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it),
         /// or long edge in pixels for the screen, e.g. 2048px
         #[arg(long)]
@@ -247,7 +239,6 @@ fn main() -> Result<()> {
             look,
             paper,
             place,
-            burn,
             size,
             resample,
             border_mm,
@@ -269,7 +260,6 @@ fn main() -> Result<()> {
             look,
             paper,
             place,
-            burn,
             size,
             resample,
             border_mm,

@@ -8,7 +8,6 @@
 //! file `mimizan print --recipe` reads. Identical recipes give identical
 //! 16-bit files; that is why the export never needs to see the history.
 
-use crate::burn::Burn;
 use crate::calib::LookFile;
 use crate::error::{Error, Result};
 use crate::print::PrintSize;
@@ -128,9 +127,6 @@ pub struct Recipe {
     /// (neutral, reference, custom) for the measurement pipeline and older
     /// recipes (`tone.rs`). The field keeps its old name in the JSON.
     pub curve: Tone,
-    /// Dodge & burn shapes, local placing (`burn.rs`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dodge_burn: Vec<Burn>,
     /// Resampling kernel of the size step.
     #[serde(default)]
     pub resample: ResampleKernel,
@@ -153,7 +149,6 @@ impl Default for Recipe {
             schema: SCHEMA,
             place: 0.0,
             curve: Tone::default(),
-            dodge_burn: Vec::new(),
             resample: ResampleKernel::default(),
             size: None,
             dpi: default_dpi(),
@@ -178,17 +173,14 @@ impl Recipe {
         if self.schema != SCHEMA {
             return Err(Error::Invalid(format!("recipe schema {} not supported", self.schema)));
         }
-        if !self.place.is_finite() || self.place.abs() > crate::burn::EV_LIMIT {
+        if !self.place.is_finite() || self.place.abs() > crate::tone::PLACE_LIMIT {
             return Err(Error::Invalid(format!(
                 "place {} not within ±{}",
                 self.place,
-                crate::burn::EV_LIMIT
+                crate::tone::PLACE_LIMIT
             )));
         }
         self.curve.validate()?;
-        for b in &self.dodge_burn {
-            b.validate()?;
-        }
         if !(self.dpi.is_finite() && self.dpi > 0.0) {
             return Err(Error::Invalid("dpi must be positive".into()));
         }
@@ -219,10 +211,10 @@ impl Recipe {
         }
     }
 
-    /// Does this recipe change any pixel beyond the plain curve (place,
-    /// shapes, border)? For log lines and the description.
+    /// Does this recipe change any pixel beyond the plain tone (place,
+    /// border)? For log lines and the description.
     pub fn has_local_work(&self) -> bool {
-        self.place != 0.0 || self.dodge_burn.iter().any(|b| b.ev() != 0.0) || self.border_mm > 0.0
+        self.place != 0.0 || self.border_mm > 0.0
     }
 }
 
@@ -235,8 +227,8 @@ mod tests {
         let r = Recipe::default();
         r.validate().unwrap();
         let json = serde_json::to_string(&r).unwrap();
-        // Zero place, no shapes, no size, no border are omitted.
-        assert!(!json.contains("place") && !json.contains("dodge_burn") && !json.contains("border"));
+        // Zero place, no size, no border are omitted.
+        assert!(!json.contains("place") && !json.contains("border"));
         assert!(json.contains(r#""resample":"lanczos3""#), "{json}");
         assert!(json.contains(r#""sharpen":{"mode":"off"}"#), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
@@ -248,17 +240,6 @@ mod tests {
         let r = Recipe {
             place: -0.5,
             curve: Tone::Paper(crate::paper::SplitGrade::new(0.25, -0.5)),
-            dodge_burn: vec![
-                Burn::radial(0.452, 0.61, 0.15, 0.5, 0.75),
-                Burn::Gradient {
-                    x0: 0.5,
-                    y0: 0.0,
-                    x1: 0.5,
-                    y1: 0.4,
-                    ev: 1.0,
-                    filter: crate::burn::Filter::Hard,
-                },
-            ],
             resample: ResampleKernel::BSpline,
             size: Some(PrintSize::Physical { width_in: 11.811, height_in: 15.748 }),
             dpi: 360.0,
@@ -268,7 +249,7 @@ mod tests {
         };
         r.validate().unwrap();
         let json = serde_json::to_string_pretty(&r).unwrap();
-        assert!(json.contains(r#""paper": "multigrade""#) && json.contains(r#""filter": "hard""#), "{json}");
+        assert!(json.contains(r#""paper": "multigrade""#), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert_eq!(r.border_px(), 283);

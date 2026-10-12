@@ -174,7 +174,6 @@ pub struct PrintArgs {
     pub look: Option<PathBuf>,
     pub paper: Option<String>,
     pub place: Option<f64>,
-    pub burn: Vec<String>,
     pub size: Option<String>,
     pub resample: Option<String>,
     pub border_mm: Option<f64>,
@@ -204,7 +203,6 @@ fn usm_default_from_negative(negative: &Path, cameras: &Path) -> Option<f64> {
 
 /// The recipe of a `print` run: the file, then every explicit flag on top.
 pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
-    use mimizan_core::burn::Burn;
     use mimizan_core::calib::LookFile;
     use mimizan_core::paper::SplitGrade;
     use mimizan_core::print::PrintSize;
@@ -234,9 +232,6 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     }
     if let Some(v) = a.place {
         r.place = v;
-    }
-    for s in &a.burn {
-        r.dodge_burn.push(Burn::parse(s)?);
     }
     if let Some(s) = &a.size {
         r.size = Some(PrintSize::parse(s)?);

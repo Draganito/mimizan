@@ -555,7 +555,7 @@ Durchgang in f64, eine Quantisierung am Ende.
   Papier mit seinen zwei Belichtungen
   `{"paper":"multigrade","soft":s,"hard":h}` oder eine Look-Datei inline;
   `tone.rs`, in JSON ohne Tag unterscheidbar am Feld `paper` bzw.
-  `points`), `dodge_burn`, `resample`, `size`, `dpi`, `border_mm`,
+  `points`), `resample`, `size`, `dpi`, `border_mm`,
   `sharpen` (`{"mode":"off"}` | `usm` | `deconv` | `screen`). Felder mit
   Default-Wert werden nicht geschrieben; das leere Rezept
   `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
@@ -597,37 +597,15 @@ Durchgang in f64, eine Quantisierung am Ende.
   `p` Szenenstops dasselbe wie `−γ_n·p` Stops Zeit auf beiden
   Belichtungen (Abnahmetest, ±1 LSB); die GUI bewegt dafür die beiden
   Belichtungen und lässt `place` bei 0.
-- **Abwedeln und Nachbelichten [Ergänzung, Anhang A, wie umgesetzt]**
-  (`--burn radial:x,y,radius,feather,ev[,filter]`,
-  `--burn gradient:x0,y0,x1,y1,ev[,filter]`, wiederholbar; Rezeptfeld
-  `dodge_burn`): lokale Platzierung,
-
-      L'(x, y) = L(x, y) · 2^(place + Σ_i ev_i · m_i(x, y)),   m_i ∈ [0; 1]
-
-  Auf Papier wirkt eine Form durch `filter` = `both` (Default, die Karte
-  vor dem Objektiv bei beiden Belichtungen), `soft` (nur die weiche
-  Belichtung: die Lichter) oder `hard` (nur die harte: Schatten und
-  Mitten); die zwei Durchgänge sehen dann an einem Pixel verschiedene
-  Exponenten, `L_s = L·2^(place + Σ_soft)`, `L_h = L·2^(place + Σ_hard)`
-  (`tone::render_in_place`, `burn::exponents_at`). Ein Look hat eine
-  Belichtung und zählt jede Form. Ohne gefilterte Form ist der Schritt
-  bit-identisch zu `burn::apply_window` gefolgt vom Tonwert.
-
-  Masken rein geometrisch: Scheibe (Gewicht 1 innerhalb
-  `radius·(1 − feather)`, 0 außerhalb `radius`, Smoothstep dazwischen)
-  und Gerade (0 bei `(x0,y0)`, 1 bei `(x1,y1)`, Smoothstep entlang der
-  Strecke, konstant jenseits der Enden — die Kartenkante der Dunkelkammer).
-  Koordinaten normiert auf das aufrechte Bild (Pixelmitte `(i + 0,5)/w`),
-  Radius als Bruchteil der langen Kante, Abstände in Einheiten der langen
-  Kante (die Scheibe ist in Pixeln rund). Vorzeichen wie `place`: positives
-  `ev` platziert heller (Abwedeln), negatives dunkler (Nachbelichten),
-  |ev| ≤ 5. **[Abweichung zu Anhang A.1/A.3]**: Der Anhang rechnet D&B
-  nach der Kurve im kodierten Raum; hier liegt es davor, multiplikativ
-  auf der linearen Luminanz, weil nur so ein EV ein Stop bleibt, die
-  Schulter der Kurve einen nachbelichteten Himmel wie jedes andere Licht
-  behandelt und nichts additiv über Papierweiß geschoben werden kann.
-  Vorschau, 1:1-Fenster und Druck werten dieselben normierten Koordinaten
-  aus (`burn::apply_window` für Ausschnitte).
+- **Abwedeln und Nachbelichten [Abweichung zu Anhang A, entfernt in
+  0.9.0]**: Es gibt keine lokale Belichtung. Anhang A sieht Formen mit
+  einem EV vor; 0.7.0 und 0.8.0 hatten sie (Scheibe, Gerade, zuletzt mit
+  Filterwahl). Sie sind ersatzlos gestrichen: Der Druck ist das Negativ,
+  eine Platzierung und zwei Belichtungen — ein gerader Abzug. Ein Pixel
+  wird nirgends anders behandelt als sein Nachbar mit demselben
+  Szenenwert, womit Vorschau, 1:1-Fenster, Histogramm und Export dieselbe
+  Funktion `L ↦ Ton(L·2^place)` sind (`tone::render`). Rezepte älterer
+  Fassungen mit `dodge_burn` werden gelesen; das Feld wird verworfen.
 - **Papier [Ergänzung, Whitepaper §3–4, anstelle der Zonenkurve]**
   (`--paper SOFT,HARD`, GUI „Enlarger“, dort die einzige
   Tonwertsteuerung; `paper.rs`): Es gibt keine Kurve, die gezogen wird.

@@ -543,8 +543,8 @@ undo history (commits when pointer and keyboard are idle, 200 steps,
 Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) and three docked translucent windows,
 one per darkroom step: *Negative* (left edge, full height: EXIF,
 histograms, development), *Enlarger* (bottom, between the side windows,
-above the strip: mix, place, zone bar, grade, fog / paper white, dodge &
-burn) and *Print* (right edge, full height: size, border, resampling,
+above the strip: mix, place, zone bar, the two exposures, grade) and
+*Print* (right edge, full height: size, border, resampling,
 sharpening, the Export button and nothing else). The windows are egui
 `Window`s with a fixed position and no movement; the picture is fitted into
 the stage left free between them, so nothing is ever covered (Tab hides
@@ -561,19 +561,12 @@ paper the negative never reaches), the two exposure sliders *soft* and
 *hard*, and a line with the equivalent single grade and the scene range.
 A drag on the bar moves both exposures so that the tone under the pointer
 follows the pointer (`PaperCurve::shift_for`). Hovering a zone tints its
-pixels in the preview (mask computed with the preview); fit / 1:1 / mask /
-shapes sit in the toolbar. Dodge &
-burn: shapes are drawn in the viewport (disc: centre drag then radius;
-gradient: start then end), stored in normalised coordinates of the upright
-picture, so the preview, the 1:1 window (`tone::render_in_place` on the
-cropped full-resolution tile with whole-picture coordinates) and the
-export all evaluate the same mask; each shape acts through both filters or
-one of them. Preview order is orient → place/burn/tone in one pass on the
-downscaled linear mix, i.e. the zooming stays what the export
-writes, except for the sharpening/compensation and the resampler — both
-belong to the output size and are stated as such on the export button.
-Three histograms: print (after place, burns, paper, full resolution, the
-weights taken per pixel through `print::upright_pixel`), negative (plain
+pixels in the preview (mask computed with the preview); fit / 1:1 / mask
+sit in the toolbar. Preview order is orient → place/tone in one pass on
+the downscaled linear mix, i.e. the zooming stays what the export writes,
+except for the sharpening/compensation and the resampler — both belong to
+the output size and are stated as such on the export button. Three
+histograms: print (after place and paper, full resolution), negative (plain
 mix) and raw (the four CFA positions of the `RawFrame`, computed once per
 session, with per-channel clipping). The film strip shows the folder as
 negatives with perforation (toggle to positives); subfolders come first as
@@ -604,7 +597,8 @@ soft pass and 60 for the hard one, μ from speed matching at D 0.6), the
 two sharing the silver, `D/Dmax = 1 − (1−a)(1−b)`, behind a straight-line
 negative of γ 0.6; reflectance relative to the base, Dmax 2.0 taken to
 black, encoded 1/2.2. The two exposure times in stops are the only tone
-parameters; dodge and burn can act through one filter.
+parameters; in 0.8.0 a dodge or burn could still act through one filter
+(gone with 0.9.0, next section).
 
 Base exposure (solved once by nested bisection from the anchors grey card
 → D 0.67, clip → D 0.10): soft −0.88 and hard −0.46 stops over the
@@ -639,13 +633,42 @@ samples); within ±1.5 stops every zone keeps a positive share of the
 paper. A placing of p scene stops and −γ·p stops on both exposures agree
 to ±1 LSB (16 bit). Per-pixel cost of the paper: two `erfc`, one `exp10`,
 one `powf`; the 24 MP export renders in the same order as before, the
-histogram keeps its 16-bit LUT while no filtered shape is active and
-evaluates per pixel otherwise.
+histogram keeps its 16-bit LUT (since 0.9.0 always; in 0.8.0 a filtered
+shape forced a per-pixel evaluation).
 
 Deliberately not modelled: the film's toe (the negative is a straight
 line), N±k development (a second contrast parameter next to the split
 would be redundant), paper base tint, dry-down. Each of these is a
 constant or a future paper file, not a user handle.
+
+### Straight prints only, and the strip as the only door (0.9.0)
+
+Dodge & burn is removed without a trace in the code: `burn.rs`, the
+`dodge_burn` recipe field, `--burn`, the filter per shape, the viewport
+tool, the shape overlay, the `Delete` key, the per-pixel branch of the
+histogram and the windowed render (`render_in_place` with whole-picture
+coordinates) are gone; `tone::render` is placing followed by the tone,
+nothing else, and the 1:1 window renders its tile with the same call as
+the whole preview. The reason is the same one that removed the zone
+handles: a shape with an EV is a local edit on a picture, and whatever it
+does cannot be told from retouching. Without it a print is the negative,
+one placing and two exposures — a straight print — and every pixel with
+the same scene value gets the same tone, which is also what makes the
+preview, the 1:1 tile, the histogram and the export one function. Old
+recipes with `dodge_burn` load; the field is dropped. The 1:1 window and
+the histogram got simpler for it (the histogram no longer depends on the
+orientation, which was only there for the shapes' coordinates). Appendix
+A of the Zonensystem paper describes shapes; SPEC §9 records the
+deviation. If local work ever returns it will be a mask of *time* through
+the paper model, not an EV on a form.
+
+With the strip in place the toolbar's *Open RAW…* and *Folder…* were two
+doors to the same room; both are gone. The strip is the way in: it starts
+in the last folder, on a first start in `~/Pictures` (or `Bilder`,
+`Images`, `Photos`), else home; the breadcrumb reaches `/`, folder tiles
+walk down, and a folder or a RAW dropped on the window or passed on the
+command line sets it. The file dialog remains for what it is right for:
+export, save and load a recipe.
 
 ## Real samples
 

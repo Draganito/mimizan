@@ -10,7 +10,6 @@ use crate::worker::{Event, Heavy, Job, Preview, PreviewRequest};
 use crate::zone_bar::zone_bar;
 use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use egui_file_dialog::FileDialog;
-use mimizan_core::burn::{Burn, Filter, EV_LIMIT};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
@@ -22,22 +21,6 @@ use mimizan_core::tone::Tone;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// A dodge & burn shape the next click in the viewport will place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Placing {
-    Disc,
-    Gradient,
-}
-
-/// Which part of the selected shape a drag in the viewport moves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShapeGrab {
-    Centre,
-    Radius,
-    Start,
-    End,
-}
 
 /// Print size choice of the export section; `Recipe::size` is derived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,8 +50,6 @@ enum HistSource {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DialogPurpose {
-    Open,
-    Folder,
     Export,
     SaveRecipe,
     LoadRecipe,
@@ -114,15 +95,6 @@ pub struct App {
     history: History,
     /// Zone under the pointer in the zone bar; tints the preview.
     hover_zone: Option<u8>,
-
-    // Dodge & burn tool
-    dnb_selected: Option<usize>,
-    dnb_placing: Option<Placing>,
-    dnb_grab: Option<ShapeGrab>,
-    /// Gradient being drawn: its start, in normalised picture coordinates.
-    dnb_gradient_start: Option<[f64; 2]>,
-    /// Show the shape outlines over the preview.
-    dnb_overlay: bool,
 
     // Export section
     size_mode: SizeMode,
@@ -236,11 +208,6 @@ impl App {
             edit: Edit::new(Weights::default()),
             history: History::new(Edit::new(Weights::default())),
             hover_zone: None,
-            dnb_selected: None,
-            dnb_placing: None,
-            dnb_grab: None,
-            dnb_gradient_start: None,
-            dnb_overlay: true,
             size_mode: SizeMode::Native,
             paper_cm: [30.0, 40.0],
             long_edge_px: 3000,
@@ -273,7 +240,7 @@ impl App {
             zoom: 1.0,
             pan: Vec2::ZERO,
             dialog: FileDialog::new(),
-            dialog_purpose: DialogPurpose::Open,
+            dialog_purpose: DialogPurpose::Export,
             cameras_dir,
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
@@ -282,7 +249,10 @@ impl App {
             Some(p) if p.is_dir() => app.set_folder(&p),
             Some(p) => app.open(p),
             None => {
-                if let Some(f) = persisted.folder.filter(|f| f.is_dir()) {
+                // The strip is the only way in: the last folder, else the
+                // pictures folder, else home.
+                let last = persisted.folder.filter(|f| f.is_dir());
+                if let Some(f) = last.or_else(start_folder) {
                     app.set_folder(&f);
                 }
             }
@@ -398,7 +368,6 @@ impl App {
             }
         }
         self.edit = e;
-        self.dnb_selected = self.dnb_selected.filter(|&i| i < self.edit.recipe.dodge_burn.len());
         self.size_mode = match self.edit.recipe.size {
             None => SizeMode::Native,
             Some(PrintSize::Physical { .. }) => SizeMode::Paper,
@@ -440,7 +409,7 @@ impl App {
     /// Record the frame's state once the pointer and keyboard let go of the
     /// widgets, so a slider drag is one history step, not sixty.
     fn commit_history(&mut self, ctx: &egui::Context) {
-        if ctx.egui_is_using_pointer() || ctx.egui_wants_keyboard_input() || self.dnb_grab.is_some() {
+        if ctx.egui_is_using_pointer() || ctx.egui_wants_keyboard_input() {
             return;
         }
         self.history.commit(&self.edit);
@@ -468,7 +437,6 @@ impl App {
             weights: self.weights(),
             tone: r.curve.clone(),
             place: r.place,
-            dodge_burn: r.dodge_burn.clone(),
             show_mask: self.show_mask,
             rotation: self.edit.rotation,
             hover_zone: self.hover_zone,
@@ -544,10 +512,6 @@ impl App {
         self.keep_scale = None;
         self.show_mask = false;
         self.hover_zone = None;
-        self.dnb_selected = None;
-        self.dnb_placing = None;
-        self.dnb_grab = None;
-        self.dnb_gradient_start = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
     }
@@ -829,9 +793,8 @@ impl App {
             self.dialog.config_mut().default_file_name = n;
         }
         match purpose {
-            DialogPurpose::Open | DialogPurpose::LoadRecipe => self.dialog.pick_file(),
-            DialogPurpose::Folder => self.dialog.pick_directory(),
-            _ => self.dialog.save_file(),
+            DialogPurpose::LoadRecipe => self.dialog.pick_file(),
+            DialogPurpose::Export | DialogPurpose::SaveRecipe => self.dialog.save_file(),
         }
     }
 
@@ -839,12 +802,6 @@ impl App {
         self.dialog.update(ctx);
         let Some(path) = self.dialog.take_picked() else { return };
         match self.dialog_purpose {
-            DialogPurpose::Open => self.open(path),
-            DialogPurpose::Folder => {
-                self.set_folder(&path);
-                self.show_strip = true;
-                self.persist();
-            }
             DialogPurpose::Export => {
                 if let Some(s) = &self.session {
                     let path = with_ext(path, "tif");
@@ -866,20 +823,12 @@ impl App {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let idle = self.busy.is_none();
-            if ui.add_enabled(idle, egui::Button::new("Open RAW…")).clicked() {
-                self.start_dialog(DialogPurpose::Open, None);
-            }
-            if ui
-                .button("Folder…")
-                .on_hover_text("Show a folder's RAW files as thumbnails in the strip below")
-                .clicked()
-            {
-                self.start_dialog(DialogPurpose::Folder, None);
-            }
             if ui
                 .selectable_label(self.show_strip, "Strip")
-                .on_hover_text("Show or hide the film strip (B). ←/→ open the neighbouring file.")
+                .on_hover_text(
+                    "Show or hide the film strip (B): the folder's RAW files, the way in. ←/→ open the \
+                     neighbouring file; a file or folder can also be dropped on the window.",
+                )
                 .clicked()
             {
                 self.toggle_strip();
@@ -892,11 +841,7 @@ impl App {
                     "Negative",
                     "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
                 ),
-                (
-                    2,
-                    "Enlarger",
-                    "2 · Expose: mix (the filter), placing, the zone bar (the grade), dodge & burn",
-                ),
+                (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
                 (1, "Print", "3 · The print: size, border, sharpening, export"),
             ] {
                 if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
@@ -984,7 +929,6 @@ impl App {
             }
             ui.checkbox(&mut self.show_mask, "mask")
                 .on_hover_text("Show the sharpening mask: white = chroma treated as texture");
-            ui.checkbox(&mut self.dnb_overlay, "shapes").on_hover_text("Show the dodge & burn outlines");
             // Status text takes only what is left and is cut, never painted
             // over the buttons.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1192,7 +1136,7 @@ impl App {
         ui.heading("Histogram");
         ui.horizontal_wrapped(|ui| {
             ui.radio_value(&mut self.hist_source, HistSource::View, "print").on_hover_text(
-                "The full-resolution negative after placing, dodge & burn and the curve, as the TIFF gets it. \
+                "The full-resolution negative after placing and the paper or look, as the TIFF gets it. \
                  black/white: pixels at 0 and 65535 in 16 bit",
             );
             ui.radio_value(&mut self.hist_source, HistSource::Negative, "negative").on_hover_text(
@@ -1340,34 +1284,13 @@ impl App {
         }
     }
 
-    /// Bottom window, step 2: everything that exposes the print. Left the
-    /// mix (the filter), placing and the zone bar (the grade); right dodge &
-    /// burn.
+    /// Bottom window, step 2: everything that exposes the print: the mix
+    /// (the filter), placing and the two paper exposures (the grade).
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
         // The zone bar sets this again while the pointer is over it.
         self.hover_zone = None;
-        let total = ui.available_width();
-        let dnb_w = 236.0;
-        let spacing = ui.spacing().item_spacing.x;
-        let zones_w = (total - dnb_w - 24.0 - 2.0 * spacing).max(240.0);
-        ui.horizontal_top(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(zones_w);
-                self.zones_column(ui, zones_w);
-            });
-            // A short divider, not `separator()`: in a horizontal layout that
-            // one fills the available height and the window would grow to it.
-            let (line, _) = ui.allocate_exact_size(Vec2::new(24.0, 110.0), Sense::hover());
-            ui.painter().vline(
-                line.center().x,
-                line.y_range(),
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-            );
-            ui.vertical(|ui| {
-                ui.set_width(dnb_w);
-                self.dodge_burn_section(ui);
-            });
-        });
+        let width = ui.available_width().max(240.0);
+        self.zones_column(ui, width);
     }
 
     /// Mix as one row, placing, the bar, the grades and the paper's ends.
@@ -1515,109 +1438,6 @@ impl App {
             )
             .weak(),
         );
-    }
-
-    /// Dodge & burn: local placing shapes, placed and moved in the viewport.
-    fn dodge_burn_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Dodge & burn");
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .selectable_label(self.dnb_placing == Some(Placing::Disc), "+ disc")
-                .on_hover_text("Then click in the picture to place a soft disc")
-                .clicked()
-            {
-                self.dnb_placing = (self.dnb_placing != Some(Placing::Disc)).then_some(Placing::Disc);
-                self.dnb_gradient_start = None;
-            }
-            if ui
-                .selectable_label(self.dnb_placing == Some(Placing::Gradient), "+ gradient")
-                .on_hover_text("Then drag in the picture from full effect to no effect")
-                .clicked()
-            {
-                self.dnb_placing = (self.dnb_placing != Some(Placing::Gradient)).then_some(Placing::Gradient);
-                self.dnb_gradient_start = None;
-            }
-            if self.dnb_placing.is_some() {
-                ui.label(RichText::new("click in the picture (Esc cancels)").weak());
-            }
-        });
-        let on_paper = self.edit.recipe.curve.is_paper();
-        let shapes = &mut self.edit.recipe.dodge_burn;
-        if shapes.is_empty() {
-            ui.label(
-                RichText::new(
-                    "Local exposure: positive stops dodge (brighter), negative burn (darker), through both \
-                     filters or one of them. Coordinates are fractions of the picture, so the shapes follow \
-                     a resize.",
-                )
-                .weak(),
-            );
-            return;
-        }
-        let mut remove: Option<usize> = None;
-        for (i, shape) in shapes.iter_mut().enumerate() {
-            let selected = self.dnb_selected == Some(i);
-            let (kind, ev_now) = match *shape {
-                Burn::Radial { ev, .. } => ("disc", ev),
-                Burn::Gradient { ev, .. } => ("gradient", ev),
-            };
-            ui.horizontal(|ui| {
-                if ui.selectable_label(selected, format!("{} {kind}", i + 1)).clicked() {
-                    self.dnb_selected = if selected { None } else { Some(i) };
-                }
-                let mut ev = ev_now;
-                ui.spacing_mut().slider_width = 110.0;
-                if ui
-                    .add(egui::Slider::new(&mut ev, -EV_LIMIT..=EV_LIMIT).fixed_decimals(2).suffix(" EV"))
-                    .changed()
-                {
-                    shape.set_ev(ev);
-                }
-                if ui.small_button("×").on_hover_text("Remove").clicked() {
-                    remove = Some(i);
-                }
-            });
-            if selected {
-                if on_paper {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("filter").weak());
-                        let mut f = shape.filter();
-                        for (filter, label, hint) in [
-                            (Filter::Both, "both", "The card over the lens for both exposures"),
-                            (Filter::Soft, "soft", "Only the soft exposure: works on the highlights"),
-                            (
-                                Filter::Hard,
-                                "hard",
-                                "Only the hard exposure: works on the shadows and mid tones",
-                            ),
-                        ] {
-                            ui.selectable_value(&mut f, filter, label).on_hover_text(hint);
-                        }
-                        if f != shape.filter() {
-                            shape.set_filter(f);
-                        }
-                    });
-                }
-                if let Burn::Radial { radius, feather, .. } = shape {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("radius").weak());
-                        ui.add(egui::DragValue::new(radius).range(0.01..=1.0).speed(0.002).fixed_decimals(3))
-                            .on_hover_text("Fraction of the long edge; or drag the ring in the picture");
-                        ui.label(RichText::new("feather").weak());
-                        ui.add(egui::DragValue::new(feather).range(0.0..=1.0).speed(0.005).fixed_decimals(2))
-                            .on_hover_text("0: hard edge, 1: the whole disc is the transition");
-                    });
-                }
-            }
-        }
-        if let Some(i) = remove {
-            shapes.remove(i);
-            self.dnb_selected = match self.dnb_selected {
-                Some(s) if s == i => None,
-                Some(s) if s > i => Some(s - 1),
-                s => s,
-            };
-        }
     }
 
     /// The print: size, resolution, border, resampling and sharpening. The
@@ -1791,11 +1611,7 @@ impl App {
             String::new()
         };
         let r = &self.edit.recipe;
-        let local = if r.has_local_work() || !r.dodge_burn.is_empty() {
-            format!(", place {:+.2}, {} shape(s)", r.place, r.dodge_burn.len())
-        } else {
-            String::new()
-        };
+        let local = if r.place != 0.0 { format!(", place {:+.2}", r.place) } else { String::new() };
         let sharpen = match r.sharpen {
             Sharpen::Off => "unsharpened".to_string(),
             Sharpen::Usm { amount } => format!("USM {amount:.2}"),
@@ -1851,15 +1667,7 @@ impl App {
                 }
             }
         }
-        // The dodge & burn tool sees the picture where it is now; a drag it
-        // takes does not pan.
-        let tool_rect = {
-            let size = Vec2::new(tw as f32, th as f32) * fit * self.zoom;
-            let max_pan = ((size - avail.size()) * 0.5).max(Vec2::ZERO);
-            Rect::from_center_size(avail.center() + self.pan.clamp(-max_pan, max_pan), size)
-        };
-        let took_drag = self.dodge_burn_tool(ui, &response, tool_rect);
-        if response.dragged() && !took_drag {
+        if response.dragged() {
             self.pan += response.drag_delta();
         }
         let (uw, uh) = self.export_size();
@@ -1923,10 +1731,6 @@ impl App {
             );
         }
 
-        if self.dnb_overlay && !self.show_mask {
-            self.draw_shapes(&painter, rect, response.hover_pos());
-        }
-
         if self.session.is_some() {
             let txt = if self.detail_rect.is_some() {
                 format!("{:.0} % · full-resolution negative pixels, unsharpened", 100.0 * mag)
@@ -1941,240 +1745,18 @@ impl App {
             painter.galley(pos, galley, Color32::from_gray(220));
         }
     }
-
-    /// Place, select and move dodge & burn shapes in the viewport. `rect` is
-    /// the whole picture in screen points. Returns true when the tool used
-    /// the pointer drag (so the panel must not pan).
-    fn dodge_burn_tool(&mut self, ui: &mut egui::Ui, response: &egui::Response, rect: Rect) -> bool {
-        if self.show_mask || rect.width() <= 0.0 || rect.height() <= 0.0 {
-            return false;
-        }
-        let norm = |p: Pos2| -> [f64; 2] {
-            [
-                (((p.x - rect.left()) / rect.width()) as f64).clamp(0.0, 1.0),
-                (((p.y - rect.top()) / rect.height()) as f64).clamp(0.0, 1.0),
-            ]
-        };
-        let to_screen = |x: f64, y: f64| {
-            Pos2::new(rect.left() + x as f32 * rect.width(), rect.top() + y as f32 * rect.height())
-        };
-        let long_px = rect.width().max(rect.height());
-
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.dnb_placing = None;
-            self.dnb_gradient_start = None;
-        }
-        if self.dnb_placing.is_some() && response.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-        }
-        match self.dnb_placing {
-            Some(Placing::Disc) => {
-                if response.clicked() {
-                    if let Some(p) = response.interact_pointer_pos() {
-                        let [x, y] = norm(p);
-                        self.edit.recipe.dodge_burn.push(Burn::radial(x, y, 0.15, 0.5, 0.5));
-                        self.dnb_selected = Some(self.edit.recipe.dodge_burn.len() - 1);
-                        self.dnb_placing = None;
-                    }
-                }
-                false
-            }
-            Some(Placing::Gradient) => {
-                if response.drag_started() {
-                    let origin =
-                        ui.input(|i| i.pointer.press_origin()).or_else(|| response.interact_pointer_pos());
-                    self.dnb_gradient_start = origin.map(norm);
-                }
-                if response.drag_stopped() {
-                    if let (Some([x0, y0]), Some(p)) =
-                        (self.dnb_gradient_start.take(), response.interact_pointer_pos())
-                    {
-                        let [x1, y1] = norm(p);
-                        if (x1 - x0).abs() > 1e-6 || (y1 - y0).abs() > 1e-6 {
-                            self.edit.recipe.dodge_burn.push(Burn::gradient(x0, y0, x1, y1, -0.5));
-                            self.dnb_selected = Some(self.edit.recipe.dodge_burn.len() - 1);
-                        }
-                        self.dnb_placing = None;
-                    }
-                }
-                true
-            }
-            None => {
-                if !self.dnb_overlay {
-                    return false;
-                }
-                // Grab a part of the selected shape where the button went down.
-                if response.drag_started() {
-                    self.dnb_grab = None;
-                    if let (Some(i), Some(p)) = (
-                        self.dnb_selected,
-                        ui.input(|i| i.pointer.press_origin()).or_else(|| response.interact_pointer_pos()),
-                    ) {
-                        if let Some(b) = self.edit.recipe.dodge_burn.get(i) {
-                            self.dnb_grab = match *b {
-                                Burn::Radial { x, y, radius, .. } => {
-                                    let c = to_screen(x, y);
-                                    let d = c.distance(p);
-                                    let r = radius as f32 * long_px;
-                                    if d < 12.0 {
-                                        Some(ShapeGrab::Centre)
-                                    } else if (d - r).abs() < 8.0 {
-                                        Some(ShapeGrab::Radius)
-                                    } else if d < r {
-                                        Some(ShapeGrab::Centre)
-                                    } else {
-                                        None
-                                    }
-                                }
-                                Burn::Gradient { x0, y0, x1, y1, .. } => {
-                                    let (s, e) = (to_screen(x0, y0), to_screen(x1, y1));
-                                    if s.distance(p) < 12.0 {
-                                        Some(ShapeGrab::Start)
-                                    } else if e.distance(p) < 12.0 {
-                                        Some(ShapeGrab::End)
-                                    } else if segment_distance(p, s, e) < 8.0 {
-                                        Some(ShapeGrab::Centre)
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                        }
-                    }
-                }
-                let mut took = false;
-                if let (Some(g), Some(i)) = (self.dnb_grab, self.dnb_selected) {
-                    took = true;
-                    if response.dragged() {
-                        let delta = response.drag_delta();
-                        let dn = [(delta.x / rect.width()) as f64, (delta.y / rect.height()) as f64];
-                        let ptr = response.interact_pointer_pos();
-                        if let Some(b) = self.edit.recipe.dodge_burn.get_mut(i) {
-                            match (b, g) {
-                                (Burn::Radial { x, y, .. }, ShapeGrab::Centre) => {
-                                    *x = (*x + dn[0]).clamp(0.0, 1.0);
-                                    *y = (*y + dn[1]).clamp(0.0, 1.0);
-                                }
-                                (Burn::Radial { x, y, radius, .. }, ShapeGrab::Radius) => {
-                                    if let Some(p) = ptr {
-                                        let d = to_screen(*x, *y).distance(p) / long_px;
-                                        *radius = (d as f64).clamp(0.01, 2.0);
-                                    }
-                                }
-                                (Burn::Gradient { x0, y0, x1, y1, .. }, ShapeGrab::Centre) => {
-                                    *x0 = (*x0 + dn[0]).clamp(0.0, 1.0);
-                                    *y0 = (*y0 + dn[1]).clamp(0.0, 1.0);
-                                    *x1 = (*x1 + dn[0]).clamp(0.0, 1.0);
-                                    *y1 = (*y1 + dn[1]).clamp(0.0, 1.0);
-                                }
-                                (Burn::Gradient { x0, y0, .. }, ShapeGrab::Start) => {
-                                    if let Some(p) = ptr {
-                                        [*x0, *y0] = norm(p);
-                                    }
-                                }
-                                (Burn::Gradient { x1, y1, .. }, ShapeGrab::End) => {
-                                    if let Some(p) = ptr {
-                                        [*x1, *y1] = norm(p);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if response.drag_stopped() {
-                    self.dnb_grab = None;
-                }
-                // A plain click selects the shape under the pointer.
-                if response.clicked() {
-                    if let Some(p) = response.interact_pointer_pos() {
-                        let hit = self.edit.recipe.dodge_burn.iter().position(|b| match *b {
-                            Burn::Radial { x, y, radius, .. } => {
-                                to_screen(x, y).distance(p) <= radius as f32 * long_px
-                            }
-                            Burn::Gradient { x0, y0, x1, y1, .. } => {
-                                segment_distance(p, to_screen(x0, y0), to_screen(x1, y1)) < 8.0
-                            }
-                        });
-                        if hit.is_some() || self.dnb_selected.is_some() {
-                            self.dnb_selected = hit;
-                        }
-                    }
-                }
-                took
-            }
-        }
-    }
-
-    /// Outlines of the shapes over the picture; the selected one in orange.
-    fn draw_shapes(&self, painter: &egui::Painter, rect: Rect, hover: Option<Pos2>) {
-        let to_screen = |x: f64, y: f64| {
-            Pos2::new(rect.left() + x as f32 * rect.width(), rect.top() + y as f32 * rect.height())
-        };
-        let long_px = rect.width().max(rect.height());
-        let font = egui::FontId::proportional(11.0);
-        for (i, b) in self.edit.recipe.dodge_burn.iter().enumerate() {
-            let selected = self.dnb_selected == Some(i);
-            let colour =
-                if selected { Color32::from_rgb(255, 170, 60) } else { Color32::from_white_alpha(150) };
-            let faint = colour.linear_multiply(0.5);
-            let label = format!("{} {:+.2}", i + 1, b.ev());
-            match *b {
-                Burn::Radial { x, y, radius, feather, .. } => {
-                    let c = to_screen(x, y);
-                    let r = radius as f32 * long_px;
-                    painter.circle_stroke(c, r, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, colour));
-                    let inner = r * (1.0 - feather as f32);
-                    if inner > 1.0 && feather > 0.0 {
-                        painter.circle_stroke(c, inner, egui::Stroke::new(1.0, faint));
-                    }
-                    painter.circle_filled(c, 3.0, colour);
-                    painter.text(
-                        c + Vec2::new(6.0, -6.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        label,
-                        font.clone(),
-                        colour,
-                    );
-                }
-                Burn::Gradient { x0, y0, x1, y1, .. } => {
-                    let (s, e) = (to_screen(x0, y0), to_screen(x1, y1));
-                    painter.line_segment([s, e], egui::Stroke::new(if selected { 2.0 } else { 1.0 }, colour));
-                    // Perpendicular ticks mark the two ends: 0 (hollow) and 1 (filled).
-                    let d = (e - s).normalized();
-                    let n = Vec2::new(-d.y, d.x) * 14.0;
-                    painter.line_segment([s - n, s + n], egui::Stroke::new(1.0, faint));
-                    painter.line_segment([e - n, e + n], egui::Stroke::new(1.0, colour));
-                    painter.circle_stroke(s, 4.0, egui::Stroke::new(1.5, colour));
-                    painter.circle_filled(e, 4.0, colour);
-                    let mid = Pos2::new((s.x + e.x) * 0.5, (s.y + e.y) * 0.5);
-                    painter.text(
-                        mid + Vec2::new(6.0, -6.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        label,
-                        font.clone(),
-                        colour,
-                    );
-                }
-            }
-        }
-        if let (Some([x0, y0]), Some(p)) = (self.dnb_gradient_start, hover) {
-            let s = to_screen(x0, y0);
-            painter.line_segment([s, p], egui::Stroke::new(1.5, Color32::from_rgb(255, 170, 60)));
-            painter.circle_stroke(s, 4.0, egui::Stroke::new(1.5, Color32::from_rgb(255, 170, 60)));
-        }
-    }
 }
 
-/// Distance from `p` to the segment `a`–`b`, in points.
-fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
-    let ab = b - a;
-    let len2 = ab.length_sq();
-    if len2 <= 1e-6 {
-        return a.distance(p);
-    }
-    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
-    (a + ab * t).distance(p)
+/// Where the strip starts when nothing is remembered: the pictures folder
+/// if there is one, else home.
+fn start_folder() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    ["Pictures", "Bilder", "Images", "Photos"]
+        .iter()
+        .map(|d| home.join(d))
+        .find(|p| p.is_dir())
+        .or(Some(home))
+        .filter(|p| p.is_dir())
 }
 
 fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
@@ -2250,7 +1832,7 @@ impl App {
         ui.horizontal(|ui| {
             match &self.folder {
                 None => {
-                    ui.label(RichText::new("No folder. Folder… above, or drop a folder here.").weak());
+                    ui.label(RichText::new("No folder. Drop a folder or a RAW file on the window.").weak());
                 }
                 Some(f) => {
                     // Breadcrumb: every ancestor is a button.
@@ -2810,9 +2392,8 @@ impl App {
         }
     }
 
-    /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Delete removes the
-    /// selected shape; Tab hides or shows every panel. Not while a text
-    /// field has the keyboard.
+    /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
+    /// every panel. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -2822,7 +2403,7 @@ impl App {
             self.panels = [!any; 3];
             self.persist();
         }
-        let (undo, redo, del) = ctx.input_mut(|i| {
+        let (undo, redo) = ctx.input_mut(|i| {
             let undo =
                 i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
             let redo = i.consume_shortcut(&egui::KeyboardShortcut::new(
@@ -2830,21 +2411,13 @@ impl App {
                 egui::Key::Z,
             )) || i
                 .consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y));
-            let del = i.key_pressed(egui::Key::Delete);
-            (undo, redo, del)
+            (undo, redo)
         });
         if undo {
             self.undo();
         }
         if redo {
             self.redo();
-        }
-        if del {
-            if let Some(i) = self.dnb_selected.take() {
-                if i < self.edit.recipe.dodge_burn.len() {
-                    self.edit.recipe.dodge_burn.remove(i);
-                }
-            }
         }
     }
 }

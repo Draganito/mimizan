@@ -1,5 +1,5 @@
 //! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
-//! one pass. Upright -> size -> place and dodge & burn -> curve -> border ->
+//! one pass. Upright -> size -> place -> curve -> border ->
 //! [Richardson–Lucy ->] USM or screen compensation -> one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
@@ -413,14 +413,14 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         }
     }
 
-    // Placing, dodge & burn and the tone in one pass: local stops on the
-    // linear luminance, then paper or look.
-    if r.place != 0.0 || r.dodge_burn.iter().any(|b| b.ev() != 0.0) {
-        info!("place {:+.2} stops, {} dodge & burn shapes", r.place, r.dodge_burn.len());
+    // Placing and the tone in one pass: stops on the linear luminance,
+    // then paper or look.
+    if r.place != 0.0 {
+        info!("place {:+.2} stops", r.place);
     }
     let tone = r.curve.compile();
     info!("tone {}", r.curve.name());
-    crate::tone::render(&mut plane, r.place, &r.dodge_burn, &tone);
+    crate::tone::render(&mut plane, r.place, &tone);
 
     if lay.border_px > 0 {
         info!("border {} px ({} mm) in paper white {:.4}", lay.border_px, r.border_mm, tone.white());
@@ -699,15 +699,9 @@ mod tests {
         let src =
             PrintSource { plane: &plane, mask: None, orientation: 6, name: "ramp".into(), description: None };
         let neutral = render_planes(&src, &PrintParams::default());
-        let with_shapes = PrintParams {
-            recipe: Recipe {
-                place: 0.0,
-                dodge_burn: vec![crate::burn::Burn::radial(0.5, 0.5, 0.4, 0.5, 0.0)],
-                ..Recipe::default()
-            },
-            ..Default::default()
-        };
-        assert_eq!(render_planes(&src, &with_shapes).plane.data, neutral.plane.data);
+        let placed_zero =
+            PrintParams { recipe: Recipe { place: 0.0, ..Recipe::default() }, ..Default::default() };
+        assert_eq!(render_planes(&src, &placed_zero).plane.data, neutral.plane.data);
         let paper = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
         let a = render_planes(&src, &paper);
         let b = render_planes(&src, &paper);

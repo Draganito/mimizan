@@ -3,7 +3,6 @@
 //! `print::render` from that file, as the CLI does, and compares 16-bit
 //! values.
 
-use mimizan_core::burn::{Burn, Filter};
 use mimizan_core::calib::LookFile;
 use mimizan_core::icc::GrayTrc;
 use mimizan_core::paper::{self, SplitGrade};
@@ -60,9 +59,9 @@ fn on_paper(soft: f64, hard: f64) -> Recipe {
     Recipe { curve: Tone::Paper(SplitGrade::new(soft, hard)), ..Recipe::default() }
 }
 
-/// Rows 1 and 7 of table 4: place = 0 and no shapes change nothing, for the
-/// neutral look and for the paper; the paper at its base exposure is a
-/// print, not the identity.
+/// Rows 1 and 7 of table 4: place = 0 changes nothing, for the neutral
+/// look and for the paper; the paper at its base exposure is a print, not
+/// the identity.
 #[test]
 fn untouched_steps_change_nothing() {
     let neg = negative_on_disk("neutral");
@@ -71,10 +70,7 @@ fn untouched_steps_change_nothing() {
     assert_eq!(run(&neg, Recipe::with_look(LookFile::neutral())), neutral);
     let base = run(&neg, Recipe::on_paper());
     assert_eq!(run(&neg, on_paper(0.0, 0.0)), base);
-    assert_eq!(
-        run(&neg, Recipe { dodge_burn: vec![Burn::radial(0.5, 0.5, 0.3, 0.5, 0.0)], ..Recipe::on_paper() }),
-        base
-    );
+    assert_eq!(run(&neg, Recipe { place: 0.0, ..Recipe::on_paper() }), base);
     assert_ne!(base, neutral);
     // With a size and a kernel too: the same paper, the same picture.
     let sized = |curve: Tone| Recipe {
@@ -113,12 +109,6 @@ fn history_does_not_exist_for_the_export() {
             }
         }
         r.place = (i as f64 * 0.07).sin() * 0.5;
-        if i % 5 == 0 {
-            let mut b =
-                Burn::radial(0.1 + 0.02 * i as f64, 0.5, 0.2, 0.5, if i % 10 == 0 { 0.5 } else { -0.5 });
-            b.set_filter(if i % 15 == 0 { Filter::Soft } else { Filter::Hard });
-            r.dodge_burn.push(b);
-        }
         r.validate().unwrap();
         history.push(r);
     }
@@ -193,18 +183,14 @@ fn both_exposures_together_are_a_placing() {
     assert!(worst <= 1, "{worst}");
 }
 
-/// Shapes and placing have no reduction over threads: 16 and 3 threads give
-/// the same 16-bit values, with a resize, a border and a filtered shape in
-/// the pass.
+/// Placing and the paper have no reduction over threads: 16 and 3 threads
+/// give the same 16-bit values, with a resize and a border in the pass.
 #[test]
 fn the_pass_is_deterministic_across_thread_counts() {
     let neg = negative_on_disk("threads");
-    let mut hard = Burn::gradient(0.0, 0.0, 0.0, 0.5, -0.7);
-    hard.set_filter(Filter::Hard);
     let recipe = Recipe {
         place: 0.3,
         curve: Tone::Paper(SplitGrade::new(-0.5, 0.5)),
-        dodge_burn: vec![Burn::radial(0.4, 0.6, 0.3, 0.6, 0.8), hard],
         resample: ResampleKernel::Mitchell,
         size: Some(PrintSize::Physical { width_in: 2.0, height_in: 3.0 }),
         dpi: 40.0,
@@ -223,12 +209,9 @@ fn the_pass_is_deterministic_across_thread_counts() {
 #[test]
 fn description_carries_the_recipe_and_the_old_fields() {
     let neg = negative_on_disk("description");
-    let mut shape = Burn::radial(0.452, 0.61, 0.15, 0.5, 0.75);
-    shape.set_filter(Filter::Soft);
     let recipe = Recipe {
         place: -0.25,
         curve: Tone::Paper(SplitGrade::new(0.5, -0.25)),
-        dodge_burn: vec![shape],
         resample: ResampleKernel::BSpline,
         ..Recipe::default()
     };
@@ -243,9 +226,6 @@ fn description_carries_the_recipe_and_the_old_fields() {
     assert_eq!(v["look_encoding"], "gamma22");
     assert_eq!(v["recipe"]["place"], -0.25);
     assert_eq!(v["recipe"]["resample"], "b-spline");
-    assert_eq!(v["recipe"]["dodge_burn"][0]["type"], "radial");
-    assert_eq!(v["recipe"]["dodge_burn"][0]["ev"], 0.75);
-    assert_eq!(v["recipe"]["dodge_burn"][0]["filter"], "soft");
     assert_eq!(v["recipe"]["sharpen"]["mode"], "off");
     assert_eq!(v["recipe"]["curve"]["paper"], "multigrade");
     assert_eq!(v["recipe"]["curve"]["soft"], 0.5);
