@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.9.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -595,11 +595,10 @@ stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$.
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
 carries as JSON): mix → orientation → size → placing and tone in one
 step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
-paper border → [deconvolution →] USM *or* screen compensation →
-file. Resizing is separable in f64 with the kernel stretched by the scale
-factor when shrinking; the kernel is a parameter (Lanczos-3 default,
-Mitchell, Catmull-Rom, cubic B-spline) and the screen compensation below
-uses the chosen kernel's transfer. The tone is a *paper*, not a curve: a
+paper border → [deconvolution →] USM → file. Resizing is separable in
+f64 with the kernel stretched by the scale factor when shrinking; the
+kernel is a parameter (Lanczos-3 default, Mitchell, Catmull-Rom, cubic
+B-spline). The tone is a *paper*, not a curve: a
 variable-contrast paper exposed in two passes (split grade), modelled as
 two emulsion components whose silver fractions are normal CDFs in
 log exposure, $a = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from
@@ -620,12 +619,9 @@ $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$ (one
 arc-minute at viewing distance $d$), Gaussian $\sigma = r_{\mathrm{px}}$,
 masked as in 7.2. Deconvolution is Richardson–Lucy with the same Gaussian
 PSF, $e_{k+1} = e_k \cdot G \circledast \big(b / (G \circledast e_k)\big)$,
-$e_0 = \max(b, 0)$, 1–10 passes, every pixel, before the USM. Screen
-compensation is a 9-tap least-squares FIR fit to the Wiener inverse
-$T(f) = (1+\epsilon) M(f) / (M(f)^2 + \epsilon)$, $\epsilon = 1/(4 g_{\max}^2)$,
-$g_{\max} = 2$, of the known resampler × pixel-aperture transfer
-$M(f) = L(f)\,\mathrm{sinc}(f)$, weight $1/(f + 0.1)$ over $f \in [0, 0.5]$,
-normalised to unit DC gain. None of this is part of the method's claim.
+$e_0 = \max(b, 0)$, 1–10 passes, every pixel, before the USM. There is no
+output for screens: the display's losses are not known to the printer,
+and the print is one file. None of this is part of the method's claim.
 
 ---
 

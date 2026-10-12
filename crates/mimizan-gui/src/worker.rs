@@ -10,9 +10,8 @@ use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
-use mimizan_core::print::{self as pr, PrintParams, PrintSize, PrintSource};
-use mimizan_core::recipe::{Recipe, Sharpen};
-use mimizan_core::screen::ScreenSharpen;
+use mimizan_core::print::{self as pr, PrintParams, PrintSource};
+use mimizan_core::recipe::Recipe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -30,17 +29,14 @@ pub enum Job {
         session: Arc<Session>,
         develop: DevelopParams,
     },
-    /// One export, two files: `path` (16-bit TIFF, the recipe rendered in one
-    /// pass against the negative: curve, placing, shapes, size, border and
-    /// sharpening as set) and `<stem>_<px>px.jpg` (the same picture without
-    /// border or print sharpening, long edge `screen_px`, screen compensation,
-    /// quality 100).
+    /// One export, one file: `path` (16-bit TIFF, the recipe rendered in one
+    /// pass against the negative: placing, paper or look, size, border and
+    /// sharpening as set).
     Export {
         session: Arc<Session>,
         weights: Weights,
         recipe: Recipe,
         path: PathBuf,
-        screen_px: usize,
         /// TIFF orientation to apply (the file's, plus the user's turns).
         orientation: u16,
     },
@@ -49,15 +45,7 @@ pub enum Job {
 pub enum Event {
     Status(String),
     Opened(Arc<Session>),
-    Exported {
-        tiff: PathBuf,
-        jpeg: PathBuf,
-        width: usize,
-        height: usize,
-        jpeg_width: usize,
-        jpeg_height: usize,
-        ms: u128,
-    },
+    Exported { tiff: PathBuf, width: usize, height: usize, ms: u128 },
     Failed(String),
 }
 
@@ -85,8 +73,8 @@ impl Heavy {
                         Job::Redevelop { session, develop } => {
                             redevelop(&session, develop, &status).map(|s| Event::Opened(Arc::new(s)))
                         }
-                        Job::Export { session, weights, recipe, path, screen_px, orientation } => {
-                            export(&session, weights, recipe, &path, screen_px, orientation, &status)
+                        Job::Export { session, weights, recipe, path, orientation } => {
+                            export(&session, weights, recipe, &path, orientation, &status)
                         }
                     };
                     let ev = match r {
@@ -163,18 +151,11 @@ fn develop_frame(
     Ok(Session { path, frame, negative, camera_file, camera_file_path, develop, preview, raw_hist })
 }
 
-/// JPEG path next to the TIFF: `<stem>_<px>px.jpg`.
-pub fn jpeg_path(tiff: &Path, screen_px: usize) -> PathBuf {
-    let stem = tiff.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "mimizan".into());
-    tiff.with_file_name(format!("{stem}_{screen_px}px.jpg"))
-}
-
 fn export(
     s: &Session,
     weights: Weights,
     recipe: Recipe,
     path: &Path,
-    screen_px: usize,
     orientation: u16,
     status: &dyn Fn(String),
 ) -> Result<Event> {
@@ -194,42 +175,16 @@ fn export(
         description: serde_json::to_value(&info).ok(),
     };
 
-    // 1. The print: the recipe in one pass against the negative.
-    let tiff_params = PrintParams { recipe: recipe.clone(), ..Default::default() };
-    status("rendering TIFF".into());
-    let tiff = pr::render_planes(&src, &tiff_params);
+    // The print: the recipe in one pass against the negative.
+    let params = PrintParams { recipe, ..Default::default() };
+    status("rendering".into());
+    let out = pr::render_planes(&src, &params);
     status(format!("writing {}", path.display()));
-    pr::write(&tiff, path, &tiff_params)?;
-    let (width, height) = (tiff.info.width, tiff.info.height);
-    drop(tiff);
-
-    // 2. Screen JPEG: the same picture (curve, placing, shapes) at the
-    // screen's long edge with exact compensation of the known losses; the
-    // border and print sharpening belong to the print.
-    let jpeg = jpeg_path(path, screen_px);
-    let sc = ScreenSharpen::default();
-    let jpeg_params = PrintParams {
-        recipe: Recipe {
-            size: Some(PrintSize::LongEdgePx(screen_px)),
-            border_mm: 0.0,
-            sharpen: Sharpen::Screen { amount: sc.amount, max_gain: sc.max_gain },
-            ..recipe
-        },
-        ..Default::default()
-    };
-    status("rendering JPEG".into());
-    let out = pr::render_planes(&src, &jpeg_params);
-    drop(plane);
-    drop(mask);
-    status(format!("writing {}", jpeg.display()));
-    pr::write(&out, &jpeg, &jpeg_params)?;
+    pr::write(&out, path, &params)?;
     Ok(Event::Exported {
         tiff: path.to_path_buf(),
-        jpeg,
-        width,
-        height,
-        jpeg_width: out.info.width,
-        jpeg_height: out.info.height,
+        width: out.info.width,
+        height: out.info.height,
         ms: t.elapsed().as_millis(),
     })
 }

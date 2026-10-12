@@ -27,7 +27,6 @@ use std::sync::Arc;
 enum SizeMode {
     Native,
     Paper,
-    LongEdge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,7 +39,7 @@ enum WbChoice {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistSource {
-    /// The 8-bit view as shown (after look and screen compensation, or the mask).
+    /// The 8-bit view as shown (after placing and the paper, or the mask).
     View,
     /// The linear mix before the curve, on a gamma-2.2 axis.
     Negative,
@@ -99,7 +98,6 @@ pub struct App {
     // Export section
     size_mode: SizeMode,
     paper_cm: [f64; 2],
-    long_edge_px: usize,
 
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
@@ -156,9 +154,6 @@ pub struct App {
 /// Zoom relative to "fit"; enough for 1:1 on a 100 MP file in a small window.
 const MAX_ZOOM: f32 = 40.0;
 
-/// Long edge of the screen JPEG: the size most galleries display 1:1.
-const SCREEN_LONG_EDGE: usize = 2048;
-
 /// "yellow-green" -> "Yellow-Green".
 fn capitalise(s: &str) -> String {
     s.split('-')
@@ -210,7 +205,6 @@ impl App {
             hover_zone: None,
             size_mode: SizeMode::Native,
             paper_cm: [30.0, 40.0],
-            long_edge_px: 3000,
             zoom_to_1to1: false,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
@@ -371,14 +365,9 @@ impl App {
         self.size_mode = match self.edit.recipe.size {
             None => SizeMode::Native,
             Some(PrintSize::Physical { .. }) => SizeMode::Paper,
-            Some(PrintSize::LongEdgePx(_)) => SizeMode::LongEdge,
         };
-        match self.edit.recipe.size {
-            Some(PrintSize::Physical { width_in, height_in }) => {
-                self.paper_cm = [width_in * 2.54, height_in * 2.54];
-            }
-            Some(PrintSize::LongEdgePx(px)) => self.long_edge_px = px,
-            None => {}
+        if let Some(PrintSize::Physical { width_in, height_in }) = self.edit.recipe.size {
+            self.paper_cm = [width_in * 2.54, height_in * 2.54];
         }
     }
 
@@ -390,7 +379,6 @@ impl App {
                 width_in: self.paper_cm[0] / 2.54,
                 height_in: self.paper_cm[1] / 2.54,
             }),
-            SizeMode::LongEdge => Some(PrintSize::LongEdgePx(self.long_edge_px.max(16))),
         };
     }
 
@@ -574,16 +562,21 @@ impl App {
                             // Moved exposures in the unattended capture.
                             self.edit.recipe.curve = Tone::Paper(SplitGrade::new(0.25, -0.5));
                         }
+                        if let Some(mm) = self
+                            .screenshot_to
+                            .as_ref()
+                            .and_then(|_| std::env::var("MIMIZAN_SCREENSHOT_BORDER").ok())
+                            .and_then(|v| v.parse::<f64>().ok())
+                        {
+                            // A paper border in the unattended capture.
+                            self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
+                        }
                     }
                     self.busy = None;
                     self.last_view = None;
                 }
-                Event::Exported { tiff, jpeg, width, height, jpeg_width, jpeg_height, ms } => {
-                    self.log(format!(
-                        "wrote {} ({width}x{height}) and {} ({jpeg_width}x{jpeg_height}) in {ms} ms",
-                        tiff.display(),
-                        jpeg.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
-                    ));
+                Event::Exported { tiff, width, height, ms } => {
+                    self.log(format!("wrote {} ({width}x{height}) in {ms} ms", tiff.display()));
                     self.busy = None;
                 }
                 Event::Failed(e) => {
@@ -811,7 +804,6 @@ impl App {
                         weights: self.weights(),
                         recipe: self.edit.recipe.clone(),
                         path,
-                        screen_px: SCREEN_LONG_EDGE,
                         orientation: self.export_orientation(),
                     });
                 }
@@ -1434,7 +1426,7 @@ impl App {
         }
         ui.label(
             RichText::new(
-                "Renders this recipe against the negative: the print as 16-bit TIFF and a screen JPEG.",
+                "Renders this recipe against the negative in one pass: the print as a 16-bit TIFF.",
             )
             .weak(),
         );
@@ -1449,8 +1441,6 @@ impl App {
             ui.selectable_value(&mut mode, SizeMode::Native, "native").on_hover_text("The negative's pixels");
             ui.selectable_value(&mut mode, SizeMode::Paper, "paper")
                 .on_hover_text("Fit into a paper size at the dpi");
-            ui.selectable_value(&mut mode, SizeMode::LongEdge, "long edge")
-                .on_hover_text("Longest edge in pixels");
         });
         self.size_mode = mode;
         match mode {
@@ -1479,23 +1469,6 @@ impl App {
                     if ui.small_button("⇄").on_hover_text("Swap width and height").clicked() {
                         self.paper_cm.swap(0, 1);
                     }
-                });
-            }
-            SizeMode::LongEdge => {
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.long_edge_px)
-                            .range(16..=20000)
-                            .speed(4.0)
-                            .suffix(" px"),
-                    );
-                    ui.label(RichText::new("at").weak());
-                    ui.add(
-                        egui::DragValue::new(&mut self.edit.recipe.dpi)
-                            .range(36.0..=1200.0)
-                            .speed(1.0)
-                            .suffix(" dpi"),
-                    );
                 });
             }
             SizeMode::Native => {
@@ -1535,7 +1508,6 @@ impl App {
             Sharpen::Off => 0,
             Sharpen::Usm { .. } => 1,
             Sharpen::Deconv { .. } => 2,
-            Sharpen::Screen { .. } => 3,
         };
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("sharpen").weak());
@@ -1544,21 +1516,16 @@ impl App {
                 .on_hover_text("Unsharp mask for the viewing distance (radius from size and dpi)");
             ui.selectable_value(&mut kind, 2, "deconvolution")
                 .on_hover_text("Richardson–Lucy against the measured sensor PSF, then optional USM");
-            ui.selectable_value(&mut kind, 3, "screen")
-                .on_hover_text("Invert the known resampling and display losses, gain capped");
         });
         let current = match s {
             Sharpen::Off => 0,
             Sharpen::Usm { .. } => 1,
             Sharpen::Deconv { .. } => 2,
-            Sharpen::Screen { .. } => 3,
         };
         if kind != current {
-            let sc = mimizan_core::screen::ScreenSharpen::default();
             *s = match kind {
                 1 => Sharpen::Usm { amount: 0.5 },
                 2 => Sharpen::Deconv { passes: 10, usm_amount: 0.0 },
-                3 => Sharpen::Screen { amount: sc.amount, max_gain: sc.max_gain },
                 _ => Sharpen::Off,
             };
         }
@@ -1569,10 +1536,6 @@ impl App {
             Sharpen::Deconv { passes, usm_amount } => {
                 ui.add(egui::Slider::new(passes, 1..=60).text("passes"));
                 ui.add(egui::Slider::new(usm_amount, 0.0..=2.0).text("USM after").fixed_decimals(2));
-            }
-            Sharpen::Screen { amount, max_gain } => {
-                ui.add(egui::Slider::new(amount, 0.0..=1.5).text("amount").fixed_decimals(2));
-                ui.add(egui::Slider::new(max_gain, 1.0..=4.0).text("max gain").fixed_decimals(2));
             }
             Sharpen::Off => {}
         }
@@ -1604,7 +1567,6 @@ impl App {
         };
         let (uw, uh) = self.export_size();
         let (ow, oh) = self.print_layout().map(|l| (l.out_w, l.out_h)).unwrap_or((uw, uh));
-        let (jw, jh) = mimizan_core::resize::fit_dims(uw, uh, SCREEN_LONG_EDGE, SCREEN_LONG_EDGE);
         let rot = if self.rotation() != 0 {
             format!(", rotated {}°", 90 * self.rotation() as u16)
         } else {
@@ -1616,13 +1578,10 @@ impl App {
             Sharpen::Off => "unsharpened".to_string(),
             Sharpen::Usm { amount } => format!("USM {amount:.2}"),
             Sharpen::Deconv { passes, .. } => format!("deconvolution {passes} passes"),
-            Sharpen::Screen { .. } => "screen compensation".to_string(),
         };
         format!(
-            "Writes two files on the {look}{rot}{local}:\n\
-             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, {sharpen} — the print, recipe in the description\n\
-             <name>_{SCREEN_LONG_EDGE}px.jpg  {jw} x {jh} px, quality 100 — the same picture with screen compensation \
-             for a 1:1 view (no border, no print sharpening)"
+            "Writes the print on the {look}{rot}{local}:\n\
+             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, {sharpen}, recipe in the description"
         )
     }
 
@@ -1647,7 +1606,24 @@ impl App {
         if tw == 0 || th == 0 {
             return;
         }
-        let fit = (avail.width() / tw as f32).min(avail.height() / th as f32);
+        // The paper border, in texture pixels: the print's border against
+        // its picture (`layout`), so it keeps its proportion at any size and
+        // dpi. A flat value, so it is painted under the picture, not
+        // rendered into it; the mask view is not a print and has none.
+        let (border_tex, white) = if self.show_mask {
+            (0.0, 0)
+        } else {
+            let b = self
+                .print_layout()
+                .filter(|l| l.border_px > 0)
+                .map(|l| l.border_px as f32 * tw as f32 / l.image_w.max(1) as f32)
+                .unwrap_or(0.0);
+            let w = self.edit.recipe.curve.compile().white();
+            (b, (w.clamp(0.0, 1.0) * 255.0).round() as u8)
+        };
+        // The sheet (picture plus border) is what fits the stage.
+        let fit = (avail.width() / (tw as f32 + 2.0 * border_tex))
+            .min(avail.height() / (th as f32 + 2.0 * border_tex));
         self.last_fit = Some(fit);
         if let Some(scale) = self.keep_scale.take() {
             self.zoom = (scale / fit).clamp(1.0, MAX_ZOOM);
@@ -1694,11 +1670,15 @@ impl App {
         }
         let scale = fit * self.zoom;
         let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
-        // Keep the image covering the viewport when zoomed, centred otherwise.
-        let max_pan = ((size - avail.size()) * 0.5).max(Vec2::ZERO);
+        let border_pts = border_tex * scale;
+        // Keep the sheet covering the viewport when zoomed, centred otherwise.
+        let max_pan = ((size + Vec2::splat(2.0 * border_pts) - avail.size()) * 0.5).max(Vec2::ZERO);
         self.pan = self.pan.clamp(-max_pan, max_pan);
         let center = avail.center() + self.pan;
         let rect = Rect::from_center_size(center, size);
+        if border_pts > 0.0 {
+            painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
+        }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
         // Magnification in screen pixels per negative pixel.

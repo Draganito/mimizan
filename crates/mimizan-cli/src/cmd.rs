@@ -177,8 +177,6 @@ pub struct PrintArgs {
     pub size: Option<String>,
     pub resample: Option<String>,
     pub border_mm: Option<f64>,
-    pub screen: Option<f64>,
-    pub screen_max_gain: f64,
     pub dpi: Option<f64>,
     pub usm_amount: Option<f64>,
     pub usm_k: f64,
@@ -186,7 +184,6 @@ pub struct PrintArgs {
     pub use_mask: bool,
     pub deconv: Option<u32>,
     pub cameras: PathBuf,
-    pub proof: Option<PathBuf>,
 }
 
 /// USM default: the camera file of the camera named in the negative's description.
@@ -251,21 +248,16 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
 
     // Sharpening: explicit flags replace the recipe's mode; without any, a
     // recipe keeps its own, and a bare run takes the camera file's USM.
-    let explicit = a.screen.is_some() || a.deconv.is_some() || a.usm_amount.is_some();
-    if a.screen.is_some() && a.deconv.is_some() {
-        bail!("--deconv and --screen exclude each other");
-    }
+    let explicit = a.deconv.is_some() || a.usm_amount.is_some();
     if explicit {
         let usm_amount = match a.usm_amount {
             Some(v) => v,
-            None if a.screen.is_none() => usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0),
-            None => 0.0,
+            None => usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0),
         };
-        r.sharpen = match (a.screen, a.deconv) {
-            (Some(amount), _) => Sharpen::Screen { amount, max_gain: a.screen_max_gain },
-            (None, Some(passes)) => Sharpen::Deconv { passes, usm_amount },
-            (None, None) if usm_amount > 0.0 => Sharpen::Usm { amount: usm_amount },
-            (None, None) => Sharpen::Off,
+        r.sharpen = match a.deconv {
+            Some(passes) => Sharpen::Deconv { passes, usm_amount },
+            None if usm_amount > 0.0 => Sharpen::Usm { amount: usm_amount },
+            None => Sharpen::Off,
         };
     } else if a.recipe.is_none() {
         let usm_amount = usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0);
@@ -279,19 +271,15 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
 
 pub fn print(a: &PrintArgs) -> Result<()> {
     use mimizan_core::print::{self as pr, PrintParams};
+    if pr::is_jpeg_path(&a.out) {
+        bail!("the print is written as a 16-bit TIFF; give -o a .tif path");
+    }
     let recipe = print_recipe(a)?;
     if let Some(p) = &a.write_recipe {
         recipe.save(p).with_context(|| format!("writing recipe {}", p.display()))?;
         info!("recipe {}", p.display());
     }
-    let size = recipe.size;
-    let p = PrintParams {
-        recipe,
-        usm_k: a.usm_k,
-        viewing_distance_mm: a.distance_mm,
-        use_mask: a.use_mask,
-        proof_jpeg: a.proof.clone(),
-    };
+    let p = PrintParams { recipe, usm_k: a.usm_k, viewing_distance_mm: a.distance_mm, use_mask: a.use_mask };
     let out = pr::render(&a.negative, &p).with_context(|| format!("rendering {}", a.negative.display()))?;
     let t = Instant::now();
     pr::write(&out, &a.out, &p)?;
@@ -301,24 +289,12 @@ pub fn print(a: &PrintArgs) -> Result<()> {
             out.info.deconvolution_iterations, out.info.usm_radius_px
         );
     }
-    if let Some(s) = &out.info.screen {
-        info!(
-            "screen compensation: amount {:.2}, gain cap {:.1}, {} taps, response {:.2} @ 0.25 c/px, {:.2} @ 0.40 c/px{}",
-            s.amount,
-            s.max_gain,
-            s.taps.len(),
-            s.response_025,
-            s.response_040,
-            if s.downscaled { "" } else { " (no downscale: aperture only)" }
-        );
-    }
     info!(
-        "wrote {} ({}x{}{}{}) in {} ms, render {} ms",
+        "wrote {} ({}x{} @ {} dpi) in {} ms, render {} ms",
         a.out.display(),
         out.info.width,
         out.info.height,
-        if size.is_some_and(|s| s.is_pixels()) { String::new() } else { format!(" @ {} dpi", p.recipe.dpi) },
-        a.proof.as_ref().map(|p| format!(", proof {}", p.display())).unwrap_or_default(),
+        p.recipe.dpi,
         t.elapsed().as_millis(),
         out.info.ms
     );

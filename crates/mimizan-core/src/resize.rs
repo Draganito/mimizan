@@ -76,7 +76,7 @@ impl ResampleKernel {
     }
 
     /// Continuous frequency response in output pixel units, DC = 1 (numeric
-    /// integration; for the screen compensation and reports).
+    /// integration; for reports).
     pub fn mtf(self, f: f64) -> f64 {
         const N: usize = 1201;
         let a = self.support();

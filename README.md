@@ -256,7 +256,7 @@ the same, so there the estimator, not the detector, is the limit).
 | binary          | purpose |
 |-----------------|---------|
 | `mimizan`      | CLI: `info`, `dump`, `negative`, `print`, `calibrate`, `synth`, `measure`, `bench` |
-| `mimizan-gui`  | Desktop darkroom: walk the folder as a film strip, judge mix, placing and the two split-grade exposures interactively, export the print recipe as TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
+| `mimizan-gui`  | Desktop darkroom: walk the folder as a film strip, judge mix, placing and the two split-grade exposures interactively, export the print recipe as a 16-bit TIFF. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
 
 Supported input: Bayer RAWs that [rawler](https://crates.io/crates/rawler)
 decodes (verified: Nikon Z f NEF). Monochrome sensors (DNG without a colour
@@ -265,7 +265,7 @@ X-Trans, Quad-Bayer, Foveon, Nikon HE/HE* NEF.
 
 Output: 16-bit grey TIFF, linear (negative, with a grey ICC profile and a
 JSON description of every parameter) or gamma 2.2 (print), plus an 8-bit
-`.mask.tif` sidecar and an optional JPEG proof.
+`.mask.tif` sidecar.
 
 What it is not: not a RAW converter, no colour output, no noise reduction,
 no lens corrections.
@@ -278,7 +278,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.9.0-1_amd64.deb
+sudo apt install ./mimizan_0.10.0-1_amd64.deb
 mimizan --version
 ```
 
@@ -310,11 +310,8 @@ mimizan info photo.nef
 mimizan negative photo.nef -o photo_neg.tif
 #   writes photo_neg.tif (16 bit linear) and photo_neg.mask.tif
 
-# Negative -> print file, 30x40 cm at 300 dpi, neutral look, mild USM, JPEG proof
-mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --usm-amount 0.5 --proof photo_print.jpg
-
-# Negative -> JPEG for the web, 2048 px long edge, exact screen compensation instead of USM
-mimizan print photo_neg.tif -o photo_2048.jpg --size 2048px --screen 1.0 --look look/reference.json
+# Negative -> print file, 30x40 cm at 300 dpi, neutral look, mild USM
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --usm-amount 0.5 --look look/neutral.json
 
 # Richardson-Lucy instead of a halo: 5 passes invert a Gaussian of the USM radius on every pixel
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --deconv 5
@@ -334,14 +331,6 @@ mimizan bench kodak --images testdata/kodak --blur 0.75 --report docs/KODAK_LENS
 mimizan bench kodak --raw testdata/*.nef --report docs/KODAK_ZF.md --strips docs/kodak_zf --out out/zf
 mimizan bench kodak --raw testdata/*.nef --scale 2 --report docs/KODAK_ZF_SOFT.md --strips docs/kodak_zf_soft --out out/zf_soft
 ```
-
-`--screen` is not a taste setting. For an image shown pixel-for-pixel on a
-screen the losses are known: the Lanczos-3 downscale and the display's pixel
-aperture (sinc). Mimizan Lab inverts their product with a 9-tap FIR designed by
-least squares against the Wiener inverse (gain capped at 2× near Nyquist),
-so the result is neither over- nor under-sharpened for a 1:1 view; `1.0` is
-the full compensation, less leaves part of the loss in. What it cannot know
-is a browser that rescales the image itself (SPEC §9).
 
 `--deconv N` is the other way to sharpen a print: Richardson–Lucy with a
 Gaussian PSF of the USM radius, N passes (1..10), on every pixel, no mask. It
@@ -367,9 +356,8 @@ with `--look` for the measurement pipeline), the **size step** (`--size`, `--dpi
 mitchell | catmull-rom | b-spline`: Lanczos-3 stays the default and the
 benchmark kernel; B-spline is the only one without overshoot, and visibly
 soft), the **border** (`--border-mm`, unexposed paper, taken from the
-paper size), and the **sharpening** (USM,
-deconvolution or screen compensation; the compensation filter is derived
-from the chosen kernel's MTF). Nothing in the recipe reads the picture:
+paper size), and the **sharpening** (USM or deconvolution, both for the
+print's viewing distance). Nothing in the recipe reads the picture:
 there is no tone equaliser and no content-adaptive mask (SPEC §9).
 
 `mimizan negative` picks `cameras/<make>_<model>.json` by the camera in the
@@ -410,9 +398,12 @@ editing step: the mix from one row of presets (*Native*, *Panchromatic* =
 the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
 47* in front of it) or the R/B sliders, the zone bar and the two exposures
 *soft* and *hard*. *Print* is the output step
-and nothing else: native size, a paper size at a dpi or a long edge, the
-border, the resampling kernel and the sharpening, the output size it adds
-up to, and the *Export…* button.
+and nothing else: native size or a paper size at a dpi, the border, the
+resampling kernel and the sharpening, the output size it adds up to, and
+the *Export…* button. The border is part of the preview: the sheet
+(picture plus border in paper white, in the print's proportion) is what
+is fitted into the stage, so a 20 mm border on 30×40 cm is judged as it
+will print.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to
@@ -437,11 +428,9 @@ Everything the panels set is one **development** (weights, turns and the
 recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole
 states, one step per released drag. The export (*Export…* in the Print
 window) renders exactly
-this recipe in one pass against the negative and writes two files:
+this recipe in one pass against the negative and writes one file:
 `<name>.tif` (16 bit, gamma 2.2 grey ICC, the recipe in the TIFF
-description, size, border and sharpening as set — the print) and
-`<name>_2048px.jpg` (the same picture without border or print sharpening,
-2048 px long edge, quality 100, the screen compensation above). *Recipe*
+description, size, border and sharpening as set — the print). *Recipe*
 saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
 back when the file is opened again) or anywhere else, and loads one; the
 same JSON drives `mimizan print --recipe`. The preview is the picture before

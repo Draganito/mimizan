@@ -12,7 +12,6 @@ use crate::calib::LookFile;
 use crate::error::{Error, Result};
 use crate::print::PrintSize;
 use crate::resize::ResampleKernel;
-use crate::screen::ScreenSharpen;
 use crate::tone::Tone;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -31,8 +30,6 @@ pub enum Sharpen {
         #[serde(default)]
         usm_amount: f64,
     },
-    /// Exact compensation of the known screen losses (replaces the USM).
-    Screen { amount: f64, max_gain: f64 },
 }
 
 impl Sharpen {
@@ -41,7 +38,7 @@ impl Sharpen {
         match *self {
             Self::Usm { amount } => amount,
             Self::Deconv { usm_amount, .. } => usm_amount,
-            Self::Off | Self::Screen { .. } => 0.0,
+            Self::Off => 0.0,
         }
     }
 
@@ -52,20 +49,12 @@ impl Sharpen {
         }
     }
 
-    pub fn screen(&self) -> Option<ScreenSharpen> {
-        match *self {
-            Self::Screen { amount, max_gain } => Some(ScreenSharpen { amount, max_gain }),
-            _ => None,
-        }
-    }
-
-    /// Anything that consults the mask (USM or screen) is on.
+    /// Is a USM, which consults the mask, on?
     pub fn uses_mask(&self) -> bool {
         match *self {
             Self::Off => false,
             Self::Usm { amount } => amount > 0.0,
             Self::Deconv { usm_amount, .. } => usm_amount > 0.0,
-            Self::Screen { amount, .. } => amount > 0.0,
         }
     }
 
@@ -87,15 +76,6 @@ impl Sharpen {
                     )));
                 }
                 usm(usm_amount)
-            }
-            Self::Screen { amount, max_gain } => {
-                if !(0.0..=1.0).contains(&amount) {
-                    return Err(Error::Invalid(format!("screen amount {amount} not within 0..1")));
-                }
-                if !(1.0..=4.0).contains(&max_gain) {
-                    return Err(Error::Invalid(format!("screen max gain {max_gain} not within 1..4")));
-                }
-                Ok(())
             }
         }
     }
@@ -265,7 +245,7 @@ mod tests {
     fn validation_catches_ranges() {
         let bad = Recipe { place: 9.0, ..Recipe::default() };
         assert!(bad.validate().is_err());
-        let bad = Recipe { sharpen: Sharpen::Screen { amount: 2.0, max_gain: 2.0 }, ..Recipe::default() };
+        let bad = Recipe { sharpen: Sharpen::Usm { amount: 2.0 }, ..Recipe::default() };
         assert!(bad.validate().is_err());
         let bad = Recipe { sharpen: Sharpen::Deconv { passes: 0, usm_amount: 0.0 }, ..Recipe::default() };
         assert!(bad.validate().is_err());

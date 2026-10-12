@@ -572,12 +572,13 @@ session, with per-channel clipping). The film strip shows the folder as
 negatives with perforation (toggle to positives); subfolders come first as
 folder tiles of frame size with their RAW count (a `mimizan-dir-count`
 thread walks them, results arrive per folder), the strip height is dragged
-on its upper edge and persisted. Export writes TIFF =
-recipe, JPEG = recipe with `LongEdgePx(screen)`, no border and screen
-compensation.
+on its upper edge and persisted. Export writes one TIFF, the recipe
+(until 0.9.0 a second file, the screen JPEG, went with it; see 0.10.0
+below).
 
 Unattended check env vars: `MIMIZAN_SCREENSHOT=out.png` (quit after the
-first preview), `MIMIZAN_SCREENSHOT_ZONES=1` (exposures soft +0.25, hard
+first preview), `MIMIZAN_SCREENSHOT_BORDER=<mm>` (a paper border in the
+capture), `MIMIZAN_SCREENSHOT_ZONES=1` (exposures soft +0.25, hard
 −0.5 instead of the base; `MIMIZAN_SCREENSHOT_CUSTOM` went with the curve
 editor),
 `MIMIZAN_SCREENSHOT_1TO1=1` (wait for the 1:1 window),
@@ -669,6 +670,39 @@ in the last folder, on a first start in `~/Pictures` (or `Bilder`,
 walk down, and a folder or a RAW dropped on the window or passed on the
 command line sets it. The file dialog remains for what it is right for:
 export, save and load a recipe.
+
+### The print window: one file, the border in the preview (0.10.0)
+
+The screen output is gone: `screen.rs` (the 9-tap Wiener-inverse FIR of
+Phase 4, which stays above as the record of what it did and measured),
+`Sharpen::Screen`, `--screen`, `--screen-max-gain`, `--proof`,
+`PrintSize::LongEdgePx` and `--size <N>px`, the GUI's *long edge* size and
+*screen* sharpening, and the second export file `<name>_2048px.jpg`. The
+CLI refuses `-o *.jpg`. The reason is not the filter, which did what it
+claimed within the model: the model assumes one image pixel per device
+pixel, and no HiDPI display and no browser keeps that, so the "known
+losses" were known for a display nobody has; and one recipe produced two
+different pictures. The print is one file. The mobile app keeps its
+full-size JPEG (its album), without compensation and without the 2048 px
+variant; `print::write` still writes a JPEG for a `.jpg` path for it.
+Old recipes with `"sharpen":{"mode":"screen"}` or a pixel size do not
+load (serde: unknown variant); the GUI logs it and keeps its default. The
+*Print* window is now: native or paper size at a dpi, border, resampler,
+sharpening off / USM / deconvolution, the size line, *Export…*.
+
+The border is in the preview. It is a flat value (`tone.white()`, 1.0 on
+paper), so it is painted, not rendered: the viewport fits the *sheet*
+(picture plus two borders) into the stage and draws a rectangle in the
+paper's white under the texture, `border_px · tex_w / image_w` texture
+pixels wide from `print::layout`, so the proportion is the print's at any
+paper size and dpi (15 mm on the Z f native print: 177 px on 4032, 4.4 %,
+and the preview shows 4.4 %). Nothing in the pixel mapping changed:
+zoom, the 1:1 tile and the zone mask address the picture as before, the
+pan limit grew by the border so a zoomed view can reach the sheet's edge.
+The mask view has no border (it is not a print), the histogram counts no
+border pixels (a flat value would only add a bar at paper white). The
+8-bit grey of the painted rectangle is the same value the texture carries
+for paper white, both through egui's sRGB path.
 
 ## Real samples
 

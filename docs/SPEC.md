@@ -556,7 +556,7 @@ Durchgang in f64, eine Quantisierung am Ende.
   `{"paper":"multigrade","soft":s,"hard":h}` oder eine Look-Datei inline;
   `tone.rs`, in JSON ohne Tag unterscheidbar am Feld `paper` bzw.
   `points`), `resample`, `size`, `dpi`, `border_mm`,
-  `sharpen` (`{"mode":"off"}` | `usm` | `deconv` | `screen`). Felder mit
+  `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Felder mit
   Default-Wert werden nicht geschrieben; das leere Rezept
   `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
   ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`); die GUI
@@ -583,8 +583,9 @@ Durchgang in f64, eine Quantisierung am Ende.
   (Gewichte außerhalb werden auf den Randpixel gelegt, Summe exakt 1).
   Niemals über Zielpixel hinaus skalieren. Die Maske wird mit Lanczos-3
   mitskaliert (sie ist ein Gewichtsfeld). Ohne `--size` bleibt die
-  Pixelzahl des Negativs. Alternativ `--size <N>px`: lange Kante in
-  Pixeln (Einpassen in ein Quadrat N×N), für den Bildschirm.
+  Pixelzahl des Negativs. Eine Pixelgröße (`<N>px`, lange Kante) gab es
+  bis 0.9.0 für den Bildschirm; sie ist mit der Bildschirmausgabe
+  gestrichen (unten).
   **[Abweichung zu Anhang A.2]**: Der dort empfohlene „Cubic B = 0,
   C = 1“ ist kein Catmull-Rom (das ist C = ½) und überschwingt an einer
   Kante stärker als Lanczos-3 (RESULTS.md, Tabelle der Kernüberschwinger);
@@ -680,8 +681,10 @@ Durchgang in f64, eine Quantisierung am Ende.
   `round(border_mm / 25,4 · DPI)` Pixel je Seite gelegt, gefüllt mit
   Papierweiß = unbelichtetes Papier (1,0) bzw. beim Look dessen Wert bei
   linear 1 (bei `neutral` 1,0); die Maske wird
-  mit 0 aufgefüllt, damit keine Schärfung in den Rand läuft. Das
-  Bildschirm-JPEG der GUI bekommt keinen Rand.
+  mit 0 aufgefüllt, damit keine Schärfung in den Rand läuft. Die GUI
+  zeigt den Rand in der Vorschau: eingepasst wird der Bogen (Bild plus
+  Rand), der Rand ist in Papierweiß gemalt, nicht gerechnet (ein flacher
+  Wert), in der Proportion `border_px / image_w` des Drucks.
 - **USM**: Radius in Pixel
 
       r_px = usm_k · d_mm · DPI,   usm_k = 1,15·10⁻⁵ (Default)
@@ -708,48 +711,27 @@ Durchgang in f64, eine Quantisierung am Ende.
   Rauschen zurück, das die Unschärfe genommen hat. Die PSF ist nicht
   gemessen, sondern die Annahme „Betrachter-Unschärfe = USM-Radius“;
   der Schritt ist damit eine Schärfung durch Inversion, keine Restaurierung.
-  Eine USM kann danach noch folgen (`--usm-amount`). Schließt
-  `--screen` aus. Die Dateibeschreibung nennt `deconvolution_iterations`,
-  solange > 0.
-- **Bildschirmkompensation [Ergänzung]** (`--screen <amount>`, ersetzt die
-  USM): Für ein Bild, das 1:1 auf einem Bildschirm steht, sind die
-  Verluste bekannt und nicht vom Betrachter abhängig: die Verkleinerung
-  mit der MTF `L(f)` des gewählten Kerns (`ResampleKernel::mtf`,
-  Fourier-Transformierte des auf 1 normierten Kerns in Ausgabepixeln; für
-  Lanczos-3 1,01 bei 0,2 c/px, 0,99 bei 0,3, 0,82 bei 0,4, 0,50 bei 0,5;
-  ein weicherer Kern wie der B-Spline hat eine tiefere MTF, die der
-  9-Tap-FIR unter der Verstärkungsgrenze nur zum Teil zurückholt) und die
-  Pixelapertur des Displays
-  (100 % Füllfaktor, `A(f) = sinc(f) = sin(πf)/(πf)`, 0,637 bei Nyquist).
-  Bekannte Übertragung `M(f) = L(f)·A(f)` (0,985 / 0,947 / 0,849 / 0,623
-  bei 0,1 / 0,2 / 0,3 / 0,4 c/px); ohne Verkleinerung nur `A(f)`.
-  Ziel ist die regularisierte Inverse (Wiener)
-
-      T(f) = (1+ε) · M(f) / (M(f)² + ε),   ε = 1 / (4·g_max²),  g_max = 2 (Default)
-
-  so dass `T(0) = 1` und die Verstärkung nahe Nyquist auf etwa `g_max`
-  begrenzt bleibt (Rauschen). `T` wird durch einen symmetrischen 9-Tap-FIR
-  `H(f) = h₀ + 2·Σ h_k cos(2πkf)` im Sinne kleinster Quadrate über
-  `f ∈ [0; 0,5]` angenähert, Gewicht `1/(f + 0,1)` (natürliche Bilder haben
-  ~1/f-Amplitudenspektren, der Fehler soll dort klein sein, wo das Bild
-  Energie hat), danach exakt auf DC-Verstärkung 1 normiert. Ergebnis für
-  Verkleinerung: `H·M` = 0,98/1,00/0,99/0,95/0,94 bei 0,1/0,2/0,25/0,3/0,4
-  c/px, `H(0,5)` = 1,91. `amount ∈ [0; 1]` mischt den Kern linear mit der
-  Identität; mehr als 1 wird nicht angeboten, weil es die gemessenen
-  Verluste überkompensieren würde. Ein Gauß-USM kann diese Inverse nicht
-  darstellen (ein Fit läuft auf σ < 0,3 px). Maskenregel wie bei der USM,
-  separabel, Rand reflect-101, nach der Kurve. Nicht bekannt und daher
-  nicht kompensiert: ein Browser, der das Bild selbst skaliert (HiDPI-Zoom),
-  Betrachtungsabstand, Display-ppi.
+  Eine USM kann danach noch folgen (`--usm-amount`). Die
+  Dateibeschreibung nennt `deconvolution_iterations`, solange > 0.
+- **Bildschirmausgabe [Abweichung, entfernt in 0.10.0]**: Bis 0.9.0 gab
+  es `--screen <amount>` (eine 9-Tap-FIR als Wiener-Inverse der bekannten
+  Übertragung Verkleinerungskern × Pixelapertur, Verstärkung auf 2
+  begrenzt), `--size <N>px`, `-o *.jpg`, `--proof` und in der GUI eine
+  zweite Exportdatei `<name>_2048px.jpg`. Alles gestrichen. Grund: Die
+  Kompensation setzt ein Bildpixel = ein Gerätepixel voraus, was kein
+  HiDPI-Bildschirm und kein Browser einhält; die „bekannten Verluste“ sind
+  beim Bildschirm des Betrachters gerade nicht bekannt, beim Druck schon
+  (Resampler, Format, Abstand). Und ein Rezept ergab zwei verschiedene
+  Bilder. Der Druck ist eine Datei, das TIFF. Das Herleitungsprotokoll
+  der Kompensation steht in RESULTS.md (Phase 4). Die Mobile-App schreibt
+  weiter ein JPEG in voller Größe (ihr Album), ohne Kompensation.
 - **Datei**: 16-Bit-TIFF mit Kurve und Gamma-2,2-Grau-ICC (bei
   `encoding = none` lineares ICC), `XResolution/YResolution` = DPI,
   `ImageDescription` = JSON mit Quelle, dem vollständigen Rezept, Größe
-  und Rand in Pixeln, USM- bzw. Kompensationsparametern (Taps, Antwort
-  bei 0,25 und 0,40 c/px) und der Beschreibung des Negativs. Endet `-o` auf `.jpg`/`.jpeg`, wird nur
-  das JPEG geschrieben (Bildschirm). `--proof` schreibt zusätzlich ein
-  8-Bit-Grau-JPEG derselben Pixel in voller Druckauflösung, Qualität 100
-  (ein Kanal, kein Chroma-Subsampling), mit demselben Grau-ICC wie das
-  TIFF.
+  und Rand in Pixeln, USM-Parametern und der Beschreibung des Negativs.
+  Die CLI schreibt nur TIFF (`-o *.jpg` wird abgelehnt); `print::write`
+  kann ein 8-Bit-Grau-JPEG (Qualität 100, ein Kanal, dasselbe Grau-ICC)
+  schreiben, das nutzt die Mobile-App.
 
 ## 10. Eichdateien
 

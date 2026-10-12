@@ -92,9 +92,9 @@ enum Cmd {
         #[arg(long)]
         crop: Option<String>,
     },
-    /// Negative TIFF -> print file in one pass: size, place, curve, border, USM or screen compensation; 16-bit TIFF (gamma 2.2 grey
-    /// ICC) or JPEG (-o *.jpg). Every print decision can come from a recipe
-    /// file (--recipe); explicit flags override its fields.
+    /// Negative TIFF -> print file in one pass: size, place, paper or look, border,
+    /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC). Every print
+    /// decision can come from a recipe file (--recipe); explicit flags override its fields.
     Print {
         negative: PathBuf,
         #[arg(short, long)]
@@ -116,8 +116,7 @@ enum Cmd {
         /// Placing in stops before the curve: L * 2^place (0 = untouched)
         #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
         place: Option<f64>,
-        /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it),
-        /// or long edge in pixels for the screen, e.g. 2048px
+        /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it)
         #[arg(long)]
         size: Option<String>,
         /// Resampling kernel: lanczos3 (default, sharpest) | catmull-rom |
@@ -127,13 +126,6 @@ enum Cmd {
         /// Paper border around the picture, mm, filled with paper white
         #[arg(long, value_name = "MM")]
         border_mm: Option<f64>,
-        /// Screen output: replace USM by the exact compensation of the known
-        /// losses (resampling kernel x display pixel aperture); value = amount 0..1
-        #[arg(long, value_name = "AMOUNT")]
-        screen: Option<f64>,
-        /// Gain cap of the screen compensation near Nyquist (Wiener regularisation)
-        #[arg(long, default_value_t = 2.0)]
-        screen_max_gain: f64,
         #[arg(long)]
         dpi: Option<f64>,
         /// USM amount (0 = off); default from the camera file named in the negative, else 0
@@ -155,9 +147,6 @@ enum Cmd {
         /// Directory with cameras/*.json for the USM default
         #[arg(long, default_value = "cameras")]
         cameras: PathBuf,
-        /// Also write an 8-bit grey JPEG proof (full print size, quality 100, grey ICC)
-        #[arg(long)]
-        proof: Option<PathBuf>,
     },
     /// Generate a synthetic scene (mosaic + ground truth)
     Synth(measure::SynthArgs),
@@ -242,8 +231,6 @@ fn main() -> Result<()> {
             size,
             resample,
             border_mm,
-            screen,
-            screen_max_gain,
             dpi,
             usm_amount,
             usm_k,
@@ -251,7 +238,6 @@ fn main() -> Result<()> {
             no_mask,
             deconv,
             cameras,
-            proof,
         } => cmd::print(&cmd::PrintArgs {
             negative,
             out,
@@ -263,8 +249,6 @@ fn main() -> Result<()> {
             size,
             resample,
             border_mm,
-            screen,
-            screen_max_gain,
             dpi,
             usm_amount,
             usm_k,
@@ -272,7 +256,6 @@ fn main() -> Result<()> {
             use_mask: !no_mask,
             deconv,
             cameras,
-            proof,
         }),
         Cmd::Synth(a) => measure::synth(&a),
         Cmd::Measure { cmd } => measure::measure(&cmd),

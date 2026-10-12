@@ -75,7 +75,7 @@ fn untouched_steps_change_nothing() {
     // With a size and a kernel too: the same paper, the same picture.
     let sized = |curve: Tone| Recipe {
         curve,
-        size: Some(PrintSize::LongEdgePx(50)),
+        size: Some(PrintSize::Physical { width_in: 0.5, height_in: 0.5 }),
         resample: ResampleKernel::CatmullRom,
         ..Recipe::default()
     };

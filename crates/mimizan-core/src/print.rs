@@ -1,9 +1,9 @@
 //! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
 //! one pass. Upright -> size -> place -> curve -> border ->
-//! [Richardson–Lucy ->] USM or screen compensation -> one quantisation ->
+//! [Richardson–Lucy ->] USM -> one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
-//! print decision (viewing model constant, sidecar use, proof path).
+//! print decision (viewing model constant, sidecar use).
 
 use crate::deconv::{richardson_lucy, DECONV_ITERATIONS};
 use crate::error::{Error, Result};
@@ -11,7 +11,6 @@ use crate::icc::GrayTrc;
 use crate::plane::Plane;
 use crate::recipe::{Recipe, Sharpen};
 use crate::resize::{fit_dims, resize_with, ResampleKernel};
-use crate::screen;
 use crate::tiffin::{read_gray, read_mask8};
 use crate::tiffout::{write_gray16, TiffMeta};
 use crate::usm::{radius_px, unsharp, USM_K};
@@ -21,32 +20,19 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
 
-/// Output size: a physical print, or a pixel box for the screen.
+/// Output size: a physical print (a paper box the picture is fitted into).
+/// An enum with one variant so the recipe JSON (`{"physical":{...}}`)
+/// stays what it was.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrintSize {
-    Physical {
-        width_in: f64,
-        height_in: f64,
-    },
-    /// Longest edge in pixels (the image is fitted into a square box).
-    LongEdgePx(usize),
+    Physical { width_in: f64, height_in: f64 },
 }
 
 impl PrintSize {
-    /// `"30x40cm"`, `"12x16in"`, `"8.5x11in"`, or `"2048px"` (long edge).
+    /// `"30x40cm"`, `"12x16in"`, `"8.5x11in"`.
     pub fn parse(s: &str) -> Result<Self> {
         let t = s.trim().to_ascii_lowercase();
-        if let Some(n) = t.strip_suffix("px") {
-            let n: usize = n
-                .trim()
-                .parse()
-                .map_err(|_| Error::Invalid(format!("size '{s}': pixel size must be an integer")))?;
-            if n == 0 {
-                return Err(Error::Invalid("size must be positive".into()));
-            }
-            return Ok(Self::LongEdgePx(n));
-        }
         let (num, unit) = if let Some(n) = t.strip_suffix("cm") {
             (n, 2.54)
         } else if let Some(n) = t.strip_suffix("mm") {
@@ -71,16 +57,8 @@ impl PrintSize {
 
     /// Bounding box in pixels.
     pub fn pixels(&self, dpi: f64) -> (usize, usize) {
-        match *self {
-            Self::Physical { width_in, height_in } => {
-                ((width_in * dpi).round().max(1.0) as usize, (height_in * dpi).round().max(1.0) as usize)
-            }
-            Self::LongEdgePx(n) => (n, n),
-        }
-    }
-
-    pub fn is_pixels(&self) -> bool {
-        matches!(self, Self::LongEdgePx(_))
+        let Self::Physical { width_in, height_in } = *self;
+        ((width_in * dpi).round().max(1.0) as usize, (height_in * dpi).round().max(1.0) as usize)
     }
 }
 
@@ -94,18 +72,11 @@ pub struct PrintParams {
     pub viewing_distance_mm: Option<f64>,
     /// Use the `.mask.tif` sidecar to restrict USM.
     pub use_mask: bool,
-    pub proof_jpeg: Option<PathBuf>,
 }
 
 impl Default for PrintParams {
     fn default() -> Self {
-        Self {
-            recipe: Recipe::default(),
-            usm_k: USM_K,
-            viewing_distance_mm: None,
-            use_mask: true,
-            proof_jpeg: None,
-        }
+        Self { recipe: Recipe::default(), usm_k: USM_K, viewing_distance_mm: None, use_mask: true }
     }
 }
 
@@ -115,8 +86,8 @@ impl PrintParams {
         Self { recipe: Recipe::with_look(look), ..Self::default() }
     }
 
-    /// USM or screen compensation, both of which consult the mask.
-    /// Deconvolution does not: it runs on the whole picture, and USM may follow it.
+    /// USM consults the mask. Deconvolution does not: it runs on the whole
+    /// picture, and USM may follow it.
     pub fn sharpens(&self) -> bool {
         self.recipe.sharpen.uses_mask()
     }
@@ -146,21 +117,7 @@ pub struct PrintInfo {
     /// Richardson–Lucy iterations when that path ran; omitted when it did not.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub deconvolution_iterations: u32,
-    /// Screen compensation, when used: amount, gain cap, the 7 taps and
-    /// the resulting response at 0.25 and 0.4 c/px.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub screen: Option<ScreenInfo>,
     pub ms: u128,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct ScreenInfo {
-    pub amount: f64,
-    pub max_gain: f64,
-    pub downscaled: bool,
-    pub taps: Vec<f64>,
-    pub response_025: f64,
-    pub response_040: f64,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -403,7 +360,6 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
 
     let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
     let (tw, th, d_mm, r_px) = (lay.image_w, lay.image_h, lay.viewing_mm, lay.usm_radius_px);
-    let downscaled = if tw < plane.width { Some(r.resample) } else { None };
     if (tw, th) != (plane.width, plane.height) {
         info!("resize {}x{} -> {}x{} ({})", plane.width, plane.height, tw, th, r.resample.name());
         plane = resize_with(&plane, tw, th, r.resample);
@@ -430,32 +386,9 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         }
     }
 
-    let mut screen_info = None;
     let mut deconv_n = 0usize;
     match r.sharpen {
-        Sharpen::Screen { amount, max_gain } if amount > 0.0 => {
-            let s = screen::ScreenSharpen { amount, max_gain };
-            let h = screen::kernel(&s, downscaled);
-            info!(
-                "screen compensation amount {:.2}, gain cap {:.1}, downscaled {}, response 0.25 c/px {:.2}, 0.40 c/px {:.2}, masked: {}",
-                amount,
-                max_gain,
-                downscaled.is_some(),
-                screen::response(&h, 0.25),
-                screen::response(&h, 0.40),
-                mask.is_some()
-            );
-            plane = screen::sharpen(&plane, &h, mask.as_ref());
-            screen_info = Some(ScreenInfo {
-                amount,
-                max_gain,
-                downscaled: downscaled.is_some(),
-                taps: h.to_vec(),
-                response_025: screen::response(&h, 0.25),
-                response_040: screen::response(&h, 0.40),
-            });
-        }
-        Sharpen::Screen { .. } | Sharpen::Off => {}
+        Sharpen::Off => {}
         Sharpen::Usm { .. } | Sharpen::Deconv { .. } => {
             let passes = r.sharpen.deconv_passes();
             if passes > 0 && r_px > 0.0 {
@@ -494,7 +427,6 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         usm_radius_px: r_px,
         usm_masked: mask.is_some(),
         deconvolution_iterations: deconv_n as u32,
-        screen: screen_info,
         ms: t.elapsed().as_millis(),
     };
     debug_assert_eq!((plane.width, plane.height), (lay.out_w, lay.out_h));
@@ -502,8 +434,8 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
 }
 
 /// Write the print: a 16-bit TIFF (grey ICC) unless `path` ends in
-/// `.jpg`/`.jpeg`, in which case only the JPEG is written; plus the optional
-/// JPEG proof.
+/// `.jpg`/`.jpeg`, in which case an 8-bit JPEG is written (the mobile
+/// app's album; the desktop writes TIFF).
 pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
     let desc = serde_json::to_string(&out.info)?;
     let trc = match p.recipe.curve.encoding() {
@@ -519,11 +451,6 @@ pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
             &TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.recipe.dpi) },
         )?;
     }
-    if let Some(jp) = &p.proof_jpeg {
-        if jp != path {
-            write_jpeg(&out.plane, jp, trc)?;
-        }
-    }
     Ok(())
 }
 
@@ -534,9 +461,9 @@ pub fn is_jpeg_path(path: &Path) -> bool {
     )
 }
 
-/// JPEG proof of an already encoded plane: full print resolution, 8-bit grey
-/// (one channel, so no chroma subsampling), quality 100, the same grey ICC
-/// as the TIFF embedded.
+/// JPEG of an already encoded plane: full print resolution, 8-bit grey (one
+/// channel, so no chroma subsampling), quality 100, the same grey ICC as
+/// the TIFF embedded.
 pub fn write_jpeg(plane: &Plane, path: &Path, trc: GrayTrc) -> Result<()> {
     use image::ImageEncoder;
     let buf: Vec<u8> = plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
@@ -555,18 +482,14 @@ mod tests {
     #[test]
     fn size_parsing() {
         let s = PrintSize::parse("30x40cm").unwrap();
-        let PrintSize::Physical { width_in, .. } = s else { panic!() };
+        let PrintSize::Physical { width_in, .. } = s;
         assert!((width_in - 11.811).abs() < 1e-3);
         assert_eq!(s.pixels(300.0), (3543, 4724));
         assert_eq!(PrintSize::parse("8x10in").unwrap().pixels(300.0), (2400, 3000));
         assert!(PrintSize::parse("30x40").is_err());
         assert!(PrintSize::parse("0x40cm").is_err());
-        let px = PrintSize::parse("2048px").unwrap();
-        assert_eq!(px, PrintSize::LongEdgePx(2048));
-        assert!(px.is_pixels());
-        assert_eq!(px.pixels(300.0), (2048, 2048));
-        assert!(PrintSize::parse("0px").is_err());
-        assert!(PrintSize::parse("2048.5px").is_err());
+        assert!(PrintSize::parse("2048px").is_err());
+        assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
     }
 
     #[test]
@@ -622,10 +545,11 @@ mod tests {
 
     #[test]
     fn downscale_detection_respects_orientation() {
-        let p = sized(PrintSize::LongEdgePx(1000));
+        // 1000 px square box at 100 dpi; 8000 px.
+        let p = sized(PrintSize::Physical { width_in: 10.0, height_in: 10.0 });
         assert!(is_downscale(4000, 3000, 1, &p));
         assert!(is_downscale(4000, 3000, 6, &p));
-        let big = sized(PrintSize::LongEdgePx(8000));
+        let big = sized(PrintSize::Physical { width_in: 80.0, height_in: 80.0 });
         assert!(!is_downscale(4000, 3000, 1, &big));
         assert!(is_jpeg_path(Path::new("a/b.JPG")) && !is_jpeg_path(Path::new("a/b.tif")));
     }
