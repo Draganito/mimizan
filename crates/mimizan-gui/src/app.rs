@@ -2,7 +2,7 @@
 //! (right). Nothing here changes pixels; it only chooses parameters and hands
 //! them to the workers.
 
-use crate::browser::{Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::browser::{dir_name, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::curve_editor::{curve_editor, curve_plot};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
@@ -2319,6 +2319,23 @@ impl App {
                             ui.label(RichText::new("›").weak());
                         }
                     }
+                    // Going down: the subfolders of the current one as a menu.
+                    if !f.subdirs.is_empty() {
+                        let n = f.subdirs.len();
+                        ui.menu_button(RichText::new(format!("› {n} ⏷")).weak(), |ui| {
+                            ui.set_min_width(160.0);
+                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                for d in &f.subdirs {
+                                    if ui.button(dir_name(d)).clicked() {
+                                        go_to = Some(d.clone());
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        })
+                        .response
+                        .on_hover_text(format!("{n} subfolder{}", if n == 1 { "" } else { "s" }));
+                    }
                     ui.label(RichText::new(format!("{} RAW", f.entries.len())).weak());
                     if ui.small_button("↻").on_hover_text("Read the folder again").clicked() {
                         rescan = true;
@@ -2378,7 +2395,22 @@ impl App {
         ui.add_space(2.0);
         let Some(folder) = &mut self.folder else { return };
         if folder.entries.is_empty() {
-            ui.label(RichText::new("No RAW files in this folder.").weak());
+            // Nothing to show as film: offer the way down instead.
+            let mut go_to: Option<PathBuf> = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("No RAW files in this folder.").weak());
+                if !folder.subdirs.is_empty() {
+                    ui.label(RichText::new("Folders:").weak());
+                }
+                for d in &folder.subdirs {
+                    if ui.button(dir_name(d)).clicked() {
+                        go_to = Some(d.clone());
+                    }
+                }
+            });
+            if let Some(p) = go_to {
+                self.set_folder(&p);
+            }
             return;
         }
         let idle = self.busy.is_none();

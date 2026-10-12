@@ -89,14 +89,24 @@ pub struct Folder {
     pub sort: Sort,
     /// Bumped on every scan so thumbnails of an old listing are ignored.
     pub generation: u64,
+    /// Visible subfolders (not hidden ones), natural order, for going down.
+    pub subdirs: Vec<PathBuf>,
 }
 
 impl Folder {
     pub fn scan(path: &Path, sort: Sort, generation: u64) -> std::io::Result<Self> {
         let mut entries = Vec::new();
+        let mut subdirs = Vec::new();
         for e in std::fs::read_dir(path)? {
             let e = e?;
             let p = e.path();
+            if p.is_dir() {
+                let hidden = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+                if !hidden {
+                    subdirs.push(p);
+                }
+                continue;
+            }
             if !p.is_file() || !is_raw(&p) {
                 continue;
             }
@@ -112,7 +122,8 @@ impl Folder {
                 texture: None,
             });
         }
-        let mut f = Self { path: path.to_path_buf(), entries, sort, generation };
+        subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
+        let mut f = Self { path: path.to_path_buf(), entries, sort, generation, subdirs };
         f.resort(sort);
         Ok(f)
     }
@@ -130,6 +141,11 @@ impl Folder {
     pub fn index_of(&self, path: &Path) -> Option<usize> {
         self.entries.iter().position(|e| e.path == path)
     }
+}
+
+/// Last path component as text (`/` for the root).
+pub fn dir_name(p: &Path) -> String {
+    p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".to_string())
 }
 
 /// `DSC_9.NEF` before `DSC_10.NEF`: digit runs compare by value.
