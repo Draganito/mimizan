@@ -1125,7 +1125,7 @@ impl App {
                 ui.end_row();
                 if info.reconstruct {
                     ui.label("reconstruct");
-                    val(ui, 
+                    val(ui,
                         RichText::new(format!("on: {:.1} % of the picture computed", 100.0 * info.computed))
                             .color(egui::Color32::from_rgb(230, 170, 60)),
                     )
