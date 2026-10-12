@@ -553,30 +553,26 @@ sufficient). A note on the bottom window: it is sized by its content, and a
 `separator()` inside a horizontal layout fills the available height, which
 made the first version 420 pt tall — the divider is a painted line of fixed
 height now, and the rows wrap or are split so the content never exceeds
-the gap between the side windows. There are no curves in the GUI: the zone
-bar in the Enlarger is the only tone control. It is the paper from fog to paper white on
-the encoded axis, split into zones 0 … VII; a patch's width is the share
-of the paper that zone gets and it is painted with the print tones it
-covers. The boundary between two zones is the handle (`ResizeHorizontal`
-cursor): a drag widens one zone and narrows the other, a double click puts
-the boundary back, ticks under the bar mark the untouched positions. For
-this the curve's nodes moved from the zone centres to the zone boundaries
-(SPEC §9 [Abweichung]); the first version of the bar (two rows on a log
-axis, handles on the centres) showed N+1 with zones 0 and I collapsed at
-the left edge because the log axis clamps at −5.5 stops, which is why the
-axis is the encoded print value now. Hovering a zone tints its pixels in
-the preview (mask computed with the preview); the place slider, the grade
-start positions N−2 … N+2 and the fog / paper-white fields sit next to
-the bar; fit / 1:1 / mask / shapes sit in the toolbar. Dodge &
+the gap between the side windows. There are no curves in the GUI, and
+since 0.8.0 no zone handles either (see "The paper" below): the Enlarger
+holds the zone bar as a display of where the zones land on the paper
+(axis = print value, patch width = share of the paper, hatched end =
+paper the negative never reaches), the two exposure sliders *soft* and
+*hard*, and a line with the equivalent single grade and the scene range.
+A drag on the bar moves both exposures so that the tone under the pointer
+follows the pointer (`PaperCurve::shift_for`). Hovering a zone tints its
+pixels in the preview (mask computed with the preview); fit / 1:1 / mask /
+shapes sit in the toolbar. Dodge &
 burn: shapes are drawn in the viewport (disc: centre drag then radius;
 gradient: start then end), stored in normalised coordinates of the upright
-picture, so the preview, the 1:1 window (`burn::apply_window` on the
+picture, so the preview, the 1:1 window (`tone::render_in_place` on the
 cropped full-resolution tile with whole-picture coordinates) and the
-export all evaluate the same mask. Preview order is orient → place/burn →
-curve on the downscaled linear mix, i.e. the zooming stays what the export
+export all evaluate the same mask; each shape acts through both filters or
+one of them. Preview order is orient → place/burn/tone in one pass on the
+downscaled linear mix, i.e. the zooming stays what the export
 writes, except for the sharpening/compensation and the resampler — both
 belong to the output size and are stated as such on the export button.
-Three histograms: print (after place, burns, curve, full resolution, the
+Three histograms: print (after place, burns, paper, full resolution, the
 weights taken per pixel through `print::upright_pixel`), negative (plain
 mix) and raw (the four CFA positions of the `RawFrame`, computed once per
 session, with per-channel clipping). The film strip shows the folder as
@@ -588,11 +584,68 @@ recipe, JPEG = recipe with `LongEdgePx(screen)`, no border and screen
 compensation.
 
 Unattended check env vars: `MIMIZAN_SCREENSHOT=out.png` (quit after the
-first preview), `MIMIZAN_SCREENSHOT_ZONES=1` (bar at grade N+1;
-`MIMIZAN_SCREENSHOT_CUSTOM` went with the curve editor),
+first preview), `MIMIZAN_SCREENSHOT_ZONES=1` (exposures soft +0.25, hard
+−0.5 instead of the base; `MIMIZAN_SCREENSHOT_CUSTOM` went with the curve
+editor),
 `MIMIZAN_SCREENSHOT_1TO1=1` (wait for the 1:1 window),
 `MIMIZAN_WINDOW=WxH` (inner size in points; default 1360×860, which is the
 size the default panel positions were laid out for).
+
+### The paper instead of a curve (0.8.0)
+
+The zone bar with one handle per boundary (0.7.0) turned out to be a
+curve editor with another face: every boundary set on its own means a
+PCHIP with kinks, local steep sections and zones squeezed to a few pixels
+of the bar — results no paper gives and the look of a digitally edited
+picture. It is gone. The tone is now a split-grade print on a modelled
+multigrade paper (`paper.rs`, SPEC §9 "Papier"): two emulsion components
+with normal-CDF silver fractions in log exposure (σ from ISO R 180 for the
+soft pass and 60 for the hard one, μ from speed matching at D 0.6), the
+two sharing the silver, `D/Dmax = 1 − (1−a)(1−b)`, behind a straight-line
+negative of γ 0.6; reflectance relative to the base, Dmax 2.0 taken to
+black, encoded 1/2.2. The two exposure times in stops are the only tone
+parameters; dodge and burn can act through one filter.
+
+Base exposure (solved once by nested bisection from the anchors grey card
+→ D 0.67, clip → D 0.10): soft −0.88 and hard −0.46 stops over the
+speed-matched times, ISO range 101 (grade ≈ 3), 5.6 scene stops between
+first tone and near-black. Where the zones land (print value, density):
+
+| exposures | ≈ grade | scene stops | 0 | I | II | III | IV | V | VI | VII | clip |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| base | 3 | 5.6 | .001 | .007 | .030 | .089 | .226 | .488 | .736 | .863 | .900 |
+| (density) | | | 2.00 | 2.00 | 1.98 | 1.83 | 1.32 | 0.67 | 0.29 | 0.14 | 0.10 |
+| soft +1 | 1½ | 7.0 | .001 | .005 | .022 | .069 | .166 | .340 | .535 | .686 | .746 |
+| soft −1 | 4 | 4.2 | .001 | .009 | .036 | .106 | .278 | .609 | .870 | .955 | .971 |
+| hard +1 | 4 | 4.2 | .000 | .000 | .003 | .015 | .053 | .147 | .374 | .719 | .837 |
+| hard −1 | 1½ | 7.0 | .014 | .049 | .126 | .275 | .474 | .640 | .768 | .865 | .900 |
+| hard −½ | 2½ | 6.3 | .004 | .021 | .067 | .170 | .372 | .608 | .765 | .865 | .900 |
+| identity (0.7.0 default) | | | .095 | .130 | .178 | .244 | .335 | .459 | .629 | .861 | 1.000 |
+
+Reading: a stop more soft light moves Zone VII by 0.18 and Zone III by
+0.02 (the highlights' exposure); a stop less hard light moves Zone III by
+0.19 and Zone VII by 0.002 (the shadows' exposure). A stop *more* hard
+light darkens the mid tones as much as the shadows — the shadows sit on
+the paper's shoulder and have little room left — which is also what the
+darkroom knows about hard exposures; the acceptance test therefore
+checks the shadow side in the direction that has room. Against the
+identity of 0.7.0 the base print is an S: shadows deeper (Zone III at
+0.089 against 0.244, density 1.83 where Adams' table has about 1.6 — the
+model has no film toe), highlights lighter up to the clip at 0.90, grey
+card 0.488 against 0.459. Zones 0 and I lie on the paper's black at the
+base exposure, as on a real sheet; the bar shows them as a sliver.
+Monotone for every pair within ±3 stops (acceptance, 64 pairs × 2000
+samples); within ±1.5 stops every zone keeps a positive share of the
+paper. A placing of p scene stops and −γ·p stops on both exposures agree
+to ±1 LSB (16 bit). Per-pixel cost of the paper: two `erfc`, one `exp10`,
+one `powf`; the 24 MP export renders in the same order as before, the
+histogram keeps its 16-bit LUT while no filtered shape is active and
+evaluates per pixel otherwise.
+
+Deliberately not modelled: the film's toe (the negative is a straight
+line), N±k development (a second contrast parameter next to the split
+would be redundant), paper base tint, dry-down. Each of these is a
+constant or a future paper file, not a user handle.
 
 ## Real samples
 

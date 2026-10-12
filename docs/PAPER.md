@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.7.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.8.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -593,20 +593,30 @@ stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$.
 ### 7.3 Output stage (for completeness)
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
-carries as JSON): mix → orientation → size → placing and dodge & burn
-(multiplicative, $L' = L\cdot 2^{p + \sum_i e_i m_i}$ with soft masks
-$m_i \in [0,1]$, so a local exposure change keeps the curve's meaning) →
-curve → paper border → [deconvolution →] USM *or* screen compensation →
+carries as JSON): mix → orientation → size → placing, dodge & burn and
+tone in one step (multiplicative exposure, $L' = L\cdot 2^{p + \sum_i e_i m_i}$
+with soft masks $m_i \in [0,1]$, so a local exposure change keeps its
+meaning) → paper border → [deconvolution →] USM *or* screen compensation →
 file. Resizing is separable in f64 with the kernel stretched by the scale
 factor when shrinking; the kernel is a parameter (Lanczos-3 default,
 Mitchell, Catmull-Rom, cubic B-spline) and the screen compensation below
-uses the chosen kernel's transfer. The curve is a monotone PCHIP through
-points in $[0,1]^2$ after $x^{1/2.2}$ encoding (`neutral` is pure gamma
-2.2; `reference` is fitted from a grey wedge against a monochrome camera's
-JPEG by weighted isotonic regression; the *zone curve* puts one node on
-each encoded zone boundary $B_k = 0.18\cdot 2^{k+0.5-5}$, so that moving a
-node widens one zone and narrows its neighbour, and is bit-identical to
-`neutral` while no node is moved). USM radius
+uses the chosen kernel's transfer. The tone is a *paper*, not a curve: a
+variable-contrast paper exposed in two passes (split grade), modelled as
+two emulsion components whose silver fractions are normal CDFs in
+log exposure, $a = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from
+the ISO range of the grade (R 180 for the soft pass, 60 for the hard one)
+and $\mu$ from speed matching at the ISO speed point, sharing the silver,
+$D/D_{\max} = 1 - (1-a)(1-b)$, behind a straight-line negative of
+$\gamma_n = 0.6$, so $\log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L)$
+for a scene value $L$ and an exposure time of $t$ stops. The print value
+is the reflectance $10^{-D}$ relative to the base with $D_{\max} = 2.0$
+taken to black, encoded $x^{1/2.2}$. The two times are the only tone
+parameters (a dodge or burn may act through one filter), the base
+exposure is the pair that puts the grey card at $D = 0.67$ and the clip
+at $D = 0.10$, and a look (monotone PCHIP through points in $[0,1]^2$
+after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a
+grey wedge against a monochrome camera's JPEG) remains for the
+measurement pipeline. USM radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$ (one
 arc-minute at viewing distance $d$), Gaussian $\sigma = r_{\mathrm{px}}$,
 masked as in 7.2. Deconvolution is Richardson–Lucy with the same Gaussian

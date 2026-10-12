@@ -17,11 +17,9 @@ pub struct Edit {
 }
 
 impl Edit {
-    /// The untouched development: the zone bar with every zone one stop
-    /// wide, which is the neutral curve bit for bit.
+    /// The untouched development: the paper at its base exposure.
     pub fn new(weights: Weights) -> Self {
-        let recipe = Recipe { curve: mimizan_core::zone::default_look(), ..Recipe::default() };
-        Self { weights, recipe, rotation: 0 }
+        Self { weights, recipe: Recipe::on_paper(), rotation: 0 }
     }
 }
 

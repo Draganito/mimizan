@@ -172,7 +172,7 @@ pub struct PrintArgs {
     pub recipe: Option<PathBuf>,
     pub write_recipe: Option<PathBuf>,
     pub look: Option<PathBuf>,
-    pub grade: Option<i32>,
+    pub paper: Option<String>,
     pub place: Option<f64>,
     pub burn: Vec<String>,
     pub size: Option<String>,
@@ -206,25 +206,31 @@ fn usm_default_from_negative(negative: &Path, cameras: &Path) -> Option<f64> {
 pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     use mimizan_core::burn::Burn;
     use mimizan_core::calib::LookFile;
+    use mimizan_core::paper::SplitGrade;
     use mimizan_core::print::PrintSize;
     use mimizan_core::recipe::{Recipe, Sharpen};
     use mimizan_core::resize::ResampleKernel;
+    use mimizan_core::tone::Tone;
 
     let mut r = match &a.recipe {
         Some(p) => Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))?,
         None => Recipe::default(),
     };
-    if a.look.is_some() && a.grade.is_some() {
-        bail!("--look and --grade exclude each other");
+    if a.look.is_some() && a.paper.is_some() {
+        bail!("--look and --paper exclude each other");
     }
     if let Some(p) = &a.look {
-        r.curve = LookFile::load(p).with_context(|| format!("look file {}", p.display()))?;
+        r.curve = Tone::Look(LookFile::load(p).with_context(|| format!("look file {}", p.display()))?);
     }
-    if let Some(g) = a.grade {
-        if !(-5..=5).contains(&g) {
-            bail!("grade must be within -5..5");
-        }
-        r.curve = mimizan_core::zone::grade(g);
+    if let Some(p) = &a.paper {
+        let (soft, hard) =
+            p.split_once(',').ok_or_else(|| anyhow::anyhow!("--paper wants SOFT,HARD stops"))?;
+        let split = SplitGrade::new(
+            soft.trim().parse().with_context(|| format!("soft exposure '{soft}'"))?,
+            hard.trim().parse().with_context(|| format!("hard exposure '{hard}'"))?,
+        );
+        split.validate()?;
+        r.curve = Tone::Paper(split);
     }
     if let Some(v) = a.place {
         r.place = v;

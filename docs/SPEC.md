@@ -544,19 +544,23 @@ Kein Prozentwert ohne eine dieser Messungen.
 
 ## 9. Ausgang (Druck und Bildschirm)
 
-Reihenfolge: Mischung → Orientierung → Größe → Platzierung und
-Abwedeln/Nachbelichten → Kurve → Rand → [Entfaltung →] USM *oder*
-Bildschirmkompensation → Datei. Ein Durchgang in f64, eine Quantisierung
-am Ende.
+Reihenfolge: Mischung → Orientierung → Größe → Platzierung,
+Abwedeln/Nachbelichten und Tonwert (Papier oder Look) in einem Schritt →
+Rand → [Entfaltung →] USM *oder* Bildschirmkompensation → Datei. Ein
+Durchgang in f64, eine Quantisierung am Ende.
 
 - **Rezept [Ergänzung, Zonensystem-Whitepaper §5 und Anhang A]**: Der
   Druck ist ein Parametersatz, keine Folge von Bearbeitungen. `Recipe`
-  (`recipe.rs`, `schema: 1`) hält `place`, `curve` (eine Look-Datei
-  inline), `dodge_burn`, `resample`, `size`, `dpi`, `border_mm`, `sharpen`
-  (`{"mode":"off"}` | `usm` | `deconv` | `screen`). Felder mit
+  (`recipe.rs`, `schema: 1`) hält `place`, `curve` (der Tonwert: das
+  Papier mit seinen zwei Belichtungen
+  `{"paper":"multigrade","soft":s,"hard":h}` oder eine Look-Datei inline;
+  `tone.rs`, in JSON ohne Tag unterscheidbar am Feld `paper` bzw.
+  `points`), `dodge_burn`, `resample`, `size`, `dpi`, `border_mm`,
+  `sharpen` (`{"mode":"off"}` | `usm` | `deconv` | `screen`). Felder mit
   Default-Wert werden nicht geschrieben; das leere Rezept
   `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
-  ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`). Das
+  ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`); die GUI
+  beginnt mit dem Papier in Grundbelichtung. Das
   Rezept steht als JSON in der `ImageDescription` des Druck-TIFFs und in
   `--write-recipe`; `--recipe` liest es, Flags auf der Kommandozeile
   überschreiben einzelne Felder. Die GUI-Historie ist eine Liste solcher
@@ -588,13 +592,26 @@ am Ende.
   Kern ist deshalb ein Parameter des Rezepts, kein Ersatz des Defaults.
 - **Platzierung [Ergänzung, Whitepaper Gl. 1]** (`--place <stops>`,
   Rezeptfeld `place`, |place| ≤ 5): `L ← L · 2^place` auf der linearen
-  Luminanz nach der Größe, vor der Kurve. `place = 0` lässt jeden Wert
-  unangetastet (kein Rechenschritt).
+  Luminanz nach der Größe, vor dem Tonwert. `place = 0` lässt jeden Wert
+  unangetastet (kein Rechenschritt). Auf Papier ist eine Platzierung um
+  `p` Szenenstops dasselbe wie `−γ_n·p` Stops Zeit auf beiden
+  Belichtungen (Abnahmetest, ±1 LSB); die GUI bewegt dafür die beiden
+  Belichtungen und lässt `place` bei 0.
 - **Abwedeln und Nachbelichten [Ergänzung, Anhang A, wie umgesetzt]**
-  (`--burn radial:x,y,radius,feather,ev`, `--burn gradient:x0,y0,x1,y1,ev`,
-  wiederholbar; Rezeptfeld `dodge_burn`): lokale Platzierung,
+  (`--burn radial:x,y,radius,feather,ev[,filter]`,
+  `--burn gradient:x0,y0,x1,y1,ev[,filter]`, wiederholbar; Rezeptfeld
+  `dodge_burn`): lokale Platzierung,
 
       L'(x, y) = L(x, y) · 2^(place + Σ_i ev_i · m_i(x, y)),   m_i ∈ [0; 1]
+
+  Auf Papier wirkt eine Form durch `filter` = `both` (Default, die Karte
+  vor dem Objektiv bei beiden Belichtungen), `soft` (nur die weiche
+  Belichtung: die Lichter) oder `hard` (nur die harte: Schatten und
+  Mitten); die zwei Durchgänge sehen dann an einem Pixel verschiedene
+  Exponenten, `L_s = L·2^(place + Σ_soft)`, `L_h = L·2^(place + Σ_hard)`
+  (`tone::render_in_place`, `burn::exponents_at`). Ein Look hat eine
+  Belichtung und zählt jede Form. Ohne gefilterte Form ist der Schritt
+  bit-identisch zu `burn::apply_window` gefolgt vom Tonwert.
 
   Masken rein geometrisch: Scheibe (Gewicht 1 innerhalb
   `radius·(1 − feather)`, 0 außerhalb `radius`, Smoothstep dazwischen)
@@ -611,7 +628,64 @@ am Ende.
   behandelt und nichts additiv über Papierweiß geschoben werden kann.
   Vorschau, 1:1-Fenster und Druck werten dieselben normierten Koordinaten
   aus (`burn::apply_window` für Ausschnitte).
-- **Kurve**: `look/*.json` mit monotonen Stützstellen in [0,1]², PCHIP
+- **Papier [Ergänzung, Whitepaper §3–4, anstelle der Zonenkurve]**
+  (`--paper SOFT,HARD`, GUI „Enlarger“, dort die einzige
+  Tonwertsteuerung; `paper.rs`): Es gibt keine Kurve, die gezogen wird.
+  Der Tonwert eines Szenenwerts ist, was ein Multigrade-Papier nach einer
+  **weichen** Belichtung (Filter 00) und einer **harten** (Filter 5)
+  durch ein Negativ dieser Szene zeigt — Splitgrade. Die einzigen zwei
+  Zahlen des Tonwerts sind die beiden Belichtungen in Stops Zeit
+  (f-Stop-Timing), |t| ≤ 3; alles, was die Dunkelkammer mit einer
+  Tonwertskala kann (verschieben, strecken, stauchen, Fuß und Schulter),
+  folgt daraus, und alles, was sie nicht kann (ein Knick, eine lokale
+  Versteilerung, eine auf nichts gestauchte Zone), ist hier nicht
+  ausdrückbar. Modell in log₁₀-Belichtung auf dem Papier:
+  - Negativ als Gerade mit `γ_n = 0,6` (Normalentwicklung): Szenenwert
+    `L` (Graukarte 0,18, Clip 1) belichtet das Papier mit
+    `log₁₀E = log₁₀2 · (t − γ_n · log₂L)`; ein Stop Zeit ist `1/γ_n`
+    Szenenstops wert.
+  - Zwei Emulsionskomponenten, je eine Normalverteilungsfunktion in
+    log-Belichtung (log-normal verteilte Kornempfindlichkeit),
+    `a = Φ((log₁₀E − μ)/σ)`. `σ` aus dem ISO-Belichtungsumfang der
+    Gradation (ISO R 180 für 00, 60 für 5; R = 100·Δlog₁₀E zwischen
+    0,04 über Grund und 90 % Dmax), `μ` aus der Empfindlichkeitsangleichung:
+    jede Belichtung allein bringt bei `t = 0` die Graukarte auf den
+    ISO-Empfindlichkeitspunkt 0,6 über Grund.
+  - Gemeinsames Silber: `D/Dmax = 1 − (1 − a)(1 − b)`, Dmax = 2,0 über
+    Grund. Die weiche Komponente mit dem langen Fuß ist, was die Lichter
+    zuerst sehen; die harte, steile, füllt die Schatten.
+  - Reflexion `10^−D` relativ zum Papiergrund, Dmax auf das Schwarz der
+    Ausgabe (Schwarzpunktkompensation), Kodierung `^(1/2,2)`.
+    Unbelichtetes Papier ist 1, ein klares Negativ (L = 0) ist 0.
+  - `t = 0` beider Belichtungen ist die **Grundbelichtung**: das Paar, das
+    die Graukarte auf D 0,67 (18 % Reflexion) und den Clip auf D 0,10
+    (Zone VIII, strukturiertes Weiß) legt, einmal aus den Konstanten
+    gelöst (Bisektion, deterministisch). Sie entspricht etwa Gradation 3
+    über 5,6 Szenenstops; Zonen 0 und I liegen auf dem Papierschwarz.
+    Mehr weiches Licht graut die Lichter und lässt die Schatten in Ruhe,
+    weniger hartes Licht öffnet die Schatten und lässt die Lichter stehen
+    (Abnahmetest: +1 Stop weich bewegt Zone VII vier Mal so weit wie Zone
+    III; −1 Stop hart bewegt Zone III zehn Mal so weit wie Zone VII).
+    Mehr hartes Licht ist eine härtere Gradation (ISO R der Summenkurve
+    kleiner), mehr weiches eine weichere; die GUI nennt die äquivalente
+    Einzelgradation (R → Grad: 2 = 120, 20 R je Grad) und den
+    Szenenumfang.
+  **[Abweichung zu Whitepaper §3–4]**: Das Whitepaper beschreibt eine
+  Zonenkurve mit Knoten je Zone, die einzeln gezogen werden. Eine solche
+  Kurve ist ein Kurveneditor mit anderem Gesicht: jede Grenze einzeln
+  setzbar heißt Knicke, lokale Steilstellen und Zonen auf null Breite —
+  Ergebnisse, die kein Papier liefert und die ein Bild digital bearbeitet
+  aussehen lassen. Die Leiste der GUI zeigt deshalb nur noch, wo die
+  Zonen auf dem Papier liegen (Achse = Tonwert, Breite = Anteil am
+  Papier); ein Zug an ihr bewegt beide Belichtungen gemeinsam, so dass der
+  Ton unter dem Zeiger dem Zeiger folgt (`PaperCurve::shift_for`,
+  Bisektion). Die Vorschau wertet das Papier über eine 16-Bit-LUT aus,
+  solange keine gefilterte Form im Spiel ist, sonst je Pixel; der Export
+  immer je Pixel in f64. Nicht modelliert und bewusst weggelassen: der
+  Fuß des Films (das Negativ ist eine Gerade) und eine Entwicklung N±k
+  (ein zweiter Kontrastparameter neben dem Splitgrade wäre doppelt).
+- **Look** (`--look <datei>`, Mess-Pipeline und ältere Rezepte):
+  `look/*.json` mit monotonen Stützstellen in [0,1]², PCHIP
   (Fritsch–Carlson, monoton). `encoding = gamma22` (Default): Eingang
   und Ausgang kodiert, d. h. `u = clamp(L,0,1)^(1/2,2)`, `v = PCHIP(u)`;
   `encoding = none`: Stützstellen auf der linearen Achse. Preset
@@ -619,45 +693,15 @@ am Ende.
   `calibrate wedge` aus dem Graukeil der Referenz-Monochromkamera (lineares
   DNG gegen ihr eigenes Kamera-JPEG) gefittet, RESULTS.md. Identität
   (keine Kurve wird gerechnet) ist erkannt, wenn erster Punkt (0,0),
-  letzter (1,1) und alle `x = y`. Druck-TIFF bekommt ein Grau-ICC mit
-  Gamma 2,2.
-- **Zonenkurve [Ergänzung, Whitepaper §3–4]** (`--grade <n>`, GUI
-  „Zones“, dort die einzige Tonwertsteuerung): ein Look namens `zones`
-  mit den Stützstellen auf den kodierten **Zonengrenzen**
-  `B_k = 0,18 · 2^(k+0,5−5)`, k = 0 … VI (die Grenze k | k+1; VII | VIII
-  bei 1,018 liegt über dem Clip, Zone VII reicht bis Papierweiß, Zone 0
-  bis zum Schleier; Zone V = das Stop-Intervall um die Graukarte 0,18),
-  dazu die Endpunkte (0, y₀) = Schleier und (1, y₁) = Papierweiß.
-  Kodierte Grenzen nach der Formel: 0,1111 / 0,1523 / 0,2086 / 0,2859 /
-  0,3918 / 0,5369 / 0,7358. **[Abweichung zu Whitepaper §3, Tabelle]**:
-  Das Whitepaper setzt die Knoten auf die Zonenmitten. Die Leiste der GUI
-  ist das Papier von Schleier bis Weiß, in Zonen geteilt; ihr Griff ist
-  die Grenze zwischen zwei Zonen, und ein Zug daran macht die eine Zone
-  breiter und die andere schmaler, sonst nichts. Dafür muss die Grenze
-  der Knoten sein — mit Mittenknoten hätte eine Zone zwei Griffe und
-  keiner wäre ihr Rand. Die Tabellenwerte des Whitepapers (0,100 / 0,137
-  / 0,187 …) stimmen außerdem nicht mit `x^(1/2,2)` überein; die Formel
-  ist normativ. Unangetastet ist die Zonenkurve bit-identisch zu
-  `neutral`. Ein Zug an Grenze k ändert deren Ausgabewert;
-  `zone::set_output` klemmt ihn zwischen die Nachbarn (Mindestabstand
-  10⁻⁴), so dass die Kurve monoton bleibt und keine Grenze die nächste
-  überholt. Grade N+n: die Grenzen um die Graukarte mit dem Faktor 1,25ⁿ
-  gespreizt (n < 0 gestaucht), danach nur noch Knoten, kein zweiter
-  Filter. Ein anderer Look wird mit `look_on_zone_nodes` auf die Grenzen
-  abgetastet (die „zweite Quelle derselben Punkte“ des Whitepapers); die
-  GUI tut das mit jedem geladenen Rezept, dessen Kurve keine Zonenkurve
-  ist, die Identität exakt. **[Abweichung zu Whitepaper §4]**: Ein Zug an
-  Grenze k ändert bei Fritsch–Carlson nicht nur die beiden angrenzenden
-  Zonen, sondern (über die Steigungen der Nachbarknoten) je zwei
-  Intervalle pro Seite; die Werte an den Nachbargrenzen selbst bleiben
-  exakt, die Mitte der übernächsten Zone verschiebt sich um wenige Prozent
-  des Zugs (Abnahmetest: Grenze VI | VII um +0,214 gezogen bewegt die
-  Graukarte um 0,0054 kodiert). Die GUI-Vorschau wertet die Kurve über
-  eine 16-Bit-LUT aus, der Export exakt in f64.
+  letzter (1,1) und alle `x = y`. Die GUI legt ein Rezept mit dem
+  neutralen Look auf das Papier in Grundbelichtung; jeden anderen Look
+  lässt sie als Look und bietet im Enlarger den Wechsel aufs Papier an.
+  Druck-TIFF bekommt ein Grau-ICC mit Gamma 2,2.
 - **Rand [Ergänzung, Anhang B.3]** (`--border-mm`, Rezeptfeld
-  `border_mm`): nach der Kurve wird das Bild in ein Papierfeld der Breite
+  `border_mm`): nach dem Tonwert wird das Bild in ein Papierfeld der Breite
   `round(border_mm / 25,4 · DPI)` Pixel je Seite gelegt, gefüllt mit
-  Papierweiß = Kurvenwert bei linear 1 (bei `neutral` 1,0); die Maske wird
+  Papierweiß = unbelichtetes Papier (1,0) bzw. beim Look dessen Wert bei
+  linear 1 (bei `neutral` 1,0); die Maske wird
   mit 0 aufgefüllt, damit keine Schärfung in den Rand läuft. Das
   Bildschirm-JPEG der GUI bekommt keinen Rand.
 - **USM**: Radius in Pixel

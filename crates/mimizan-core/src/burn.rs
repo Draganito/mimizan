@@ -23,10 +23,59 @@
 //! width and height (pixel centres at `(i + 0.5) / w`), radii as a fraction
 //! of the long edge, so one recipe means the same place on the preview, the
 //! 1:1 window and the print at any size.
+//!
+//! On paper (`paper.rs`) a shape can act through one filter: a burn with
+//! the hard filter deepens shadows and leaves the highlights, a dodge with
+//! the soft filter opens highlights, as the split-grade printer does it.
+//! [`Filter::Both`] is the plain card over the lens. A look (`curve.rs`)
+//! has one exposure and treats every shape as `Both`.
 
 use crate::plane::Plane;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Which exposure of a split-grade print a shape acts on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Filter {
+    /// The card over the lens for both passes (and the only case a look knows).
+    #[default]
+    Both,
+    /// Only the soft pass (filter 00): the highlights.
+    Soft,
+    /// Only the hard pass (filter 5): the shadows.
+    Hard,
+}
+
+impl Filter {
+    pub const ALL: [Filter; 3] = [Filter::Both, Filter::Soft, Filter::Hard];
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name() == s.trim().to_ascii_lowercase())
+    }
+
+    #[inline]
+    pub fn soft(&self) -> bool {
+        matches!(self, Self::Both | Self::Soft)
+    }
+
+    #[inline]
+    pub fn hard(&self) -> bool {
+        matches!(self, Self::Both | Self::Hard)
+    }
+}
+
+fn is_both(f: &Filter) -> bool {
+    *f == Filter::Both
+}
 
 /// One dodge (positive `ev`, brighter) or burn (negative `ev`, darker) shape.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,14 +83,38 @@ use serde::{Deserialize, Serialize};
 pub enum Burn {
     /// Disc: weight 1 inside `radius · (1 − feather)`, 0 outside `radius`,
     /// a smoothstep in between. `radius` is a fraction of the long edge.
-    Radial { x: f64, y: f64, radius: f64, feather: f64, ev: f64 },
+    Radial {
+        x: f64,
+        y: f64,
+        radius: f64,
+        feather: f64,
+        ev: f64,
+        #[serde(default, skip_serializing_if = "is_both")]
+        filter: Filter,
+    },
     /// Straight gradient: weight 0 at `(x0, y0)`, 1 at `(x1, y1)`, a
     /// smoothstep along the line between them, constant beyond either end.
     /// The card edge of the darkroom.
-    Gradient { x0: f64, y0: f64, x1: f64, y1: f64, ev: f64 },
+    Gradient {
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        ev: f64,
+        #[serde(default, skip_serializing_if = "is_both")]
+        filter: Filter,
+    },
 }
 
 impl Burn {
+    pub fn radial(x: f64, y: f64, radius: f64, feather: f64, ev: f64) -> Self {
+        Self::Radial { x, y, radius, feather, ev, filter: Filter::Both }
+    }
+
+    pub fn gradient(x0: f64, y0: f64, x1: f64, y1: f64, ev: f64) -> Self {
+        Self::Gradient { x0, y0, x1, y1, ev, filter: Filter::Both }
+    }
+
     pub fn ev(&self) -> f64 {
         match *self {
             Self::Radial { ev, .. } | Self::Gradient { ev, .. } => ev,
@@ -54,20 +127,41 @@ impl Burn {
         }
     }
 
-    /// Command-line form: `radial:x,y,radius,feather,ev` or
-    /// `gradient:x0,y0,x1,y1,ev` (normalised coordinates, stops).
+    pub fn filter(&self) -> Filter {
+        match *self {
+            Self::Radial { filter, .. } | Self::Gradient { filter, .. } => filter,
+        }
+    }
+
+    pub fn set_filter(&mut self, f: Filter) {
+        match self {
+            Self::Radial { filter, .. } | Self::Gradient { filter, .. } => *filter = f,
+        }
+    }
+
+    /// Command-line form: `radial:x,y,radius,feather,ev[,filter]` or
+    /// `gradient:x0,y0,x1,y1,ev[,filter]` (normalised coordinates, stops,
+    /// filter `both` (default), `soft` or `hard`).
     pub fn parse(s: &str) -> crate::Result<Self> {
         let bad = |m: &str| crate::Error::Invalid(format!("dodge & burn '{s}': {m}"));
         let (kind, rest) = s.trim().split_once(':').ok_or_else(|| bad("expected kind:values"))?;
-        let v: Vec<f64> = rest
-            .split(',')
-            .map(|t| t.trim().parse::<f64>().map_err(|_| bad("bad number")))
+        let mut parts: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let filter = match parts.last().and_then(|t| Filter::parse(t)) {
+            Some(f) => {
+                parts.pop();
+                f
+            }
+            None => Filter::Both,
+        };
+        let v: Vec<f64> = parts
+            .iter()
+            .map(|t| t.parse::<f64>().map_err(|_| bad("bad number")))
             .collect::<crate::Result<_>>()?;
         let b = match (kind.trim().to_ascii_lowercase().as_str(), v.len()) {
-            ("radial", 5) => Self::Radial { x: v[0], y: v[1], radius: v[2], feather: v[3], ev: v[4] },
-            ("gradient", 5) => Self::Gradient { x0: v[0], y0: v[1], x1: v[2], y1: v[3], ev: v[4] },
-            ("radial", _) => return Err(bad("radial needs x,y,radius,feather,ev")),
-            ("gradient", _) => return Err(bad("gradient needs x0,y0,x1,y1,ev")),
+            ("radial", 5) => Self::Radial { x: v[0], y: v[1], radius: v[2], feather: v[3], ev: v[4], filter },
+            ("gradient", 5) => Self::Gradient { x0: v[0], y0: v[1], x1: v[2], y1: v[3], ev: v[4], filter },
+            ("radial", _) => return Err(bad("radial needs x,y,radius,feather,ev[,filter]")),
+            ("gradient", _) => return Err(bad("gradient needs x0,y0,x1,y1,ev[,filter]")),
             _ => return Err(bad("kind is radial or gradient")),
         };
         b.validate()?;
@@ -83,7 +177,7 @@ impl Burn {
             Ok(())
         };
         match *self {
-            Self::Radial { x, y, radius, feather, ev } => {
+            Self::Radial { x, y, radius, feather, ev, .. } => {
                 unit(x, "x")?;
                 unit(y, "y")?;
                 unit(feather, "feather")?;
@@ -94,7 +188,7 @@ impl Burn {
                 }
                 check_ev(ev)
             }
-            Self::Gradient { x0, y0, x1, y1, ev } => {
+            Self::Gradient { x0, y0, x1, y1, ev, .. } => {
                 for (v, w) in [(x0, "x0"), (y0, "y0"), (x1, "x1"), (y1, "y1")] {
                     unit(v, w)?;
                 }
@@ -157,7 +251,8 @@ fn smoothstep(t: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Exponent field `place + Σ ev_i m_i` at one pixel (centre convention).
+/// Exponent field `place + Σ ev_i m_i` at one pixel (centre convention),
+/// every shape counted (a look has one exposure).
 #[inline]
 pub fn exponent_at(place: f64, burns: &[Burn], x: usize, y: usize, w: usize, h: usize) -> f64 {
     let (wf, hf) = (w as f64, h as f64);
@@ -165,6 +260,23 @@ pub fn exponent_at(place: f64, burns: &[Burn], x: usize, y: usize, w: usize, h: 
     let nx = (x as f64 + 0.5) / wf;
     let ny = (y as f64 + 0.5) / hf;
     burns.iter().fold(place, |e, b| e + b.ev() * b.weight(nx, ny, wf, hf, long))
+}
+
+/// Does any active shape act through one filter only? Then the two passes
+/// of the paper see different exponents and [`exponents_at`] is needed.
+pub fn needs_split(burns: &[Burn]) -> bool {
+    burns.iter().any(|b| b.ev() != 0.0 && b.filter() != Filter::Both)
+}
+
+/// The two exponent fields at a normalised position: (soft, hard), each
+/// `place + Σ ev_i m_i` over the shapes that act on that pass.
+#[inline]
+pub fn exponents_at(place: f64, burns: &[Burn], nx: f64, ny: f64, w: f64, h: f64, long: f64) -> (f64, f64) {
+    burns.iter().fold((place, place), |(es, eh), b| {
+        let d = b.ev() * b.weight(nx, ny, w, h, long);
+        let f = b.filter();
+        (es + if f.soft() { d } else { 0.0 }, eh + if f.hard() { d } else { 0.0 })
+    })
 }
 
 /// `L ← L · 2^(place + Σ ev_i m_i)` in place. `place == 0` with no shapes
@@ -238,10 +350,7 @@ mod tests {
         let mut p = src.clone();
         apply(&mut p, 0.0, &[]);
         assert_eq!(p.data, src.data);
-        let burns = [
-            Burn::Radial { x: 0.5, y: 0.5, radius: 0.3, feather: 0.5, ev: 0.0 },
-            Burn::Gradient { x0: 0.0, y0: 0.0, x1: 1.0, y1: 0.0, ev: 0.0 },
-        ];
+        let burns = [Burn::radial(0.5, 0.5, 0.3, 0.5, 0.0), Burn::gradient(0.0, 0.0, 1.0, 0.0, 0.0)];
         apply(&mut p, 0.0, &burns);
         assert_eq!(p.data, src.data);
     }
@@ -267,7 +376,7 @@ mod tests {
     #[test]
     fn radial_mask_is_round_and_monotone() {
         let (w, h) = (200, 100);
-        let b = Burn::Radial { x: 0.5, y: 0.5, radius: 0.2, feather: 0.5, ev: 1.0 };
+        let b = Burn::radial(0.5, 0.5, 0.2, 0.5, 1.0);
         b.validate().unwrap();
         let f = stops_field(&[b], w, h);
         // Long edge 200 px: radius 40 px, inner 20 px.
@@ -297,7 +406,7 @@ mod tests {
     #[test]
     fn gradient_mask() {
         let (w, h) = (100, 60);
-        let b = Burn::Gradient { x0: 0.2, y0: 0.5, x1: 0.8, y1: 0.5, ev: -1.0 };
+        let b = Burn::gradient(0.2, 0.5, 0.8, 0.5, -1.0);
         b.validate().unwrap();
         let f = stops_field(&[b], w, h);
         assert_eq!(f.at(5, 30), 0.0);
@@ -321,8 +430,8 @@ mod tests {
     #[test]
     fn shapes_add_in_stops() {
         let (w, h) = (40, 40);
-        let a = Burn::Radial { x: 0.5, y: 0.5, radius: 1.0, feather: 0.0, ev: 1.0 };
-        let b = Burn::Radial { x: 0.5, y: 0.5, radius: 1.0, feather: 0.0, ev: 0.5 };
+        let a = Burn::radial(0.5, 0.5, 1.0, 0.0, 1.0);
+        let b = Burn::radial(0.5, 0.5, 1.0, 0.0, 0.5);
         let e = exponent_at(0.25, &[a, b], 20, 20, w, h);
         assert!((e - 1.75).abs() < 1e-12);
         let src = ramp(w, h);
@@ -337,10 +446,7 @@ mod tests {
     fn window_matches_the_whole() {
         let (w, h) = (90, 70);
         let src = ramp(w, h);
-        let burns = [
-            Burn::Radial { x: 0.3, y: 0.6, radius: 0.25, feather: 0.4, ev: 0.6 },
-            Burn::Gradient { x0: 0.9, y0: 0.1, x1: 0.5, y1: 0.5, ev: -0.4 },
-        ];
+        let burns = [Burn::radial(0.3, 0.6, 0.25, 0.4, 0.6), Burn::gradient(0.9, 0.1, 0.5, 0.5, -0.4)];
         let mut whole = src.clone();
         apply(&mut whole, 0.2, &burns);
         let (x0, y0, cw, ch) = (17, 23, 40, 30);
@@ -358,26 +464,38 @@ mod tests {
 
     #[test]
     fn validation() {
-        assert!(Burn::Radial { x: 1.2, y: 0.5, radius: 0.1, feather: 0.0, ev: 0.0 }.validate().is_err());
-        assert!(Burn::Radial { x: 0.5, y: 0.5, radius: 0.0, feather: 0.0, ev: 0.0 }.validate().is_err());
-        assert!(Burn::Radial { x: 0.5, y: 0.5, radius: 0.1, feather: 0.0, ev: 9.0 }.validate().is_err());
-        assert!(Burn::Gradient { x0: 0.5, y0: 0.5, x1: 0.5, y1: 0.5, ev: 1.0 }.validate().is_err());
-        let json =
-            serde_json::to_string(&Burn::Radial { x: 0.452, y: 0.61, radius: 0.15, feather: 0.5, ev: 0.75 })
-                .unwrap();
+        assert!(Burn::radial(1.2, 0.5, 0.1, 0.0, 0.0).validate().is_err());
+        assert!(Burn::radial(0.5, 0.5, 0.0, 0.0, 0.0).validate().is_err());
+        assert!(Burn::radial(0.5, 0.5, 0.1, 0.0, 9.0).validate().is_err());
+        assert!(Burn::gradient(0.5, 0.5, 0.5, 0.5, 1.0).validate().is_err());
+        let json = serde_json::to_string(&Burn::radial(0.452, 0.61, 0.15, 0.5, 0.75)).unwrap();
         assert!(json.starts_with(r#"{"type":"radial","x":0.452"#), "{json}");
         let back: Burn = serde_json::from_str(&json).unwrap();
         assert_eq!(back.ev(), 0.75);
         assert_eq!(
             Burn::parse("radial:0.452,0.61,0.15,0.5,0.75").unwrap(),
-            Burn::Radial { x: 0.452, y: 0.61, radius: 0.15, feather: 0.5, ev: 0.75 }
+            Burn::radial(0.452, 0.61, 0.15, 0.5, 0.75)
         );
         assert_eq!(
             Burn::parse(" Gradient: 0.5, 0, 0.5, 0.4, 1 ").unwrap(),
-            Burn::Gradient { x0: 0.5, y0: 0.0, x1: 0.5, y1: 0.4, ev: 1.0 }
+            Burn::gradient(0.5, 0.0, 0.5, 0.4, 1.0)
         );
         assert!(Burn::parse("radial:0.5,0.5,0.1").is_err());
         assert!(Burn::parse("disc:0.5,0.5,0.1,0,1").is_err());
         assert!(Burn::parse("radial:0.5,0.5,0.1,0,9").is_err());
+        // A filter at the end; absent or `both` is not written.
+        let hard = Burn::parse("radial:0.5,0.5,0.1,0,-1,hard").unwrap();
+        assert_eq!(hard.filter(), Filter::Hard);
+        let json = serde_json::to_string(&hard).unwrap();
+        assert!(json.ends_with(r#""filter":"hard"}"#), "{json}");
+        assert!(!serde_json::to_string(&Burn::radial(0.5, 0.5, 0.1, 0.0, 1.0)).unwrap().contains("filter"));
+        assert!(Burn::parse("radial:0.5,0.5,0.1,0,-1,blue").is_err());
+        assert!(needs_split(&[hard]));
+        assert!(!needs_split(&[Burn::radial(0.5, 0.5, 0.1, 0.0, 1.0)]));
+        let mut soft = Burn::gradient(0.0, 0.0, 1.0, 0.0, 1.0);
+        soft.set_filter(Filter::Soft);
+        // At the far end of the gradient the soft pass sees +1, the hard pass nothing.
+        let (es, eh) = exponents_at(0.25, &[soft, hard], 1.0, 0.5, 100.0, 100.0, 100.0);
+        assert!((es - 1.25).abs() < 1e-12 && (eh - 0.25).abs() < 1e-12);
     }
 }

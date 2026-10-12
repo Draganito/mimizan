@@ -3,14 +3,16 @@
 //! `print::render` from that file, as the CLI does, and compares 16-bit
 //! values.
 
-use mimizan_core::burn::Burn;
+use mimizan_core::burn::{Burn, Filter};
 use mimizan_core::calib::LookFile;
 use mimizan_core::icc::GrayTrc;
+use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::plane::Plane;
 use mimizan_core::print::{render, PrintParams, PrintSize};
 use mimizan_core::recipe::{Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::tiffout::{write_gray16, write_gray8, TiffMeta};
+use mimizan_core::tone::Tone;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 
@@ -54,58 +56,68 @@ fn run(neg: &Path, recipe: Recipe) -> Vec<u16> {
     q16(&render(neg, &p).unwrap().plane)
 }
 
-/// Rows 1 and 7 of table 4: the untouched bar is `neutral`, place = 0 moves
-/// nothing, and grade 0 is the untouched bar.
+fn on_paper(soft: f64, hard: f64) -> Recipe {
+    Recipe { curve: Tone::Paper(SplitGrade::new(soft, hard)), ..Recipe::default() }
+}
+
+/// Rows 1 and 7 of table 4: place = 0 and no shapes change nothing, for the
+/// neutral look and for the paper; the paper at its base exposure is a
+/// print, not the identity.
 #[test]
-fn untouched_bar_exports_as_neutral() {
+fn untouched_steps_change_nothing() {
     let neg = negative_on_disk("neutral");
     let neutral = run(&neg, Recipe::default());
-    assert_eq!(run(&neg, Recipe::with_look(zone::default_look())), neutral);
-    assert_eq!(run(&neg, Recipe::with_look(zone::grade(0))), neutral);
     assert_eq!(run(&neg, Recipe { place: 0.0, ..Recipe::default() }), neutral);
-    // With a size and a kernel too: the untouched curve stays neutral.
-    let sized = |curve: LookFile| Recipe {
+    assert_eq!(run(&neg, Recipe::with_look(LookFile::neutral())), neutral);
+    let base = run(&neg, Recipe::on_paper());
+    assert_eq!(run(&neg, on_paper(0.0, 0.0)), base);
+    assert_eq!(
+        run(&neg, Recipe { dodge_burn: vec![Burn::radial(0.5, 0.5, 0.3, 0.5, 0.0)], ..Recipe::on_paper() }),
+        base
+    );
+    assert_ne!(base, neutral);
+    // With a size and a kernel too: the same paper, the same picture.
+    let sized = |curve: Tone| Recipe {
         curve,
         size: Some(PrintSize::LongEdgePx(50)),
         resample: ResampleKernel::CatmullRom,
         ..Recipe::default()
     };
-    assert_eq!(run(&neg, sized(zone::default_look())), run(&neg, sized(LookFile::neutral())));
+    assert_eq!(run(&neg, sized(Tone::paper())), run(&neg, sized(Tone::paper())));
 }
 
-/// Row 2: a node dragged and dragged back is a run that was never dragged.
+/// Row 2: an exposure moved and moved back is a run that was never moved.
 /// Row 3: the last of a long history equals a fresh run with that set.
-/// Row 4: exporting twice is bit-identical.
+/// Row 4: exporting twice is bit-identical; the recipe through JSON too.
 #[test]
 fn history_does_not_exist_for_the_export() {
     let neg = negative_on_disk("history");
-    let mut look = zone::default_look();
-    let v4 = look.points[4][1];
-    zone::set_output(&mut look, 4, 0.6);
-    zone::set_output(&mut look, 4, v4);
-    assert_eq!(look.points, zone::default_look().points);
-    assert_eq!(run(&neg, Recipe::with_look(look)), run(&neg, Recipe::default()));
+    let mut r = Recipe::on_paper();
+    r.curve.as_paper_mut().unwrap().hard += 0.75;
+    r.curve.as_paper_mut().unwrap().hard -= 0.75;
+    assert_eq!(r, Recipe::on_paper());
+    assert_eq!(run(&neg, r), run(&neg, Recipe::on_paper()));
 
     // Five hours: a list of recipes. The export knows only the last.
-    let mut history = vec![Recipe::default()];
+    let mut history = vec![Recipe::on_paper()];
     for i in 1..40 {
         let mut r = history.last().unwrap().clone();
-        if r.curve.name != zone::LOOK_NAME {
-            r.curve = zone::default_look();
+        {
+            let s = r.curve.as_paper_mut().unwrap();
+            if i % 2 == 0 {
+                s.soft = (s.soft + if i % 3 == 0 { -0.3 } else { 0.2 })
+                    .clamp(-paper::STOP_LIMIT, paper::STOP_LIMIT);
+            } else {
+                s.hard = (s.hard + if i % 3 == 0 { 0.25 } else { -0.15 })
+                    .clamp(-paper::STOP_LIMIT, paper::STOP_LIMIT);
+            }
         }
-        let n = r.curve.points.len();
-        let idx = 1 + i % (n - 2);
-        let cur = r.curve.points[idx][1];
-        zone::set_output(&mut r.curve, idx, cur + if i % 3 == 0 { -0.03 } else { 0.02 });
         r.place = (i as f64 * 0.07).sin() * 0.5;
         if i % 5 == 0 {
-            r.dodge_burn.push(Burn::Radial {
-                x: 0.1 + 0.02 * i as f64,
-                y: 0.5,
-                radius: 0.2,
-                feather: 0.5,
-                ev: if i % 10 == 0 { 0.5 } else { -0.5 },
-            });
+            let mut b =
+                Burn::radial(0.1 + 0.02 * i as f64, 0.5, 0.2, 0.5, if i % 10 == 0 { 0.5 } else { -0.5 });
+            b.set_filter(if i % 15 == 0 { Filter::Soft } else { Filter::Hard });
+            r.dodge_burn.push(b);
         }
         r.validate().unwrap();
         history.push(r);
@@ -123,85 +135,76 @@ fn history_does_not_exist_for_the_export() {
     assert_eq!(run(&neg, loaded), fresh);
 }
 
-/// Row 5, as the interpolation allows it: a dragged node changes the slope
-/// at its two direct neighbours (Fritsch–Carlson is C¹, the slope at a node
-/// is a mean of the two adjacent secants), so two intervals on each side
-/// move; beyond the second neighbour the curve is bit-identical. The
-/// neighbours' values themselves do not move. **[Abweichung]** from the
-/// paper's wording "beyond the next node", documented in the SPEC.
+/// What the paper cannot do: for any pair of exposures within the limits
+/// the print is monotone in the scene and the border is unexposed paper;
+/// within the working range of the exposures no zone collapses (every
+/// zone keeps a share of the paper; at the extremes the outer zones sit on
+/// the paper's black or white, as they do on a real sheet). The soft pass
+/// is the highlights' exposure, the hard pass the shadows'.
 #[test]
-fn a_drag_stays_inside_two_intervals_per_side() {
-    use mimizan_core::curve::Curve;
-    let before = zone::default_look();
-    let mut after = before.clone();
-    let i = 4;
-    let target = after.points[i][1] + 0.05;
-    zone::set_output(&mut after, i, target);
-    for (k, (a, b)) in after.points.iter().zip(&before.points).enumerate() {
-        if k != i {
-            assert_eq!(a, b, "neighbour {k} moved");
+fn the_paper_is_monotone_and_keeps_every_zone() {
+    let probes = [-3.0, -2.0, -1.0, 0.0, 0.5, 1.5, 2.5, 3.0];
+    for &soft in &probes {
+        for &hard in &probes {
+            let c = SplitGrade::new(soft, hard).curve();
+            let mut last = c.eval(0.0);
+            assert_eq!(last, 0.0);
+            assert_eq!(c.white(), 1.0);
+            for i in 1..=2000 {
+                let v = c.eval(i as f64 / 2000.0);
+                assert!(v >= last, "not monotone at {i} for {soft},{hard}");
+                last = v;
+            }
+            // Zone widths on the print: positive for every zone under the clip
+            // while the exposures stay within a stop and a half of the base.
+            let working = soft.abs() <= 1.5 && hard.abs() <= 1.5;
+            let mut prev = c.eval(0.0);
+            for k in zone::boundaries() {
+                let v = c.eval(zone::boundary_linear(k));
+                assert!(
+                    v >= prev && (!working || v > prev),
+                    "zone {} collapsed at {soft},{hard}",
+                    zone::numeral(k)
+                );
+                prev = v;
+            }
+            assert!(c.eval(1.0) >= prev && (!working || c.eval(1.0) > prev));
         }
     }
-    let (cb, ca) = (Curve::from_look(&before), Curve::from_look(&after));
-    let (lo, hi) = (before.points[i - 2][0], before.points[i + 2][0]);
-    let mut changed_inside = false;
-    for k in 0..=2000 {
-        let u = k as f64 / 2000.0;
-        let lin = zone::decode(u);
-        let d = (ca.eval(lin) - cb.eval(lin)).abs();
-        if u <= lo || u >= hi {
-            assert!(d < 1e-12, "changed outside at u = {u}: {d}");
-        } else if u > before.points[i - 1][0] && u < before.points[i + 1][0] {
-            changed_inside |= d > 1e-6;
-        }
-    }
-    assert!(changed_inside);
-    assert!(ca.eval(zone::decode(before.points[i][0])) > cb.eval(zone::decode(before.points[i][0])));
+    let base = SplitGrade::default().curve();
+    assert!((base.density(zone::GRAY_CARD) - paper::GREY_DENSITY).abs() < 1e-9);
+    assert!((base.density(1.0) - paper::CLIP_DENSITY).abs() < 1e-9);
+    let (shadow, light) = (zone::linear(3), zone::linear(7));
+    let more_soft = SplitGrade::new(1.0, 0.0).curve();
+    let less_hard = SplitGrade::new(0.0, -1.0).curve();
+    let d = |c: &paper::PaperCurve, l: f64| (c.eval(l) - base.eval(l)).abs();
+    assert!(d(&more_soft, light) > 4.0 * d(&more_soft, shadow));
+    assert!(d(&less_hard, shadow) > 10.0 * d(&less_hard, light));
 }
 
-/// Row 6: preset N+1 then clamping: strictly increasing, gap at least 1e-4.
-/// Row 8: place = 0 with only the shoulder pulled keeps Zone V's boundaries
-/// exactly and its centre within a few percent of the pull.
+/// Row 6, on paper: a stop more of both exposures is the scene placed down
+/// by 1/γ_n stops — the bar dragged as a whole is a placing, nothing else.
 #[test]
-fn presets_clamp_and_the_shoulder_leaves_zone_v() {
-    use mimizan_core::curve::Curve;
-    for n in -5..=5 {
-        let g = zone::grade(n);
-        for w in g.points.windows(2) {
-            assert!(w[1][1] - w[0][1] >= zone::MIN_GAP - 1e-12, "N{n:+}");
-        }
-    }
-    let mut look = zone::default_look();
-    let n = look.points.len();
-    let pull = 0.95 - look.points[n - 2][1];
-    zone::set_output(&mut look, n - 2, 0.95); // boundary VI|VII up: Zone VII narrower, VI wider
-    zone::set_output(&mut look, n - 1, 0.97); // paper white down
-    let c = Curve::from_look(&look);
-    let neutral = Curve::from_look(&LookFile::neutral());
-    // The two boundaries of Zone V are nodes and did not move: exact.
-    for i in [n - 4, n - 3] {
-        let lin = zone::decode(look.points[i][0]);
-        assert!((c.eval(lin) - neutral.eval(lin)).abs() < 1e-12, "boundary {i} moved");
-    }
-    // The grey card itself lies in the interval next to the changed slope
-    // (second interval from the pulled node, SPEC [Abweichung]): the C¹
-    // curve bends towards the pulled node, by a few percent of the pull.
-    let d = (c.eval(zone::GRAY_CARD) - neutral.eval(zone::GRAY_CARD)).abs();
-    assert!(d < 0.03 * pull, "Zone V moved by {d} for a pull of {pull}");
+fn both_exposures_together_are_a_placing() {
+    let neg = negative_on_disk("placing");
+    let shifted = run(&neg, on_paper(0.6, 0.6));
+    let placed = run(&neg, Recipe { place: -0.6 / paper::NEGATIVE_GAMMA, ..Recipe::on_paper() });
+    let worst = shifted.iter().zip(&placed).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+    assert!(worst <= 1, "{worst}");
 }
 
 /// Shapes and placing have no reduction over threads: 16 and 3 threads give
-/// the same 16-bit values, with a resize and a border in the pass.
+/// the same 16-bit values, with a resize, a border and a filtered shape in
+/// the pass.
 #[test]
 fn the_pass_is_deterministic_across_thread_counts() {
     let neg = negative_on_disk("threads");
+    let mut hard = Burn::gradient(0.0, 0.0, 0.0, 0.5, -0.7);
+    hard.set_filter(Filter::Hard);
     let recipe = Recipe {
         place: 0.3,
-        curve: zone::grade(1),
-        dodge_burn: vec![
-            Burn::Radial { x: 0.4, y: 0.6, radius: 0.3, feather: 0.6, ev: 0.8 },
-            Burn::Gradient { x0: 0.0, y0: 0.0, x1: 0.0, y1: 0.5, ev: -0.7 },
-        ],
+        curve: Tone::Paper(SplitGrade::new(-0.5, 0.5)),
+        dodge_burn: vec![Burn::radial(0.4, 0.6, 0.3, 0.6, 0.8), hard],
         resample: ResampleKernel::Mitchell,
         size: Some(PrintSize::Physical { width_in: 2.0, height_in: 3.0 }),
         dpi: 40.0,
@@ -220,10 +223,12 @@ fn the_pass_is_deterministic_across_thread_counts() {
 #[test]
 fn description_carries_the_recipe_and_the_old_fields() {
     let neg = negative_on_disk("description");
+    let mut shape = Burn::radial(0.452, 0.61, 0.15, 0.5, 0.75);
+    shape.set_filter(Filter::Soft);
     let recipe = Recipe {
         place: -0.25,
-        curve: zone::grade(-1),
-        dodge_burn: vec![Burn::Radial { x: 0.452, y: 0.61, radius: 0.15, feather: 0.5, ev: 0.75 }],
+        curve: Tone::Paper(SplitGrade::new(0.5, -0.25)),
+        dodge_burn: vec![shape],
         resample: ResampleKernel::BSpline,
         ..Recipe::default()
     };
@@ -234,13 +239,16 @@ fn description_carries_the_recipe_and_the_old_fields() {
     let g = mimizan_core::tiffin::read_gray(&out_path).unwrap();
     let v: serde_json::Value = serde_json::from_str(g.description.as_deref().unwrap()).unwrap();
     assert_eq!(v["stage"], "print");
-    assert_eq!(v["look"], "zones");
+    assert_eq!(v["look"], "paper multigrade soft +0.50 hard -0.25");
+    assert_eq!(v["look_encoding"], "gamma22");
     assert_eq!(v["recipe"]["place"], -0.25);
     assert_eq!(v["recipe"]["resample"], "b-spline");
     assert_eq!(v["recipe"]["dodge_burn"][0]["type"], "radial");
     assert_eq!(v["recipe"]["dodge_burn"][0]["ev"], 0.75);
+    assert_eq!(v["recipe"]["dodge_burn"][0]["filter"], "soft");
     assert_eq!(v["recipe"]["sharpen"]["mode"], "off");
-    assert_eq!(v["recipe"]["curve"]["points"].as_array().unwrap().len(), zone::default_nodes().len() + 2);
+    assert_eq!(v["recipe"]["curve"]["paper"], "multigrade");
+    assert_eq!(v["recipe"]["curve"]["soft"], 0.5);
     // The negative's own description is still inside.
     assert_eq!(v["source_description"]["stage"], "negative");
     assert!(v["usm_amount"].is_number() && v["width"].is_number());

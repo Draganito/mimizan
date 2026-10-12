@@ -256,7 +256,7 @@ the same, so there the estimator, not the detector, is the limit).
 | binary          | purpose |
 |-----------------|---------|
 | `mimizan`      | CLI: `info`, `dump`, `negative`, `print`, `calibrate`, `synth`, `measure`, `bench` |
-| `mimizan-gui`  | Desktop darkroom: open a RAW, judge mix, placing, zone curve and dodge & burn interactively, export the print recipe as TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
+| `mimizan-gui`  | Desktop darkroom: open a RAW, judge mix, split-grade exposures and dodge & burn interactively, export the print recipe as TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
 
 Supported input: Bayer RAWs that [rawler](https://crates.io/crates/rawler)
 decodes (verified: Nikon Z f NEF). Monochrome sensors (DNG without a colour
@@ -278,7 +278,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.7.0-1_amd64.deb
+sudo apt install ./mimizan_0.8.0-1_amd64.deb
 mimizan --version
 ```
 
@@ -319,11 +319,11 @@ mimizan print photo_neg.tif -o photo_2048.jpg --size 2048px --screen 1.0 --look 
 # Richardson-Lucy instead of a halo: 5 passes invert a Gaussian of the USM radius on every pixel
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --deconv 5
 
-# The zone system as the print curve: grade N+1, placed a third of a stop down,
-# a disc dodged half a stop at (0.3, 0.6), a gradient burning the top edge,
-# 20 mm paper-white border, B-spline resampling; the recipe is written too
-mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --grade 1 --place -0.33 \
-  --burn radial:0.3,0.6,0.2,0.5,0.5 --burn gradient:0.5,0.4,0.5,0.0,-0.7 \
+# A split-grade print: half a stop less hard light (open shadows), a disc
+# dodged half a stop at (0.3, 0.6), a gradient burning the top edge through the
+# hard filter, 20 mm paper-white border, B-spline resampling; the recipe is written too
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --paper 0,-0.5 \
+  --burn radial:0.3,0.6,0.2,0.5,0.5 --burn gradient:0.5,0.4,0.5,0.0,-0.7,hard \
   --border-mm 20 --resample b-spline --write-recipe photo.recipe.json
 # ... and the same print again, from the recipe alone
 mimizan print photo_neg.tif -o photo_print.tif --recipe photo.recipe.json
@@ -356,19 +356,24 @@ that `mimizan print` renders in one pass against the negative, so there is
 exactly one quantisation and the same recipe gives the same bytes. The
 recipe holds, in the order the pipeline applies them: the **placing**
 (`--place`, stops; `L ← L·2^place`, the darkroom's exposure), **dodge &
-burn** shapes (`--burn radial:x,y,radius,feather,ev` and
-`--burn gradient:x0,y0,x1,y1,ev`; local placing by a geometric mask, positive
-ev brighter, negative darker, coordinates as fractions of the upright picture
-so a recipe means the same place at any size), the **curve** (the **zone
-curve**, `--grade N` on the CLI: one PCHIP node per zone *boundary*,
-`0.18·2^(k+0.5−5)` encoded, so moving a boundary widens one zone and narrows
-its neighbour; grade presets spread the mid zones around the grey card by
-1.25 per grade; the untouched zone curve is bit-identical to `neutral`; the
-CLI also still takes any look file with `--look`), the **size step** (`--size`, `--dpi`, `--resample lanczos3 |
+burn** shapes (`--burn radial:x,y,radius,feather,ev[,filter]` and
+`--burn gradient:x0,y0,x1,y1,ev[,filter]`; local exposure by a geometric
+mask, positive ev brighter, negative darker, through both filters or only
+the soft or the hard one, coordinates as fractions of the upright picture
+so a recipe means the same place at any size), the **paper** (`--paper
+SOFT,HARD`: there is no tone curve; the print is what a multigrade paper
+gives after a soft exposure (filter 00) and a hard one (filter 5) through
+a gamma-0.6 negative of the scene, each pass a normal CDF in log exposure
+with the width of its ISO range and the two sharing the silver, `D/Dmax =
+1 − (1−a)(1−b)`; the two exposures in stops of time from the base print are
+the only tone parameters, so a kink, a local steepening or a zone squeezed
+to nothing cannot be expressed — more soft light greys the highlights,
+less hard light opens the shadows; the CLI also still takes any look file
+with `--look` for the measurement pipeline), the **size step** (`--size`, `--dpi`, `--resample lanczos3 |
 mitchell | catmull-rom | b-spline`: Lanczos-3 stays the default and the
 benchmark kernel; B-spline is the only one without overshoot, and visibly
-soft), the **border** (`--border-mm`, paper white = the curve's value at
-linear 1, taken from the paper size), and the **sharpening** (USM,
+soft), the **border** (`--border-mm`, unexposed paper, taken from the
+paper size), and the **sharpening** (USM,
 deconvolution or screen compensation; the compensation filter is derived
 from the chosen kernel's MTF). Nothing in the recipe reads the picture:
 there is no tone equaliser and no content-adaptive mask (SPEC §9).
@@ -409,27 +414,33 @@ without a GPU driver. *Negative* is the judging step: the file's exposure
 from EXIF, the histograms and the *Development* fold. *Enlarger* is the
 editing step: the mix from one row of presets (*Native*, *Panchromatic* =
 the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
-47* in front of it) or the R/B sliders, the *place* slider, the zone bar,
-grade, fog and paper white, and *dodge & burn*. *Print* is the output step
+47* in front of it) or the R/B sliders, the zone bar, the two exposures
+*soft* and *hard*, and *dodge & burn*. *Print* is the output step
 and nothing else: native size, a paper size at a dpi or a long edge, the
 border, the resampling kernel and the sharpening, the output size it adds
 up to, and the *Export…* button.
 
-The zone bar is the paper from fog to paper white, split into the zones
-0 … VII; the width of a patch is the share of the paper that zone gets,
-and the patch is painted with the print tones it covers. The boundary
-between two zones is the handle: drag it and one zone widens while its
-neighbour narrows, nothing else moves (the curve through the boundaries is
-monotone by construction, boundaries cannot overtake each other, and the
-untouched bar is plain gamma 2.2 to the bit). Double-click puts a boundary
-back; hover a zone and its pixels light up in the preview; the *place*
-slider above the bar is the exposure (every zone one stop up or down);
-*fog* and *paper white* set the ends; the grade buttons N−2 … N+2 are
-start positions, nothing more. Dodge & burn shapes are placed in the
-picture (*+ disc* then click, *+ gradient* then drag from no effect to
-full effect), moved by their centre, resized by the ring or the end
-points, set in EV in the Enlarger; `Delete` removes the selected one.
-*fit*, *1:1*, the mask and the shape overlay sit in the toolbar.
+The Enlarger works like a split-grade session, and nothing in it can do
+what a sheet of paper cannot. The zone bar is the paper from its black to
+its white, and it shows where the zones 0 … VII of the negative land: the
+width of a patch is the share of the paper that zone gets, the hatched
+end is paper the negative never reaches. Nothing on the bar is a handle
+for one zone; the shape of the scale is the paper's. Two sliders are the
+whole tone control: *soft* (filter 00) and *hard* (filter 5), in stops of
+time from the base print (the pair that puts the grey card at 18 % and
+the clip at a textured white). More soft light greys the highlights and
+leaves the shadows; less hard light opens the shadows and leaves the
+highlights; a drag on the bar moves both so that the tone under the
+pointer follows the pointer — one more or less second under the
+enlarger. The line under the sliders names the single grade this pair
+equals and the scene stops the paper holds; *base* goes back. Hover a
+zone and its pixels light up in the preview. Dodge & burn shapes are
+placed in the picture (*+ disc* then click, *+ gradient* then drag from
+no effect to full effect), moved by their centre, resized by the ring or
+the end points, set in EV in the Enlarger, and each one acts through
+*both* filters, only the *soft* one (highlights) or only the *hard* one
+(shadows); `Delete` removes the selected one. *fit*, *1:1*, the mask and
+the shape overlay sit in the toolbar.
 
 Everything the panels set is one **development** (weights, turns and the
 recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole

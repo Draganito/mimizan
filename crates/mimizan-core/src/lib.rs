@@ -21,6 +21,7 @@ pub mod kodak;
 pub mod mask;
 pub mod metrics;
 pub mod mix;
+pub mod paper;
 pub mod pipeline;
 pub mod plane;
 pub mod preview;
@@ -34,6 +35,7 @@ pub mod synth;
 pub mod thumb;
 pub mod tiffin;
 pub mod tiffout;
+pub mod tone;
 pub mod usm;
 pub mod zone;
 

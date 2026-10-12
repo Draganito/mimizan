@@ -5,8 +5,6 @@
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
 //! print decision (viewing model constant, sidecar use, proof path).
 
-use crate::burn;
-use crate::curve::Curve;
 use crate::deconv::{richardson_lucy, DECONV_ITERATIONS};
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
@@ -415,18 +413,18 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         }
     }
 
-    // Placing and dodge & burn: local stops on the linear luminance.
+    // Placing, dodge & burn and the tone in one pass: local stops on the
+    // linear luminance, then paper or look.
     if r.place != 0.0 || r.dodge_burn.iter().any(|b| b.ev() != 0.0) {
         info!("place {:+.2} stops, {} dodge & burn shapes", r.place, r.dodge_burn.len());
-        burn::apply(&mut plane, r.place, &r.dodge_burn);
     }
-
-    let curve = Curve::from_look(&r.curve);
-    let mut plane = curve.apply(&plane);
+    let tone = r.curve.compile();
+    info!("tone {}", r.curve.name());
+    crate::tone::render(&mut plane, r.place, &r.dodge_burn, &tone);
 
     if lay.border_px > 0 {
-        info!("border {} px ({} mm) in paper white {:.4}", lay.border_px, r.border_mm, curve.white());
-        plane = add_border(&plane, lay.border_px, curve.white());
+        info!("border {} px ({} mm) in paper white {:.4}", lay.border_px, r.border_mm, tone.white());
+        plane = add_border(&plane, lay.border_px, tone.white());
         if let Some(m) = mask.take() {
             mask = Some(add_border(&m, lay.border_px, 0.0));
         }
@@ -484,8 +482,8 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         stage: "print",
         source: src.name.clone(),
         source_description: src.description.clone(),
-        look: r.curve.name.clone(),
-        look_encoding: format!("{:?}", r.curve.encoding).to_ascii_lowercase(),
+        look: r.curve.name(),
+        look_encoding: format!("{:?}", r.curve.encoding()).to_ascii_lowercase(),
         width: lay.out_w,
         height: lay.out_h,
         dpi: r.dpi,
@@ -508,7 +506,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
 /// JPEG proof.
 pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
     let desc = serde_json::to_string(&out.info)?;
-    let trc = match p.recipe.curve.encoding {
+    let trc = match p.recipe.curve.encoding() {
         crate::calib::LookEncoding::Gamma22 => GrayTrc::Gamma(2.2),
         crate::calib::LookEncoding::None => GrayTrc::Linear,
     };
@@ -660,7 +658,7 @@ mod tests {
         assert_eq!((out.plane.width, out.plane.height), (500, 400));
         assert_eq!(out.info.border_px, 100);
         assert_eq!((out.info.width, out.info.height), (500, 400));
-        let white = Curve::from_look(&p.recipe.curve).white();
+        let white = p.recipe.curve.compile().white();
         assert_eq!(white, 1.0);
         assert_eq!(out.plane.at(0, 0), 1.0);
         assert_eq!(out.plane.at(99, 399), 1.0);
@@ -669,18 +667,31 @@ mod tests {
         assert!((out.plane.at(100, 100) - grey).abs() < 1e-12);
         assert!((out.plane.at(399, 299) - grey).abs() < 1e-12);
         assert_eq!(out.plane.at(400, 299), 1.0);
-        // A look with a damped paper white fills the border with that value.
-        let mut look = crate::zone::default_look();
-        let n = look.points.len();
-        crate::zone::set_output(&mut look, n - 1, 0.95);
-        let p2 = PrintParams { recipe: Recipe { curve: look, ..p.recipe.clone() }, ..Default::default() };
+        // A look with a damped paper white fills the border with that value;
+        // on paper the border is unexposed paper, 1 whatever the exposures.
+        let mut look = crate::calib::LookFile::neutral();
+        look.points.last_mut().unwrap()[1] = 0.95;
+        let p2 = PrintParams {
+            recipe: Recipe { curve: crate::tone::Tone::Look(look), ..p.recipe.clone() },
+            ..Default::default()
+        };
         let out2 = render_planes(&src, &p2);
         assert!((out2.plane.at(0, 0) - 0.95).abs() < 1e-12);
+        let p3 = PrintParams {
+            recipe: Recipe {
+                curve: crate::tone::Tone::Paper(crate::paper::SplitGrade::new(1.0, 1.0)),
+                ..p.recipe.clone()
+            },
+            ..Default::default()
+        };
+        let out3 = render_planes(&src, &p3);
+        assert_eq!(out3.plane.at(0, 0), 1.0);
+        assert!(out3.plane.at(100, 100) < grey);
     }
 
     /// Paper, table 4: place = 0 and empty shapes are the run that never had
-    /// the step; the zone default is the neutral look; the same recipe twice
-    /// is the same picture.
+    /// the step; the same recipe twice is the same picture; paper at its
+    /// base exposure is a different picture from the neutral look.
     #[test]
     fn untouched_recipe_is_bit_identical_to_neutral() {
         let (w, h) = (48, 32);
@@ -688,19 +699,20 @@ mod tests {
         let src =
             PrintSource { plane: &plane, mask: None, orientation: 6, name: "ramp".into(), description: None };
         let neutral = render_planes(&src, &PrintParams::default());
-        let zones = PrintParams::with_look(crate::zone::default_look());
-        let z = render_planes(&src, &zones);
-        assert_eq!(z.plane.data, neutral.plane.data);
         let with_shapes = PrintParams {
             recipe: Recipe {
                 place: 0.0,
-                dodge_burn: vec![burn::Burn::Radial { x: 0.5, y: 0.5, radius: 0.4, feather: 0.5, ev: 0.0 }],
+                dodge_burn: vec![crate::burn::Burn::radial(0.5, 0.5, 0.4, 0.5, 0.0)],
                 ..Recipe::default()
             },
             ..Default::default()
         };
         assert_eq!(render_planes(&src, &with_shapes).plane.data, neutral.plane.data);
-        assert_eq!(render_planes(&src, &zones).plane.data, z.plane.data);
+        let paper = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let a = render_planes(&src, &paper);
+        let b = render_planes(&src, &paper);
+        assert_eq!(a.plane.data, b.plane.data);
+        assert_ne!(a.plane.data, neutral.plane.data);
         // A placed picture is a different one, and the description says so.
         let placed = PrintParams { recipe: Recipe { place: 0.5, ..Recipe::default() }, ..Default::default() };
         let out = render_planes(&src, &placed);

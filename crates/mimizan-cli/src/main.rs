@@ -109,17 +109,19 @@ enum Cmd {
         /// Look file (look/*.json); default: neutral
         #[arg(long)]
         look: Option<PathBuf>,
-        /// Zone curve preset: paper grade N+n / N-n around the grey card
-        /// (0 = the untouched zone bar = neutral). Replaces --look.
-        #[arg(long, value_name = "GRADE", allow_hyphen_values = true)]
-        grade: Option<i32>,
+        /// Print on paper: split-grade exposures "SOFT,HARD" in stops of time
+        /// from the base exposure (e.g. "0,0" for the base print, "0,-0.5"
+        /// for half a stop less hard light). Replaces --look.
+        #[arg(long, value_name = "SOFT,HARD", allow_hyphen_values = true)]
+        paper: Option<String>,
         /// Placing in stops before the curve: L * 2^place (0 = untouched)
         #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
         place: Option<f64>,
-        /// Dodge & burn shape, repeatable: "radial:x,y,radius,feather,ev" or
-        /// "gradient:x0,y0,x1,y1,ev" (coordinates in 0..1 of the upright
-        /// picture, radius as a fraction of the long edge, ev in stops like
-        /// --place: positive = dodge (brighter), negative = burn (darker))
+        /// Dodge & burn shape, repeatable: "radial:x,y,radius,feather,ev[,filter]"
+        /// or "gradient:x0,y0,x1,y1,ev[,filter]" (coordinates in 0..1 of the
+        /// upright picture, radius as a fraction of the long edge, ev in stops
+        /// like --place: positive = dodge (brighter), negative = burn (darker);
+        /// filter both (default), soft or hard on paper)
         #[arg(long, value_name = "SHAPE")]
         burn: Vec<String>,
         /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it),
@@ -243,7 +245,7 @@ fn main() -> Result<()> {
             recipe,
             write_recipe,
             look,
-            grade,
+            paper,
             place,
             burn,
             size,
@@ -265,7 +267,7 @@ fn main() -> Result<()> {
             recipe,
             write_recipe,
             look,
-            grade,
+            paper,
             place,
             burn,
             size,

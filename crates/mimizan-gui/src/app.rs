@@ -10,13 +10,15 @@ use crate::worker::{Event, Heavy, Job, Preview, PreviewRequest};
 use crate::zone_bar::zone_bar;
 use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use egui_file_dialog::FileDialog;
-use mimizan_core::burn::{Burn, EV_LIMIT};
+use mimizan_core::burn::{Burn, Filter, EV_LIMIT};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
+use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::print::PrintSize;
 use mimizan_core::recipe::{Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
+use mimizan_core::tone::Tone;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -381,21 +383,19 @@ impl App {
     }
 
     /// Replace the whole development (undo, redo, a loaded recipe) and drop
-    /// tool state that pointed into the old one. The curve is always a zone
-    /// bar here: any other look (an older recipe, a CLI look) is sampled on
-    /// the zone boundaries, the identity exactly.
+    /// tool state that pointed into the old one. An older recipe with the
+    /// neutral look is put on paper; any other look stays a look (the
+    /// Enlarger offers the paper instead of the bar).
     fn set_edit(&mut self, mut e: Edit) {
         if e.rotation != self.edit.rotation {
             self.keep_scale = None;
         }
-        if !zone::is_zone_look(&e.recipe.curve) {
-            let c = &e.recipe.curve;
-            e.recipe.curve = if mimizan_core::curve::Curve::from_look(c).is_identity() {
-                zone::default_look()
+        if let Tone::Look(l) = &e.recipe.curve {
+            if mimizan_core::curve::Curve::from_look(l).is_identity() {
+                e.recipe.curve = Tone::paper();
             } else {
-                self.log(format!("curve \"{}\" sampled on the zone boundaries", c.name));
-                zone::look_on_zone_nodes(c)
-            };
+                self.log(format!("recipe prints through the look \"{}\", not on paper", l.name));
+            }
         }
         self.edit = e;
         self.dnb_selected = self.dnb_selected.filter(|&i| i < self.edit.recipe.dodge_burn.len());
@@ -466,7 +466,7 @@ impl App {
         let r = &self.edit.recipe;
         ViewParams {
             weights: self.weights(),
-            look: r.curve.clone(),
+            tone: r.curve.clone(),
             place: r.place,
             dodge_burn: r.dodge_burn.clone(),
             show_mask: self.show_mask,
@@ -607,8 +607,8 @@ impl App {
                         if self.screenshot_to.is_some()
                             && std::env::var_os("MIMIZAN_SCREENSHOT_ZONES").is_some()
                         {
-                            // A moved bar in the unattended capture.
-                            self.edit.recipe.curve = zone::grade(1);
+                            // Moved exposures in the unattended capture.
+                            self.edit.recipe.curve = Tone::Paper(SplitGrade::new(0.25, -0.5));
                         }
                     }
                     self.busy = None;
@@ -1396,67 +1396,94 @@ impl App {
                 raw.r, raw.g, raw.b
             ));
         });
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let mut place = self.edit.recipe.place;
-            ui.spacing_mut().slider_width = (width - 190.0).max(120.0);
-            if ui
-                .add(egui::Slider::new(&mut place, -3.0..=3.0).text("place (stops)").fixed_decimals(2))
-                .on_hover_text(
-                    "Exposure placing before the curve: +1 moves every zone one zone up (brighter). \
-                     The bar then decides how much of the paper each zone gets.",
-                )
-                .changed()
-            {
-                self.edit.recipe.place = place;
-            }
-        });
         ui.add_space(6.0);
-        self.hover_zone = zone_bar(ui, &mut self.edit.recipe.curve, width);
+        let Some(split) = self.edit.recipe.curve.as_paper().cloned() else {
+            // A look from a file or an older recipe: no paper to expose.
+            ui.label(
+                RichText::new(format!(
+                    "This recipe prints through the look \"{}\", not on paper.",
+                    self.edit.recipe.curve.name()
+                ))
+                .weak(),
+            );
+            if ui
+                .button("Print on paper")
+                .on_hover_text("Replace the look by the paper at its base exposure")
+                .clicked()
+            {
+                self.edit.recipe.curve = Tone::paper();
+            }
+            self.hover_zone = None;
+            return;
+        };
+        let mut split = split;
+        self.hover_zone = zone_bar(ui, &mut split, width);
         ui.add_space(4.0);
+        let slider_w = (width - 170.0).max(120.0);
+        let exposure = |ui: &mut egui::Ui, label: &str, filter: &str, v: &mut f64, hint: &str| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().slider_width = slider_w;
+                ui.label(RichText::new(label).weak()).on_hover_text(hint);
+                let changed = ui
+                    .add(
+                        egui::Slider::new(v, -SLIDER_STOPS..=SLIDER_STOPS)
+                            .fixed_decimals(2)
+                            .step_by(1.0 / 12.0)
+                            .suffix(" stops"),
+                    )
+                    .on_hover_text(hint)
+                    .changed();
+                ui.label(RichText::new(filter).weak().small());
+                changed
+            });
+        };
+        exposure(
+            ui,
+            "soft",
+            "filter 00",
+            &mut split.soft,
+            "The soft exposure, in stops of time from the base print. More soft light greys the \
+             highlights and hardly touches the shadows: the highlights' exposure.",
+        );
+        exposure(
+            ui,
+            "hard",
+            "filter 5",
+            &mut split.hard,
+            "The hard exposure, in stops of time from the base print. More hard light deepens the \
+             shadows and the mid tones with them, the highlights stay: the shadows' exposure.",
+        );
+        if split != *self.edit.recipe.curve.as_paper().unwrap() {
+            self.edit.recipe.curve = Tone::Paper(split.clone());
+        }
+        let curve = split.curve();
         ui.horizontal(|ui| {
-            ui.label(RichText::new("grade").weak());
-            for n in -2..=2 {
-                let label = match n {
-                    0 => "N".to_string(),
-                    n if n > 0 => format!("N+{n}"),
-                    n => format!("N{n}"),
-                };
-                let g = zone::grade(n);
-                let same = self.edit.recipe.curve.points == g.points;
-                if ui
-                    .selectable_label(same, label)
-                    .on_hover_text(format!(
-                        "Start position: the mid zones spread by {:.3} around the grey card. Only the boundaries count afterwards.",
-                        zone::GRADE_FACTOR.powi(n)
-                    ))
-                    .clicked()
-                {
-                    self.edit.recipe.curve = g;
+            ui.label(
+                RichText::new(format!(
+                    "≈ grade {} · {:.1} stops of scene · grey card prints at {:.2}",
+                    paper::grade_label(curve.grade()),
+                    curve.scene_range_stops(),
+                    curve.eval(zone::GRAY_CARD)
+                ))
+                .weak(),
+            )
+            .on_hover_text(
+                "The single filter grade this pair of exposures equals (by its ISO range), the scene \
+                 stops between the paper's first tone and its near-black, and where Zone V lands.",
+            );
+            if (split.soft != 0.0 || split.hard != 0.0)
+                && ui.small_button("base").on_hover_text("Back to the base exposure").clicked()
+            {
+                self.edit.recipe.curve = Tone::paper();
+            }
+            if self.edit.recipe.place != 0.0 {
+                ui.label(RichText::new(format!("place {:+.2}", self.edit.recipe.place)).weak().small())
+                    .on_hover_text(
+                        "A placing from the recipe, in scene stops; the bar moves both exposures instead.",
+                    );
+                if ui.small_button("0").on_hover_text("Drop the placing").clicked() {
+                    self.edit.recipe.place = 0.0;
                 }
-            }
-        });
-        ui.horizontal(|ui| {
-            let c = &mut self.edit.recipe.curve;
-            let n = c.points.len();
-            let mut fog = c.points[0][1];
-            let mut white = c.points[n - 1][1];
-            ui.label(RichText::new("fog").weak());
-            if ui
-                .add(egui::DragValue::new(&mut fog).range(0.0..=0.5).speed(0.002).fixed_decimals(3))
-                .on_hover_text("The darkest tone of the paper (the print value of linear 0)")
-                .changed()
-            {
-                zone::set_output(c, 0, fog);
-            }
-            ui.add_space(8.0);
-            ui.label(RichText::new("paper white").weak());
-            if ui
-                .add(egui::DragValue::new(&mut white).range(0.5..=1.0).speed(0.002).fixed_decimals(3))
-                .on_hover_text("The lightest tone of the paper (the print value of linear 1)")
-                .changed()
-            {
-                zone::set_output(c, n - 1, white);
             }
         });
     }
@@ -1514,12 +1541,14 @@ impl App {
                 ui.label(RichText::new("click in the picture (Esc cancels)").weak());
             }
         });
+        let on_paper = self.edit.recipe.curve.is_paper();
         let shapes = &mut self.edit.recipe.dodge_burn;
         if shapes.is_empty() {
             ui.label(
                 RichText::new(
-                    "Local placing before the curve: positive stops dodge (brighter), negative burn (darker). \
-                     Coordinates are fractions of the picture, so the shapes follow a resize.",
+                    "Local exposure: positive stops dodge (brighter), negative burn (darker), through both \
+                     filters or one of them. Coordinates are fractions of the picture, so the shapes follow \
+                     a resize.",
                 )
                 .weak(),
             );
@@ -1537,6 +1566,7 @@ impl App {
                     self.dnb_selected = if selected { None } else { Some(i) };
                 }
                 let mut ev = ev_now;
+                ui.spacing_mut().slider_width = 110.0;
                 if ui
                     .add(egui::Slider::new(&mut ev, -EV_LIMIT..=EV_LIMIT).fixed_decimals(2).suffix(" EV"))
                     .changed()
@@ -1548,6 +1578,26 @@ impl App {
                 }
             });
             if selected {
+                if on_paper {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("filter").weak());
+                        let mut f = shape.filter();
+                        for (filter, label, hint) in [
+                            (Filter::Both, "both", "The card over the lens for both exposures"),
+                            (Filter::Soft, "soft", "Only the soft exposure: works on the highlights"),
+                            (
+                                Filter::Hard,
+                                "hard",
+                                "Only the hard exposure: works on the shadows and mid tones",
+                            ),
+                        ] {
+                            ui.selectable_value(&mut f, filter, label).on_hover_text(hint);
+                        }
+                        if f != shape.filter() {
+                            shape.set_filter(f);
+                        }
+                    });
+                }
                 if let Burn::Radial { radius, feather, .. } = shape {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("radius").weak());
@@ -1727,10 +1777,10 @@ impl App {
         if self.session.is_none() {
             return "Open a RAW file first.".into();
         }
-        let look = if mimizan_core::curve::Curve::from_look(&self.edit.recipe.curve).is_identity() {
-            "untouched zone"
-        } else {
-            "zone"
+        let look = match &self.edit.recipe.curve {
+            Tone::Paper(s) if s.soft == 0.0 && s.hard == 0.0 => "base paper".to_string(),
+            Tone::Paper(s) => format!("paper (soft {:+.2}, hard {:+.2})", s.soft, s.hard),
+            Tone::Look(l) => format!("look \"{}\"", l.name),
         };
         let (uw, uh) = self.export_size();
         let (ow, oh) = self.print_layout().map(|l| (l.out_w, l.out_h)).unwrap_or((uw, uh));
@@ -1753,7 +1803,7 @@ impl App {
             Sharpen::Screen { .. } => "screen compensation".to_string(),
         };
         format!(
-            "Writes two files with the {look} curve{rot}{local}:\n\
+            "Writes two files on the {look}{rot}{local}:\n\
              <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, {sharpen} — the print, recipe in the description\n\
              <name>_{SCREEN_LONG_EDGE}px.jpg  {jw} x {jh} px, quality 100 — the same picture with screen compensation \
              for a 1:1 view (no border, no print sharpening)"
@@ -1922,13 +1972,7 @@ impl App {
                 if response.clicked() {
                     if let Some(p) = response.interact_pointer_pos() {
                         let [x, y] = norm(p);
-                        self.edit.recipe.dodge_burn.push(Burn::Radial {
-                            x,
-                            y,
-                            radius: 0.15,
-                            feather: 0.5,
-                            ev: 0.5,
-                        });
+                        self.edit.recipe.dodge_burn.push(Burn::radial(x, y, 0.15, 0.5, 0.5));
                         self.dnb_selected = Some(self.edit.recipe.dodge_burn.len() - 1);
                         self.dnb_placing = None;
                     }
@@ -1947,7 +1991,7 @@ impl App {
                     {
                         let [x1, y1] = norm(p);
                         if (x1 - x0).abs() > 1e-6 || (y1 - y0).abs() > 1e-6 {
-                            self.edit.recipe.dodge_burn.push(Burn::Gradient { x0, y0, x1, y1, ev: -0.5 });
+                            self.edit.recipe.dodge_burn.push(Burn::gradient(x0, y0, x1, y1, -0.5));
                             self.dnb_selected = Some(self.edit.recipe.dodge_burn.len() - 1);
                         }
                         self.dnb_placing = None;
@@ -2655,6 +2699,10 @@ struct Docks {
 
 /// Width of the side panels, points.
 const PANEL_W: f32 = 318.0;
+/// Reach of the exposure sliders, stops of time either way (the recipe
+/// allows `paper::STOP_LIMIT`; beyond two stops the print is all black or
+/// all grey).
+const SLIDER_STOPS: f64 = 2.0;
 /// Gap between the stage edge and a panel.
 const PANEL_GAP: f32 = 12.0;
 

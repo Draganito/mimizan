@@ -14,6 +14,7 @@ use crate::error::{Error, Result};
 use crate::print::PrintSize;
 use crate::resize::ResampleKernel;
 use crate::screen::ScreenSharpen;
+use crate::tone::Tone;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -123,10 +124,10 @@ pub struct Recipe {
     /// Placing, in stops, before the curve (paper, equation 1).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub place: f64,
-    /// The one curve: a look (neutral, reference, zones, or custom). A zone
-    /// curve is a look named `zones` on the encoded zone centres
-    /// (`zone.rs`); fog and paper white are its end points.
-    pub curve: LookFile,
+    /// The tone: the paper with its two exposures (`paper.rs`), or a look
+    /// (neutral, reference, custom) for the measurement pipeline and older
+    /// recipes (`tone.rs`). The field keeps its old name in the JSON.
+    pub curve: Tone,
     /// Dodge & burn shapes, local placing (`burn.rs`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dodge_burn: Vec<Burn>,
@@ -151,7 +152,7 @@ impl Default for Recipe {
         Self {
             schema: SCHEMA,
             place: 0.0,
-            curve: LookFile::neutral(),
+            curve: Tone::default(),
             dodge_burn: Vec::new(),
             resample: ResampleKernel::default(),
             size: None,
@@ -165,7 +166,12 @@ impl Default for Recipe {
 impl Recipe {
     /// A recipe with just a look, everything else default.
     pub fn with_look(look: LookFile) -> Self {
-        Self { curve: look, ..Self::default() }
+        Self { curve: Tone::Look(look), ..Self::default() }
+    }
+
+    /// A recipe on paper at the base exposure, everything else default.
+    pub fn on_paper() -> Self {
+        Self { curve: Tone::paper(), ..Self::default() }
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -241,10 +247,17 @@ mod tests {
     fn full_recipe_round_trips() {
         let r = Recipe {
             place: -0.5,
-            curve: crate::zone::grade(1),
+            curve: Tone::Paper(crate::paper::SplitGrade::new(0.25, -0.5)),
             dodge_burn: vec![
-                Burn::Radial { x: 0.452, y: 0.61, radius: 0.15, feather: 0.5, ev: 0.75 },
-                Burn::Gradient { x0: 0.5, y0: 0.0, x1: 0.5, y1: 0.4, ev: 1.0 },
+                Burn::radial(0.452, 0.61, 0.15, 0.5, 0.75),
+                Burn::Gradient {
+                    x0: 0.5,
+                    y0: 0.0,
+                    x1: 0.5,
+                    y1: 0.4,
+                    ev: 1.0,
+                    filter: crate::burn::Filter::Hard,
+                },
             ],
             resample: ResampleKernel::BSpline,
             size: Some(PrintSize::Physical { width_in: 11.811, height_in: 15.748 }),
@@ -255,6 +268,7 @@ mod tests {
         };
         r.validate().unwrap();
         let json = serde_json::to_string_pretty(&r).unwrap();
+        assert!(json.contains(r#""paper": "multigrade""#) && json.contains(r#""filter": "hard""#), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert_eq!(r.border_px(), 283);
@@ -278,6 +292,9 @@ mod tests {
         assert!(bad.validate().is_err());
         let bad = Recipe { schema: 2, ..Recipe::default() };
         assert!(bad.validate().is_err());
+        let bad = Recipe { curve: Tone::Paper(crate::paper::SplitGrade::new(0.0, 9.0)), ..Recipe::default() };
+        assert!(bad.validate().is_err());
+        Recipe::on_paper().validate().unwrap();
         assert!(Sharpen::Usm { amount: 1.5 }.validate().is_ok());
         assert!(Sharpen::Usm { amount: 1.6 }.validate().is_err());
         assert!(!Sharpen::Deconv { passes: 3, usm_amount: 0.0 }.uses_mask());
