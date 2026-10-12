@@ -397,19 +397,23 @@ grain are unchanged by any weighting (fine detail comes from `L̂` alone);
 a filter adds only band-limited chroma noise, 19–21 % σ on smooth areas
 for the red filter, far less for yellow or orange.
 
-The GUI is a darkroom: the picture fills the window and three translucent
-panels float over it (move them by the title, collapse them with a click,
-close them and bring them back from the toolbar, `Tab` hides all three).
-They are plain egui on glow — alpha and a shadow, no blur — so the app looks
-the same on a machine without a GPU driver. *Analysis* (left) shows the
-file's exposure from EXIF, the histograms and the *Development* fold.
-*Enlarger* (right) holds the mix from one row of presets (*Native*,
-*Panchromatic* = the camera file's calibrated weights, and the filters
-*Yellow 8* … *Blue 47* in front of it) or the R/B sliders, *dodge & burn*,
-and the *Print*: native size, a paper size at a dpi or a long edge, the
-border, the resampling kernel and the sharpening, with the output size it
-adds up to. *Zones* (bottom, above the film strip) is the whole tone
-control; there are no curves.
+The GUI is a darkroom in three steps, and the three windows are the
+steps: *Negative* on the left, *Enlarger* in the middle at the bottom,
+*Print* on the right. The side windows always stand full height at their
+edge, the Enlarger sits at the bottom between them above the film strip,
+and the picture is fitted into the free area in between, never hidden
+behind a window; close a window from its title bar or the toolbar and the
+picture takes the space (`Tab` hides all three). They are plain egui on
+glow — alpha and a shadow, no blur — so the app looks the same on a machine
+without a GPU driver. *Negative* is the judging step: the file's exposure
+from EXIF, the histograms and the *Development* fold. *Enlarger* is the
+editing step: the mix from one row of presets (*Native*, *Panchromatic* =
+the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
+47* in front of it) or the R/B sliders, the *place* slider, the zone bar,
+grade, fog and paper white, and *dodge & burn*. *Print* is the output step
+and nothing else: native size, a paper size at a dpi or a long edge, the
+border, the resampling kernel and the sharpening, the output size it adds
+up to, and the *Export…* button.
 
 The zone bar is the paper from fog to paper white, split into the zones
 0 … VII; the width of a patch is the share of the paper that zone gets,
@@ -424,12 +428,13 @@ slider above the bar is the exposure (every zone one stop up or down);
 start positions, nothing more. Dodge & burn shapes are placed in the
 picture (*+ disc* then click, *+ gradient* then drag from no effect to
 full effect), moved by their centre, resized by the ring or the end
-points, set in EV in the panel; `Delete` removes the selected one. *fit*,
-*1:1*, the mask and the shape overlay sit in the toolbar.
+points, set in EV in the Enlarger; `Delete` removes the selected one.
+*fit*, *1:1*, the mask and the shape overlay sit in the toolbar.
 
 Everything the panels set is one **development** (weights, turns and the
 recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole
-states, one step per released drag. The export (*Export…*) renders exactly
+states, one step per released drag. The export (*Export…* in the Print
+window) renders exactly
 this recipe in one pass against the negative and writes two files:
 `<name>.tif` (16 bit, gamma 2.2 grey ICC, the recipe in the TIFF
 description, size, border and sharpening as set — the print) and
@@ -460,7 +465,11 @@ development to the camera-file defaults and keeps the negative.
 The strip at the bottom is the folder browser, drawn as film: *Folder…*
 (or dropping a folder, or opening any file) lists the folder's RAW files
 as frames with perforation, sorted by name or file date, with a breadcrumb
-to walk up. The frames are shown as negatives (the *negative* toggle shows
+to walk up. Subfolders come first, as folder tiles the size of a frame with
+the number of RAW files inside (counted in the background, as a file
+manager does it); a click walks in, the breadcrumb walks out, and the
+strip's height follows a drag on its upper edge. The frames are shown as
+negatives (the *negative* toggle shows
 them as prints instead). Each thumbnail is the mosaic binned to grey with
 the file's balance and the camera file's weights — the same mix the
 development would produce, not the camera's embedded JPEG, which carries

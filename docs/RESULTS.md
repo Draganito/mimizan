@@ -540,11 +540,21 @@ part of its deeper roll-off (an open limit, not hidden).
 
 The GUI edits the recipe (`Edit { weights, recipe, rotation }`) with an
 undo history (commits when pointer and keyboard are idle, 200 steps,
-Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) and three floating translucent panels over
-the picture (Analysis, Enlarger, Print; Tab hides them, egui-only, no
-blur, so the glow backend and every driver stays sufficient). There are
-no curves in the GUI: the *Zones* window (bottom centre, above the strip)
-is the only tone control. Its bar is the paper from fog to paper white on
+Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) and three docked translucent windows,
+one per darkroom step: *Negative* (left edge, full height: EXIF,
+histograms, development), *Enlarger* (bottom, between the side windows,
+above the strip: mix, place, zone bar, grade, fog / paper white, dodge &
+burn) and *Print* (right edge, full height: size, border, resampling,
+sharpening, the Export button and nothing else). The windows are egui
+`Window`s with a fixed position and no movement; the picture is fitted into
+the stage left free between them, so nothing is ever covered (Tab hides
+all three; egui-only, no blur, so the glow backend and every driver stays
+sufficient). A note on the bottom window: it is sized by its content, and a
+`separator()` inside a horizontal layout fills the available height, which
+made the first version 420 pt tall — the divider is a painted line of fixed
+height now, and the rows wrap or are split so the content never exceeds
+the gap between the side windows. There are no curves in the GUI: the zone
+bar in the Enlarger is the only tone control. It is the paper from fog to paper white on
 the encoded axis, split into zones 0 … VII; a patch's width is the share
 of the paper that zone gets and it is painted with the print tones it
 covers. The boundary between two zones is the handle (`ResizeHorizontal`
@@ -556,9 +566,8 @@ axis, handles on the centres) showed N+1 with zones 0 and I collapsed at
 the left edge because the log axis clamps at −5.5 stops, which is why the
 axis is the encoded print value now. Hovering a zone tints its pixels in
 the preview (mask computed with the preview); the place slider, the grade
-start positions N−2 … N+2 and the fog / paper-white fields sit in the same
-window. The Enlarger panel keeps mix, dodge & burn and the print section;
-fit / 1:1 / mask / shapes moved to the toolbar. Dodge &
+start positions N−2 … N+2 and the fog / paper-white fields sit next to
+the bar; fit / 1:1 / mask / shapes sit in the toolbar. Dodge &
 burn: shapes are drawn in the viewport (disc: centre drag then radius;
 gradient: start then end), stored in normalised coordinates of the upright
 picture, so the preview, the 1:1 window (`burn::apply_window` on the
@@ -571,7 +580,10 @@ Three histograms: print (after place, burns, curve, full resolution, the
 weights taken per pixel through `print::upright_pixel`), negative (plain
 mix) and raw (the four CFA positions of the `RawFrame`, computed once per
 session, with per-channel clipping). The film strip shows the folder as
-negatives with perforation (toggle to positives). Export writes TIFF =
+negatives with perforation (toggle to positives); subfolders come first as
+folder tiles of frame size with their RAW count (a `mimizan-dir-count`
+thread walks them, results arrive per folder), the strip height is dragged
+on its upper edge and persisted. Export writes TIFF =
 recipe, JPEG = recipe with `LongEdgePx(screen)`, no border and screen
 compensation.
 

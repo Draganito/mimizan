@@ -89,8 +89,16 @@ pub struct Folder {
     pub sort: Sort,
     /// Bumped on every scan so thumbnails of an old listing are ignored.
     pub generation: u64,
-    /// Visible subfolders (not hidden ones), natural order, for going down.
-    pub subdirs: Vec<PathBuf>,
+    /// Visible subfolders (not hidden ones), natural order: the strip shows
+    /// them as tiles before the frames.
+    pub subdirs: Vec<SubDir>,
+}
+
+/// A subfolder tile. `raws` arrives from [`count_raws`] in the background.
+pub struct SubDir {
+    pub path: PathBuf,
+    pub name: String,
+    pub raws: Option<usize>,
 }
 
 impl Folder {
@@ -123,6 +131,8 @@ impl Folder {
             });
         }
         subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
+        let subdirs =
+            subdirs.into_iter().map(|p| SubDir { name: dir_name(&p), path: p, raws: None }).collect();
         let mut f = Self { path: path.to_path_buf(), entries, sort, generation, subdirs };
         f.resort(sort);
         Ok(f)
@@ -141,6 +151,27 @@ impl Folder {
     pub fn index_of(&self, path: &Path) -> Option<usize> {
         self.entries.iter().position(|e| e.path == path)
     }
+}
+
+/// Counts the RAW files of every folder in `dirs` on a thread and sends
+/// `(generation, path, count)` as each is done, so a slow (network) folder
+/// never stalls the strip. Dropping the receiver ends the thread quietly.
+pub fn count_raws(generation: u64, dirs: Vec<PathBuf>) -> std::sync::mpsc::Receiver<(u64, PathBuf, usize)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("mimizan-dir-count".into())
+        .spawn(move || {
+            for d in dirs {
+                let n = std::fs::read_dir(&d)
+                    .map(|rd| rd.filter_map(|e| e.ok()).filter(|e| is_raw(&e.path())).count())
+                    .unwrap_or(0);
+                if tx.send((generation, d, n)).is_err() {
+                    return;
+                }
+            }
+        })
+        .ok();
+    rx
 }
 
 /// Last path component as text (`/` for the root).

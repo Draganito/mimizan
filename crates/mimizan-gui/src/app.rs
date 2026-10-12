@@ -2,7 +2,7 @@
 //! (right). Nothing here changes pixels; it only chooses parameters and hands
 //! them to the workers.
 
-use crate::browser::{dir_name, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::browser::{self, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{Converter, DetailRect, DevelopParams, Histogram, Session, ViewParams};
@@ -91,9 +91,11 @@ pub struct App {
     strip_height_saved: f32,
     /// Floating panels shown: analysis, enlarger, print.
     panels: [bool; 3],
-    /// Zones window: measured size, and whether the user has moved it.
-    zones_size: Option<Vec2>,
-    zones_pinned: bool,
+    /// Measured height of the enlarger window (docked at the bottom); the
+    /// stage above it is laid out with it.
+    enlarger_h: Option<f32>,
+    /// RAW counts of the strip's subfolders, arriving in the background.
+    dir_counts: Option<std::sync::mpsc::Receiver<(u64, PathBuf, usize)>>,
     /// Priority list last sent to the thumbnail worker.
     last_wanted: Vec<PathBuf>,
     /// Keyboard moved the selection: bring the tile into view once.
@@ -222,8 +224,8 @@ impl App {
                 .unwrap_or(STRIP_HEIGHT)
                 .clamp(STRIP_MIN_H, STRIP_MAX_H),
             panels: persisted.panels.unwrap_or([true; 3]),
-            zones_size: None,
-            zones_pinned: false,
+            enlarger_h: None,
+            dir_counts: None,
             last_wanted: Vec::new(),
             scroll_to_selected: false,
             current_path: None,
@@ -307,7 +309,15 @@ impl App {
         let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         match Folder::scan(path, self.sort, self.folder_generation) {
             Ok(f) => {
-                self.log(format!("{}: {} RAW files", f.path.display(), f.entries.len()));
+                self.log(format!(
+                    "{}: {} RAW files, {} folders",
+                    f.path.display(),
+                    f.entries.len(),
+                    f.subdirs.len()
+                ));
+                self.dir_counts = (!f.subdirs.is_empty()).then(|| {
+                    browser::count_raws(f.generation, f.subdirs.iter().map(|d| d.path.clone()).collect())
+                });
                 self.folder = Some(f);
             }
             Err(e) => {
@@ -874,32 +884,27 @@ impl App {
             {
                 self.toggle_strip();
             }
-            for (i, (name, hover)) in [
-                ("Analysis", "File, histograms, development (Tab hides every panel)"),
-                ("Enlarger", "Mix (the filter), dodge & burn, the print's size, border and sharpening"),
+            // Panel indices: 0 left, 1 right, 2 bottom — shown in the order
+            // of the three steps.
+            for (i, name, hover) in [
                 (
-                    "Zones",
-                    "The zone bar: placing (the exposure) and the print range of every zone (the grade)",
+                    0,
+                    "Negative",
+                    "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
                 ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
+                (
+                    2,
+                    "Enlarger",
+                    "2 · Expose: mix (the filter), placing, the zone bar (the grade), dodge & burn",
+                ),
+                (1, "Print", "3 · The print: size, border, sharpening, export"),
+            ] {
                 if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
                     self.panels[i] = !self.panels[i];
                     self.persist();
                 }
             }
             let has = self.session.is_some();
-            let export_hover = self.export_hover_text();
-            if ui
-                .add_enabled(idle && has, egui::Button::new("Export…"))
-                .on_disabled_hover_text(export_hover.clone())
-                .on_hover_text(export_hover)
-                .clicked()
-            {
-                self.start_export();
-            }
             if ui
                 .add_enabled(has, egui::Button::new("⟳ 90°"))
                 .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
@@ -1247,7 +1252,10 @@ impl App {
     /// calibrated weights) and the classic contrast filters derived from it.
     /// All of them are only a weight triple; the sliders below are the free
     /// form, and moving one leaves every preset unselected.
-    fn mix_presets(&mut self, ui: &mut egui::Ui) {
+    /// The mix as one drop-down: Native, Panchromatic (the camera file) and
+    /// the classic filters in front of it; "custom" while the sliders stand
+    /// elsewhere. Each entry keeps its explanation as hover text.
+    fn mix_combo(&mut self, ui: &mut egui::Ui) {
         let cam = self.session.as_ref().and_then(|s| {
             s.camera_file.as_ref().map(|c| (s.default_weights(), c.weights(), c.weights_space))
         });
@@ -1264,8 +1272,23 @@ impl App {
         let current = self.weights();
         let same = |a: &Weights, b: &Weights| (a.r - b.r).abs() < 5e-4 && (a.b - b.b).abs() < 5e-4;
         let mut pick: Option<Weights> = None;
-        ui.horizontal_wrapped(|ui| {
-            let native = Weights::default();
+        // Name of the preset the sliders stand on.
+        let mut selected = "custom".to_string();
+        let native = Weights::default();
+        if same(&current, &native) {
+            selected = "Native".into();
+        }
+        if let Some((w, _, _)) = cam {
+            if same(&current, &w) {
+                selected = "Panchromatic".into();
+            }
+        }
+        for f in ColorFilter::ALL.into_iter().filter(|f| *f != ColorFilter::None) {
+            if same(&current, &base.filtered(f)) {
+                selected = format!("{} {}", capitalise(f.colour()), f.wratten().unwrap_or(0));
+            }
+        }
+        egui::ComboBox::from_id_salt("mix-combo").selected_text(selected).width(118.0).show_ui(ui, |ui| {
             if ui
                 .selectable_label(same(&current, &native), "Native")
                 .on_hover_text("¼ ½ ¼: exactly the Bayer luminance, no chroma mixed in")
@@ -1317,45 +1340,63 @@ impl App {
         }
     }
 
-    /// Right panel: the enlarger's filter (the mix), dodge & burn, and the
-    /// print's size, border and sharpening.
+    /// Bottom window, step 2: everything that exposes the print. Left the
+    /// mix (the filter), placing and the zone bar (the grade); right dodge &
+    /// burn.
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Mix");
-        let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
-        self.mix_presets(ui);
-        ui.add_space(2.0);
-        let cur = self.weights();
-        let mut r = cur.r;
-        let mut b = cur.b;
-        if ui.add(egui::Slider::new(&mut r, 0.0..=1.0).text("R").fixed_decimals(3)).changed() {
-            self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
-        }
-        if ui.add(egui::Slider::new(&mut b, 0.0..=1.0).text("B").fixed_decimals(3)).changed() {
-            self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
-        }
-        let w = self.weights();
-        ui.label(format!("G = {:.3}   (R + G + B = 1, balanced channels)", w.g));
-        let raw = w.balanced_to_raw(wb);
-        ui.label(RichText::new(format!("raw channels: R {:.3} G {:.3} B {:.3}", raw.r, raw.g, raw.b)).weak())
-            .on_hover_text(
-                "The same mix on the sensor channels before white balance: the illuminant-independent form",
-            );
-
-        ui.add_space(10.0);
-        ui.separator();
-        self.dodge_burn_section(ui);
-
-        ui.add_space(10.0);
-        ui.separator();
-        self.print_section(ui);
-    }
-
-    /// Bottom window: the zone bar — placing (the exposure) and the print
-    /// range of every zone (the grade). Nothing else edits the curve.
-    fn zones_window(&mut self, ui: &mut egui::Ui) {
         // The zone bar sets this again while the pointer is over it.
         self.hover_zone = None;
-        let width = ui.available_width();
+        let total = ui.available_width();
+        let dnb_w = 236.0;
+        let spacing = ui.spacing().item_spacing.x;
+        let zones_w = (total - dnb_w - 24.0 - 2.0 * spacing).max(240.0);
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(zones_w);
+                self.zones_column(ui, zones_w);
+            });
+            // A short divider, not `separator()`: in a horizontal layout that
+            // one fills the available height and the window would grow to it.
+            let (line, _) = ui.allocate_exact_size(Vec2::new(24.0, 110.0), Sense::hover());
+            ui.painter().vline(
+                line.center().x,
+                line.y_range(),
+                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            );
+            ui.vertical(|ui| {
+                ui.set_width(dnb_w);
+                self.dodge_burn_section(ui);
+            });
+        });
+    }
+
+    /// Mix as one row, placing, the bar, the grades and the paper's ends.
+    fn zones_column(&mut self, ui: &mut egui::Ui, width: f32) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("mix").weak());
+            self.mix_combo(ui);
+            let cur = self.weights();
+            let (mut r, mut b) = (cur.r, cur.b);
+            ui.label(RichText::new("R").weak());
+            if ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed()
+            {
+                self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
+            }
+            ui.label(RichText::new("B").weak());
+            if ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed()
+            {
+                self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
+            }
+            let w = self.weights();
+            let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
+            let raw = w.balanced_to_raw(wb);
+            ui.label(RichText::new(format!("G {:.3}", w.g)).weak()).on_hover_text(format!(
+                "R + G + B = 1 on the balanced channels.\nOn the sensor channels before white balance: \
+                 R {:.3} G {:.3} B {:.3}",
+                raw.r, raw.g, raw.b
+            ));
+        });
+        ui.add_space(4.0);
         ui.horizontal(|ui| {
             let mut place = self.edit.recipe.place;
             ui.spacing_mut().slider_width = (width - 190.0).max(120.0);
@@ -1394,7 +1435,8 @@ impl App {
                     self.edit.recipe.curve = g;
                 }
             }
-            ui.add_space(12.0);
+        });
+        ui.horizontal(|ui| {
             let c = &mut self.edit.recipe.curve;
             let n = c.points.len();
             let mut fog = c.points[0][1];
@@ -1407,6 +1449,7 @@ impl App {
             {
                 zone::set_output(c, 0, fog);
             }
+            ui.add_space(8.0);
             ui.label(RichText::new("paper white").weak());
             if ui
                 .add(egui::DragValue::new(&mut white).range(0.5..=1.0).speed(0.002).fixed_decimals(3))
@@ -1416,20 +1459,34 @@ impl App {
                 zone::set_output(c, n - 1, white);
             }
         });
-        ui.add(
-            egui::Label::new(
-                RichText::new(
-                    "The paper from fog to white; each patch is the share one zone gets. Drag a boundary: one \
-                     zone widens, its neighbour narrows. Double-click: back.",
-                )
-                .weak(),
+    }
+
+    /// Right window, step 3: the print and its export.
+    fn print_panel(&mut self, ui: &mut egui::Ui) {
+        self.print_section(ui);
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        let idle = self.busy.is_none();
+        let has = self.session.is_some();
+        let hover = self.export_hover_text();
+        if ui
+            .add_enabled(
+                idle && has,
+                egui::Button::new(RichText::new("Export…").strong())
+                    .min_size(Vec2::new(ui.available_width(), 30.0)),
             )
-            .truncate(),
-        )
-        .on_hover_text(
-            "Untouched, the bar equals plain gamma 2.2 exactly (one stop per zone, the highlights getting most \
-             of the paper, as the encoding has it). The curve through the boundaries is monotone by \
-             construction: nothing can overtake, nothing solarises.",
+            .on_disabled_hover_text(hover.clone())
+            .on_hover_text(hover)
+            .clicked()
+        {
+            self.start_export();
+        }
+        ui.label(
+            RichText::new(
+                "Renders this recipe against the negative: the print as 16-bit TIFF and a screen JPEG.",
+            )
+            .weak(),
         );
     }
 
@@ -2179,8 +2236,8 @@ impl App {
                             ui.set_min_width(160.0);
                             egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
                                 for d in &f.subdirs {
-                                    if ui.button(dir_name(d)).clicked() {
-                                        go_to = Some(d.clone());
+                                    if ui.button(&d.name).clicked() {
+                                        go_to = Some(d.path.clone());
                                         ui.close();
                                     }
                                 }
@@ -2246,24 +2303,19 @@ impl App {
         ui.add_space(2.0);
         self.strip_bar(ui);
         ui.add_space(2.0);
-        let Some(folder) = &mut self.folder else { return };
-        if folder.entries.is_empty() {
-            // Nothing to show as film: offer the way down instead.
-            let mut go_to: Option<PathBuf> = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("No RAW files in this folder.").weak());
-                if !folder.subdirs.is_empty() {
-                    ui.label(RichText::new("Folders:").weak());
-                }
-                for d in &folder.subdirs {
-                    if ui.button(dir_name(d)).clicked() {
-                        go_to = Some(d.clone());
+        // Subfolder counts arriving from the background.
+        if let Some(rx) = &self.dir_counts {
+            while let Ok((generation, path, n)) = rx.try_recv() {
+                if let Some(f) = self.folder.as_mut().filter(|f| f.generation == generation) {
+                    if let Some(d) = f.subdirs.iter_mut().find(|d| d.path == path) {
+                        d.raws = Some(n);
                     }
                 }
-            });
-            if let Some(p) = go_to {
-                self.set_folder(&p);
             }
+        }
+        let Some(folder) = &mut self.folder else { return };
+        if folder.entries.is_empty() && folder.subdirs.is_empty() {
+            ui.label(RichText::new("No RAW files and no folders here.").weak());
             return;
         }
         let idle = self.busy.is_none();
@@ -2272,6 +2324,7 @@ impl App {
         let negative = self.strip_negative;
         let scroll_to = std::mem::take(&mut self.scroll_to_selected);
         let mut clicked: Option<PathBuf> = None;
+        let mut go_dir: Option<PathBuf> = None;
         // (distance from the viewport centre, index) of tiles that still
         // need a thumbnail; visible ones first, then two screens around.
         let mut wanted: Vec<(f32, usize)> = Vec::new();
@@ -2292,6 +2345,56 @@ impl App {
             ui.painter().rect_filled(film, 0.0, FILM_BASE);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
+                // Folders first, as tiles of the frame's size (no perforation:
+                // a folder is not film). Click goes down into it.
+                for d in &folder.subdirs {
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
+                    if !clip.intersects(rect) {
+                        continue;
+                    }
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 0.0, FILM_BASE);
+                    let frame = Rect::from_min_size(
+                        Pos2::new(rect.left(), rect.top() + PERF_H),
+                        Vec2::new(tile_w, img_h),
+                    );
+                    if resp.hovered() {
+                        painter.rect_filled(frame, 0.0, Color32::from_white_alpha(10));
+                    }
+                    draw_folder(
+                        painter,
+                        frame.shrink2(Vec2::new(tile_w * 0.18, img_h * 0.16)),
+                        resp.hovered(),
+                    );
+                    let count = match d.raws {
+                        Some(0) => String::new(),
+                        Some(n) => format!("{n} RAW"),
+                        None => "…".to_string(),
+                    };
+                    if !count.is_empty() {
+                        painter.text(
+                            Pos2::new(frame.center().x, frame.bottom() - img_h * 0.16),
+                            egui::Align2::CENTER_CENTER,
+                            count,
+                            egui::FontId::proportional(11.0),
+                            Color32::from_gray(200),
+                        );
+                    }
+                    painter.text(
+                        Pos2::new(rect.center().x, rect.max.y - EDGE_H * 0.5),
+                        egui::Align2::CENTER_CENTER,
+                        truncate_middle(&d.name, (tile_w / 7.5) as usize),
+                        egui::FontId::proportional(11.0),
+                        Color32::from_rgb(200, 190, 170),
+                    );
+                    painter.line_segment(
+                        [rect.right_top(), rect.right_bottom()],
+                        egui::Stroke::new(1.0, Color32::from_white_alpha(8)),
+                    );
+                    if resp.on_hover_text(d.path.display().to_string()).clicked() {
+                        go_dir = Some(d.path.clone());
+                    }
+                }
                 for (i, e) in folder.entries.iter_mut().enumerate() {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
                     let is_current = current.as_deref() == Some(e.path.as_path());
@@ -2447,7 +2550,33 @@ impl App {
         if let Some(p) = clicked {
             self.open(p);
         }
+        if let Some(p) = go_dir {
+            self.set_folder(&p);
+        }
     }
+}
+
+/// A folder as the file managers draw it: tab, body, a lighter front flap.
+fn draw_folder(painter: &egui::Painter, r: Rect, hovered: bool) {
+    let back = if hovered { Color32::from_rgb(150, 120, 70) } else { Color32::from_rgb(120, 96, 56) };
+    let front = if hovered { Color32::from_rgb(205, 170, 100) } else { Color32::from_rgb(180, 146, 84) };
+    let tab_w = r.width() * 0.38;
+    let tab_h = (r.height() * 0.14).max(4.0);
+    painter.rect_filled(
+        Rect::from_min_size(r.left_top(), Vec2::new(tab_w, tab_h + 3.0)),
+        egui::CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 },
+        back,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(r.left(), r.top() + tab_h), r.right_bottom()),
+        3.0,
+        back,
+    );
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(r.left(), r.top() + tab_h + r.height() * 0.22), r.right_bottom()),
+        3.0,
+        front,
+    );
 }
 
 /// `DSC_0001_very_long_name.NEF` -> `DSC_0001_…name.NEF` within `max` chars.
@@ -2495,13 +2624,17 @@ impl eframe::App for App {
                 self.persist();
             }
         }
-        // The picture fills what is left; the panels float over it.
-        let stage = egui::CentralPanel::default()
+        // What is left is the darkroom: the three docked windows and, in
+        // the room between them, the picture — never under a window.
+        let docks = egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.preview_panel(ui))
-            .response
-            .rect;
-        self.glass_panels(&ctx, stage);
+            .show(ui, |ui| {
+                let docks = self.docks(ui.available_rect_before_wrap());
+                ui.scope_builder(egui::UiBuilder::new().max_rect(docks.stage), |ui| self.preview_panel(ui));
+                docks
+            })
+            .inner;
+        self.dock_windows(&ctx, &docks);
 
         self.edit_keys(&ctx);
         self.commit_history(&ctx);
@@ -2509,6 +2642,15 @@ impl eframe::App for App {
         self.flush_converter_redevelop();
         self.strip_keys(&ctx);
     }
+}
+
+/// The docked windows' places for one frame.
+struct Docks {
+    left: Option<Rect>,
+    right: Option<Rect>,
+    bottom: Option<Rect>,
+    /// What is left for the picture.
+    stage: Rect,
 }
 
 /// Width of the side panels, points.
@@ -2528,73 +2670,90 @@ fn glass_frame() -> egui::Frame {
 }
 
 impl App {
-    /// The three floating panels over the stage: analysis left, enlarger
-    /// (mix, dodge & burn, print) right, the zone bar at the bottom centre.
-    /// Each is a window the user can move, collapse (click the title) or
-    /// close; the toolbar brings it back.
-    fn glass_panels(&mut self, ctx: &egui::Context, stage: Rect) {
-        // The side panels always stand at the stage's height (min = max, so
-        // they follow the window and the strip); the content scrolls.
-        let max_h = (stage.height() - 2.0 * PANEL_GAP).max(120.0);
+    /// Where the three windows stand and what is left for the picture.
+    fn docks(&self, full: Rect) -> Docks {
+        let gap = PANEL_GAP;
+        let h = (full.height() - 2.0 * gap).max(120.0);
+        let left = self.panels[0]
+            .then(|| Rect::from_min_size(full.left_top() + Vec2::splat(gap), Vec2::new(PANEL_W, h)));
+        let right = self.panels[1].then(|| {
+            Rect::from_min_size(
+                Pos2::new(full.right() - gap - PANEL_W, full.top() + gap),
+                Vec2::new(PANEL_W, h),
+            )
+        });
+        let x0 = left.map(|r| r.right() + gap).unwrap_or(full.left() + gap);
+        let x1 = right.map(|r| r.left() - gap).unwrap_or(full.right() - gap);
+        let bottom = self.panels[2].then(|| {
+            let bh = self.enlarger_h.unwrap_or(190.0).min(h);
+            Rect::from_min_max(Pos2::new(x0, full.bottom() - gap - bh), Pos2::new(x1, full.bottom() - gap))
+        });
+        let stage = Rect::from_min_max(
+            Pos2::new(x0, full.top()),
+            Pos2::new(x1, bottom.map(|r| r.top() - gap).unwrap_or(full.bottom())),
+        );
+        Docks { left, right, bottom, stage }
+    }
+
+    /// The three docked windows: the negative left, the print right (both
+    /// at the stage's full height), the enlarger at the bottom between them.
+    /// Nothing is movable; × closes, the toolbar or Tab brings one back.
+    fn dock_windows(&mut self, ctx: &egui::Context, docks: &Docks) {
         let mut open = self.panels;
-        egui::Window::new("Analysis")
-            .frame(glass_frame())
-            .open(&mut open[0])
-            .default_pos(stage.left_top() + Vec2::splat(PANEL_GAP))
-            .default_width(PANEL_W)
-            .min_width(PANEL_W)
-            .max_width(PANEL_W)
-            .default_height(max_h)
-            .min_height(max_h)
-            .max_height(max_h)
-            .resizable([false, true])
-            .vscroll(true)
-            .constrain_to(stage)
-            .show(ctx, |ui| self.analysis_panel(ui));
-        egui::Window::new("Enlarger")
-            .frame(glass_frame())
-            .open(&mut open[1])
-            .default_pos(stage.right_top() + Vec2::new(-PANEL_W - PANEL_GAP - 12.0, PANEL_GAP))
-            .default_width(PANEL_W)
-            .min_width(PANEL_W)
-            .max_width(PANEL_W)
-            .default_height(max_h)
-            .min_height(max_h)
-            .max_height(max_h)
-            .resizable([false, true])
-            .vscroll(true)
-            .constrain_to(stage)
-            .show(ctx, |ui| self.enlarger_panel(ui));
-        // The zones window sits at the bottom centre, above the strip, as
-        // wide as the room between the side panels, until the user drags it
-        // somewhere; its height is only known after a frame, so the position
-        // follows the measured size. (No scroll area here: a window that may
-        // grow to the stage's height is constrained as if it did, and would
-        // sit at the top.)
-        let side = |open: bool| if open { PANEL_W + 2.0 * PANEL_GAP + 24.0 } else { PANEL_GAP };
-        let zones_w = (stage.width() - side(open[0]) - side(open[1])).clamp(420.0, 1000.0);
-        let mut zones = egui::Window::new("Zones")
-            .frame(glass_frame())
-            .open(&mut open[2])
-            .default_width(zones_w)
-            .min_width(zones_w)
-            .max_width(zones_w)
-            .resizable(false)
-            .constrain_to(stage);
-        if !self.zones_pinned {
-            let size = self.zones_size.unwrap_or(Vec2::new(zones_w + 24.0, 170.0));
-            // egui's title-bar drag mode re-applies the stored position over
-            // `current_pos`; drag-anywhere mode does not, and the first drag
-            // pins the window anyway.
-            zones = zones.drag_area(egui::WindowDrag::Anywhere).current_pos(Pos2::new(
-                stage.center().x - size.x * 0.5,
-                (stage.bottom() - PANEL_GAP - size.y).max(stage.top() + PANEL_GAP),
-            ));
+        if let Some(r) = docks.left {
+            egui::Window::new("Negative")
+                .frame(glass_frame())
+                .open(&mut open[0])
+                .fixed_pos(r.min)
+                .movable(false)
+                .collapsible(false)
+                .default_width(PANEL_W)
+                .min_width(PANEL_W)
+                .max_width(PANEL_W)
+                .default_height(r.height())
+                .min_height(r.height())
+                .max_height(r.height())
+                .resizable([false, true])
+                .vscroll(true)
+                .show(ctx, |ui| self.analysis_panel(ui));
         }
-        if let Some(r) = zones.show(ctx, |ui| self.zones_window(ui)) {
-            self.zones_size = Some(r.response.rect.size());
-            if r.response.dragged() {
-                self.zones_pinned = true;
+        if let Some(r) = docks.right {
+            egui::Window::new("Print")
+                .frame(glass_frame())
+                .open(&mut open[1])
+                .fixed_pos(r.min)
+                .movable(false)
+                .collapsible(false)
+                .default_width(PANEL_W)
+                .min_width(PANEL_W)
+                .max_width(PANEL_W)
+                .default_height(r.height())
+                .min_height(r.height())
+                .max_height(r.height())
+                .resizable([false, true])
+                .vscroll(true)
+                .show(ctx, |ui| self.print_panel(ui));
+        }
+        if let Some(r) = docks.bottom {
+            // Height follows the content; the stage is laid out with the
+            // measured value of the last frame.
+            let shown = egui::Window::new("Enlarger")
+                .frame(glass_frame())
+                .open(&mut open[2])
+                .fixed_pos(r.min)
+                .movable(false)
+                .collapsible(false)
+                .default_width(r.width())
+                .min_width(r.width())
+                .max_width(r.width())
+                .resizable(false)
+                .show(ctx, |ui| self.enlarger_panel(ui));
+            if let Some(s) = shown {
+                let h = s.response.rect.height();
+                if self.enlarger_h.is_none_or(|old| (old - h).abs() > 0.5) {
+                    self.enlarger_h = Some(h);
+                    ctx.request_repaint();
+                }
             }
         }
         if open != self.panels {
