@@ -11,6 +11,7 @@ use mimizan_core::calib::{CameraFile, LookFile};
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::print::{self as pr, PrintParams, PrintSize, PrintSource};
+use mimizan_core::recipe::{Recipe, Sharpen};
 use mimizan_core::screen::ScreenSharpen;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
@@ -190,7 +191,7 @@ fn export(
     };
 
     // 1. Full resolution, look applied, nothing sharpened: the file to work on.
-    let tiff_params = PrintParams { look: look.clone(), ..Default::default() };
+    let tiff_params = PrintParams::with_look(look.clone());
     status("rendering TIFF".into());
     let tiff = pr::render_planes(&src, &tiff_params);
     status(format!("writing {}", path.display()));
@@ -200,10 +201,14 @@ fn export(
 
     // 2. Screen JPEG: long edge, exact compensation of the known losses.
     let jpeg = jpeg_path(path, screen_px);
+    let s = ScreenSharpen::default();
     let jpeg_params = PrintParams {
-        look,
-        size: Some(PrintSize::LongEdgePx(screen_px)),
-        screen: Some(ScreenSharpen::default()),
+        recipe: Recipe {
+            curve: look,
+            size: Some(PrintSize::LongEdgePx(screen_px)),
+            sharpen: Sharpen::Screen { amount: s.amount, max_gain: s.max_gain },
+            ..Recipe::default()
+        },
         ..Default::default()
     };
     status("rendering JPEG".into());

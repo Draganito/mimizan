@@ -92,28 +92,56 @@ enum Cmd {
         #[arg(long)]
         crop: Option<String>,
     },
-    /// Negative TIFF -> print file: size, look curve, USM or screen compensation,
-    /// 16-bit TIFF (gamma 2.2 grey ICC) or JPEG (-o *.jpg)
+    /// Negative TIFF -> print file in one pass: size, place and dodge & burn,
+    /// curve, border, USM or screen compensation; 16-bit TIFF (gamma 2.2 grey
+    /// ICC) or JPEG (-o *.jpg). Every print decision can come from a recipe
+    /// file (--recipe); explicit flags override its fields.
     Print {
         negative: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
+        /// Recipe JSON (as written by --write-recipe or the GUI); flags override
+        #[arg(long)]
+        recipe: Option<PathBuf>,
+        /// Write the recipe this run used (after overrides) to a JSON file
+        #[arg(long)]
+        write_recipe: Option<PathBuf>,
         /// Look file (look/*.json); default: neutral
         #[arg(long)]
         look: Option<PathBuf>,
+        /// Zone curve preset: paper grade N+n / N-n around the grey card
+        /// (0 = the untouched zone bar = neutral). Replaces --look.
+        #[arg(long, value_name = "GRADE", allow_hyphen_values = true)]
+        grade: Option<i32>,
+        /// Placing in stops before the curve: L * 2^place (0 = untouched)
+        #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
+        place: Option<f64>,
+        /// Dodge & burn shape, repeatable: "radial:x,y,radius,feather,ev" or
+        /// "gradient:x0,y0,x1,y1,ev" (coordinates in 0..1 of the upright
+        /// picture, radius as a fraction of the long edge, ev in stops like
+        /// --place: positive = dodge (brighter), negative = burn (darker))
+        #[arg(long, value_name = "SHAPE")]
+        burn: Vec<String>,
         /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it),
         /// or long edge in pixels for the screen, e.g. 2048px
         #[arg(long)]
         size: Option<String>,
+        /// Resampling kernel: lanczos3 (default, sharpest) | catmull-rom |
+        /// mitchell | b-spline (no overshoot, softest)
+        #[arg(long, value_name = "KERNEL")]
+        resample: Option<String>,
+        /// Paper border around the picture, mm, filled with paper white
+        #[arg(long, value_name = "MM")]
+        border_mm: Option<f64>,
         /// Screen output: replace USM by the exact compensation of the known
-        /// losses (Lanczos-3 resampling x display pixel aperture); value = amount 0..1
+        /// losses (resampling kernel x display pixel aperture); value = amount 0..1
         #[arg(long, value_name = "AMOUNT")]
         screen: Option<f64>,
         /// Gain cap of the screen compensation near Nyquist (Wiener regularisation)
         #[arg(long, default_value_t = 2.0)]
         screen_max_gain: f64,
-        #[arg(long, default_value_t = 300.0)]
-        dpi: f64,
+        #[arg(long)]
+        dpi: Option<f64>,
         /// USM amount (0 = off); default from the camera file named in the negative, else 0
         #[arg(long)]
         usm_amount: Option<f64>,
@@ -212,8 +240,15 @@ fn main() -> Result<()> {
         Cmd::Print {
             negative,
             out,
+            recipe,
+            write_recipe,
             look,
+            grade,
+            place,
+            burn,
             size,
+            resample,
+            border_mm,
             screen,
             screen_max_gain,
             dpi,
@@ -227,8 +262,15 @@ fn main() -> Result<()> {
         } => cmd::print(&cmd::PrintArgs {
             negative,
             out,
+            recipe,
+            write_recipe,
             look,
+            grade,
+            place,
+            burn,
             size,
+            resample,
+            border_mm,
             screen,
             screen_max_gain,
             dpi,

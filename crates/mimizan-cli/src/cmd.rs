@@ -169,11 +169,18 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
 pub struct PrintArgs {
     pub negative: PathBuf,
     pub out: PathBuf,
+    pub recipe: Option<PathBuf>,
+    pub write_recipe: Option<PathBuf>,
     pub look: Option<PathBuf>,
+    pub grade: Option<i32>,
+    pub place: Option<f64>,
+    pub burn: Vec<String>,
     pub size: Option<String>,
+    pub resample: Option<String>,
+    pub border_mm: Option<f64>,
     pub screen: Option<f64>,
     pub screen_max_gain: f64,
-    pub dpi: f64,
+    pub dpi: Option<f64>,
     pub usm_amount: Option<f64>,
     pub usm_k: f64,
     pub distance_mm: Option<f64>,
@@ -195,57 +202,94 @@ fn usm_default_from_negative(negative: &Path, cameras: &Path) -> Option<f64> {
     Some(c.usm_amount)
 }
 
-pub fn print(a: &PrintArgs) -> Result<()> {
+/// The recipe of a `print` run: the file, then every explicit flag on top.
+pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
+    use mimizan_core::burn::Burn;
     use mimizan_core::calib::LookFile;
-    use mimizan_core::print::{self as pr, PrintParams, PrintSize};
-    use mimizan_core::screen::ScreenSharpen;
-    if a.dpi.is_nan() || a.dpi <= 0.0 {
-        bail!("dpi must be positive");
-    }
-    let look = match &a.look {
-        Some(p) => LookFile::load(p).with_context(|| format!("look file {}", p.display()))?,
-        None => LookFile::neutral(),
+    use mimizan_core::print::PrintSize;
+    use mimizan_core::recipe::{Recipe, Sharpen};
+    use mimizan_core::resize::ResampleKernel;
+
+    let mut r = match &a.recipe {
+        Some(p) => Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))?,
+        None => Recipe::default(),
     };
-    let size = a.size.as_deref().map(PrintSize::parse).transpose()?;
-    let usm_amount = match a.usm_amount {
-        Some(v) => v,
-        None => usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0),
-    };
-    if !(0.0..=1.5).contains(&usm_amount) {
-        bail!("usm amount must be within 0..1.5");
+    if a.look.is_some() && a.grade.is_some() {
+        bail!("--look and --grade exclude each other");
     }
-    let screen = match a.screen {
-        Some(amount) => {
-            if !(0.0..=1.0).contains(&amount) {
-                bail!("screen amount must be within 0..1");
-            }
-            if !(1.0..=4.0).contains(&a.screen_max_gain) {
-                bail!("screen max gain must be within 1..4");
-            }
-            Some(ScreenSharpen { amount, max_gain: a.screen_max_gain })
+    if let Some(p) = &a.look {
+        r.curve = LookFile::load(p).with_context(|| format!("look file {}", p.display()))?;
+    }
+    if let Some(g) = a.grade {
+        if !(-5..=5).contains(&g) {
+            bail!("grade must be within -5..5");
         }
-        None => None,
-    };
-    if let Some(n) = a.deconv {
-        if !(1..=mimizan_core::deconv::DECONV_ITERATIONS as u32).contains(&n) {
-            bail!("deconv passes must be within 1..{}", mimizan_core::deconv::DECONV_ITERATIONS);
-        }
-        if screen.is_some() {
-            bail!("--deconv and --screen exclude each other");
+        r.curve = mimizan_core::zone::grade(g);
+    }
+    if let Some(v) = a.place {
+        r.place = v;
+    }
+    for s in &a.burn {
+        r.dodge_burn.push(Burn::parse(s)?);
+    }
+    if let Some(s) = &a.size {
+        r.size = Some(PrintSize::parse(s)?);
+    }
+    if let Some(k) = &a.resample {
+        r.resample = ResampleKernel::parse(k).ok_or_else(|| {
+            let names: Vec<&str> = ResampleKernel::ALL.iter().map(|k| k.name()).collect();
+            anyhow::anyhow!("unknown kernel '{k}' ({})", names.join("|"))
+        })?;
+    }
+    if let Some(b) = a.border_mm {
+        r.border_mm = b;
+    }
+    if let Some(d) = a.dpi {
+        r.dpi = d;
+    }
+
+    // Sharpening: explicit flags replace the recipe's mode; without any, a
+    // recipe keeps its own, and a bare run takes the camera file's USM.
+    let explicit = a.screen.is_some() || a.deconv.is_some() || a.usm_amount.is_some();
+    if a.screen.is_some() && a.deconv.is_some() {
+        bail!("--deconv and --screen exclude each other");
+    }
+    if explicit {
+        let usm_amount = match a.usm_amount {
+            Some(v) => v,
+            None if a.screen.is_none() => usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0),
+            None => 0.0,
+        };
+        r.sharpen = match (a.screen, a.deconv) {
+            (Some(amount), _) => Sharpen::Screen { amount, max_gain: a.screen_max_gain },
+            (None, Some(passes)) => Sharpen::Deconv { passes, usm_amount },
+            (None, None) if usm_amount > 0.0 => Sharpen::Usm { amount: usm_amount },
+            (None, None) => Sharpen::Off,
+        };
+    } else if a.recipe.is_none() {
+        let usm_amount = usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0);
+        if usm_amount > 0.0 {
+            r.sharpen = Sharpen::Usm { amount: usm_amount };
         }
     }
+    r.validate()?;
+    Ok(r)
+}
+
+pub fn print(a: &PrintArgs) -> Result<()> {
+    use mimizan_core::print::{self as pr, PrintParams};
+    let recipe = print_recipe(a)?;
+    if let Some(p) = &a.write_recipe {
+        recipe.save(p).with_context(|| format!("writing recipe {}", p.display()))?;
+        info!("recipe {}", p.display());
+    }
+    let size = recipe.size;
     let p = PrintParams {
-        size,
-        dpi: a.dpi,
-        look,
-        usm_amount,
+        recipe,
         usm_k: a.usm_k,
         viewing_distance_mm: a.distance_mm,
         use_mask: a.use_mask,
         proof_jpeg: a.proof.clone(),
-        screen,
-        deconvolution: a.deconv.is_some(),
-        deconv_iterations: a.deconv.unwrap_or(0),
     };
     let out = pr::render(&a.negative, &p).with_context(|| format!("rendering {}", a.negative.display()))?;
     let t = Instant::now();
@@ -272,7 +316,7 @@ pub fn print(a: &PrintArgs) -> Result<()> {
         a.out.display(),
         out.info.width,
         out.info.height,
-        if size.is_some_and(|s| s.is_pixels()) { String::new() } else { format!(" @ {} dpi", a.dpi) },
+        if size.is_some_and(|s| s.is_pixels()) { String::new() } else { format!(" @ {} dpi", p.recipe.dpi) },
         a.proof.as_ref().map(|p| format!(", proof {}", p.display())).unwrap_or_default(),
         t.elapsed().as_millis(),
         out.info.ms

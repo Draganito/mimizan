@@ -95,9 +95,25 @@ pub struct Curve {
 
 impl Curve {
     pub fn from_look(look: &LookFile) -> Self {
-        let identity_points =
-            look.points.len() == 2 && look.points[0] == [0.0, 0.0] && look.points[1] == [1.0, 1.0];
+        // Any node set on the diagonal is the identity, however many nodes:
+        // the PCHIP through collinear points is the line up to rounding, and
+        // rounding could flip a 16-bit value, so the shortcut makes the
+        // untouched zone bar bit-identical to `neutral` (zone paper, table 4).
+        let n = look.points.len();
+        let identity_points = look.points[0] == [0.0, 0.0]
+            && look.points[n - 1] == [1.0, 1.0]
+            && look.points.iter().all(|p| p[0] == p[1]);
         Self { encoding: look.encoding, pchip: Pchip::new(&look.points), identity_points }
+    }
+
+    /// Is this curve the plain encoding (no tone change)?
+    pub fn is_identity(&self) -> bool {
+        self.identity_points
+    }
+
+    /// Output for linear white: the paper white the border is filled with.
+    pub fn white(&self) -> f64 {
+        self.eval(1.0)
     }
 
     /// Linear in [0,1] -> encoded in [0,1].

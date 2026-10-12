@@ -1,26 +1,31 @@
-//! Negative -> print file (SPEC section 9): size -> curve -> USM (or screen
-//! compensation) -> file. The mix already happened when the negative was
-//! written.
+//! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
+//! one pass. Upright -> size -> place and dodge & burn -> curve -> border ->
+//! [Richardson–Lucy ->] USM or screen compensation -> one quantisation ->
+//! file. The mix already happened when the negative was written. Everything
+//! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
+//! print decision (viewing model constant, sidecar use, proof path).
 
-use crate::calib::LookFile;
+use crate::burn;
 use crate::curve::Curve;
 use crate::deconv::{richardson_lucy, DECONV_ITERATIONS};
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
 use crate::plane::Plane;
-use crate::resize::{fit_dims, resize};
-use crate::screen::{self, ScreenSharpen};
+use crate::recipe::{Recipe, Sharpen};
+use crate::resize::{fit_dims, resize_with, ResampleKernel};
+use crate::screen;
 use crate::tiffin::{read_gray, read_mask8};
 use crate::tiffout::{write_gray16, TiffMeta};
 use crate::usm::{radius_px, unsharp, USM_K};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
 
 /// Output size: a physical print, or a pixel box for the screen.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PrintSize {
     Physical {
         width_in: f64,
@@ -83,51 +88,39 @@ impl PrintSize {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrintParams {
-    pub size: Option<PrintSize>,
-    pub dpi: f64,
-    pub look: LookFile,
-    pub usm_amount: f64,
+    /// Every print decision.
+    pub recipe: Recipe,
+    /// USM radius constant of the viewing model (`usm.rs`).
     pub usm_k: f64,
     /// Viewing distance for the USM radius, mm. `None` = print diagonal.
     pub viewing_distance_mm: Option<f64>,
     /// Use the `.mask.tif` sidecar to restrict USM.
     pub use_mask: bool,
     pub proof_jpeg: Option<PathBuf>,
-    /// Screen compensation instead of USM (see `screen.rs`).
-    pub screen: Option<ScreenSharpen>,
-    /// Richardson–Lucy instead of USM, on every pixel, no mask.
-    /// Screen compensation still wins when `screen` is set.
-    pub deconvolution: bool,
-    /// Passes when `deconvolution` is set (1..10). Zero skips it.
-    pub deconv_iterations: u32,
 }
 
 impl Default for PrintParams {
     fn default() -> Self {
         Self {
-            size: None,
-            dpi: 300.0,
-            look: LookFile::neutral(),
-            usm_amount: 0.0,
+            recipe: Recipe::default(),
             usm_k: USM_K,
             viewing_distance_mm: None,
             use_mask: true,
             proof_jpeg: None,
-            screen: None,
-            deconvolution: false,
-            deconv_iterations: 0,
         }
     }
 }
 
 impl PrintParams {
+    /// Just a look, everything else default (the GUI's TIFF export).
+    pub fn with_look(look: crate::calib::LookFile) -> Self {
+        Self { recipe: Recipe::with_look(look), ..Self::default() }
+    }
+
     /// USM or screen compensation, both of which consult the mask.
     /// Deconvolution does not: it runs on the whole picture, and USM may follow it.
     pub fn sharpens(&self) -> bool {
-        match self.screen {
-            Some(s) => s.amount > 0.0,
-            None => self.usm_amount > 0.0,
-        }
+        self.recipe.sharpen.uses_mask()
     }
 }
 
@@ -143,6 +136,12 @@ pub struct PrintInfo {
     pub height: usize,
     pub dpi: f64,
     pub orientation_applied: u16,
+    /// The recipe this pass ran (Zonensystem paper, section 11): place,
+    /// curve nodes, shapes, kernel, size, border, sharpening mode.
+    pub recipe: Recipe,
+    /// Border in pixels on each side, when there is one.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub border_px: usize,
     pub usm_amount: f64,
     pub usm_radius_px: f64,
     pub usm_masked: bool,
@@ -167,6 +166,10 @@ pub struct ScreenInfo {
 }
 
 fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
 
@@ -293,35 +296,88 @@ pub struct PrintSource<'a> {
     pub description: Option<serde_json::Value>,
 }
 
-/// Print geometry for a negative of `w×h` (before orientation): final pixel
-/// size, viewing distance (mm) and USM radius (px).
-pub fn geometry(w: usize, h: usize, orientation: u16, p: &PrintParams) -> (usize, usize, f64, f64) {
+/// Where the picture lands: its pixel size, the border around it, the sheet
+/// (picture plus border), and the viewing model's numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    /// Picture size after the fit, pixels.
+    pub image_w: usize,
+    pub image_h: usize,
+    /// Border on each side, pixels.
+    pub border_px: usize,
+    /// Output file size: picture plus twice the border.
+    pub out_w: usize,
+    pub out_h: usize,
+    /// Viewing distance, mm (given, or the sheet diagonal).
+    pub viewing_mm: f64,
+    /// USM radius, pixels.
+    pub usm_radius_px: f64,
+}
+
+/// Layout for a negative of `w×h` (before orientation). The border is taken
+/// from the paper box before the fit, so picture plus border never exceeds
+/// the size asked for.
+pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
+    let r = &p.recipe;
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
-    let (tw, th) = match p.size {
+    let b = r.border_px();
+    let (image_w, image_h) = match r.size {
         Some(sz) => {
-            let (bw, bh) = sz.pixels(p.dpi);
-            fit_dims(w, h, bw, bh)
+            let (bw, bh) = sz.pixels(r.dpi);
+            // A border wider than the paper leaves one pixel of picture.
+            fit_dims(w, h, bw.saturating_sub(2 * b).max(1), bh.saturating_sub(2 * b).max(1))
         }
         None => (w, h),
     };
-    let d_mm = p.viewing_distance_mm.unwrap_or_else(|| {
-        let diag_in = ((tw as f64 / p.dpi).powi(2) + (th as f64 / p.dpi).powi(2)).sqrt();
+    let (out_w, out_h) = (image_w + 2 * b, image_h + 2 * b);
+    let viewing_mm = p.viewing_distance_mm.unwrap_or_else(|| {
+        let diag_in = ((out_w as f64 / r.dpi).powi(2) + (out_h as f64 / r.dpi).powi(2)).sqrt();
         diag_in * 25.4
     });
-    (tw, th, d_mm, radius_px(p.usm_k, d_mm, p.dpi))
+    Layout {
+        image_w,
+        image_h,
+        border_px: b,
+        out_w,
+        out_h,
+        viewing_mm,
+        usm_radius_px: radius_px(p.usm_k, viewing_mm, r.dpi),
+    }
 }
 
-/// Is the output smaller than the upright source (so the Lanczos-3 roll-off
+/// Print geometry for a negative of `w×h` (before orientation): picture
+/// pixel size, viewing distance (mm) and USM radius (px).
+pub fn geometry(w: usize, h: usize, orientation: u16, p: &PrintParams) -> (usize, usize, f64, f64) {
+    let l = layout(w, h, orientation, p);
+    (l.image_w, l.image_h, l.viewing_mm, l.usm_radius_px)
+}
+
+/// Is the picture smaller than the upright source (so the kernel's roll-off
 /// is part of the known loss)?
 pub fn is_downscale(w: usize, h: usize, orientation: u16, p: &PrintParams) -> bool {
-    let (tw, _th, _d, _r) = geometry(w, h, orientation, p);
+    let l = layout(w, h, orientation, p);
     let upright_w = if matches!(orientation, 5..=8) { h } else { w };
-    tw < upright_w
+    l.image_w < upright_w
 }
 
-/// Size, curve and USM on in-memory planes. `info.ms` covers this call only.
+/// Surround `p` with `b` pixels of `value` on every side. The mask gets 0
+/// there (nothing to sharpen on paper).
+pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
+    if b == 0 {
+        return p.clone();
+    }
+    let (w, h) = (p.width + 2 * b, p.height + 2 * b);
+    let mut out = Plane::from_vec(w, h, vec![value; w * h]);
+    out.data.par_chunks_mut(w).enumerate().skip(b).take(p.height).for_each(|(y, row)| {
+        row[b..b + p.width].copy_from_slice(p.row(y - b));
+    });
+    out
+}
+
+/// The one pass on in-memory planes. `info.ms` covers this call only.
 pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     let t = Instant::now();
+    let r = &p.recipe;
     let mut mask: Option<Plane> = None;
     // Upright first, so the fit uses the displayed aspect ratio.
     let mut plane = orient(src.plane, src.orientation);
@@ -331,87 +387,103 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         }
     }
 
-    let (tw, th, d_mm, r_px) = geometry(src.plane.width, src.plane.height, src.orientation, p);
-    let downscaled = tw < plane.width;
+    let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
+    let (tw, th, d_mm, r_px) = (lay.image_w, lay.image_h, lay.viewing_mm, lay.usm_radius_px);
+    let downscaled = if tw < plane.width { Some(r.resample) } else { None };
     if (tw, th) != (plane.width, plane.height) {
-        info!("resize {}x{} -> {}x{} (Lanczos-3)", plane.width, plane.height, tw, th);
-        plane = resize(&plane, tw, th);
+        info!("resize {}x{} -> {}x{} ({})", plane.width, plane.height, tw, th, r.resample.name());
+        plane = resize_with(&plane, tw, th, r.resample);
         if let Some(m) = mask.take() {
             // The mask is a weight field; a plain resample is enough.
-            mask = Some(resize(&m, tw, th));
+            mask = Some(resize_with(&m, tw, th, ResampleKernel::Lanczos3));
         }
     }
 
-    let curve = Curve::from_look(&p.look);
+    // Placing and dodge & burn: local stops on the linear luminance.
+    if r.place != 0.0 || r.dodge_burn.iter().any(|b| b.ev() != 0.0) {
+        info!("place {:+.2} stops, {} dodge & burn shapes", r.place, r.dodge_burn.len());
+        burn::apply(&mut plane, r.place, &r.dodge_burn);
+    }
+
+    let curve = Curve::from_look(&r.curve);
     let mut plane = curve.apply(&plane);
 
+    if lay.border_px > 0 {
+        info!("border {} px ({} mm) in paper white {:.4}", lay.border_px, r.border_mm, curve.white());
+        plane = add_border(&plane, lay.border_px, curve.white());
+        if let Some(m) = mask.take() {
+            mask = Some(add_border(&m, lay.border_px, 0.0));
+        }
+    }
+
     let mut screen_info = None;
-    match p.screen {
-        Some(s) if s.amount > 0.0 => {
+    let mut deconv_n = 0usize;
+    match r.sharpen {
+        Sharpen::Screen { amount, max_gain } if amount > 0.0 => {
+            let s = screen::ScreenSharpen { amount, max_gain };
             let h = screen::kernel(&s, downscaled);
             info!(
                 "screen compensation amount {:.2}, gain cap {:.1}, downscaled {}, response 0.25 c/px {:.2}, 0.40 c/px {:.2}, masked: {}",
-                s.amount,
-                s.max_gain,
-                downscaled,
+                amount,
+                max_gain,
+                downscaled.is_some(),
                 screen::response(&h, 0.25),
                 screen::response(&h, 0.40),
                 mask.is_some()
             );
             plane = screen::sharpen(&plane, &h, mask.as_ref());
             screen_info = Some(ScreenInfo {
-                amount: s.amount,
-                max_gain: s.max_gain,
-                downscaled,
+                amount,
+                max_gain,
+                downscaled: downscaled.is_some(),
                 taps: h.to_vec(),
                 response_025: screen::response(&h, 0.25),
                 response_040: screen::response(&h, 0.40),
             });
         }
-        Some(_) => {}
-        None => {
-            if p.deconvolution && p.deconv_iterations > 0 && r_px > 0.0 {
-                let n = (p.deconv_iterations as usize).clamp(1, DECONV_ITERATIONS);
-                info!("richardson-lucy {n} iterations, sigma {r_px:.2} px, no mask");
-                plane = richardson_lucy(&plane, r_px, n);
+        Sharpen::Screen { .. } | Sharpen::Off => {}
+        Sharpen::Usm { .. } | Sharpen::Deconv { .. } => {
+            let passes = r.sharpen.deconv_passes();
+            if passes > 0 && r_px > 0.0 {
+                deconv_n = (passes as usize).clamp(1, DECONV_ITERATIONS);
+                info!("richardson-lucy {deconv_n} iterations, sigma {r_px:.2} px, no mask");
+                plane = richardson_lucy(&plane, r_px, deconv_n);
             }
-            if p.usm_amount > 0.0 {
+            let amount = r.sharpen.usm_amount();
+            if amount > 0.0 {
                 info!(
                     "usm amount {:.2}, radius {:.2} px (d = {:.0} mm), masked: {}",
-                    p.usm_amount,
+                    amount,
                     r_px,
                     d_mm,
                     mask.is_some()
                 );
-                plane = unsharp(&plane, r_px, p.usm_amount, mask.as_ref());
+                plane = unsharp(&plane, r_px, amount, mask.as_ref());
             }
         }
     }
-    let deconv_n = if p.screen.is_none() && p.deconvolution && p.deconv_iterations > 0 && r_px > 0.0 {
-        (p.deconv_iterations as usize).clamp(1, DECONV_ITERATIONS)
-    } else {
-        0
-    };
-    let usm_amount = if p.screen.is_some() { 0.0 } else { p.usm_amount };
 
     let info = PrintInfo {
         mimizan: env!("CARGO_PKG_VERSION"),
         stage: "print",
         source: src.name.clone(),
         source_description: src.description.clone(),
-        look: p.look.name.clone(),
-        look_encoding: format!("{:?}", p.look.encoding).to_ascii_lowercase(),
-        width: tw,
-        height: th,
-        dpi: p.dpi,
+        look: r.curve.name.clone(),
+        look_encoding: format!("{:?}", r.curve.encoding).to_ascii_lowercase(),
+        width: lay.out_w,
+        height: lay.out_h,
+        dpi: r.dpi,
         orientation_applied: src.orientation,
-        usm_amount,
+        recipe: r.clone(),
+        border_px: lay.border_px,
+        usm_amount: r.sharpen.usm_amount(),
         usm_radius_px: r_px,
         usm_masked: mask.is_some(),
         deconvolution_iterations: deconv_n as u32,
         screen: screen_info,
         ms: t.elapsed().as_millis(),
     };
+    debug_assert_eq!((plane.width, plane.height), (lay.out_w, lay.out_h));
     PrintOutput { plane, info }
 }
 
@@ -420,7 +492,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
 /// JPEG proof.
 pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
     let desc = serde_json::to_string(&out.info)?;
-    let trc = match p.look.encoding {
+    let trc = match p.recipe.curve.encoding {
         crate::calib::LookEncoding::Gamma22 => GrayTrc::Gamma(2.2),
         crate::calib::LookEncoding::None => GrayTrc::Linear,
     };
@@ -430,7 +502,7 @@ pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
         write_gray16(
             path,
             &out.plane,
-            &TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.dpi) },
+            &TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.recipe.dpi) },
         )?;
     }
     if let Some(jp) = &p.proof_jpeg {
@@ -504,8 +576,10 @@ mod tests {
         let plain = PrintParams { viewing_distance_mm: Some(400.0), ..Default::default() };
         let base = render_planes(&src, &plain);
         let deconv = PrintParams {
-            deconvolution: true,
-            deconv_iterations: crate::deconv::DECONV_ITERATIONS as u32,
+            recipe: Recipe {
+                sharpen: Sharpen::Deconv { passes: crate::deconv::DECONV_ITERATIONS as u32, usm_amount: 0.0 },
+                ..Recipe::default()
+            },
             viewing_distance_mm: Some(400.0),
             ..Default::default()
         };
@@ -519,19 +593,104 @@ mod tests {
             contrast(&out.plane),
             contrast(&base.plane)
         );
-        let usm = PrintParams { usm_amount: 1.0, viewing_distance_mm: Some(400.0), ..Default::default() };
+        let usm = PrintParams {
+            recipe: Recipe { sharpen: Sharpen::Usm { amount: 1.0 }, ..Recipe::default() },
+            viewing_distance_mm: Some(400.0),
+            ..Default::default()
+        };
         let masked = render_planes(&src, &usm);
         assert_eq!(masked.plane.data, base.plane.data);
     }
 
+    fn sized(size: PrintSize) -> PrintParams {
+        PrintParams { recipe: Recipe { size: Some(size), ..Recipe::default() }, ..Default::default() }
+    }
+
     #[test]
     fn downscale_detection_respects_orientation() {
-        let p = PrintParams { size: Some(PrintSize::LongEdgePx(1000)), ..Default::default() };
+        let p = sized(PrintSize::LongEdgePx(1000));
         assert!(is_downscale(4000, 3000, 1, &p));
         assert!(is_downscale(4000, 3000, 6, &p));
-        let big = PrintParams { size: Some(PrintSize::LongEdgePx(8000)), ..Default::default() };
+        let big = sized(PrintSize::LongEdgePx(8000));
         assert!(!is_downscale(4000, 3000, 1, &big));
         assert!(is_jpeg_path(Path::new("a/b.JPG")) && !is_jpeg_path(Path::new("a/b.tif")));
+    }
+
+    /// The border is taken from the paper, filled with the curve's white,
+    /// and the picture sits centred inside it.
+    #[test]
+    fn border_is_paper_white_inside_the_paper() {
+        let (w, h) = (60, 40);
+        let plane = Plane::from_vec(w, h, vec![0.5; w * h]);
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "flat".into(), description: None };
+        // 1 inch of border at 100 dpi on a 6x4 inch sheet: the 3:2 picture
+        // fits the 400x200 inner box as 300x200, the file is 500x400.
+        let p = PrintParams {
+            recipe: Recipe {
+                size: Some(PrintSize::Physical { width_in: 6.0, height_in: 4.0 }),
+                dpi: 100.0,
+                border_mm: 25.4,
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        let lay = layout(w, h, 1, &p);
+        assert_eq!(
+            (lay.image_w, lay.image_h, lay.border_px, lay.out_w, lay.out_h),
+            (300, 200, 100, 500, 400)
+        );
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (500, 400));
+        assert_eq!(out.info.border_px, 100);
+        assert_eq!((out.info.width, out.info.height), (500, 400));
+        let white = Curve::from_look(&p.recipe.curve).white();
+        assert_eq!(white, 1.0);
+        assert_eq!(out.plane.at(0, 0), 1.0);
+        assert_eq!(out.plane.at(99, 399), 1.0);
+        assert_eq!(out.plane.at(499, 0), 1.0);
+        let grey = 0.5f64.powf(1.0 / 2.2);
+        assert!((out.plane.at(100, 100) - grey).abs() < 1e-12);
+        assert!((out.plane.at(399, 299) - grey).abs() < 1e-12);
+        assert_eq!(out.plane.at(400, 299), 1.0);
+        // A look with a damped paper white fills the border with that value.
+        let mut look = crate::zone::default_look();
+        let n = look.points.len();
+        crate::zone::set_output(&mut look, n - 1, 0.95);
+        let p2 = PrintParams { recipe: Recipe { curve: look, ..p.recipe.clone() }, ..Default::default() };
+        let out2 = render_planes(&src, &p2);
+        assert!((out2.plane.at(0, 0) - 0.95).abs() < 1e-12);
+    }
+
+    /// Paper, table 4: place = 0 and empty shapes are the run that never had
+    /// the step; the zone default is the neutral look; the same recipe twice
+    /// is the same picture.
+    #[test]
+    fn untouched_recipe_is_bit_identical_to_neutral() {
+        let (w, h) = (48, 32);
+        let plane = Plane::from_vec(w, h, (0..w * h).map(|i| (i % 97) as f64 / 96.0).collect());
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 6, name: "ramp".into(), description: None };
+        let neutral = render_planes(&src, &PrintParams::default());
+        let zones = PrintParams::with_look(crate::zone::default_look());
+        let z = render_planes(&src, &zones);
+        assert_eq!(z.plane.data, neutral.plane.data);
+        let with_shapes = PrintParams {
+            recipe: Recipe {
+                place: 0.0,
+                dodge_burn: vec![burn::Burn::Radial { x: 0.5, y: 0.5, radius: 0.4, feather: 0.5, ev: 0.0 }],
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(render_planes(&src, &with_shapes).plane.data, neutral.plane.data);
+        assert_eq!(render_planes(&src, &zones).plane.data, z.plane.data);
+        // A placed picture is a different one, and the description says so.
+        let placed = PrintParams { recipe: Recipe { place: 0.5, ..Recipe::default() }, ..Default::default() };
+        let out = render_planes(&src, &placed);
+        assert_ne!(out.plane.data, neutral.plane.data);
+        let json = serde_json::to_string(&out.info).unwrap();
+        assert!(json.contains(r#""recipe":{"#) && json.contains(r#""place":0.5"#), "{json}");
     }
 
     #[test]

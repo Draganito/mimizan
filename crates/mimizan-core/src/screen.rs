@@ -2,7 +2,7 @@
 //!
 //! For a print the unknown is the viewer (distance, eye), and the USM radius
 //! follows a viewing model. For an image shown pixel-for-pixel on a screen the
-//! losses are *known*: the Lanczos-3 resampling that produced the pixels and
+//! losses are *known*: the resampling kernel that produced the pixels and
 //! the display's pixel aperture (a 100 %-fill square pixel, MTF = sinc(f)).
 //! Both have closed-form transfer functions, so the compensation is the
 //! regularised inverse of their product, approximated by a short symmetric
@@ -12,6 +12,7 @@
 
 use crate::filter::lowpass;
 use crate::plane::Plane;
+use crate::resize::ResampleKernel;
 use crate::usm::MASK_THRESHOLD;
 use rayon::prelude::*;
 use std::f64::consts::PI;
@@ -21,7 +22,7 @@ pub const HALF: usize = 4;
 /// Knee of the 1/(f + knee) fit weight (cycles per pixel).
 const FIT_WEIGHT_KNEE: f64 = 0.1;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScreenSharpen {
     /// 0 = off, 1 = full compensation of the known losses.
     pub amount: f64,
@@ -36,26 +37,6 @@ impl Default for ScreenSharpen {
     }
 }
 
-/// Lanczos-3 continuous frequency response in output pixel units (DC = 1).
-fn lanczos3_mtf(f: f64) -> f64 {
-    const N: usize = 1201;
-    let dx = 6.0 / (N - 1) as f64;
-    let mut num = 0.0;
-    let mut den = 0.0;
-    for i in 0..N {
-        let x = -3.0 + i as f64 * dx;
-        let k = if x.abs() < 1e-12 {
-            1.0
-        } else {
-            let px = PI * x;
-            3.0 * px.sin() * (px / 3.0).sin() / (px * px)
-        };
-        num += k * (2.0 * PI * f * x).cos();
-        den += k;
-    }
-    num / den
-}
-
 /// Square pixel aperture, 100 % fill.
 fn aperture_mtf(f: f64) -> f64 {
     if f.abs() < 1e-12 {
@@ -65,29 +46,31 @@ fn aperture_mtf(f: f64) -> f64 {
     }
 }
 
-/// Combined known loss at output frequency `f` (cycles per output pixel).
-pub fn known_mtf(f: f64, downscaled: bool) -> f64 {
+/// Combined known loss at output frequency `f` (cycles per output pixel):
+/// the display aperture, times the resampling kernel when the picture was
+/// shrunk to its size.
+pub fn known_mtf(f: f64, downscaled: Option<ResampleKernel>) -> f64 {
     let a = aperture_mtf(f);
-    if downscaled {
-        a * lanczos3_mtf(f)
-    } else {
-        a
+    match downscaled {
+        Some(k) => a * k.mtf(f),
+        None => a,
     }
 }
 
 /// Wiener inverse of the known MTF, gain capped at `max_gain`, scaled so the
 /// DC gain is exactly one (the regularisation alone would give 1/(1+ε)).
-pub fn target_response(f: f64, downscaled: bool, max_gain: f64) -> f64 {
+pub fn target_response(f: f64, downscaled: Option<ResampleKernel>, max_gain: f64) -> f64 {
     let m = known_mtf(f, downscaled);
     let eps = 1.0 / (4.0 * max_gain * max_gain);
     (1.0 + eps) * m / (m * m + eps)
 }
 
-/// Symmetric 7-tap kernel `h[-3..=3]` whose response fits the target over
+/// Symmetric 9-tap kernel `h[-4..=4]` whose response fits the target over
 /// 0..0.5 c/px in least squares, normalised to DC gain 1 and blended with the
-/// identity by `amount`.
-pub fn kernel(s: &ScreenSharpen, downscaled: bool) -> [f64; 2 * HALF + 1] {
-    // Unknowns c0..c3 with H(f) = c0 + 2·Σ c_k cos(2πkf).
+/// identity by `amount`. `downscaled` names the kernel that shrank the
+/// picture, `None` when it was not shrunk.
+pub fn kernel(s: &ScreenSharpen, downscaled: Option<ResampleKernel>) -> [f64; 2 * HALF + 1] {
+    // Unknowns c0..c4 with H(f) = c0 + 2·Σ c_k cos(2πkf).
     const M: usize = HALF + 1;
     let fs: Vec<f64> = (0..=50).map(|i| i as f64 * 0.01).collect();
     let basis = |f: f64, k: usize| if k == 0 { 1.0 } else { 2.0 * (2.0 * PI * k as f64 * f).cos() };
@@ -183,28 +166,46 @@ mod tests {
 
     #[test]
     fn known_losses_match_closed_forms() {
+        let l3 = ResampleKernel::Lanczos3;
         assert!((aperture_mtf(0.5) - 2.0 / PI).abs() < 1e-9);
-        assert!((lanczos3_mtf(0.0) - 1.0).abs() < 1e-9);
+        assert!((l3.mtf(0.0) - 1.0).abs() < 1e-9);
         // Lanczos-3 passes 0.2 c/px essentially unattenuated and rolls off by 0.4.
-        assert!(lanczos3_mtf(0.2) > 0.99);
-        assert!(lanczos3_mtf(0.4) < 0.9 && lanczos3_mtf(0.4) > 0.7);
+        assert!(l3.mtf(0.2) > 0.99);
+        assert!(l3.mtf(0.4) < 0.9 && l3.mtf(0.4) > 0.7);
+        // Without a downscale only the aperture is compensated.
+        assert!((known_mtf(0.3, None) - aperture_mtf(0.3)).abs() < 1e-12);
     }
 
     #[test]
     fn kernel_compensates_within_the_passband_and_stays_capped() {
         let s = ScreenSharpen::default();
-        let h = kernel(&s, true);
-        assert!((h.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-        assert!((response(&h, 0.0) - 1.0).abs() < 1e-9);
-        // Within the band the product of loss and compensation is close to one.
-        for f in [0.1, 0.2, 0.3] {
-            let p = response(&h, f) * known_mtf(f, true);
-            assert!((p - 1.0).abs() < 0.08, "f {f}: {p}");
+        for k in ResampleKernel::ALL {
+            let h = kernel(&s, Some(k));
+            assert!((h.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+            assert!((response(&h, 0.0) - 1.0).abs() < 1e-9);
+            // Within the band the product of loss and compensation is close
+            // to one for the sharp kernels. The soft ones lose more than
+            // nine taps under a gain cap of 2 can give back; there the
+            // compensation must at least close most of the gap.
+            for f in [0.1, 0.2, 0.3] {
+                let m = known_mtf(f, Some(k));
+                let p = response(&h, f) * m;
+                match k {
+                    ResampleKernel::Lanczos3 | ResampleKernel::CatmullRom => {
+                        assert!((p - 1.0).abs() < 0.08, "{k:?} f {f}: {p}")
+                    }
+                    _ => assert!((p - 1.0).abs() < 0.5 * (m - 1.0).abs() + 0.02, "{k:?} f {f}: {p} vs {m}"),
+                }
+            }
+            // Gain at Nyquist is bounded by the cap (with slack for the fit).
+            assert!(response(&h, 0.5) < s.max_gain * 1.15, "{k:?}");
         }
-        // Gain at Nyquist is bounded by the cap (with slack for the fit).
-        assert!(response(&h, 0.5) < s.max_gain * 1.15);
+        // A softer kernel asks for more compensation in the mid band.
+        let soft = kernel(&s, Some(ResampleKernel::BSpline));
+        let sharp = kernel(&s, Some(ResampleKernel::Lanczos3));
+        assert!(response(&soft, 0.3) > response(&sharp, 0.3));
         // Amount 0 is the identity.
-        let id = kernel(&ScreenSharpen { amount: 0.0, max_gain: 2.0 }, true);
+        let id = kernel(&ScreenSharpen { amount: 0.0, max_gain: 2.0 }, Some(ResampleKernel::Lanczos3));
         assert!(
             (id[HALF] - 1.0).abs() < 1e-12
                 && id.iter().enumerate().all(|(i, &v)| i == HALF || v.abs() < 1e-12)
@@ -220,7 +221,7 @@ mod tests {
                 p.set(x, y, if x < 32 { 0.2 } else { 0.8 });
             }
         }
-        let h = kernel(&ScreenSharpen::default(), true);
+        let h = kernel(&ScreenSharpen::default(), Some(ResampleKernel::Lanczos3));
         let out = sharpen(&p, &h, None);
         assert!((out.at(5, 4) - 0.2).abs() < 1e-9);
         assert!(out.at(31, 4) < 0.2 && out.at(32, 4) > 0.8);

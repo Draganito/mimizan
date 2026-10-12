@@ -5,6 +5,7 @@
 pub mod baseline;
 pub mod bench;
 pub mod blockfft;
+pub mod burn;
 pub mod calib;
 pub mod calibrate;
 pub mod cfa;
@@ -24,6 +25,7 @@ pub mod pipeline;
 pub mod plane;
 pub mod preview;
 pub mod print;
+pub mod recipe;
 pub mod reconstruct;
 pub mod resize;
 pub mod screen;
@@ -33,6 +35,7 @@ pub mod thumb;
 pub mod tiffin;
 pub mod tiffout;
 pub mod usm;
+pub mod zone;
 
 pub use error::{Error, Result};
 
