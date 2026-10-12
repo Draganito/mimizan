@@ -61,10 +61,6 @@ impl Tone {
         }
     }
 
-    pub fn is_paper(&self) -> bool {
-        matches!(self, Self::Paper(_))
-    }
-
     pub fn as_paper(&self) -> Option<&SplitGrade> {
         match self {
             Self::Paper(s) => Some(s),
@@ -168,7 +164,7 @@ mod tests {
         // An older recipe's curve object.
         let old = r#"{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}"#;
         assert_eq!(serde_json::from_str::<Tone>(old).unwrap(), look);
-        assert!(Tone::paper().is_paper() && !look.is_paper());
+        assert!(Tone::paper().as_paper().is_some() && look.as_paper().is_none());
         assert!(!Tone::paper().compile().is_identity() && look.compile().is_identity());
         assert_eq!(Tone::paper().compile().white(), 1.0);
     }

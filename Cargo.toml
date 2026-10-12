@@ -25,7 +25,6 @@ libm = "0.2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-approx = "0.5"
 proptest = "1"
 criterion = "0.7"
 

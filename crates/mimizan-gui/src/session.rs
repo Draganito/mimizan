@@ -577,7 +577,7 @@ pub struct PreviewImage {
 }
 
 /// Full-resolution histograms kept between renders: they depend on the
-/// weights, the look, placing and the shapes, not on the mask view or the
+/// weights, the tone and the placing, not on the mask view or the
 /// hovered zone.
 pub struct HistCache {
     key: Option<(*const Session, HistKey)>,

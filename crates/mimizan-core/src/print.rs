@@ -106,7 +106,7 @@ pub struct PrintInfo {
     pub dpi: f64,
     pub orientation_applied: u16,
     /// The recipe this pass ran (Zonensystem paper, section 11): place,
-    /// curve nodes, shapes, kernel, size, border, sharpening mode.
+    /// curve, kernel, size, border, sharpening mode.
     pub recipe: Recipe,
     /// Border in pixels on each side, when there is one.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
@@ -154,9 +154,10 @@ pub fn orient(p: &Plane, orientation: u16) -> Plane {
 }
 
 /// Where source pixel (`sx`, `sy`) of a `w` x `h` plane lands after
-/// `orient(_, orientation)`: the inverse of the lookup inside `orient`.
-#[inline]
-pub fn upright_pixel(orientation: u16, w: usize, h: usize, sx: usize, sy: usize) -> (usize, usize) {
+/// `orient(_, orientation)`: the inverse of the lookup inside `orient`,
+/// kept to test it.
+#[cfg(test)]
+fn upright_pixel(orientation: u16, w: usize, h: usize, sx: usize, sy: usize) -> (usize, usize) {
     match orientation {
         2 => (w - 1 - sx, sy),
         3 => (w - 1 - sx, h - 1 - sy),
@@ -321,14 +322,6 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
 pub fn geometry(w: usize, h: usize, orientation: u16, p: &PrintParams) -> (usize, usize, f64, f64) {
     let l = layout(w, h, orientation, p);
     (l.image_w, l.image_h, l.viewing_mm, l.usm_radius_px)
-}
-
-/// Is the picture smaller than the upright source (so the kernel's roll-off
-/// is part of the known loss)?
-pub fn is_downscale(w: usize, h: usize, orientation: u16, p: &PrintParams) -> bool {
-    let l = layout(w, h, orientation, p);
-    let upright_w = if matches!(orientation, 5..=8) { h } else { w };
-    l.image_w < upright_w
 }
 
 /// Surround `p` with `b` pixels of `value` on every side. The mask gets 0
@@ -544,13 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn downscale_detection_respects_orientation() {
-        // 1000 px square box at 100 dpi; 8000 px.
+    fn layout_fits_the_upright_picture_into_the_box() {
+        // 10 in square box at the default 300 dpi: 3000 px; 80 in: 24000 px.
         let p = sized(PrintSize::Physical { width_in: 10.0, height_in: 10.0 });
-        assert!(is_downscale(4000, 3000, 1, &p));
-        assert!(is_downscale(4000, 3000, 6, &p));
+        assert_eq!(layout(4000, 3000, 1, &p).image_w, 3000);
+        assert_eq!(layout(4000, 3000, 6, &p).image_h, 3000);
         let big = sized(PrintSize::Physical { width_in: 80.0, height_in: 80.0 });
-        assert!(!is_downscale(4000, 3000, 1, &big));
+        assert_eq!(layout(4000, 3000, 1, &big).image_w, 24000);
+        assert_eq!(layout(4000, 3000, 1, &PrintParams::default()).image_w, 4000);
         assert!(is_jpeg_path(Path::new("a/b.JPG")) && !is_jpeg_path(Path::new("a/b.tif")));
     }
 
@@ -613,7 +607,7 @@ mod tests {
         assert!(out3.plane.at(100, 100) < grey);
     }
 
-    /// Paper, table 4: place = 0 and empty shapes are the run that never had
+    /// Paper, table 4: place = 0 is the run that never had
     /// the step; the same recipe twice is the same picture; paper at its
     /// base exposure is a different picture from the neutral look.
     #[test]

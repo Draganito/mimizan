@@ -39,7 +39,7 @@ extended-description = """\
 Bayer RAW to linear monochrome negative without demosaicing: luminance is
 estimated directly from the mosaic (pixel-adaptive frequency separation),
 written as 16-bit linear TIFF with a mask sidecar, and
-rendered to print size with look curve and USM. Includes the mimizan CLI
+printed through a split-grade paper model, USM optional. Includes the mimizan CLI
 and the mimizan-gui desktop app."""
 assets = [
     ["target/release/mimizan", "usr/bin/", "755"],

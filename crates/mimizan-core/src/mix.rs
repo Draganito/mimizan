@@ -82,27 +82,6 @@ impl Weights {
         let t = f.transmission();
         Self::normalised([self.r * t[0], self.g * t[1], self.b * t[2]])
     }
-
-    /// Weights that reproduce CIE Y from the *balanced* camera channels: the
-    /// middle row of the camera->XYZ matrix, divided by the balance multipliers
-    /// (balanced = raw × wb) and normalised to sum 1. Falls back to native if
-    /// the matrix is singular or a weight turns negative.
-    pub fn from_xyz_to_cam(m: &[[f64; 3]; 3], wb: [f64; 3]) -> Self {
-        let inv = invert3(m);
-        match inv {
-            Some(i) => {
-                let y = [i[1][0] / wb[0], i[1][1] / wb[1], i[1][2] / wb[2]];
-                let s: f64 = y.iter().sum();
-                let w = Weights { r: y[0] / s, g: y[1] / s, b: y[2] / s };
-                if w.r < 0.0 || w.g < 0.0 || w.b < 0.0 {
-                    Self::default()
-                } else {
-                    w
-                }
-            }
-            None => Self::default(),
-        }
-    }
 }
 
 /// The classic black-and-white contrast filters, as transmissions of the
@@ -220,33 +199,6 @@ impl ColorFilter {
                 || f.wratten().is_some_and(|n| k == n.to_string() || k == format!("wratten-{n}"))
         })
     }
-}
-
-fn invert3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if det.abs() < 1e-12 {
-        return None;
-    }
-    let d = 1.0 / det;
-    Some([
-        [
-            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * d,
-            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * d,
-            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * d,
-        ],
-        [
-            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * d,
-            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * d,
-            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * d,
-        ],
-        [
-            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * d,
-            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * d,
-            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * d,
-        ],
-    ])
 }
 
 /// `out = L̂ + (w_G − w_R − w_B)·Ĉ1' + 2·(w_R − w_B)·Ĉ2'` (mask gains are inside Ĉ').

@@ -10,11 +10,12 @@ use crate::worker::{Event, Heavy, Job, Preview, PreviewRequest};
 use crate::zone_bar::zone_bar;
 use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use egui_file_dialog::FileDialog;
+use mimizan_core::deconv::DECONV_ITERATIONS;
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::print::PrintSize;
-use mimizan_core::recipe::{Recipe, Sharpen};
+use mimizan_core::recipe::{Recipe, Sharpen, USM_MAX};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
 use mimizan_core::tone::Tone;
@@ -1184,10 +1185,6 @@ impl App {
         ui.separator();
     }
 
-    /// One row of weight presets: Native, Panchromatic (the camera file's
-    /// calibrated weights) and the classic contrast filters derived from it.
-    /// All of them are only a weight triple; the sliders below are the free
-    /// form, and moving one leaves every preset unselected.
     /// The mix as one drop-down: Native, Panchromatic (the camera file) and
     /// the classic filters in front of it; "custom" while the sliders stand
     /// elsewhere. Each entry keeps its explanation as hover text.
@@ -1515,7 +1512,7 @@ impl App {
             ui.selectable_value(&mut kind, 1, "USM")
                 .on_hover_text("Unsharp mask for the viewing distance (radius from size and dpi)");
             ui.selectable_value(&mut kind, 2, "deconvolution")
-                .on_hover_text("Richardson–Lucy against the measured sensor PSF, then optional USM");
+                .on_hover_text("Richardson–Lucy against a Gaussian of the USM radius (an assumption, not a measured PSF), then optional USM");
         });
         let current = match s {
             Sharpen::Off => 0,
@@ -1531,11 +1528,11 @@ impl App {
         }
         match s {
             Sharpen::Usm { amount } => {
-                ui.add(egui::Slider::new(amount, 0.0..=2.0).text("amount").fixed_decimals(2));
+                ui.add(egui::Slider::new(amount, 0.0..=USM_MAX).text("amount").fixed_decimals(2));
             }
             Sharpen::Deconv { passes, usm_amount } => {
-                ui.add(egui::Slider::new(passes, 1..=60).text("passes"));
-                ui.add(egui::Slider::new(usm_amount, 0.0..=2.0).text("USM after").fixed_decimals(2));
+                ui.add(egui::Slider::new(passes, 1..=DECONV_ITERATIONS as u32).text("passes"));
+                ui.add(egui::Slider::new(usm_amount, 0.0..=USM_MAX).text("USM after").fixed_decimals(2));
             }
             Sharpen::Off => {}
         }

@@ -276,7 +276,8 @@ Two kernel sets are used:
 
 | Set | $f_c$ | $\Delta f$ | $A$ | $\beta$ | $N$ |
 |---|---|---|---|---|---|
-| fixed estimator (4.2), chroma core (Appendix A) | 0.15 | 0.05 | 60 dB | 5.65 | 73 |
+| fixed estimator (4.2) | 0.15 | 0.05 | 60 dB | 5.65 | 73 |
+| chroma core (Appendix A) | 0.05 | 0.05 | 60 dB | 5.65 | 37 |
 | directional estimator (4.3–4.4) | 0.15 / 0.30 / 0.25 | 0.15 | 40 dB | 3.40 | 15 |
 
 The separable product has a *square* pass band ($|f_x| < f_c$ and
@@ -829,8 +830,8 @@ and $\hat L$ as in 4.2 with the primed estimates. Measured: neutral at 1×,
 −1.5 to −3 dB in the band-limited condition against the fixed estimator,
 because it keeps carrier energy it classifies as texture. An optional
 Gauss–Seidel cross-term loop (subtract the other carriers' current estimates
-before demodulating each one; stop at relative change $< 10^{-4}$, carrier
-energy below noise, or 12 rounds) changed no figure beyond the fourth
+before demodulating each one; stop at relative change $< 10^{-4}$ or at
+the round cap) changed no figure beyond the fourth
 decimal and doubled the run time; default one round.
 
 ## Appendix B. Reproduction recipe

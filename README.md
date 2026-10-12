@@ -274,7 +274,7 @@ no lens corrections.
 
 Prebuilt packages are on the
 [releases page](https://github.com/Draganito/mimizan/releases):
-`mimizan_<version>_amd64.deb` (Debian/Ubuntu, both binaries, camera and look
+`mimizan_<version>-1_amd64.deb` (Debian/Ubuntu, both binaries, camera and look
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
@@ -282,8 +282,8 @@ sudo apt install ./mimizan_0.10.0-1_amd64.deb
 mimizan --version
 ```
 
-From source (Rust 1.95 or newer, no system libraries needed beyond a working
-OpenGL for the GUI):
+From source (a recent stable Rust, a C++ compiler for the vendored
+demosaicers, and a working OpenGL for the GUI):
 
 ```bash
 git clone https://github.com/Draganito/mimizan
@@ -394,16 +394,17 @@ picture takes the space (`Tab` hides all three). They are plain egui on
 glow — alpha and a shadow, no blur — so the app looks the same on a machine
 without a GPU driver. *Negative* is the judging step: the file's exposure
 from EXIF, the histograms and the *Development* fold. *Enlarger* is the
-editing step: the mix from one row of presets (*Native*, *Panchromatic* =
+editing step: the mix from one drop-down (*Native*, *Panchromatic* =
 the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
-47* in front of it) or the R/B sliders, the zone bar and the two exposures
+47* in front of it) or the R and B fields, the zone bar and the two exposures
 *soft* and *hard*. *Print* is the output step
 and nothing else: native size or a paper size at a dpi, the border, the
 resampling kernel and the sharpening, the output size it adds up to, and
 the *Export…* button. The border is part of the preview: the sheet
 (picture plus border in paper white, in the print's proportion) is what
 is fitted into the stage, so a 20 mm border on 30×40 cm is judged as it
-will print.
+will print. The border is drawn, not rendered — the picture under it is
+still the one before size and sharpening.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to
@@ -434,13 +435,14 @@ description, size, border and sharpening as set — the print). *Recipe*
 saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
 back when the file is opened again) or anywhere else, and loads one; the
 same JSON drives `mimizan print --recipe`. The preview is the picture before
-size, border and sharpening — mix, placing and the paper exactly as the
-TIFF gets them — and once you zoom past the fit-to-window preview (scroll,
+size and sharpening — mix, placing and the paper exactly as the TIFF gets
+them — and once you zoom past the fit-to-window preview (scroll,
 `1:1`, or a double click) the visible window is rendered from the
 full-resolution separation, pixel for pixel, so the
 negative can be judged, carrier residue included. The *Development* fold
 defaults to Mimizan with the Dubois separation (`mask: Dubois`); the fixed
-estimator, the block mask and reconstruction stay one click away. The same
+estimator, the block mask and reconstruction are there, and *Apply* recomputes
+with them. The same
 fold can switch to AMaZE, RCD, DCB or LMMSE; that recomputes the picture
 at once and leaves the Mimizan path untouched. Three histograms (256 bins,
 linear or log), all from the full-resolution data, never from the preview
@@ -536,14 +538,14 @@ planes. Output is bit-identical between runs and between thread counts.
 ## Repository layout
 
 ```
-crates/mimizan-core   decode, ingest, separate, dubois, mask, reconstruct, mix, resize, curve, usm, print, calibrate, synth, metrics, kodak
+crates/mimizan-core   the pipeline: decode, ingest, separate (dubois, mask, reconstruct), mix, paper, tone, recipe, print (resize, usm, deconv), zone, calibrate, synth, kodak, metrics
 crates/mimizan-cli    the `mimizan` binary (clap)
 crates/mimizan-gui    the `mimizan-gui` binary (egui/eframe); links mimizan-demosaic
 crates/mimizan-demosaic  AMaZE, RCD, DCB, LMMSE via librtprocess (GPL-3.0-or-later)
 third_party/librtprocess  vendored RawTherapee demosaic library
-cameras/               per-camera JSON (noise, weights, USM, star MTF)
+cameras/               per-camera JSON (noise, weights, USM; star MTF optional)
 look/                  look curves (PCHIP points over gamma-2.2 encoded values)
-docs/                  SPEC.md, RESULTS.md, KODAK*.md + kodak*/ (benchmark reports and crops), whitepaper, screenshot
+docs/                  SPEC.md, PAPER.md, RESULTS.md, KODAK*.md + kodak*/ and kodak-field/ (benchmark reports and crops), VISION_ENTRY.md, whitepaper, screenshot
 dist/                  release packaging (cargo-deb + tarball)
 testdata/              RAW samples and Kodak pictures, not in git (see testdata/README.md)
 ```
@@ -558,8 +560,8 @@ errors in CI), `cargo test --release` (unit, property and determinism tests),
   marked **[Abweichung]** in the SPEC with their reason.
 - Reconstruction quality: see "Where it stands". The numbers there are the
   current state, not a target.
-- Reference look, Z f mix weights and star MTF are measured; the noise model
-  still carries defaults.
+- Reference look and the Z f mix weights are measured; the noise model
+  still carries defaults, and no star MTF is shipped with the camera file.
 - Wayland: when the GUI window is fully covered or opened behind the focused
   window, the compositor pauses it; a running export still finishes, the log
   line appears once the window is visible again.

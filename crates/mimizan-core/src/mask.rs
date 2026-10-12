@@ -290,7 +290,9 @@ fn decimate2(p: &Plane) -> Plane {
     out
 }
 
-/// Bilinear 2x upsampling back to (w, h).
+/// Bilinear 2x upsampling back to (w, h); the production path samples the
+/// half-resolution core through `HalfRow` instead.
+#[cfg(test)]
 fn upsample2(p: &Plane, w: usize, h: usize) -> Plane {
     let mut out = Plane::zeros(w, h);
     out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
@@ -321,7 +323,8 @@ pub fn chroma_core_half(c_wide: &Plane) -> Plane {
 }
 
 /// Full-resolution core (tests).
-pub fn chroma_core(c_wide: &Plane) -> Plane {
+#[cfg(test)]
+fn chroma_core(c_wide: &Plane) -> Plane {
     upsample2(&chroma_core_half(c_wide), c_wide.width, c_wide.height)
 }
 

@@ -28,7 +28,7 @@ CFA-Array (`RawImage.data`), nie ein demosaictes Bild.
 
 | Größe | Quelle | Regel |
 |---|---|---|
-| Schwarzpegel | `blacklevel.levels`, positional über das CFA-Tile (`(y % h)·w + (x % w)`); ein einzelner Wert gilt für alle | pro Photosite abziehen |
+| Schwarzpegel | `blacklevel.levels`: ein Wert für alle Photosites oder ein 2×2-Tile (CFA-Reihenfolge); andere Kachelgrößen sind ein Fehler | pro Photosite abziehen |
 | Weißpegel | `whitelevel.0`; ein Wert oder vier (RGBE-Reihenfolge nach Farbe) | pro Photosite teilen |
 | CFA-Phase | `photometric = Cfa(cfg)`, `cfg.cfa.name` ∈ {RGGB, BGGR, GRBG, GBRG}, relativ zur vollen Sensorfläche (vor Crop) | Pflicht; Kameradatei darf nur bestätigen, nicht überschreiben |
 | Crop | `crop_area` (Herstellerempfehlung); falls `None`: `active_area`; falls `None`: ganzes Bild | Crop-Ursprung muss gerade sein, sonst um 1 nach innen verschieben, damit die Phase erhalten bleibt |
@@ -266,10 +266,9 @@ geschätzten Beiträge der anderen Träger abgezogen.
         m_k = m − Σ_{j≠k} g_j·carrier_j·Ĉ_j        (mit den aktuellsten Ĉ_j)
         Ĉ_k = LP(carrier_k · m_k)
       L̂_n nach 5.3
-    Abbruch, wenn eine Bedingung erfüllt ist:
-      (a) ‖L̂_n − L̂_{n−1}‖₂ / ‖L̂_{n−1}‖₂ < 10⁻⁴
-      (b) Trägerenergie von L̂_n (Abschnitt 8) unter der erwarteten Rauschenergie
-      (c) n = 12
+    Abbruch, wenn
+      ‖L̂_n − L̂_{n−1}‖₂ / ‖L̂_{n−1}‖₂ < 10⁻⁴
+      oder n = consistency_rounds_max
 
 Default `consistency_rounds_max = 1` (**[gemessen]**: auf der Messbank
 änderte keine weitere Runde eine Kennzahl jenseits der vierten Stelle,
@@ -441,9 +440,9 @@ Drei Gewichte `w_R, w_G, w_B ≥ 0`, Summe 1, auf *abgeglichene* Kanäle
 
     out = L̂ + (w_G − w_R − w_B)·Ĉ1' + 2·(w_R − w_B)·Ĉ2'
 
-(`Ĉ'` aus 5.3; die Gewichte g sind darin bereits enthalten.) Für die
-Matrix-Variante ist `w` die Y-Zeile von `cam_to_xyz`, kanalweise durch
-`k_c` geteilt und auf Summe 1 normiert.
+(`Ĉ'` aus 5.3; die Gewichte g sind darin bereits enthalten.) Eine
+Matrix-Variante (Y-Zeile von `cam_to_xyz`) gab es; sie ist der gefitteten
+Kameradatei (§10) gewichen.
 
 **Gewichtsraum [Ergänzung, gemessen].** Die Formel verbraucht Gewichte auf
 abgeglichenen Kanälen (`balanced`). Eine Monochromkamera hat aber eine
@@ -470,8 +469,7 @@ fordert gleichzeitig drei Gewichte. Beides zugleich geht nur für
 0,25/0,50/0,25 (dann ist `out = L̂` exakt). Jedes andere Gewicht braucht die
 tiefpassgefilterte Chrominanz, siehe Umkehrung in Abschnitt 4. Die
 Chrominanz-Korrektur ist bandbegrenzt (≤ 0,15 c/px), die Kantenauflösung
-bleibt die von `L̂`. `matrix_fallback = true` heißt: `w` ist die normierte
-Y-Zeile der Kameramatrix (`rgb_cam`), ebenfalls erst nach der Trennung.
+bleibt die von `L̂`.
 
 **Kontrastfilter [Ergänzung].** Ein Farbfilter vor einem Monochromsensor
 ist eine spektrale Gewichtung vor der Summe, also genau das, was die
@@ -545,12 +543,11 @@ trägt `reconstruct: true` und `computed` (mittleres β).
 
 Kein Prozentwert ohne eine dieser Messungen.
 
-## 9. Ausgang (Druck und Bildschirm)
+## 9. Ausgang (Druck)
 
-Reihenfolge: Mischung → Orientierung → Größe → Platzierung,
-Abwedeln/Nachbelichten und Tonwert (Papier oder Look) in einem Schritt →
-Rand → [Entfaltung →] USM *oder* Bildschirmkompensation → Datei. Ein
-Durchgang in f64, eine Quantisierung am Ende.
+Reihenfolge: Mischung → Orientierung → Größe → Platzierung und Tonwert
+(Papier oder Look) in einem Schritt → Rand → [Entfaltung →] USM → Datei.
+Ein Durchgang in f64, eine Quantisierung am Ende.
 
 - **Rezept [Ergänzung, Zonensystem-Whitepaper §5 und Anhang A]**: Der
   Druck ist ein Parametersatz, keine Folge von Bearbeitungen. `Recipe`
@@ -559,8 +556,9 @@ Durchgang in f64, eine Quantisierung am Ende.
   `{"paper":"multigrade","soft":s,"hard":h}` oder eine Look-Datei inline;
   `tone.rs`, in JSON ohne Tag unterscheidbar am Feld `paper` bzw.
   `points`), `resample`, `size`, `dpi`, `border_mm`,
-  `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Felder mit
-  Default-Wert werden nicht geschrieben; das leere Rezept
+  `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Weggelassen werden
+  `place` (0), `size` (nativ) und `border_mm` (0); `schema`, `resample` und
+  `sharpen` stehen immer in der Datei. Das leere Rezept
   `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
   ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`); die GUI
   beginnt mit dem Papier in Grundbelichtung. Das
@@ -661,9 +659,9 @@ Durchgang in f64, eine Quantisierung am Ende.
   Zonen auf dem Papier liegen (Achse = Tonwert, Breite = Anteil am
   Papier); ein Zug an ihr bewegt beide Belichtungen gemeinsam, so dass der
   Ton unter dem Zeiger dem Zeiger folgt (`PaperCurve::shift_for`,
-  Bisektion). Die Vorschau wertet das Papier über eine 16-Bit-LUT aus,
-  solange keine gefilterte Form im Spiel ist, sonst je Pixel; der Export
-  immer je Pixel in f64. Nicht modelliert und bewusst weggelassen: der
+  Bisektion). Vorschau und Export werten das Papier je Pixel in f64 aus
+  (dieselbe Kette, `tone::render`); die 16-Bit-LUT dient nur den
+  Histogrammen. Nicht modelliert und bewusst weggelassen: der
   Fuß des Films (das Negativ ist eine Gerade) und eine Entwicklung N±k
   (ein zweiter Kontrastparameter neben dem Splitgrade wäre doppelt).
 - **Look** (`--look <datei>`, Mess-Pipeline und ältere Rezepte):
@@ -750,7 +748,6 @@ Durchgang in f64, eine Quantisierung am Ende.
   "weights_rgb": [0.25, 0.50, 0.25],
   "weights_space": "balanced",
   "usm_amount": 0.0,
-  "matrix_fallback": false,
   "fitted": { "noise": false, "weights": false }
 }
 ```

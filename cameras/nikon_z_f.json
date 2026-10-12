@@ -12,7 +12,6 @@
   ],
   "weights_space": "raw",
   "usm_amount": 0.0,
-  "matrix_fallback": false,
   "fitted": {
     "noise": false,
     "weights": true

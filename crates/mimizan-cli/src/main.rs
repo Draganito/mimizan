@@ -37,6 +37,7 @@ enum Cmd {
         raw: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
+        /// Skip the defect repair (SPEC section 2): every photosite stays as measured
         #[arg(long)]
         no_defects: bool,
         /// Also write a gamma-encoded PNG quick look, downscaled by --preview-scale
@@ -82,6 +83,7 @@ enum Cmd {
         /// not measured; the sidecar records where.
         #[arg(long)]
         reconstruct: bool,
+        /// Skip the defect repair (SPEC section 2): every photosite stays as measured
         #[arg(long)]
         no_defects: bool,
         #[arg(long)]

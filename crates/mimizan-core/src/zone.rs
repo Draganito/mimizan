@@ -41,12 +41,6 @@ pub fn stops(l: f64) -> f64 {
     (l.max(1e-6)).log2() - GRAY_CARD.log2()
 }
 
-/// Zone whose stop interval `[k − 0.5, k + 0.5)` holds the linear value, as
-/// a real number clamped to 0 … X (for hover tinting and the bar).
-pub fn zone_of(l: f64) -> f64 {
-    (stops(l) + 5.0).clamp(0.0, (ZONES - 1) as f64)
-}
-
 /// Linear scene value at the boundary between zone `k` and `k + 1`:
 /// `0.18 · 2^(k + 0.5 − 5)`.
 pub fn boundary_linear(k: usize) -> f64 {
@@ -85,10 +79,7 @@ mod tests {
         assert_eq!(numeral(10), "X");
         assert!((stops(0.18)).abs() < 1e-12);
         assert!((stops(0.36) - 1.0).abs() < 1e-12);
-        assert!((zone_of(0.18) - 5.0).abs() < 1e-12);
-        assert!((zone_of(0.045) - 3.0).abs() < 1e-12);
-        assert_eq!(zone_of(0.0), 0.0);
-        assert_eq!(zone_of(100.0), 10.0);
+        assert!((stops(0.045) + 2.0).abs() < 1e-12);
         assert!((decode(encode(0.3)) - 0.3).abs() < 1e-12);
     }
 }

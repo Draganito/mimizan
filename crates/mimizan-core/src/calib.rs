@@ -39,7 +39,6 @@ pub struct CameraFile {
     #[serde(default)]
     pub weights_space: WeightSpace,
     pub usm_amount: f64,
-    pub matrix_fallback: bool,
     pub fitted: Fitted,
     /// Provenance of fitted weights (reference file), optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,7 +60,6 @@ impl CameraFile {
             weights_rgb: [0.25, 0.5, 0.25],
             weights_space: WeightSpace::Balanced,
             usm_amount: 0.0,
-            matrix_fallback: false,
             fitted: Fitted { noise: false, weights: false },
             weights_fitted_against: None,
             star: None,

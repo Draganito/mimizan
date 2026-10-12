@@ -16,6 +16,9 @@ use crate::tone::Tone;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Largest USM amount a recipe accepts (the GUI slider ends here too).
+pub const USM_MAX: f64 = 1.5;
+
 /// What sharpens the print after the curve, if anything.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
@@ -60,8 +63,8 @@ impl Sharpen {
 
     pub fn validate(&self) -> Result<()> {
         let usm = |a: f64| {
-            if !(0.0..=1.5).contains(&a) {
-                return Err(Error::Invalid(format!("usm amount {a} not within 0..1.5")));
+            if !(0.0..=USM_MAX).contains(&a) {
+                return Err(Error::Invalid(format!("usm amount {a} not within 0..{USM_MAX}")));
             }
             Ok(())
         };
@@ -190,12 +193,6 @@ impl Recipe {
             (self.border_mm / 25.4 * self.dpi).round() as usize
         }
     }
-
-    /// Does this recipe change any pixel beyond the plain tone (place,
-    /// border)? For log lines and the description.
-    pub fn has_local_work(&self) -> bool {
-        self.place != 0.0 || self.border_mm > 0.0
-    }
 }
 
 #[cfg(test)]
@@ -233,7 +230,6 @@ mod tests {
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert_eq!(r.border_px(), 283);
-        assert!(r.has_local_work());
         // Older fields missing: defaults fill in.
         let minimal: Recipe =
             serde_json::from_str(r#"{"curve":{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}}"#)
