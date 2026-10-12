@@ -1056,72 +1056,76 @@ impl App {
         };
         let n = &s.negative;
         let info = &n.info;
+        // Value cells never widen the panel: long text is elided (the full
+        // text is the tooltip), so the title bar and the body stay one width.
+        fn val(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
+            ui.add(egui::Label::new(text).truncate())
+        }
         egui::Grid::new("file-info").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
             ui.label("name");
-            ui.label(s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
+            val(ui, s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
                 .on_hover_text(s.path.display().to_string());
             ui.end_row();
             ui.label("camera");
-            ui.label(format!("{} {}", info.camera.make.trim(), info.camera.model.trim()));
+            val(ui, format!("{} {}", info.camera.make.trim(), info.camera.model.trim()));
             ui.end_row();
             let exposure = info.camera.exposure.summary();
             ui.label("exposure");
             if exposure.is_empty() {
-                ui.label(RichText::new("not in file").weak());
+                val(ui, RichText::new("not in file").weak());
             } else {
-                ui.label(RichText::new(&exposure).strong());
+                val(ui, RichText::new(&exposure).strong());
             }
             ui.end_row();
             if let Some(lens) = &info.camera.exposure.lens {
                 ui.label("lens");
-                ui.label(lens.trim());
+                val(ui, lens.trim());
                 ui.end_row();
             }
             ui.label("sensor");
-            ui.label(format!("{} x {} @ {} bit", n.plane.width, n.plane.height, info.camera.bits));
+            val(ui, format!("{} x {} @ {} bit", n.plane.width, n.plane.height, info.camera.bits));
             ui.end_row();
             ui.label("pattern");
-            ui.label(info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "mono".into()));
+            val(ui, info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "mono".into()));
             ui.end_row();
             ui.label("orientation");
-            ui.label(if self.rotation() == 0 {
+            val(ui, if self.rotation() == 0 {
                 format!("{}", n.orientation)
             } else {
                 format!("{} + {}° cw", n.orientation, 90 * self.rotation() as u16)
             });
             ui.end_row();
             ui.label("balance");
-            ui.label(format!("R {:.3}  B {:.3} ({})", info.wb[0], info.wb[2], info.report.wb_source));
+            val(ui, format!("R {:.3}  B {:.3} ({})", info.wb[0], info.wb[2], info.report.wb_source));
             ui.end_row();
             let px = n.plane.data.len() as f64;
             ui.label("saturated");
-            ui.label(format!(
+            val(ui, format!(
                 "{:.2} % ({:.2} % dilated)",
                 100.0 * info.report.saturated_raw as f64 / px,
                 100.0 * info.report.saturated_dilated as f64 / px
             ));
             ui.end_row();
             ui.label("defects");
-            ui.label(format!("{} ({:.3} %)", info.report.defects, 100.0 * info.report.defects as f64 / px));
+            val(ui, format!("{} ({:.3} %)", info.report.defects, 100.0 * info.report.defects as f64 / px));
             ui.end_row();
             ui.label("camera file");
             match &s.camera_file_path {
-                Some(p) => ui
-                    .label(p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
+                Some(p) => val(ui, p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
                     .on_hover_text(p.display().to_string()),
-                None => ui.label(RichText::new("none (defaults)").weak()),
+                None => val(ui, RichText::new("none (defaults)").weak()),
             };
             ui.end_row();
             ui.label("converter");
-            ui.label(info.demosaic.as_deref().unwrap_or("Mimizan"));
+            val(ui, info.demosaic.as_deref().unwrap_or("Mimizan"));
             ui.end_row();
             if info.demosaic.is_none() {
                 ui.label("mask");
-                ui.label(format!("{:?}, {} round(s)", info.mask, info.rounds));
+                val(ui, format!("{:?}, {} round(s)", info.mask, info.rounds));
                 ui.end_row();
                 if info.reconstruct {
                     ui.label("reconstruct");
-                    ui.label(
+                    val(ui, 
                         RichText::new(format!("on: {:.1} % of the picture computed", 100.0 * info.computed))
                             .color(egui::Color32::from_rgb(230, 170, 60)),
                     )
@@ -1131,13 +1135,13 @@ impl App {
             }
             ui.label("timing");
             let step = if info.demosaic.is_some() { "demosaic" } else { "separate" };
-            ui.label(format!(
+            val(ui, format!(
                 "decode {} · ingest {} · {step} {} ms",
                 info.timing.decode_ms, info.timing.ingest_ms, info.timing.separate_ms
             ));
             ui.end_row();
             ui.label("preview");
-            ui.label(format!(
+            val(ui, format!(
                 "{} x {} ({:.1} %), {} ms",
                 self.tex_size[0],
                 self.tex_size[1],
@@ -2702,6 +2706,7 @@ impl App {
             .open(&mut open[0])
             .default_pos(stage.left_top() + Vec2::splat(PANEL_GAP))
             .default_width(PANEL_W)
+            .min_width(PANEL_W)
             .max_width(PANEL_W)
             .default_height(max_h)
             .min_height(max_h)
@@ -2715,6 +2720,7 @@ impl App {
             .open(&mut open[1])
             .default_pos(stage.right_top() + Vec2::new(-PANEL_W - PANEL_GAP - 12.0, PANEL_GAP))
             .default_width(PANEL_W)
+            .min_width(PANEL_W)
             .max_width(PANEL_W)
             .default_height(max_h)
             .min_height(max_h)
