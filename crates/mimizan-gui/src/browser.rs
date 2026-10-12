@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime};
 
 /// Long edge of a thumbnail in pixels: enough for a 160-point tile on a
 /// HiDPI screen.
-pub const THUMB_LONG_EDGE: usize = 240;
+pub const THUMB_LONG_EDGE: usize = 480;
 
 /// Extensions rawler reads (lower case).
 const RAW_EXTENSIONS: &[&str] = &[
@@ -209,6 +209,8 @@ fn cache_key(path: &Path, size: u64, modified: SystemTime) -> String {
     feed(&size.to_le_bytes());
     let secs = modified.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     feed(&secs.to_le_bytes());
+    // A larger thumbnail size must not pick up the old, smaller pictures.
+    feed(&(THUMB_LONG_EDGE as u64).to_le_bytes());
     format!("{h:016x}")
 }
 
@@ -399,6 +401,9 @@ pub struct Persisted {
     /// Floating panels shown: analysis, enlarger, print. `None` means all.
     #[serde(default)]
     pub panels: Option<[bool; 3]>,
+    /// Height of the strip panel in points (the user drags its top edge).
+    #[serde(default)]
+    pub strip_height: Option<f32>,
 }
 
 /// `$XDG_CONFIG_HOME/mimizan/gui.json` or `~/.config/mimizan/gui.json`.

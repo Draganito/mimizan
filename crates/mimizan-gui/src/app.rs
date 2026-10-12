@@ -98,6 +98,10 @@ pub struct App {
     show_strip: bool,
     /// Strip tiles inverted (the film), not the print.
     strip_negative: bool,
+    /// Strip panel height in points; `strip_height_saved` is what the
+    /// config file holds, so a drag is written once, when it ends.
+    strip_height: f32,
+    strip_height_saved: f32,
     /// Floating panels shown: analysis, enlarger, print.
     panels: [bool; 3],
     /// Print panel: measured size, and whether the user has moved it.
@@ -248,6 +252,11 @@ impl App {
             sort: persisted.sort,
             show_strip: persisted.strip.unwrap_or(true),
             strip_negative: persisted.strip_negative.unwrap_or(true),
+            strip_height: persisted.strip_height.unwrap_or(STRIP_HEIGHT).clamp(STRIP_MIN_H, STRIP_MAX_H),
+            strip_height_saved: persisted
+                .strip_height
+                .unwrap_or(STRIP_HEIGHT)
+                .clamp(STRIP_MIN_H, STRIP_MAX_H),
             panels: persisted.panels.unwrap_or([true; 3]),
             print_size: None,
             print_pinned: false,
@@ -322,6 +331,7 @@ impl App {
             strip: Some(self.show_strip),
             strip_negative: Some(self.strip_negative),
             panels: Some(self.panels),
+            strip_height: Some(self.strip_height),
         }
         .save();
     }
@@ -2239,11 +2249,15 @@ fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
 /// of film: a perforation band above and below the picture, the name as
 /// the edge print underneath.
 const STRIP_HEIGHT: f32 = 214.0;
+/// The strip's top edge is draggable within this range; the frames scale
+/// with it (perforation and edge print keep their size, the picture grows).
+const STRIP_MIN_H: f32 = 120.0;
+const STRIP_MAX_H: f32 = 640.0;
+/// Frame proportions at the default height: 150 x 108 pt picture area.
 const TILE_W: f32 = 150.0;
 const TILE_IMG_H: f32 = 108.0;
 const PERF_H: f32 = 13.0;
 const EDGE_H: f32 = 17.0;
-const TILE_H: f32 = PERF_H + TILE_IMG_H + PERF_H + EDGE_H;
 const FILM_BASE: Color32 = Color32::from_rgb(16, 15, 14);
 const FILM_HOLE: Color32 = Color32::from_rgb(38, 38, 40);
 
@@ -2423,19 +2437,24 @@ impl App {
         // need a thumbnail; visible ones first, then two screens around.
         let mut wanted: Vec<(f32, usize)> = Vec::new();
         let ctx = ui.ctx().clone();
+        // Frame geometry follows the panel height: whatever is left under
+        // the bar (minus the scrollbar) is one film frame.
+        let tile_h = (ui.available_height() - ui.spacing().scroll.allocated_width()).max(60.0);
+        let img_h = (tile_h - 2.0 * PERF_H - EDGE_H).max(30.0);
+        let tile_w = (img_h * TILE_W / TILE_IMG_H).round();
         egui::ScrollArea::horizontal().id_salt("strip-scroll").show(ui, |ui| {
             let clip = ui.clip_rect();
             let centre = clip.center().x;
             // The film base runs under every frame.
             let film = Rect::from_min_size(
                 ui.cursor().min,
-                Vec2::new(ui.available_width().max(clip.width()), TILE_H),
+                Vec2::new(ui.available_width().max(clip.width()), tile_h),
             );
             ui.painter().rect_filled(film, 0.0, FILM_BASE);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for (i, e) in folder.entries.iter_mut().enumerate() {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(TILE_W, TILE_H), Sense::click());
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
                     let is_current = current.as_deref() == Some(e.path.as_path());
                     if is_current && scroll_to {
                         ui.scroll_to_rect(rect, Some(egui::Align::Center));
@@ -2470,17 +2489,17 @@ impl App {
                     let vis = ui.visuals();
                     painter.rect_filled(rect, 0.0, FILM_BASE);
                     // Perforation above and below the frame.
-                    draw_perforation(painter, Rect::from_min_size(rect.min, Vec2::new(TILE_W, PERF_H)));
+                    draw_perforation(painter, Rect::from_min_size(rect.min, Vec2::new(tile_w, PERF_H)));
                     draw_perforation(
                         painter,
                         Rect::from_min_size(
-                            Pos2::new(rect.left(), rect.top() + PERF_H + TILE_IMG_H),
-                            Vec2::new(TILE_W, PERF_H),
+                            Pos2::new(rect.left(), rect.top() + PERF_H + img_h),
+                            Vec2::new(tile_w, PERF_H),
                         ),
                     );
                     let frame = Rect::from_min_size(
                         Pos2::new(rect.left(), rect.top() + PERF_H),
-                        Vec2::new(TILE_W, TILE_IMG_H),
+                        Vec2::new(tile_w, img_h),
                     );
                     let img_rect = frame.shrink2(Vec2::new(5.0, 2.0));
                     if resp.hovered() && !is_current {
@@ -2528,7 +2547,7 @@ impl App {
                     }
                     // Edge print: the name in the film's orange.
                     let label_pos = Pos2::new(rect.center().x, rect.max.y - EDGE_H * 0.5);
-                    let name = truncate_middle(&e.name, 20);
+                    let name = truncate_middle(&e.name, (tile_w / 7.5) as usize);
                     painter.text(
                         label_pos,
                         egui::Align2::CENTER_CENTER,
@@ -2622,11 +2641,20 @@ impl eframe::App for App {
             ui.add_space(2.0);
         });
         if self.show_strip {
-            egui::Panel::bottom("strip")
-                .resizable(false)
-                .exact_size(STRIP_HEIGHT)
+            let r = egui::Panel::bottom("strip")
+                .resizable(true)
+                .default_size(self.strip_height)
+                .size_range(STRIP_MIN_H..=STRIP_MAX_H)
                 .frame(egui::Frame::new().fill(FILM_BASE).inner_margin(egui::Margin::symmetric(6, 0)))
                 .show(ui, |ui| self.strip_panel(ui));
+            self.strip_height = r.response.rect.height();
+            // Written once the drag has ended, not on every frame of it.
+            if (self.strip_height - self.strip_height_saved).abs() > 0.5
+                && !ctx.input(|i| i.pointer.any_down())
+            {
+                self.strip_height_saved = self.strip_height;
+                self.persist();
+            }
         }
         // The picture fills what is left; the panels float over it.
         let stage = egui::CentralPanel::default()
@@ -2665,9 +2693,8 @@ impl App {
     /// (mix, placing, curve, dodge & burn) right, print at the bottom centre. Each is a window the user can
     /// move, collapse (click the title) or close; the toolbar brings it back.
     fn glass_panels(&mut self, ctx: &egui::Context, stage: Rect) {
-        // Side panels open at the stage's height (egui's default window
-        // height of 420 pt would cut the histogram and the dodge & burn
-        // section); the user can shorten them, the content scrolls.
+        // The side panels always stand at the stage's height (min = max, so
+        // they follow the window and the strip); the content scrolls.
         let max_h = (stage.height() - 2.0 * PANEL_GAP).max(120.0);
         let mut open = self.panels;
         egui::Window::new("Analysis")
@@ -2677,6 +2704,7 @@ impl App {
             .default_width(PANEL_W)
             .max_width(PANEL_W)
             .default_height(max_h)
+            .min_height(max_h)
             .max_height(max_h)
             .resizable([false, true])
             .vscroll(true)
@@ -2689,6 +2717,7 @@ impl App {
             .default_width(PANEL_W)
             .max_width(PANEL_W)
             .default_height(max_h)
+            .min_height(max_h)
             .max_height(max_h)
             .resizable([false, true])
             .vscroll(true)
