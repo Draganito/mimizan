@@ -604,7 +604,8 @@ uses the chosen kernel's transfer. The curve is a monotone PCHIP through
 points in $[0,1]^2$ after $x^{1/2.2}$ encoding (`neutral` is pure gamma
 2.2; `reference` is fitted from a grey wedge against a monochrome camera's
 JPEG by weighted isotonic regression; the *zone curve* puts one node on
-each encoded zone centre $Z_k = 0.18\cdot 2^{k-5}$ and is bit-identical to
+each encoded zone boundary $B_k = 0.18\cdot 2^{k+0.5-5}$, so that moving a
+node widens one zone and narrows its neighbour, and is bit-identical to
 `neutral` while no node is moved). USM radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$ (one
 arc-minute at viewing distance $d$), Gaussian $\sigma = r_{\mathrm{px}}$,

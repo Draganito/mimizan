@@ -2,12 +2,16 @@
 //! sections 3–6, 13).
 //!
 //! A zone is a pair of scene value and print value. Zone V is the grey card
-//! at 0.18 linear, one zone is one stop: `Z_k = 0.18 · 2^(k−5)`. The curve
-//! stays the PCHIP of `curve.rs`, applied after the 1/2.2 encoding; the zone
-//! nodes are the encoded zone centres that fall into (0, 1), with output =
-//! input in the untouched state, so the untouched bar is bit-identical to
-//! the `neutral` look. Nothing here is a second mapping: a zone look is a
-//! [`LookFile`] like any other, named `zones`.
+//! at 0.18 linear, one zone is one stop: `Z_k = 0.18 · 2^(k−5)`, and zone k
+//! is the interval of a stop around it. The curve stays the PCHIP of
+//! `curve.rs`, applied after the 1/2.2 encoding; the nodes are the encoded
+//! *boundaries* between neighbouring zones (`0.18 · 2^(k+0.5−5)`) that fall
+//! into (0, 1), with output = input in the untouched state, so the
+//! untouched bar is bit-identical to the `neutral` look. A boundary is what
+//! the hand moves on the bar: dragging it widens the zone on one side and
+//! narrows the one on the other, nothing else changes its value. Nothing
+//! here is a second mapping: a zone look is a [`LookFile`] like any other,
+//! named `zones`.
 
 use crate::calib::{LookEncoding, LookFile};
 
@@ -57,15 +61,29 @@ pub fn zone_of(l: f64) -> f64 {
     (stops(l) + 5.0).clamp(0.0, (ZONES - 1) as f64)
 }
 
-/// Zones whose encoded centre lies in the open interval (0, 1): the inner
-/// nodes of the curve. Zones 0 … VII; VIII and above are over the clip.
-pub fn inner_zones() -> Vec<usize> {
-    (0..ZONES).filter(|&k| linear(k) < 1.0).collect()
+/// Linear scene value at the boundary between zone `k` and `k + 1`:
+/// `0.18 · 2^(k + 0.5 − 5)`.
+pub fn boundary_linear(k: usize) -> f64 {
+    GRAY_CARD * 2f64.powf(k as f64 + 0.5 - 5.0)
 }
 
-/// Encoded zone centres that are inner nodes.
+/// Zone boundaries that lie under the clip (linear < 1): `k` for the
+/// boundary k | k+1, these are the inner nodes of the curve. 0|I … VI|VII;
+/// VII|VIII at 1.018 is over the clip, so zone VII runs up to paper white
+/// and zone 0 down to fog.
+pub fn boundaries() -> Vec<usize> {
+    (0..ZONES - 1).filter(|&k| boundary_linear(k) < 1.0).collect()
+}
+
+/// Zones the bar shows: 0 … the last one with a boundary below it, plus
+/// the open-ended top zone (VII).
+pub fn bar_zones() -> usize {
+    boundaries().len() + 1
+}
+
+/// Encoded zone boundaries that are inner nodes.
 pub fn default_nodes() -> Vec<f64> {
-    inner_zones().into_iter().map(|k| encode(linear(k))).collect()
+    boundaries().into_iter().map(|k| encode(boundary_linear(k))).collect()
 }
 
 /// The untouched zone look: inner nodes with output = input, end points
@@ -96,7 +114,7 @@ pub fn is_zone_look(look: &LookFile) -> bool {
 }
 
 /// Any look expressed on the zone nodes: output values sampled from the
-/// look's own curve at the encoded zone centres, end points kept. For
+/// look's own curve at the encoded zone boundaries, end points kept. For
 /// `reference` and custom looks this is the "second source for the same
 /// points" of the paper; the result is an approximation of the original
 /// curve (PCHIP through fewer nodes) and the paper's bar can pull it.
@@ -121,9 +139,9 @@ pub fn look_on_zone_nodes(look: &LookFile) -> LookFile {
     out
 }
 
-/// Clamp output node `i` (0 = fog, last = paper white, 1 … n−2 the zones)
-/// to `v` while keeping the nodes strictly increasing by at least
-/// [`MIN_GAP`]. Returns the value actually set.
+/// Clamp output node `i` (0 = fog, last = paper white, 1 … n−2 the zone
+/// boundaries) to `v` while keeping the nodes strictly increasing by at
+/// least [`MIN_GAP`]. Returns the value actually set.
 pub fn set_output(look: &mut LookFile, i: usize, v: f64) -> f64 {
     let n = look.points.len();
     assert!(i < n, "node index");
@@ -171,7 +189,8 @@ pub const GRADE_FACTOR: f64 = 1.25;
 /// output spread (or compressed) around Zone V by `GRADE_FACTOR^n`, clamped
 /// into the fog/paper-white interval and made strictly increasing. These are
 /// lists of nodes, not a second filter; after the preset only the node set
-/// counts. Zone V stays on the grey card.
+/// counts. The pivot is the grey card, so the two boundaries of Zone V move
+/// apart (or together) symmetrically in the encoded domain.
 pub fn grade(n: i32) -> LookFile {
     let mut look = default_look();
     if n == 0 {
@@ -199,7 +218,16 @@ mod tests {
         assert!((linear(4) - 0.09).abs() < 1e-15);
         assert!((linear(7) - 0.72).abs() < 1e-15);
         assert!(linear(8) > 1.0);
-        assert_eq!(inner_zones(), vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(boundaries(), vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(bar_zones(), 8);
+        assert!((boundary_linear(4) - 0.18 / 2f64.sqrt()).abs() < 1e-15);
+        assert!((boundary_linear(5) - 0.18 * 2f64.sqrt()).abs() < 1e-15);
+        assert!(boundary_linear(7) > 1.0);
+        // The boundary nodes of the SPEC, encoded.
+        let want = [0.11111, 0.15226, 0.20864, 0.28592, 0.39181, 0.53691, 0.73576];
+        for (u, w) in default_nodes().iter().zip(want) {
+            assert!((u - w).abs() < 5e-6, "{u} vs {w}");
+        }
         assert_eq!(numeral(5), "V");
         assert_eq!(numeral(10), "X");
         assert!((stops(0.18)).abs() < 1e-12);
@@ -250,11 +278,14 @@ mod tests {
         look.validate().unwrap();
     }
 
-    /// Presets are strictly increasing with the minimum gap, Zone V does not
-    /// move, N+1 spreads and N−1 compresses the mid zones.
+    /// Presets are strictly increasing with the minimum gap, the grey card
+    /// is the pivot (its two boundaries move symmetrically in the encoded
+    /// domain), N+1 spreads and N−1 compresses the mid zones.
     #[test]
     fn grades_are_monotone_and_pivot_on_zone_v() {
-        let v_index = 1 + inner_zones().iter().position(|&k| k == 5).unwrap();
+        // Nodes 1 + k are the boundaries k | k+1: Zone V lies between
+        // boundary 4 (IV|V) and boundary 5 (V|VI).
+        let (below, above) = (1 + 4, 1 + 5);
         let pivot = encode(GRAY_CARD);
         for n in -3..=3 {
             let g = grade(n);
@@ -262,14 +293,21 @@ mod tests {
             for w in g.points.windows(2) {
                 assert!(w[1][1] - w[0][1] >= MIN_GAP - 1e-12, "N{n:+}: {:?}", g.points);
             }
-            assert!((g.points[v_index][1] - pivot).abs() < 1e-12, "N{n:+}");
+            let (lo, hi) = (g.points[below][1], g.points[above][1]);
+            let (u_lo, u_hi) = (g.points[below][0], g.points[above][0]);
+            // Symmetric in the encoded domain around the pivot.
+            assert!(((pivot - lo) / (pivot - u_lo) - (hi - pivot) / (u_hi - pivot)).abs() < 1e-9, "N{n:+}");
         }
         let (hard, soft, normal) = (grade(1), grade(-1), grade(0));
         assert_eq!(normal.points, default_look().points);
-        let vi = v_index + 1;
-        let iv = v_index - 1;
-        assert!(hard.points[vi][1] > normal.points[vi][1] && hard.points[iv][1] < normal.points[iv][1]);
-        assert!(soft.points[vi][1] < normal.points[vi][1] && soft.points[iv][1] > normal.points[iv][1]);
+        assert!(
+            hard.points[above][1] > normal.points[above][1]
+                && hard.points[below][1] < normal.points[below][1]
+        );
+        assert!(
+            soft.points[above][1] < normal.points[above][1]
+                && soft.points[below][1] > normal.points[below][1]
+        );
     }
 
     /// The reference look on zone nodes reproduces the reference curve at
@@ -295,7 +333,7 @@ mod tests {
             let lin = i as f64 / 200.0;
             worst = worst.max((zc.eval(lin) - r.eval(lin)).abs());
         }
-        // Eight nodes cannot carry every bend of a 20-point fit; the
+        // Seven nodes cannot carry every bend of a 20-point fit; the
         // deviation is below the 3/255 acceptance of the look itself.
         assert!(worst < 3.0 / 255.0, "{worst}");
     }

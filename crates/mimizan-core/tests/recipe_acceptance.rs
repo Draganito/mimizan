@@ -160,7 +160,8 @@ fn a_drag_stays_inside_two_intervals_per_side() {
 }
 
 /// Row 6: preset N+1 then clamping: strictly increasing, gap at least 1e-4.
-/// Row 8: place = 0 with only the shoulder pulled keeps Zone V on Zone V.
+/// Row 8: place = 0 with only the shoulder pulled keeps Zone V's boundaries
+/// exactly and its centre within a few percent of the pull.
 #[test]
 fn presets_clamp_and_the_shoulder_leaves_zone_v() {
     use mimizan_core::curve::Curve;
@@ -172,11 +173,21 @@ fn presets_clamp_and_the_shoulder_leaves_zone_v() {
     }
     let mut look = zone::default_look();
     let n = look.points.len();
-    zone::set_output(&mut look, n - 2, 0.95); // Zone VII up
+    let pull = 0.95 - look.points[n - 2][1];
+    zone::set_output(&mut look, n - 2, 0.95); // boundary VI|VII up: Zone VII narrower, VI wider
     zone::set_output(&mut look, n - 1, 0.97); // paper white down
     let c = Curve::from_look(&look);
-    let v = Curve::from_look(&LookFile::neutral()).eval(zone::GRAY_CARD);
-    assert!((c.eval(zone::GRAY_CARD) - v).abs() < 1e-12, "Zone V moved");
+    let neutral = Curve::from_look(&LookFile::neutral());
+    // The two boundaries of Zone V are nodes and did not move: exact.
+    for i in [n - 4, n - 3] {
+        let lin = zone::decode(look.points[i][0]);
+        assert!((c.eval(lin) - neutral.eval(lin)).abs() < 1e-12, "boundary {i} moved");
+    }
+    // The grey card itself lies in the interval next to the changed slope
+    // (second interval from the pulled node, SPEC [Abweichung]): the C¹
+    // curve bends towards the pulled node, by a few percent of the pull.
+    let d = (c.eval(zone::GRAY_CARD) - neutral.eval(zone::GRAY_CARD)).abs();
+    assert!(d < 0.03 * pull, "Zone V moved by {d} for a pull of {pull}");
 }
 
 /// Shapes and placing have no reduction over threads: 16 and 3 threads give

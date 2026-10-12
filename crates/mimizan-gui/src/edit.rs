@@ -17,8 +17,11 @@ pub struct Edit {
 }
 
 impl Edit {
+    /// The untouched development: the zone bar with every zone one stop
+    /// wide, which is the neutral curve bit for bit.
     pub fn new(weights: Weights) -> Self {
-        Self { weights, recipe: Recipe::default(), rotation: 0 }
+        let recipe = Recipe { curve: mimizan_core::zone::default_look(), ..Recipe::default() };
+        Self { weights, recipe, rotation: 0 }
     }
 }
 

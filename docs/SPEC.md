@@ -622,26 +622,38 @@ am Ende.
   letzter (1,1) und alle `x = y`. Druck-TIFF bekommt ein Grau-ICC mit
   Gamma 2,2.
 - **Zonenkurve [Ergänzung, Whitepaper §3–4]** (`--grade <n>`, GUI
-  „Zones“): ein Look namens `zones` mit den Stützstellen auf den
-  kodierten Zonenmitten `Z_k = 0,18 · 2^(k−5)`, k = 0 … VII (VIII und
-  darüber liegen über dem Clip; Zone V = 0,18 = Graukarte, eine Zone =
-  ein Stop), dazu die Endpunkte (0, y₀) = Schleier und (1, y₁) =
-  Papierweiß. Kodierte Zonenmitten nach der Formel: 0,0949 / 0,1301 /
-  0,1782 / 0,2442 / 0,3347 / 0,4587 / 0,6285 / 0,8613. **[Hinweis]**: Die
-  Tabellenwerte im Whitepaper (0,100 / 0,137 / 0,187 …) stimmen nicht mit
-  `x^(1/2,2)` überein; die Formel ist normativ. Unangetastet ist die
-  Zonenkurve bit-identisch zu `neutral`. Ein Zug am Knoten k ändert
-  dessen Ausgabewert; `zone::set_output` klemmt ihn zwischen die
-  Nachbarn (Mindestabstand 10⁻⁴), so dass die Kurve monoton bleibt. Grade
-  N+n: die mittleren Knoten um Zone V mit dem Faktor 1,25ⁿ gespreizt
-  (n < 0 gestaucht), danach nur noch Knoten, kein zweiter Filter. Ein
-  anderer Look wird mit `look_on_zone_nodes` auf die Zonenknoten
-  abgetastet (die „zweite Quelle derselben Punkte“ des Whitepapers).
-  **[Abweichung zu Whitepaper §4]**: Ein Zug an Knoten k ändert bei
-  Fritsch–Carlson nicht nur die beiden angrenzenden Intervalle, sondern
-  (über die Steigungen der Nachbarknoten) je zwei Intervalle pro Seite;
-  die Werte an den Nachbarknoten selbst bleiben. Die GUI-Vorschau
-  wertet die Kurve über eine 16-Bit-LUT aus, der Export exakt in f64.
+  „Zones“, dort die einzige Tonwertsteuerung): ein Look namens `zones`
+  mit den Stützstellen auf den kodierten **Zonengrenzen**
+  `B_k = 0,18 · 2^(k+0,5−5)`, k = 0 … VI (die Grenze k | k+1; VII | VIII
+  bei 1,018 liegt über dem Clip, Zone VII reicht bis Papierweiß, Zone 0
+  bis zum Schleier; Zone V = das Stop-Intervall um die Graukarte 0,18),
+  dazu die Endpunkte (0, y₀) = Schleier und (1, y₁) = Papierweiß.
+  Kodierte Grenzen nach der Formel: 0,1111 / 0,1523 / 0,2086 / 0,2859 /
+  0,3918 / 0,5369 / 0,7358. **[Abweichung zu Whitepaper §3, Tabelle]**:
+  Das Whitepaper setzt die Knoten auf die Zonenmitten. Die Leiste der GUI
+  ist das Papier von Schleier bis Weiß, in Zonen geteilt; ihr Griff ist
+  die Grenze zwischen zwei Zonen, und ein Zug daran macht die eine Zone
+  breiter und die andere schmaler, sonst nichts. Dafür muss die Grenze
+  der Knoten sein — mit Mittenknoten hätte eine Zone zwei Griffe und
+  keiner wäre ihr Rand. Die Tabellenwerte des Whitepapers (0,100 / 0,137
+  / 0,187 …) stimmen außerdem nicht mit `x^(1/2,2)` überein; die Formel
+  ist normativ. Unangetastet ist die Zonenkurve bit-identisch zu
+  `neutral`. Ein Zug an Grenze k ändert deren Ausgabewert;
+  `zone::set_output` klemmt ihn zwischen die Nachbarn (Mindestabstand
+  10⁻⁴), so dass die Kurve monoton bleibt und keine Grenze die nächste
+  überholt. Grade N+n: die Grenzen um die Graukarte mit dem Faktor 1,25ⁿ
+  gespreizt (n < 0 gestaucht), danach nur noch Knoten, kein zweiter
+  Filter. Ein anderer Look wird mit `look_on_zone_nodes` auf die Grenzen
+  abgetastet (die „zweite Quelle derselben Punkte“ des Whitepapers); die
+  GUI tut das mit jedem geladenen Rezept, dessen Kurve keine Zonenkurve
+  ist, die Identität exakt. **[Abweichung zu Whitepaper §4]**: Ein Zug an
+  Grenze k ändert bei Fritsch–Carlson nicht nur die beiden angrenzenden
+  Zonen, sondern (über die Steigungen der Nachbarknoten) je zwei
+  Intervalle pro Seite; die Werte an den Nachbargrenzen selbst bleiben
+  exakt, die Mitte der übernächsten Zone verschiebt sich um wenige Prozent
+  des Zugs (Abnahmetest: Grenze VI | VII um +0,214 gezogen bewegt die
+  Graukarte um 0,0054 kodiert). Die GUI-Vorschau wertet die Kurve über
+  eine 16-Bit-LUT aus, der Export exakt in f64.
 - **Rand [Ergänzung, Anhang B.3]** (`--border-mm`, Rezeptfeld
   `border_mm`): nach der Kurve wird das Bild in ein Papierfeld der Breite
   `round(border_mm / 25,4 · DPI)` Pixel je Seite gelegt, gefüllt mit

@@ -3,7 +3,6 @@
 //! them to the workers.
 
 use crate::browser::{dir_name, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
-use crate::curve_editor::{curve_editor, curve_plot};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{Converter, DetailRect, DevelopParams, Histogram, Session, ViewParams};
@@ -12,7 +11,6 @@ use crate::zone_bar::zone_bar;
 use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use egui_file_dialog::FileDialog;
 use mimizan_core::burn::{Burn, EV_LIMIT};
-use mimizan_core::calib::{LookEncoding, LookFile};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::print::PrintSize;
@@ -22,15 +20,6 @@ use mimizan_core::separate::MaskMode;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// How the recipe's curve is presented; derived from the curve itself, so
-/// undo/redo and a loaded recipe land in the right editor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CurveMode {
-    Preset(usize),
-    Zones,
-    Custom,
-}
 
 /// A dodge & burn shape the next click in the viewport will place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,8 +68,6 @@ enum DialogPurpose {
     Open,
     Folder,
     Export,
-    SaveLook,
-    LoadLook,
     SaveRecipe,
     LoadRecipe,
 }
@@ -104,9 +91,9 @@ pub struct App {
     strip_height_saved: f32,
     /// Floating panels shown: analysis, enlarger, print.
     panels: [bool; 3],
-    /// Print panel: measured size, and whether the user has moved it.
-    print_size: Option<Vec2>,
-    print_pinned: bool,
+    /// Zones window: measured size, and whether the user has moved it.
+    zones_size: Option<Vec2>,
+    zones_pinned: bool,
     /// Priority list last sent to the thumbnail worker.
     last_wanted: Vec<PathBuf>,
     /// Keyboard moved the selection: bring the tile into view once.
@@ -121,9 +108,7 @@ pub struct App {
     /// history. The export renders exactly `edit`.
     edit: Edit,
     history: History,
-    /// Presets the Look section offers (neutral first, then `look/*.json`).
-    looks: Vec<LookFile>,
-    /// Scene zone under the pointer in the zone bar; tints the preview.
+    /// Zone under the pointer in the zone bar; tints the preview.
     hover_zone: Option<u8>,
 
     // Dodge & burn tool
@@ -185,7 +170,6 @@ pub struct App {
     dialog: FileDialog,
     dialog_purpose: DialogPurpose,
     cameras_dir: PathBuf,
-    look_dir: PathBuf,
 
     /// `MIMIZAN_SCREENSHOT=<png>`: capture the window once the first preview
     /// is on screen, then quit. Used for unattended checks and the README.
@@ -217,29 +201,9 @@ fn resource_dir(name: &str) -> PathBuf {
     mimizan_core::calib::resolve_dir(Path::new(name))
 }
 
-fn load_looks(dir: &Path) -> Vec<LookFile> {
-    let mut looks = vec![LookFile::neutral()];
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        let mut paths: Vec<PathBuf> = rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .collect();
-        paths.sort();
-        for p in paths {
-            match LookFile::load(&p) {
-                Ok(l) if l.name != "neutral" => looks.push(l),
-                Ok(_) => {}
-                Err(e) => tracing::warn!("look {}: {e}", p.display()),
-            }
-        }
-    }
-    looks
-}
-
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        let look_dir = resource_dir("look");
         let cameras_dir = resource_dir("cameras");
         let persisted = Persisted::load();
         let mut app = Self {
@@ -258,8 +222,8 @@ impl App {
                 .unwrap_or(STRIP_HEIGHT)
                 .clamp(STRIP_MIN_H, STRIP_MAX_H),
             panels: persisted.panels.unwrap_or([true; 3]),
-            print_size: None,
-            print_pinned: false,
+            zones_size: None,
+            zones_pinned: false,
             last_wanted: Vec::new(),
             scroll_to_selected: false,
             current_path: None,
@@ -267,7 +231,6 @@ impl App {
             log: Vec::new(),
             edit: Edit::new(Weights::default()),
             history: History::new(Edit::new(Weights::default())),
-            looks: load_looks(&look_dir),
             hover_zone: None,
             dnb_selected: None,
             dnb_placing: None,
@@ -308,7 +271,6 @@ impl App {
             dialog: FileDialog::new(),
             dialog_purpose: DialogPurpose::Open,
             cameras_dir,
-            look_dir,
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
         };
@@ -408,23 +370,22 @@ impl App {
         self.edit.rotation
     }
 
-    /// Which editor the current curve belongs to.
-    fn curve_mode(&self) -> CurveMode {
-        let c = &self.edit.recipe.curve;
-        if zone::is_zone_look(c) {
-            CurveMode::Zones
-        } else if let Some(i) = self.looks.iter().position(|l| l == c) {
-            CurveMode::Preset(i)
-        } else {
-            CurveMode::Custom
-        }
-    }
-
     /// Replace the whole development (undo, redo, a loaded recipe) and drop
-    /// tool state that pointed into the old one.
-    fn set_edit(&mut self, e: Edit) {
+    /// tool state that pointed into the old one. The curve is always a zone
+    /// bar here: any other look (an older recipe, a CLI look) is sampled on
+    /// the zone boundaries, the identity exactly.
+    fn set_edit(&mut self, mut e: Edit) {
         if e.rotation != self.edit.rotation {
             self.keep_scale = None;
+        }
+        if !zone::is_zone_look(&e.recipe.curve) {
+            let c = &e.recipe.curve;
+            e.recipe.curve = if mimizan_core::curve::Curve::from_look(c).is_identity() {
+                zone::default_look()
+            } else {
+                self.log(format!("curve \"{}\" sampled on the zone boundaries", c.name));
+                zone::look_on_zone_nodes(c)
+            };
         }
         self.edit = e;
         self.dnb_selected = self.dnb_selected.filter(|&i| i < self.edit.recipe.dodge_burn.len());
@@ -489,10 +450,6 @@ impl App {
             reconstruct: self.reconstruct,
             converter: self.converter,
         }
-    }
-
-    fn current_look(&self) -> LookFile {
-        self.edit.recipe.curve.clone()
     }
 
     fn view_params(&self) -> ViewParams {
@@ -637,19 +594,11 @@ impl App {
                             self.load_recipe(&p);
                             self.history = History::new(self.edit.clone());
                         }
-                        if self.screenshot_to.is_some() {
-                            if std::env::var_os("MIMIZAN_SCREENSHOT_CUSTOM").is_some() {
-                                // Show the curve editor in the unattended capture.
-                                self.edit.recipe.curve = LookFile {
-                                    schema: 1,
-                                    name: "custom".into(),
-                                    points: vec![[0.0, 0.0], [0.25, 0.22], [0.75, 0.78], [1.0, 1.0]],
-                                    encoding: LookEncoding::Gamma22,
-                                    fitted_against: None,
-                                };
-                            } else if std::env::var_os("MIMIZAN_SCREENSHOT_ZONES").is_some() {
-                                self.edit.recipe.curve = zone::grade(1);
-                            }
+                        if self.screenshot_to.is_some()
+                            && std::env::var_os("MIMIZAN_SCREENSHOT_ZONES").is_some()
+                        {
+                            // A moved bar in the unattended capture.
+                            self.edit.recipe.curve = zone::grade(1);
                         }
                     }
                     self.busy = None;
@@ -870,9 +819,7 @@ impl App {
             self.dialog.config_mut().default_file_name = n;
         }
         match purpose {
-            DialogPurpose::Open | DialogPurpose::LoadLook | DialogPurpose::LoadRecipe => {
-                self.dialog.pick_file()
-            }
+            DialogPurpose::Open | DialogPurpose::LoadRecipe => self.dialog.pick_file(),
             DialogPurpose::Folder => self.dialog.pick_directory(),
             _ => self.dialog.save_file(),
         }
@@ -902,27 +849,6 @@ impl App {
                     });
                 }
             }
-            DialogPurpose::SaveLook => {
-                let path = with_ext(path, "json");
-                let mut look = self.current_look();
-                if let Some(stem) = path.file_stem() {
-                    look.name = stem.to_string_lossy().to_string();
-                }
-                match look.validate().and_then(|_| look.save(&path)) {
-                    Ok(()) => {
-                        self.log(format!("saved look {}", path.display()));
-                        self.edit.recipe.curve.name = look.name;
-                    }
-                    Err(e) => self.log(format!("look not saved: {e}")),
-                }
-            }
-            DialogPurpose::LoadLook => match LookFile::load(&path) {
-                Ok(l) => {
-                    self.log(format!("loaded look {} ({} points)", l.name, l.points.len()));
-                    self.edit.recipe.curve = l;
-                }
-                Err(e) => self.log(format!("look not loaded: {e}")),
-            },
             DialogPurpose::SaveRecipe => self.save_recipe(&with_ext(path, "json")),
             DialogPurpose::LoadRecipe => self.load_recipe(&path),
         }
@@ -950,8 +876,11 @@ impl App {
             }
             for (i, (name, hover)) in [
                 ("Analysis", "File, histograms, development (Tab hides every panel)"),
-                ("Enlarger", "Mix (the filter), placing (the exposure), the curve (the grade), dodge & burn"),
-                ("Print", "Size, border, sharpening, view"),
+                ("Enlarger", "Mix (the filter), dodge & burn, the print's size, border and sharpening"),
+                (
+                    "Zones",
+                    "The zone bar: placing (the exposure) and the print range of every zone (the grade)",
+                ),
             ]
             .into_iter()
             .enumerate()
@@ -981,14 +910,14 @@ impl App {
             ui.separator();
             let (pos, len) = self.history.position();
             if ui
-                .add_enabled(self.history.can_undo(), egui::Button::new("↶"))
+                .add_enabled(self.history.can_undo(), egui::Button::new("↺"))
                 .on_hover_text(format!("Undo (Ctrl+Z) — step {pos} of {len}"))
                 .clicked()
             {
                 self.undo();
             }
             if ui
-                .add_enabled(self.history.can_redo(), egui::Button::new("↷"))
+                .add_enabled(self.history.can_redo(), egui::Button::new("↻"))
                 .on_hover_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
                 .clicked()
             {
@@ -1031,6 +960,26 @@ impl App {
                     ui.close();
                 }
             });
+            ui.separator();
+            // The view: fit / 1:1 and the two overlays.
+            if ui
+                .add_enabled(has, egui::Button::new("fit"))
+                .on_hover_text("Whole picture in the window")
+                .clicked()
+            {
+                self.zoom = 1.0;
+                self.pan = Vec2::ZERO;
+            }
+            if ui
+                .add_enabled(has, egui::Button::new("1:1"))
+                .on_hover_text("One negative pixel per screen pixel (double-click toggles)")
+                .clicked()
+            {
+                self.zoom_to_1to1 = true;
+            }
+            ui.checkbox(&mut self.show_mask, "mask")
+                .on_hover_text("Show the sharpening mask: white = chroma treated as texture");
+            ui.checkbox(&mut self.dnb_overlay, "shapes").on_hover_text("Show the dodge & burn outlines");
             // Status text takes only what is left and is cut, never painted
             // over the buttons.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1368,10 +1317,9 @@ impl App {
         }
     }
 
-    /// Right panel: the negative's mix, placing and the curve, dodge & burn.
-    fn zones_panel(&mut self, ui: &mut egui::Ui) {
-        // The zone bar sets this again while the pointer is over it.
-        self.hover_zone = None;
+    /// Right panel: the enlarger's filter (the mix), dodge & burn, and the
+    /// print's size, border and sharpening.
+    fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Mix");
         let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
         self.mix_presets(ui);
@@ -1395,207 +1343,94 @@ impl App {
 
         ui.add_space(10.0);
         ui.separator();
-        self.zones_section(ui);
+        self.dodge_burn_section(ui);
 
         ui.add_space(10.0);
         ui.separator();
-        self.dodge_burn_section(ui);
-    }
-
-    /// Bottom panel: the print's size, border and sharpening; the view.
-    fn print_panel(&mut self, ui: &mut egui::Ui) {
         self.print_section(ui);
-
-        ui.add_space(6.0);
-        ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("view").weak());
-            if ui.button("fit").clicked() {
-                self.zoom = 1.0;
-                self.pan = Vec2::ZERO;
-            }
-            if ui.button("1:1").on_hover_text("One negative pixel per screen pixel").clicked() {
-                self.zoom_to_1to1 = true;
-            }
-            ui.checkbox(&mut self.show_mask, "mask")
-                .on_hover_text("Show the sharpening mask: white = chroma treated as texture");
-            ui.checkbox(&mut self.dnb_overlay, "shapes").on_hover_text("Show the dodge & burn outlines");
-        })
-        .response
-        .on_hover_text(
-            "Scroll to zoom, drag to pan, double-click toggles fit and 1:1. The preview is the picture \
-             before size, border and sharpening: mix, placing, dodge & burn and curve, exactly as the TIFF \
-             gets them.",
-        );
     }
 
-    /// Placing and the one curve: a preset look, the zone bar, or free points.
-    fn zones_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Zones");
-        let mut place = self.edit.recipe.place;
-        if ui
-            .add(egui::Slider::new(&mut place, -3.0..=3.0).text("place (stops)").fixed_decimals(2))
-            .on_hover_text(
-                "Exposure placing before the curve: +1 moves every zone one zone up (brighter). \
-                 The curve then decides where each zone prints.",
-            )
-            .changed()
-        {
-            self.edit.recipe.place = place;
-        }
-        ui.add_space(4.0);
-        let mode = self.curve_mode();
-        let mut pick: Option<CurveMode> = None;
-        ui.horizontal_wrapped(|ui| {
-            for i in 0..self.looks.len() {
-                let name = capitalise(&self.looks[i].name.replace('_', "-"));
-                let label = if self.looks[i].encoding == LookEncoding::Gamma22 {
-                    name
-                } else {
-                    format!("{name} (linear)")
-                };
-                let hover = match self.looks[i].name.as_str() {
-                    "neutral" => "Plain gamma 2.2 encoding, no tone curve".to_string(),
-                    "reference" => {
-                        "The tone rendering of the monochrome reference camera, fitted from its own JPEG"
-                            .to_string()
-                    }
-                    _ => self.looks[i]
-                        .fitted_against
-                        .clone()
-                        .map(|f| format!("fitted against {f}"))
-                        .unwrap_or_default(),
-                };
-                if ui.selectable_label(mode == CurveMode::Preset(i), label).on_hover_text(hover).clicked() {
-                    pick = Some(CurveMode::Preset(i));
-                }
-            }
+    /// Bottom window: the zone bar — placing (the exposure) and the print
+    /// range of every zone (the grade). Nothing else edits the curve.
+    fn zones_window(&mut self, ui: &mut egui::Ui) {
+        // The zone bar sets this again while the pointer is over it.
+        self.hover_zone = None;
+        let width = ui.available_width();
+        ui.horizontal(|ui| {
+            let mut place = self.edit.recipe.place;
+            ui.spacing_mut().slider_width = (width - 190.0).max(120.0);
             if ui
-                .selectable_label(mode == CurveMode::Zones, "Zones")
+                .add(egui::Slider::new(&mut place, -3.0..=3.0).text("place (stops)").fixed_decimals(2))
                 .on_hover_text(
-                    "The zone system as the print curve: one node per zone on the encoded zone centres. \
-                     Switching from another curve samples it on those nodes.",
+                    "Exposure placing before the curve: +1 moves every zone one zone up (brighter). \
+                     The bar then decides how much of the paper each zone gets.",
                 )
-                .clicked()
+                .changed()
             {
-                pick = Some(CurveMode::Zones);
-            }
-            if ui
-                .selectable_label(mode == CurveMode::Custom, "Custom")
-                .on_hover_text("Free control points (PCHIP), the same interpolation as the print path")
-                .clicked()
-            {
-                pick = Some(CurveMode::Custom);
+                self.edit.recipe.place = place;
             }
         });
-        match pick {
-            Some(CurveMode::Preset(i)) => self.edit.recipe.curve = self.looks[i].clone(),
-            Some(CurveMode::Zones) if mode != CurveMode::Zones => {
-                let c = &self.edit.recipe.curve;
-                self.edit.recipe.curve = if mimizan_core::curve::Curve::from_look(c).is_identity() {
-                    zone::default_look()
-                } else {
-                    zone::look_on_zone_nodes(c)
-                };
-            }
-            Some(CurveMode::Custom) if mode != CurveMode::Custom => {
-                let mut c = self.edit.recipe.curve.clone();
-                c.name = "custom".into();
-                if c.encoding != LookEncoding::Gamma22 {
-                    // The editor works in the encoded domain.
-                    c = zone::look_on_zone_nodes(&c);
-                    c.name = "custom".into();
-                }
-                self.edit.recipe.curve = c;
-            }
-            _ => {}
-        }
+        ui.add_space(6.0);
+        self.hover_zone = zone_bar(ui, &mut self.edit.recipe.curve, width);
         ui.add_space(4.0);
-        let width = ui.available_width().min(300.0);
-        match self.curve_mode() {
-            CurveMode::Zones => {
-                self.hover_zone = zone_bar(ui, &mut self.edit.recipe.curve, width);
-                ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("grade").weak());
-                    for n in -2..=2 {
-                        let label = match n {
-                            0 => "N".to_string(),
-                            n if n > 0 => format!("N+{n}"),
-                            n => format!("N{n}"),
-                        };
-                        let g = zone::grade(n);
-                        let same = self.edit.recipe.curve.points == g.points;
-                        if ui
-                            .selectable_label(same, label)
-                            .on_hover_text(format!(
-                                "Node preset: mid zones spread by {:.3} around Zone V. Only the nodes count afterwards.",
-                                zone::GRADE_FACTOR.powi(n)
-                            ))
-                            .clicked()
-                        {
-                            self.edit.recipe.curve = g;
-                        }
-                    }
-                });
-                ui.horizontal(|ui| {
-                    let c = &mut self.edit.recipe.curve;
-                    let n = c.points.len();
-                    let mut fog = c.points[0][1];
-                    let mut white = c.points[n - 1][1];
-                    ui.label(RichText::new("fog").weak());
-                    if ui
-                        .add(egui::DragValue::new(&mut fog).range(0.0..=0.5).speed(0.002).fixed_decimals(3))
-                        .changed()
-                    {
-                        zone::set_output(c, 0, fog);
-                    }
-                    ui.label(RichText::new("paper white").weak());
-                    if ui
-                        .add(egui::DragValue::new(&mut white).range(0.5..=1.0).speed(0.002).fixed_decimals(3))
-                        .changed()
-                    {
-                        zone::set_output(c, n - 1, white);
-                    }
-                });
-                curve_plot(ui, &self.edit.recipe.curve.points, egui::vec2(width, 90.0));
-                ui.label(
-                    RichText::new(
-                        "Scene below, print above; drag a handle to move where that zone prints. \
-                         Hover a zone to see its pixels. Untouched, the bar equals the neutral look exactly.",
-                    )
-                    .weak(),
-                );
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("grade").weak());
+            for n in -2..=2 {
+                let label = match n {
+                    0 => "N".to_string(),
+                    n if n > 0 => format!("N+{n}"),
+                    n => format!("N{n}"),
+                };
+                let g = zone::grade(n);
+                let same = self.edit.recipe.curve.points == g.points;
+                if ui
+                    .selectable_label(same, label)
+                    .on_hover_text(format!(
+                        "Start position: the mid zones spread by {:.3} around the grey card. Only the boundaries count afterwards.",
+                        zone::GRADE_FACTOR.powi(n)
+                    ))
+                    .clicked()
+                {
+                    self.edit.recipe.curve = g;
+                }
             }
-            CurveMode::Custom => {
-                curve_editor(ui, &mut self.edit.recipe.curve.points, width.min(236.0));
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("straight").clicked() {
-                        self.edit.recipe.curve.points = vec![[0.0, 0.0], [1.0, 1.0]];
-                    }
-                    if ui.button("S-curve").clicked() {
-                        self.edit.recipe.curve.points =
-                            vec![[0.0, 0.0], [0.25, 0.20], [0.5, 0.5], [0.75, 0.80], [1.0, 1.0]];
-                    }
-                    if ui.button("Load…").clicked() {
-                        self.start_dialog(DialogPurpose::LoadLook, None);
-                    }
-                    if ui.button("Save…").clicked() {
-                        let dir = self.look_dir.clone();
-                        self.dialog.config_mut().initial_directory = dir;
-                        let name = self.edit.recipe.curve.name.clone();
-                        self.start_dialog(DialogPurpose::SaveLook, Some(format!("{name}.json")));
-                    }
-                });
-                ui.label(
-                    RichText::new("Points apply after gamma 2.2 encoding (x = encoded input, y = output).")
-                        .weak(),
-                );
+            ui.add_space(12.0);
+            let c = &mut self.edit.recipe.curve;
+            let n = c.points.len();
+            let mut fog = c.points[0][1];
+            let mut white = c.points[n - 1][1];
+            ui.label(RichText::new("fog").weak());
+            if ui
+                .add(egui::DragValue::new(&mut fog).range(0.0..=0.5).speed(0.002).fixed_decimals(3))
+                .on_hover_text("The darkest tone of the paper (the print value of linear 0)")
+                .changed()
+            {
+                zone::set_output(c, 0, fog);
             }
-            CurveMode::Preset(_) => {
-                curve_plot(ui, &self.edit.recipe.curve.points, egui::vec2(width, 90.0));
+            ui.label(RichText::new("paper white").weak());
+            if ui
+                .add(egui::DragValue::new(&mut white).range(0.5..=1.0).speed(0.002).fixed_decimals(3))
+                .on_hover_text("The lightest tone of the paper (the print value of linear 1)")
+                .changed()
+            {
+                zone::set_output(c, n - 1, white);
             }
-        }
+        });
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "The paper from fog to white; each patch is the share one zone gets. Drag a boundary: one \
+                     zone widens, its neighbour narrows. Double-click: back.",
+                )
+                .weak(),
+            )
+            .truncate(),
+        )
+        .on_hover_text(
+            "Untouched, the bar equals plain gamma 2.2 exactly (one stop per zone, the highlights getting most \
+             of the paper, as the encoding has it). The curve through the boundaries is monotone by \
+             construction: nothing can overtake, nothing solarises.",
+        );
     }
 
     /// Dodge & burn: local placing shapes, placed and moved in the viewport.
@@ -1835,10 +1670,10 @@ impl App {
         if self.session.is_none() {
             return "Open a RAW file first.".into();
         }
-        let look = match self.curve_mode() {
-            CurveMode::Preset(_) => capitalise(&self.current_look().name.replace('_', "-")),
-            CurveMode::Zones => "zone".to_string(),
-            CurveMode::Custom => format!("custom curve \"{}\"", self.current_look().name),
+        let look = if mimizan_core::curve::Curve::from_look(&self.edit.recipe.curve).is_identity() {
+            "untouched zone"
+        } else {
+            "zone"
         };
         let (uw, uh) = self.export_size();
         let (ow, oh) = self.print_layout().map(|l| (l.out_w, l.out_h)).unwrap_or((uw, uh));
@@ -2694,8 +2529,9 @@ fn glass_frame() -> egui::Frame {
 
 impl App {
     /// The three floating panels over the stage: analysis left, enlarger
-    /// (mix, placing, curve, dodge & burn) right, print at the bottom centre. Each is a window the user can
-    /// move, collapse (click the title) or close; the toolbar brings it back.
+    /// (mix, dodge & burn, print) right, the zone bar at the bottom centre.
+    /// Each is a window the user can move, collapse (click the title) or
+    /// close; the toolbar brings it back.
     fn glass_panels(&mut self, ctx: &egui::Context, stage: Rect) {
         // The side panels always stand at the stage's height (min = max, so
         // they follow the window and the strip); the content scrolls.
@@ -2728,33 +2564,37 @@ impl App {
             .resizable([false, true])
             .vscroll(true)
             .constrain_to(stage)
-            .show(ctx, |ui| self.zones_panel(ui));
-        // The print panel sits at the bottom centre, above the strip, until
-        // the user drags it somewhere; its height is only known after a
-        // frame, so the position follows the measured size.
-        // (No scroll area here: a window that may grow to the stage's
-        // height is constrained as if it did, and would sit at the top.)
-        let mut print = egui::Window::new("Print")
+            .show(ctx, |ui| self.enlarger_panel(ui));
+        // The zones window sits at the bottom centre, above the strip, as
+        // wide as the room between the side panels, until the user drags it
+        // somewhere; its height is only known after a frame, so the position
+        // follows the measured size. (No scroll area here: a window that may
+        // grow to the stage's height is constrained as if it did, and would
+        // sit at the top.)
+        let side = |open: bool| if open { PANEL_W + 2.0 * PANEL_GAP + 24.0 } else { PANEL_GAP };
+        let zones_w = (stage.width() - side(open[0]) - side(open[1])).clamp(420.0, 1000.0);
+        let mut zones = egui::Window::new("Zones")
             .frame(glass_frame())
             .open(&mut open[2])
-            .default_width(460.0)
-            .max_width(460.0)
+            .default_width(zones_w)
+            .min_width(zones_w)
+            .max_width(zones_w)
             .resizable(false)
             .constrain_to(stage);
-        if !self.print_pinned {
-            let size = self.print_size.unwrap_or(Vec2::new(484.0, 330.0));
+        if !self.zones_pinned {
+            let size = self.zones_size.unwrap_or(Vec2::new(zones_w + 24.0, 170.0));
             // egui's title-bar drag mode re-applies the stored position over
             // `current_pos`; drag-anywhere mode does not, and the first drag
             // pins the window anyway.
-            print = print.drag_area(egui::WindowDrag::Anywhere).current_pos(Pos2::new(
+            zones = zones.drag_area(egui::WindowDrag::Anywhere).current_pos(Pos2::new(
                 stage.center().x - size.x * 0.5,
                 (stage.bottom() - PANEL_GAP - size.y).max(stage.top() + PANEL_GAP),
             ));
         }
-        if let Some(r) = print.show(ctx, |ui| self.print_panel(ui)) {
-            self.print_size = Some(r.response.rect.size());
+        if let Some(r) = zones.show(ctx, |ui| self.zones_window(ui)) {
+            self.zones_size = Some(r.response.rect.size());
             if r.response.dragged() {
-                self.print_pinned = true;
+                self.zones_pinned = true;
             }
         }
         if open != self.panels {

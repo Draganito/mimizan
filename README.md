@@ -359,11 +359,12 @@ recipe holds, in the order the pipeline applies them: the **placing**
 burn** shapes (`--burn radial:x,y,radius,feather,ev` and
 `--burn gradient:x0,y0,x1,y1,ev`; local placing by a geometric mask, positive
 ev brighter, negative darker, coordinates as fractions of the upright picture
-so a recipe means the same place at any size), the **curve** (a look, a custom
-curve, or the **zone curve** `--grade N`: one PCHIP node per zone on the
-encoded zone centres `Z_k = 0.18·2^(k−5)`, grade presets spread the mid zones
-around Zone V by 1.25 per grade; the untouched zone curve is bit-identical to
-`neutral`), the **size step** (`--size`, `--dpi`, `--resample lanczos3 |
+so a recipe means the same place at any size), the **curve** (the **zone
+curve**, `--grade N` on the CLI: one PCHIP node per zone *boundary*,
+`0.18·2^(k+0.5−5)` encoded, so moving a boundary widens one zone and narrows
+its neighbour; grade presets spread the mid zones around the grey card by
+1.25 per grade; the untouched zone curve is bit-identical to `neutral`; the
+CLI also still takes any look file with `--look`), the **size step** (`--size`, `--dpi`, `--resample lanczos3 |
 mitchell | catmull-rom | b-spline`: Lanczos-3 stays the default and the
 benchmark kernel; B-spline is the only one without overshoot, and visibly
 soft), the **border** (`--border-mm`, paper white = the curve's value at
@@ -402,27 +403,29 @@ close them and bring them back from the toolbar, `Tab` hides all three).
 They are plain egui on glow — alpha and a shadow, no blur — so the app looks
 the same on a machine without a GPU driver. *Analysis* (left) shows the
 file's exposure from EXIF, the histograms and the *Development* fold.
-*Enlarger* (right) holds everything that exposes the print: the mix from
-one row of presets (*Native*, *Panchromatic* = the camera file's calibrated
-weights, and the filters *Yellow 8* … *Blue 47* in front of it) or the R/B
-sliders, the *place* slider (stops, the exposure), the curve — a look
-(`neutral`, `reference`), the **zone bar**, or a custom curve — and *dodge
-& burn*. *Print* (bottom) is the paper: native size, a paper size at a dpi
-or a long edge, the border, the resampling kernel and the sharpening, with
-the output size it adds up to.
+*Enlarger* (right) holds the mix from one row of presets (*Native*,
+*Panchromatic* = the camera file's calibrated weights, and the filters
+*Yellow 8* … *Blue 47* in front of it) or the R/B sliders, *dodge & burn*,
+and the *Print*: native size, a paper size at a dpi or a long edge, the
+border, the resampling kernel and the sharpening, with the output size it
+adds up to. *Zones* (bottom, above the film strip) is the whole tone
+control; there are no curves.
 
-The zone bar is the paper's split bar: eleven zones on one logarithmic axis
-with Zone V in the middle, the print above, the scene below, a line from
-each scene zone to where it prints. Drag a handle to move that zone's
-output (the curve stays monotone; the neighbours clamp it), double-click
-to put it back, hover a zone and its pixels light up in the preview; *fog*
-and *paper white* are the two end handles. The grade buttons N−2 … N+2 are
-node presets, nothing more: after a click only the nodes count. Switching
-from a look to *Zones* samples that look on the zone nodes. Dodge & burn
-shapes are placed in the picture (*+ disc* then click, *+ gradient* then
-drag from no effect to full effect), moved by their centre, resized by the
-ring or the end points, set in EV in the panel; `Delete` removes the
-selected one. The outline overlay can be hidden under *view*.
+The zone bar is the paper from fog to paper white, split into the zones
+0 … VII; the width of a patch is the share of the paper that zone gets,
+and the patch is painted with the print tones it covers. The boundary
+between two zones is the handle: drag it and one zone widens while its
+neighbour narrows, nothing else moves (the curve through the boundaries is
+monotone by construction, boundaries cannot overtake each other, and the
+untouched bar is plain gamma 2.2 to the bit). Double-click puts a boundary
+back; hover a zone and its pixels light up in the preview; the *place*
+slider above the bar is the exposure (every zone one stop up or down);
+*fog* and *paper white* set the ends; the grade buttons N−2 … N+2 are
+start positions, nothing more. Dodge & burn shapes are placed in the
+picture (*+ disc* then click, *+ gradient* then drag from no effect to
+full effect), moved by their centre, resized by the ring or the end
+points, set in EV in the panel; `Delete` removes the selected one. *fit*,
+*1:1*, the mask and the shape overlay sit in the toolbar.
 
 Everything the panels set is one **development** (weights, turns and the
 recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole

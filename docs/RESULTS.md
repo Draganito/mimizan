@@ -542,11 +542,23 @@ The GUI edits the recipe (`Edit { weights, recipe, rotation }`) with an
 undo history (commits when pointer and keyboard are idle, 200 steps,
 Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) and three floating translucent panels over
 the picture (Analysis, Enlarger, Print; Tab hides them, egui-only, no
-blur, so the glow backend and every driver stays sufficient). The zone bar
-is the whitepaper's split bar: print row above, scene row below, lines
-from each scene zone to where it prints, handles under the print row
-dragged on the log axis, double click puts a node back, hovering a zone
-tints its pixels in the preview (mask computed with the preview). Dodge &
+blur, so the glow backend and every driver stays sufficient). There are
+no curves in the GUI: the *Zones* window (bottom centre, above the strip)
+is the only tone control. Its bar is the paper from fog to paper white on
+the encoded axis, split into zones 0 … VII; a patch's width is the share
+of the paper that zone gets and it is painted with the print tones it
+covers. The boundary between two zones is the handle (`ResizeHorizontal`
+cursor): a drag widens one zone and narrows the other, a double click puts
+the boundary back, ticks under the bar mark the untouched positions. For
+this the curve's nodes moved from the zone centres to the zone boundaries
+(SPEC §9 [Abweichung]); the first version of the bar (two rows on a log
+axis, handles on the centres) showed N+1 with zones 0 and I collapsed at
+the left edge because the log axis clamps at −5.5 stops, which is why the
+axis is the encoded print value now. Hovering a zone tints its pixels in
+the preview (mask computed with the preview); the place slider, the grade
+start positions N−2 … N+2 and the fog / paper-white fields sit in the same
+window. The Enlarger panel keeps mix, dodge & burn and the print section;
+fit / 1:1 / mask / shapes moved to the toolbar. Dodge &
 burn: shapes are drawn in the viewport (disc: centre drag then radius;
 gradient: start then end), stored in normalised coordinates of the upright
 picture, so the preview, the 1:1 window (`burn::apply_window` on the
@@ -564,8 +576,8 @@ recipe, JPEG = recipe with `LongEdgePx(screen)`, no border and screen
 compensation.
 
 Unattended check env vars: `MIMIZAN_SCREENSHOT=out.png` (quit after the
-first preview), `MIMIZAN_SCREENSHOT_CUSTOM=1` (custom curve editor on),
-`MIMIZAN_SCREENSHOT_ZONES=1` (zone bar on, grade N+1),
+first preview), `MIMIZAN_SCREENSHOT_ZONES=1` (bar at grade N+1;
+`MIMIZAN_SCREENSHOT_CUSTOM` went with the curve editor),
 `MIMIZAN_SCREENSHOT_1TO1=1` (wait for the 1:1 window),
 `MIMIZAN_WINDOW=WxH` (inner size in points; default 1360×860, which is the
 size the default panel positions were laid out for).

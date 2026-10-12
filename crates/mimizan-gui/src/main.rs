@@ -9,7 +9,6 @@
 mod app;
 mod browser;
 mod convert;
-mod curve_editor;
 mod edit;
 mod histogram;
 mod session;

@@ -1,59 +1,53 @@
-//! The zone bar: the paper's split bar for a zone curve (`zone.rs`). Two
-//! rows on one logarithmic axis, one stop per zone, Zone V in the middle:
-//! the print on top (fixed output zones), the scene below (the negative's
-//! zones). A line connects each scene zone to the print tone it gets; drag
-//! the handle at the top of a line to move that zone's output. Fog and
-//! paper white are the handles at the two ends. The curve stays monotone
-//! because every move goes through `zone::set_output`.
+//! The zone bar: the paper from fog to paper white, split into the zones
+//! 0 … VII. The axis is the encoded print value (gamma 2.2, close to
+//! perceptual lightness), so the width of a patch is the share of the
+//! paper's tonal range that zone gets, and the patch is painted with the
+//! print tones it covers. The boundary between two zones is the handle:
+//! drag it and the zone on one side widens while the other narrows; no
+//! other zone changes. Every move goes through `zone::set_output`, so the
+//! curve stays monotone and the boundaries cannot overtake each other. Fog
+//! and paper white are the ends; they are set with the fields next to the
+//! bar, and the paper outside them is shown as unreachable. Double-click a
+//! boundary to put it back where it came from.
 
-use egui::{pos2, vec2, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui};
+use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui};
 use mimizan_core::calib::LookFile;
 use mimizan_core::zone;
 
-const ROW_H: f32 = 26.0;
-const GAP_H: f32 = 44.0;
-/// Stops shown each side of Zone V: the bar covers zones 0 … X exactly.
-const HALF_SPAN: f64 = 5.5;
-
-/// Encoded tone of a linear value, as the preview grey.
-fn tone(l: f64) -> Color32 {
-    Color32::from_gray((zone::encode(l.clamp(0.0, 1.0)) * 255.0).round() as u8)
+/// Height of the bar, points.
+pub const BAR_H: f32 = 44.0;
+/// Identity ticks and the numeral row under the bar.
+const BELOW_H: f32 = 12.0;
+/// Encoded value shown as the print grey.
+fn grey(v: f64) -> Color32 {
+    Color32::from_gray((v.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-/// Where a linear value sits on the axis, in stops from Zone V, clamped to
-/// the bar.
-fn axis_stops(l: f64) -> f64 {
-    zone::stops(l).clamp(-HALF_SPAN, HALF_SPAN)
-}
-
-/// Draws the bar and edits `look` in place. Returns the scene zone (0 … X)
+/// Draws the bar and edits `look` in place. Returns the zone (0 … VII)
 /// under the pointer, for tinting the preview.
 pub fn zone_bar(ui: &mut Ui, look: &mut LookFile, width: f32) -> Option<u8> {
-    let height = 2.0 * ROW_H + GAP_H;
-    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H + BELOW_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals().clone();
     let n = look.points.len();
-    let inner = zone::inner_zones();
-    debug_assert_eq!(n, inner.len() + 2);
+    let zones = zone::bar_zones();
+    debug_assert_eq!(n, zones + 1);
+    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), BAR_H));
 
-    let x_of = |e: f64| -> f32 { rect.left() + ((e + HALF_SPAN) / (2.0 * HALF_SPAN)) as f32 * rect.width() };
-    let e_of = |x: f32| -> f64 { ((x - rect.left()) / rect.width()) as f64 * 2.0 * HALF_SPAN - HALF_SPAN };
-    let print_row = Rect::from_min_size(rect.min, vec2(rect.width(), ROW_H));
-    let scene_row = Rect::from_min_size(pos2(rect.left(), rect.bottom() - ROW_H), vec2(rect.width(), ROW_H));
-    // Handle y: just under the print row.
-    let handle_y = print_row.bottom() + 7.0;
+    // Encoded print value <-> x.
+    let x_of = |v: f64| -> f32 { bar.left() + v.clamp(0.0, 1.0) as f32 * bar.width() };
+    let v_of = |x: f32| -> f64 { (((x - bar.left()) / bar.width()) as f64).clamp(0.0, 1.0) };
+    let node_x = |look: &LookFile, i: usize| -> f32 { x_of(look.points[i][1]) };
 
-    // Where node i (0 = fog, n-1 = paper white, else a zone) lands on the
-    // print axis, in stops.
-    let node_stops = |look: &LookFile, i: usize| -> f64 { axis_stops(zone::decode(look.points[i][1])) };
-
-    // Hit test: nearest handle within reach.
+    // Hit test: the nearest inner boundary within reach.
     let nearest = |pos: Pos2, look: &LookFile| -> Option<usize> {
+        if !bar.expand2(vec2(0.0, 6.0)).contains(pos) {
+            return None;
+        }
         let mut best: Option<(usize, f32)> = None;
-        for i in 0..n {
-            let d = pos2(x_of(node_stops(look, i)), handle_y).distance(pos);
-            if d < 11.0 && best.is_none_or(|(_, bd)| d < bd) {
+        for i in 1..n - 1 {
+            let d = (node_x(look, i) - pos.x).abs();
+            if d < 8.0 && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -76,18 +70,8 @@ pub fn zone_bar(ui: &mut Ui, look: &mut LookFile, width: f32) -> Option<u8> {
     }
     if response.dragged() {
         if let (Some(i), Some(pos)) = (dragging, response.interact_pointer_pos()) {
-            if i < n {
-                let e = e_of(pos.x).clamp(-HALF_SPAN, HALF_SPAN);
-                // The ends of the axis are 0 and 1 exactly, not 2^±5.5.
-                let v = if e <= -HALF_SPAN {
-                    0.0
-                } else if e >= HALF_SPAN {
-                    1.0
-                } else {
-                    zone::encode(zone::GRAY_CARD * 2f64.powf(e))
-                };
-                zone::set_output(look, i, v);
-            }
+            // Past a neighbour the clamp keeps the gap.
+            zone::set_output(look, i, v_of(pos.x));
         }
     }
     if response.drag_stopped() {
@@ -95,53 +79,83 @@ pub fn zone_bar(ui: &mut Ui, look: &mut LookFile, width: f32) -> Option<u8> {
         dragging = None;
     }
     if response.double_clicked() {
-        // Back to the identity for that node.
         if let Some(i) = response.interact_pointer_pos().and_then(|p| nearest(p, look)) {
             zone::set_output(look, i, look.points[i][0]);
         }
     }
 
-    // Rows: eleven patches each, the print row's tones fixed, the scene
-    // row's tones the zone centres (what the negative holds there).
+    let hover_handle = response.hover_pos().and_then(|p| nearest(p, look));
+    if hover_handle.is_some() || dragging.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+    }
+    // The zone under the pointer: the patch, or the zone left of a handle.
+    let hover_zone: Option<u8> = match (dragging.or(hover_handle), response.hover_pos()) {
+        (Some(i), _) => Some((i - 1) as u8),
+        (None, Some(p)) if bar.contains(p) => {
+            let mut k = zones - 1;
+            for i in 1..n - 1 {
+                if p.x < node_x(look, i) {
+                    k = i - 1;
+                    break;
+                }
+            }
+            Some(k as u8)
+        }
+        _ => None,
+    };
+
+    // Paper outside fog and paper white: unreachable, hatched.
+    let hatch = Stroke::new(1.0, Color32::from_gray(70));
+    for r in [
+        Rect::from_min_max(bar.left_top(), pos2(node_x(look, 0), bar.bottom())),
+        Rect::from_min_max(pos2(node_x(look, n - 1), bar.top()), bar.right_bottom()),
+    ] {
+        if r.width() > 0.5 {
+            painter.rect_filled(r, 0.0, Color32::from_gray(28));
+            let mut x = r.left() - BAR_H;
+            while x < r.right() {
+                let a = pos2(x.max(r.left()), bar.bottom() - (x.max(r.left()) - x));
+                let b =
+                    pos2((x + BAR_H).min(r.right()), bar.top() + (x + BAR_H - (x + BAR_H).min(r.right())));
+                painter.line_segment([a, b], hatch);
+                x += 8.0;
+            }
+        }
+    }
+    // Patches: zone k runs from node k to node k+1, painted as the print
+    // tones between those two outputs.
     let text_on = |c: Color32| if c.r() > 128 { Color32::from_gray(20) } else { Color32::from_gray(235) };
-    for k in 0..zone::ZONES {
-        let e0 = k as f64 - 5.5;
-        let (x0, x1) = (x_of(e0), x_of(e0 + 1.0));
-        let c = tone(zone::linear(k));
-        for row in [print_row, scene_row] {
-            let r = Rect::from_min_max(pos2(x0, row.top()), pos2(x1, row.bottom()));
-            painter.rect_filled(r, 0.0, c);
+    for k in 0..zones {
+        let (x0, x1) = (node_x(look, k), node_x(look, k + 1));
+        let (v0, v1) = (look.points[k][1], look.points[k + 1][1]);
+        let r = Rect::from_min_max(pos2(x0, bar.top()), pos2(x1, bar.bottom()));
+        let mut mesh = Mesh::default();
+        let (c0, c1) = (grey(v0), grey(v1));
+        mesh.colored_vertex(r.left_top(), c0);
+        mesh.colored_vertex(r.right_top(), c1);
+        mesh.colored_vertex(r.right_bottom(), c1);
+        mesh.colored_vertex(r.left_bottom(), c0);
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(Shape::mesh(mesh));
+        if r.width() > 14.0 {
+            let mid = grey(0.5 * (v0 + v1));
             painter.text(
                 r.center(),
                 Align2::CENTER_CENTER,
                 zone::numeral(k),
-                FontId::proportional(11.0),
-                text_on(c),
+                FontId::proportional(12.0),
+                text_on(mid),
             );
         }
     }
     let frame = Stroke::new(1.0, visuals.weak_text_color().linear_multiply(0.6));
-    painter.rect_stroke(print_row, 0.0, frame, egui::StrokeKind::Inside);
-    painter.rect_stroke(scene_row, 0.0, frame, egui::StrokeKind::Inside);
+    painter.rect_stroke(bar, 0.0, frame, egui::StrokeKind::Inside);
 
-    // Hover: a scene patch, or the zone a handle belongs to.
-    let hover_handle = response.hover_pos().and_then(|p| nearest(p, look));
-    let hover_zone: Option<u8> = match hover_handle {
-        Some(i) if i > 0 && i < n - 1 => Some(inner[i - 1] as u8),
-        Some(0) => Some(0),
-        Some(_) => Some((zone::ZONES - 1) as u8),
-        None => response.hover_pos().and_then(|p| {
-            if scene_row.contains(p) || print_row.contains(p) {
-                let k = ((e_of(p.x) + HALF_SPAN).floor() as i64).clamp(0, zone::ZONES as i64 - 1);
-                Some(k as u8)
-            } else {
-                None
-            }
-        }),
-    };
+    // Hovered zone: an outline.
     if let Some(k) = hover_zone {
-        let e0 = k as f64 - 5.5;
-        let r = Rect::from_min_max(pos2(x_of(e0), scene_row.top()), pos2(x_of(e0 + 1.0), scene_row.bottom()));
+        let k = k as usize;
+        let r = Rect::from_min_max(pos2(node_x(look, k), bar.top()), pos2(node_x(look, k + 1), bar.bottom()));
         painter.rect_stroke(
             r,
             0.0,
@@ -150,54 +164,74 @@ pub fn zone_bar(ui: &mut Ui, look: &mut LookFile, width: f32) -> Option<u8> {
         );
     }
 
-    // Connections and handles.
-    let line = Stroke::new(1.5, visuals.text_color().linear_multiply(0.8));
-    let moved = Stroke::new(1.5, Color32::from_rgb(255, 200, 80));
-    for i in 0..n {
-        let (scene_e, label) = if i == 0 {
-            (-HALF_SPAN, "fog")
-        } else if i == n - 1 {
-            (HALF_SPAN, "paper")
-        } else {
-            (inner[i - 1] as f64 - 5.0, "")
-        };
-        let out_e = node_stops(look, i);
+    // Boundaries: a line through the bar with a grip; moved ones in the
+    // film's orange. Under the bar a tick marks where each one started.
+    let tick_y = bar.bottom() + 1.0;
+    for i in 1..n - 1 {
+        let x = node_x(look, i);
         let identity = look.points[i][1] == look.points[i][0];
-        let from = pos2(x_of(scene_e), scene_row.top());
-        let to = pos2(x_of(out_e), handle_y);
-        painter.line_segment([from, to], if identity { line } else { moved });
         let active = dragging == Some(i) || hover_handle == Some(i);
-        let r = if active { 6.5 } else { 5.0 };
-        painter.circle(
-            to,
-            r,
-            if active {
-                Color32::from_rgb(255, 200, 80)
-            } else if identity {
-                visuals.text_color()
-            } else {
-                Color32::from_rgb(230, 170, 60)
-            },
-            Stroke::new(1.0, visuals.extreme_bg_color),
+        let colour = if active {
+            Color32::from_rgb(255, 200, 80)
+        } else if identity {
+            visuals.text_color()
+        } else {
+            Color32::from_rgb(230, 170, 60)
+        };
+        painter.line_segment(
+            [pos2(x, bar.top()), pos2(x, bar.bottom())],
+            Stroke::new(if active { 2.5 } else { 1.5 }, colour),
         );
-        if !label.is_empty() {
-            let align = if i == 0 { Align2::LEFT_TOP } else { Align2::RIGHT_TOP };
-            let p = pos2(to.x, handle_y + 9.0);
-            painter.text(p, align, label, FontId::proportional(10.0), visuals.weak_text_color());
+        // Grip: a short bar in the middle, dark edge so it reads on white.
+        let grip =
+            Rect::from_center_size(pos2(x, bar.center().y), vec2(if active { 7.0 } else { 5.0 }, 14.0));
+        painter.rect_filled(grip, 2.0, colour);
+        painter.rect_stroke(
+            grip,
+            2.0,
+            Stroke::new(1.0, Color32::from_black_alpha(160)),
+            egui::StrokeKind::Outside,
+        );
+        // Identity tick.
+        let x0 = x_of(look.points[i][0]);
+        painter.line_segment(
+            [pos2(x0, tick_y), pos2(x0, tick_y + 5.0)],
+            Stroke::new(
+                1.0,
+                if identity { visuals.weak_text_color() } else { Color32::from_rgb(230, 170, 60) },
+            ),
+        );
+        if !identity {
+            painter.line_segment(
+                [pos2(x0, tick_y + 3.0), pos2(x, tick_y + 3.0)],
+                Stroke::new(1.0, Color32::from_rgb(230, 170, 60).linear_multiply(0.7)),
+            );
         }
     }
-    if let Some(i) = hover_handle {
+    painter.text(
+        pos2(node_x(look, 0), tick_y + 1.0),
+        Align2::LEFT_TOP,
+        "fog",
+        FontId::proportional(9.0),
+        visuals.weak_text_color(),
+    );
+    painter.text(
+        pos2(node_x(look, n - 1), tick_y + 1.0),
+        Align2::RIGHT_TOP,
+        "paper white",
+        FontId::proportional(9.0),
+        visuals.weak_text_color(),
+    );
+
+    if let Some(i) = hover_handle.or(dragging) {
         let v = look.points[i][1];
-        let what = if i == 0 {
-            "fog".to_string()
-        } else if i == n - 1 {
-            "paper white".to_string()
-        } else {
-            format!("Zone {}", zone::numeral(inner[i - 1]))
-        };
+        let e = zone::stops(zone::decode(v));
         response.clone().on_hover_text(format!(
-            "{what}: output {v:.3} (print zone {:.2})\ndrag: move · double-click: back to identity",
-            zone::zone_of(zone::decode(v))
+            "Boundary {} | {}: prints at {v:.3} ({e:+.2} stops from the grey card, {:+.3} from untouched)\n\
+             drag: widen one zone, narrow the other · double-click: back",
+            zone::numeral(i - 1),
+            zone::numeral(i),
+            v - look.points[i][0],
         ));
     }
 
