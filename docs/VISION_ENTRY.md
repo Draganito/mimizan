@@ -6,7 +6,7 @@ wording is Dragan's. Two pieces, ready to paste.
 ## 1. Table row for "Projects: local folder ↔ GitHub repo"
 
 ```
-| `mimizan` | [mimizan](https://github.com/Draganito/mimizan) | GPL-3.0-or-later | v0.10.0 (Debian `.deb` + Linux tarball, CI) |
+| `mimizan` | [mimizan](https://github.com/Draganito/mimizan) | GPL-3.0-or-later | v0.10.1 (Debian `.deb` + Linux tarball, CI) |
 ```
 
 ## 2. Paragraph under "Line 2: Splitgrade darkroom" (or a third line, see note)
