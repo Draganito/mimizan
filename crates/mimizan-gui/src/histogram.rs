@@ -3,8 +3,79 @@
 //! bins, so clipped pixels show as full-height edge bars without flattening
 //! the rest.
 
-use crate::session::Histogram;
+use crate::session::{Histogram, RawHistogram};
 use egui::{pos2, Color32, Sense, Stroke, Ui};
+use mimizan_core::cfa::Color;
+
+/// Colour a CFA channel is drawn in (the two greens differ in shade).
+fn channel_colour(c: Color, second_green: bool) -> Color32 {
+    match c {
+        Color::R => Color32::from_rgb(235, 80, 70),
+        Color::G if second_green => Color32::from_rgb(90, 200, 110),
+        Color::G => Color32::from_rgb(150, 230, 120),
+        Color::B => Color32::from_rgb(90, 140, 255),
+    }
+}
+
+/// Four CFA channels as outlines on one gamma-2.2 axis, each normalised to
+/// its own peak (excluding the end bins) so the shapes compare; the
+/// clipping fraction per channel is printed beside the legend.
+pub fn raw_histogram_widget(ui: &mut Ui, h: &RawHistogram, size: egui::Vec2, log_scale: bool) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+    let grid = Stroke::new(1.0, visuals.weak_text_color().linear_multiply(0.4));
+    for i in 1..4 {
+        let x = rect.left() + rect.width() * i as f32 / 4.0;
+        painter.line_segment([pos2(x, rect.top()), pos2(x, rect.bottom())], grid);
+    }
+    if h.total.iter().all(|&t| t == 0) {
+        return;
+    }
+    let mut seen_green = false;
+    for t in 0..4 {
+        let bins = &h.bins[t];
+        let peak = bins[1..255].iter().copied().max().unwrap_or(0).max(1) as f64;
+        let colour = channel_colour(h.colors[t], h.colors[t] == Color::G && seen_green);
+        seen_green |= h.colors[t] == Color::G;
+        let pts: Vec<egui::Pos2> = bins
+            .iter()
+            .enumerate()
+            .map(|(i, &n)| {
+                let f = if n == 0 {
+                    0.0
+                } else if log_scale {
+                    ((n as f64).ln_1p() / peak.ln_1p()).min(1.0)
+                } else {
+                    (n as f64 / peak).min(1.0)
+                };
+                pos2(
+                    rect.left() + (i as f32 + 0.5) / 256.0 * rect.width(),
+                    rect.bottom() - 1.0 - f as f32 * (rect.height() - 3.0),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(1.2, colour)));
+    }
+    // Legend with clipping per channel, top-left.
+    let font = egui::FontId::proportional(10.5);
+    let mut y = rect.top() + 3.0;
+    seen_green = false;
+    for t in 0..4 {
+        let colour = channel_colour(h.colors[t], h.colors[t] == Color::G && seen_green);
+        let name = match h.colors[t] {
+            Color::R => "R",
+            Color::G if seen_green => "G2",
+            Color::G => "G1",
+            Color::B => "B",
+        };
+        seen_green |= h.colors[t] == Color::G;
+        let txt = format!("{name} {:.2} %", 100.0 * h.clipped_frac(t));
+        painter.text(pos2(rect.left() + 4.0, y), egui::Align2::LEFT_TOP, txt, font.clone(), colour);
+        y += 12.0;
+    }
+}
 
 pub fn histogram_widget(ui: &mut Ui, h: &Histogram, size: egui::Vec2, log_scale: bool) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());

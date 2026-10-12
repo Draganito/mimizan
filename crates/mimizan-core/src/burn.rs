@@ -171,22 +171,36 @@ pub fn exponent_at(place: f64, burns: &[Burn], x: usize, y: usize, w: usize, h: 
 /// (or every `ev == 0`) returns without touching a value, so the untouched
 /// recipe is bit-identical to the run that never had this step.
 pub fn apply(plane: &mut Plane, place: f64, burns: &[Burn]) {
+    let (w, h) = (plane.width, plane.height);
+    apply_window(plane, place, burns, (w, h), (0, 0));
+}
+
+/// The same on a window of a `full` (w, h) picture whose top-left pixel is
+/// `origin` in that picture: the shapes are evaluated in the coordinates of
+/// the whole picture, so a 1:1 crop and the whole preview agree.
+pub fn apply_window(
+    plane: &mut Plane,
+    place: f64,
+    burns: &[Burn],
+    full: (usize, usize),
+    origin: (usize, usize),
+) {
     let active: Vec<Burn> = burns.iter().copied().filter(|b| b.ev() != 0.0).collect();
     if place == 0.0 && active.is_empty() {
         return;
     }
-    let (w, h) = (plane.width, plane.height);
+    let w = plane.width;
     let global = 2f64.powf(place);
     if active.is_empty() {
         plane.data.par_iter_mut().for_each(|v| *v *= global);
         return;
     }
-    let (wf, hf) = (w as f64, h as f64);
+    let (wf, hf) = (full.0 as f64, full.1 as f64);
     let long = wf.max(hf);
     plane.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        let ny = (y as f64 + 0.5) / hf;
+        let ny = ((origin.1 + y) as f64 + 0.5) / hf;
         for (x, v) in row.iter_mut().enumerate() {
-            let nx = (x as f64 + 0.5) / wf;
+            let nx = ((origin.0 + x) as f64 + 0.5) / wf;
             let e = active.iter().fold(place, |e, b| e + b.ev() * b.weight(nx, ny, wf, hf, long));
             *v *= 2f64.powf(e);
         }
@@ -315,6 +329,31 @@ mod tests {
         let mut p = src.clone();
         apply(&mut p, 0.25, &[a, b]);
         assert!((p.at(20, 20) - src.at(20, 20) * 2f64.powf(1.75)).abs() < 1e-14);
+    }
+
+    /// A window rendered with `apply_window` equals the same pixels of the
+    /// whole picture rendered with `apply`.
+    #[test]
+    fn window_matches_the_whole() {
+        let (w, h) = (90, 70);
+        let src = ramp(w, h);
+        let burns = [
+            Burn::Radial { x: 0.3, y: 0.6, radius: 0.25, feather: 0.4, ev: 0.6 },
+            Burn::Gradient { x0: 0.9, y0: 0.1, x1: 0.5, y1: 0.5, ev: -0.4 },
+        ];
+        let mut whole = src.clone();
+        apply(&mut whole, 0.2, &burns);
+        let (x0, y0, cw, ch) = (17, 23, 40, 30);
+        let mut win = Plane::zeros(cw, ch);
+        for y in 0..ch {
+            win.row_mut(y).copy_from_slice(&src.row(y0 + y)[x0..x0 + cw]);
+        }
+        apply_window(&mut win, 0.2, &burns, (w, h), (x0, y0));
+        for y in 0..ch {
+            for x in 0..cw {
+                assert_eq!(win.at(x, y), whole.at(x0 + x, y0 + y), "at {x},{y}");
+            }
+        }
     }
 
     #[test]

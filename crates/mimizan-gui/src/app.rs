@@ -3,23 +3,57 @@
 //! them to the workers.
 
 use crate::browser::{Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
-use crate::curve_editor::curve_editor;
-use crate::histogram::histogram_widget;
+use crate::curve_editor::{curve_editor, curve_plot};
+use crate::edit::{Edit, History};
+use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{Converter, DetailRect, DevelopParams, Histogram, Session, ViewParams};
 use crate::worker::{Event, Heavy, Job, Preview, PreviewRequest};
+use crate::zone_bar::zone_bar;
 use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
 use egui_file_dialog::FileDialog;
+use mimizan_core::burn::{Burn, EV_LIMIT};
 use mimizan_core::calib::{LookEncoding, LookFile};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
+use mimizan_core::print::PrintSize;
+use mimizan_core::recipe::{Recipe, Sharpen};
+use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
+use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// How the recipe's curve is presented; derived from the curve itself, so
+/// undo/redo and a loaded recipe land in the right editor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LookChoice {
+enum CurveMode {
     Preset(usize),
+    Zones,
     Custom,
+}
+
+/// A dodge & burn shape the next click in the viewport will place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placing {
+    Disc,
+    Gradient,
+}
+
+/// Which part of the selected shape a drag in the viewport moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShapeGrab {
+    Centre,
+    Radius,
+    Start,
+    End,
+}
+
+/// Print size choice of the export section; `Recipe::size` is derived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeMode {
+    Native,
+    Paper,
+    LongEdge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +70,8 @@ enum HistSource {
     View,
     /// The linear mix before the curve, on a gamma-2.2 axis.
     Negative,
+    /// The four sensor channels as shot (per 2x2 tile position).
+    Raw,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +81,8 @@ enum DialogPurpose {
     Export,
     SaveLook,
     LoadLook,
+    SaveRecipe,
+    LoadRecipe,
 }
 
 pub struct App {
@@ -68,21 +106,31 @@ pub struct App {
     busy: Option<String>,
     log: Vec<String>,
 
-    // Mix
-    w_r: f64,
-    w_b: f64,
-
-    // Look
+    /// The development being edited (weights, recipe, turns) and its
+    /// history. The export renders exactly `edit`.
+    edit: Edit,
+    history: History,
+    /// Presets the Look section offers (neutral first, then `look/*.json`).
     looks: Vec<LookFile>,
-    look_choice: LookChoice,
-    custom_points: Vec<[f64; 2]>,
-    custom_name: String,
+    /// Scene zone under the pointer in the zone bar; tints the preview.
+    hover_zone: Option<u8>,
 
-    // Export: long edge of the screen JPEG; the TIFF is always full size.
+    // Dodge & burn tool
+    dnb_selected: Option<usize>,
+    dnb_placing: Option<Placing>,
+    dnb_grab: Option<ShapeGrab>,
+    /// Gradient being drawn: its start, in normalised picture coordinates.
+    dnb_gradient_start: Option<[f64; 2]>,
+    /// Show the shape outlines over the preview.
+    dnb_overlay: bool,
+
+    // Export section
+    size_mode: SizeMode,
+    paper_cm: [f64; 2],
+    long_edge_px: usize,
+
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
-    /// Clockwise quarter turns added to the file's orientation (0..3).
-    rotation: u8,
 
     // Development
     wb_choice: WbChoice,
@@ -197,14 +245,19 @@ impl App {
             current_path: None,
             busy: None,
             log: Vec::new(),
-            w_r: 0.25,
-            w_b: 0.25,
+            edit: Edit::new(Weights::default()),
+            history: History::new(Edit::new(Weights::default())),
             looks: load_looks(&look_dir),
-            look_choice: LookChoice::Preset(0),
-            custom_points: vec![[0.0, 0.0], [0.25, 0.22], [0.75, 0.78], [1.0, 1.0]],
-            custom_name: "custom".into(),
+            hover_zone: None,
+            dnb_selected: None,
+            dnb_placing: None,
+            dnb_grab: None,
+            dnb_gradient_start: None,
+            dnb_overlay: true,
+            size_mode: SizeMode::Native,
+            paper_cm: [30.0, 40.0],
+            long_edge_px: 3000,
             zoom_to_1to1: false,
-            rotation: 0,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
             mask_mode: DevelopParams::default().mask,
@@ -319,14 +372,84 @@ impl App {
     }
 
     fn weights(&self) -> Weights {
-        let r = self.w_r.clamp(0.0, 1.0);
-        let b = self.w_b.clamp(0.0, 1.0 - r);
-        Weights { r, g: 1.0 - r - b, b }
+        self.edit.weights
     }
 
     fn set_weights(&mut self, w: Weights) {
-        self.w_r = w.r;
-        self.w_b = w.b;
+        let r = w.r.clamp(0.0, 1.0);
+        let b = w.b.clamp(0.0, 1.0 - r);
+        self.edit.weights = Weights { r, g: 1.0 - r - b, b };
+    }
+
+    fn rotation(&self) -> u8 {
+        self.edit.rotation
+    }
+
+    /// Which editor the current curve belongs to.
+    fn curve_mode(&self) -> CurveMode {
+        let c = &self.edit.recipe.curve;
+        if zone::is_zone_look(c) {
+            CurveMode::Zones
+        } else if let Some(i) = self.looks.iter().position(|l| l == c) {
+            CurveMode::Preset(i)
+        } else {
+            CurveMode::Custom
+        }
+    }
+
+    /// Replace the whole development (undo, redo, a loaded recipe) and drop
+    /// tool state that pointed into the old one.
+    fn set_edit(&mut self, e: Edit) {
+        if e.rotation != self.edit.rotation {
+            self.keep_scale = None;
+        }
+        self.edit = e;
+        self.dnb_selected = self.dnb_selected.filter(|&i| i < self.edit.recipe.dodge_burn.len());
+        self.size_mode = match self.edit.recipe.size {
+            None => SizeMode::Native,
+            Some(PrintSize::Physical { .. }) => SizeMode::Paper,
+            Some(PrintSize::LongEdgePx(_)) => SizeMode::LongEdge,
+        };
+        match self.edit.recipe.size {
+            Some(PrintSize::Physical { width_in, height_in }) => {
+                self.paper_cm = [width_in * 2.54, height_in * 2.54];
+            }
+            Some(PrintSize::LongEdgePx(px)) => self.long_edge_px = px,
+            None => {}
+        }
+    }
+
+    /// `Recipe::size` from the export section's choice.
+    fn sync_size(&mut self) {
+        self.edit.recipe.size = match self.size_mode {
+            SizeMode::Native => None,
+            SizeMode::Paper => Some(PrintSize::Physical {
+                width_in: self.paper_cm[0] / 2.54,
+                height_in: self.paper_cm[1] / 2.54,
+            }),
+            SizeMode::LongEdge => Some(PrintSize::LongEdgePx(self.long_edge_px.max(16))),
+        };
+    }
+
+    fn undo(&mut self) {
+        if let Some(e) = self.history.undo().cloned() {
+            self.set_edit(e);
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(e) = self.history.redo().cloned() {
+            self.set_edit(e);
+        }
+    }
+
+    /// Record the frame's state once the pointer and keyboard let go of the
+    /// widgets, so a slider drag is one history step, not sixty.
+    fn commit_history(&mut self, ctx: &egui::Context) {
+        if ctx.egui_is_using_pointer() || ctx.egui_wants_keyboard_input() || self.dnb_grab.is_some() {
+            return;
+        }
+        self.history.commit(&self.edit);
     }
 
     fn develop_params(&self) -> DevelopParams {
@@ -346,42 +469,50 @@ impl App {
     }
 
     fn current_look(&self) -> LookFile {
-        match self.look_choice {
-            LookChoice::Preset(i) => self.looks.get(i).cloned().unwrap_or_else(LookFile::neutral),
-            LookChoice::Custom => LookFile {
-                schema: 1,
-                name: self.custom_name.clone(),
-                points: self.custom_points.clone(),
-                encoding: LookEncoding::Gamma22,
-                fitted_against: None,
-            },
-        }
+        self.edit.recipe.curve.clone()
     }
 
     fn view_params(&self) -> ViewParams {
+        let r = &self.edit.recipe;
         ViewParams {
             weights: self.weights(),
-            look: self.current_look(),
+            look: r.curve.clone(),
+            place: r.place,
+            dodge_burn: r.dodge_burn.clone(),
             show_mask: self.show_mask,
-            rotation: self.rotation,
+            rotation: self.edit.rotation,
+            hover_zone: self.hover_zone,
         }
     }
 
     /// Orientation the export applies: the file's plus the user's turns.
     fn export_orientation(&self) -> u16 {
         let base = self.session.as_ref().map(|s| s.negative.orientation).unwrap_or(1);
-        mimizan_core::print::rotated(base, self.rotation)
+        mimizan_core::print::rotated(base, self.rotation())
     }
 
-    /// Size of the exported TIFF (upright, after the user's turns).
+    /// Size of the picture before the print's size step (upright, after the
+    /// user's turns).
     fn export_size(&self) -> (usize, usize) {
         let Some(s) = &self.session else { return (0, 0) };
         let (w, h) = s.upright_size();
-        if self.rotation % 2 == 1 {
+        if self.rotation() % 2 == 1 {
             (h, w)
         } else {
             (w, h)
         }
+    }
+
+    /// Output size of the print TIFF (after size step and border).
+    fn print_layout(&self) -> Option<mimizan_core::print::Layout> {
+        let (w, h) = self.export_size();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let params =
+            mimizan_core::print::PrintParams { recipe: self.edit.recipe.clone(), ..Default::default() };
+        // Already upright: orientation 1.
+        Some(mimizan_core::print::layout(w, h, 1, &params))
     }
 
     fn start_export(&mut self) {
@@ -410,20 +541,51 @@ impl App {
         });
     }
 
-    /// Controls back to the session's defaults; the negative stays.
-    fn reset(&mut self) {
-        if let Some(s) = self.session.clone() {
-            self.set_weights(s.default_weights());
-        } else {
-            self.set_weights(Weights::default());
+    /// Controls back to the session's defaults; the negative stays. A new
+    /// file starts a new history; on the same file the reset is one step.
+    fn reset(&mut self, fresh: bool) {
+        let weights = self.session.as_ref().map(|s| s.default_weights()).unwrap_or_default();
+        let e = Edit::new(weights);
+        if fresh {
+            self.history = History::new(e.clone());
         }
-        self.look_choice = LookChoice::Preset(0);
-        self.rotation = 0;
+        self.set_edit(e);
         self.tex_rotation = 0;
         self.keep_scale = None;
         self.show_mask = false;
+        self.hover_zone = None;
+        self.dnb_selected = None;
+        self.dnb_placing = None;
+        self.dnb_grab = None;
+        self.dnb_gradient_start = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
+    }
+
+    /// Recipe file next to the RAW: `<name>.recipe.json`.
+    fn recipe_sidecar(&self) -> Option<PathBuf> {
+        let s = self.session.as_ref()?;
+        let stem = s.path.file_stem()?.to_string_lossy().to_string();
+        Some(s.path.with_file_name(format!("{stem}.recipe.json")))
+    }
+
+    fn load_recipe(&mut self, path: &Path) {
+        match Recipe::load(path) {
+            Ok(r) => {
+                let mut e = self.edit.clone();
+                e.recipe = r;
+                self.set_edit(e);
+                self.log(format!("loaded recipe {}", path.display()));
+            }
+            Err(e) => self.log(format!("recipe not loaded: {e}")),
+        }
+    }
+
+    fn save_recipe(&mut self, path: &Path) {
+        match self.edit.recipe.validate().and_then(|_| self.edit.recipe.save(path)) {
+            Ok(()) => self.log(format!("saved recipe {}", path.display())),
+            Err(e) => self.log(format!("recipe not saved: {e}")),
+        }
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
@@ -446,12 +608,25 @@ impl App {
                     ));
                     self.session = Some(s);
                     if fresh {
-                        self.reset();
-                        if self.screenshot_to.is_some()
-                            && std::env::var_os("MIMIZAN_SCREENSHOT_CUSTOM").is_some()
-                        {
-                            // Show the curve editor in the unattended capture.
-                            self.look_choice = LookChoice::Custom;
+                        self.reset(true);
+                        // A recipe saved next to the file comes back with it.
+                        if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
+                            self.load_recipe(&p);
+                            self.history = History::new(self.edit.clone());
+                        }
+                        if self.screenshot_to.is_some() {
+                            if std::env::var_os("MIMIZAN_SCREENSHOT_CUSTOM").is_some() {
+                                // Show the curve editor in the unattended capture.
+                                self.edit.recipe.curve = LookFile {
+                                    schema: 1,
+                                    name: "custom".into(),
+                                    points: vec![[0.0, 0.0], [0.25, 0.22], [0.75, 0.78], [1.0, 1.0]],
+                                    encoding: LookEncoding::Gamma22,
+                                    fitted_against: None,
+                                };
+                            } else if std::env::var_os("MIMIZAN_SCREENSHOT_ZONES").is_some() {
+                                self.edit.recipe.curve = zone::grade(1);
+                            }
                         }
                     }
                     self.busy = None;
@@ -512,7 +687,30 @@ impl App {
                     }
                 }
                 self.tex_rotation = im.rotation;
-                let img = ColorImage::from_gray([im.width, im.height], &im.gray);
+                let img = match &im.zone_mask {
+                    // Hovered zone: its pixels in the bar's orange over the grey.
+                    Some(mask) => {
+                        let pixels: Vec<Color32> = im
+                            .gray
+                            .iter()
+                            .zip(mask.iter())
+                            .map(|(&g, &m)| {
+                                if m != 0 {
+                                    let g = g as u16;
+                                    Color32::from_rgb(
+                                        ((g + 2 * 255) / 3) as u8,
+                                        ((g + 2 * 140) / 3) as u8,
+                                        ((g + 2 * 30) / 3) as u8,
+                                    )
+                                } else {
+                                    Color32::from_gray(g)
+                                }
+                            })
+                            .collect();
+                        ColorImage::new([im.width, im.height], pixels)
+                    }
+                    None => ColorImage::from_gray([im.width, im.height], &im.gray),
+                };
                 let opts = TextureOptions::LINEAR;
                 match &mut self.texture {
                     Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
@@ -649,7 +847,9 @@ impl App {
             self.dialog.config_mut().default_file_name = n;
         }
         match purpose {
-            DialogPurpose::Open | DialogPurpose::LoadLook => self.dialog.pick_file(),
+            DialogPurpose::Open | DialogPurpose::LoadLook | DialogPurpose::LoadRecipe => {
+                self.dialog.pick_file()
+            }
             DialogPurpose::Folder => self.dialog.pick_directory(),
             _ => self.dialog.save_file(),
         }
@@ -672,7 +872,7 @@ impl App {
                     self.heavy.send(Job::Export {
                         session: Arc::clone(s),
                         weights: self.weights(),
-                        look: self.current_look(),
+                        recipe: self.edit.recipe.clone(),
                         path,
                         screen_px: SCREEN_LONG_EDGE,
                         orientation: self.export_orientation(),
@@ -688,20 +888,20 @@ impl App {
                 match look.validate().and_then(|_| look.save(&path)) {
                     Ok(()) => {
                         self.log(format!("saved look {}", path.display()));
-                        self.custom_name = look.name;
+                        self.edit.recipe.curve.name = look.name;
                     }
                     Err(e) => self.log(format!("look not saved: {e}")),
                 }
             }
             DialogPurpose::LoadLook => match LookFile::load(&path) {
                 Ok(l) => {
-                    self.custom_points = l.points.clone();
-                    self.custom_name = l.name.clone();
-                    self.look_choice = LookChoice::Custom;
                     self.log(format!("loaded look {} ({} points)", l.name, l.points.len()));
+                    self.edit.recipe.curve = l;
                 }
                 Err(e) => self.log(format!("look not loaded: {e}")),
             },
+            DialogPurpose::SaveRecipe => self.save_recipe(&with_ext(path, "json")),
+            DialogPurpose::LoadRecipe => self.load_recipe(&path),
         }
     }
 
@@ -740,11 +940,61 @@ impl App {
                 .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
                 .clicked()
             {
-                self.rotation = (self.rotation + 1) % 4;
+                self.edit.rotation = (self.edit.rotation + 1) % 4;
+            }
+            ui.separator();
+            let (pos, len) = self.history.position();
+            if ui
+                .add_enabled(self.history.can_undo(), egui::Button::new("↶"))
+                .on_hover_text(format!("Undo (Ctrl+Z) — step {pos} of {len}"))
+                .clicked()
+            {
+                self.undo();
+            }
+            if ui
+                .add_enabled(self.history.can_redo(), egui::Button::new("↷"))
+                .on_hover_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
+                .clicked()
+            {
+                self.redo();
             }
             if ui.button("Reset").on_hover_text("Controls back to defaults; the negative stays").clicked() {
-                self.reset();
+                self.reset(false);
             }
+            ui.separator();
+            ui.menu_button("Recipe", |ui| {
+                ui.set_min_width(200.0);
+                ui.label(RichText::new("The development as a parameter set (JSON).").weak());
+                let sidecar = self.recipe_sidecar();
+                if ui
+                    .add_enabled(has, egui::Button::new("Save next to the RAW"))
+                    .on_hover_text(
+                        sidecar
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "<name>.recipe.json".into()),
+                    )
+                    .clicked()
+                {
+                    if let Some(p) = sidecar {
+                        self.save_recipe(&p);
+                    }
+                    ui.close();
+                }
+                if ui.add_enabled(has, egui::Button::new("Save as…")).clicked() {
+                    let name = self
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
+                        .unwrap_or_else(|| "mimizan".into());
+                    self.start_dialog(DialogPurpose::SaveRecipe, Some(format!("{name}.recipe.json")));
+                    ui.close();
+                }
+                if ui.button("Load…").clicked() {
+                    self.start_dialog(DialogPurpose::LoadRecipe, None);
+                    ui.close();
+                }
+            });
             // Status text takes only what is left and is cut, never painted
             // over the buttons.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -798,10 +1048,10 @@ impl App {
             ui.label(info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "mono".into()));
             ui.end_row();
             ui.label("orientation");
-            ui.label(if self.rotation == 0 {
+            ui.label(if self.rotation() == 0 {
                 format!("{}", n.orientation)
             } else {
-                format!("{} + {}° cw", n.orientation, 90 * self.rotation as u16)
+                format!("{} + {}° cw", n.orientation, 90 * self.rotation() as u16)
             });
             ui.end_row();
             ui.label("balance");
@@ -947,22 +1197,37 @@ impl App {
 
     fn histogram_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Histogram");
-        ui.horizontal(|ui| {
-            ui.radio_value(&mut self.hist_source, HistSource::View, "with curve (TIFF)").on_hover_text(
-                "The full-resolution negative after the look curve, as the TIFF gets it. \
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut self.hist_source, HistSource::View, "print").on_hover_text(
+                "The full-resolution negative after placing, dodge & burn and the curve, as the TIFF gets it. \
                  black/white: pixels at 0 and 65535 in 16 bit",
             );
             ui.radio_value(&mut self.hist_source, HistSource::Negative, "negative").on_hover_text(
-                "The full-resolution linear mix before the curve, drawn on a gamma-2.2 axis. \
+                "The full-resolution linear mix before any placing or curve, drawn on a gamma-2.2 axis. \
                  black/white: pixels at 0 and 65535 in 16 bit",
+            );
+            ui.radio_value(&mut self.hist_source, HistSource::Raw, "raw").on_hover_text(
+                "The four sensor channels as shot (R, G1, G2, B by tile position), each normalised by its \
+                 black and white level, on a gamma-2.2 axis. The percentages are pixels at the white level.",
             );
             ui.checkbox(&mut self.hist_log, "log");
         });
-        let h = match self.hist_source {
-            HistSource::View => &self.hist_view,
-            HistSource::Negative => &self.hist_negative,
-        };
         let width = ui.available_width().min(300.0);
+        if self.hist_source == HistSource::Raw {
+            match &self.session {
+                Some(s) => raw_histogram_widget(ui, &s.raw_hist, egui::vec2(width, 96.0), self.hist_log),
+                None => {
+                    ui.label(RichText::new("no file").weak());
+                }
+            }
+            ui.add_space(10.0);
+            ui.separator();
+            return;
+        }
+        let h = match self.hist_source {
+            HistSource::Negative => &self.hist_negative,
+            _ => &self.hist_view,
+        };
         histogram_widget(ui, h, egui::vec2(width, 96.0), self.hist_log);
         if h.total > 0 {
             let lo = 100.0 * h.clipped_low();
@@ -1065,20 +1330,21 @@ impl App {
     }
 
     fn controls_column(&mut self, ui: &mut egui::Ui) {
+        // The zone bar sets this again while the pointer is over it.
+        self.hover_zone = None;
         self.histogram_section(ui);
         ui.heading("Mix");
         let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
         self.mix_presets(ui);
         ui.add_space(2.0);
-        let mut r = self.w_r;
-        let mut b = self.w_b;
+        let cur = self.weights();
+        let mut r = cur.r;
+        let mut b = cur.b;
         if ui.add(egui::Slider::new(&mut r, 0.0..=1.0).text("R").fixed_decimals(3)).changed() {
-            self.w_r = r;
-            self.w_b = self.w_b.min(1.0 - r);
+            self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
         }
         if ui.add(egui::Slider::new(&mut b, 0.0..=1.0).text("B").fixed_decimals(3)).changed() {
-            self.w_b = b;
-            self.w_r = self.w_r.min(1.0 - b);
+            self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
         }
         let w = self.weights();
         ui.label(format!("G = {:.3}   (R + G + B = 1, balanced channels)", w.g));
@@ -1090,62 +1356,21 @@ impl App {
 
         ui.add_space(10.0);
         ui.separator();
-        ui.heading("Look");
-        for i in 0..self.looks.len() {
-            let name = capitalise(&self.looks[i].name.replace('_', "-"));
-            let label = if self.looks[i].encoding == LookEncoding::Gamma22 {
-                name
-            } else {
-                format!("{name} (linear)")
-            };
-            let hover = match self.looks[i].name.as_str() {
-                "neutral" => "Plain gamma 2.2 encoding, no tone curve".to_string(),
-                "reference" => {
-                    "The tone rendering of the monochrome reference camera, fitted from its own JPEG"
-                        .to_string()
-                }
-                _ => self.looks[i]
-                    .fitted_against
-                    .clone()
-                    .map(|f| format!("fitted against {f}"))
-                    .unwrap_or_default(),
-            };
-            ui.radio_value(&mut self.look_choice, LookChoice::Preset(i), label).on_hover_text(hover);
-        }
-        ui.radio_value(
-            &mut self.look_choice,
-            LookChoice::Custom,
-            format!("Custom curve ({})", self.custom_name),
-        );
-        if self.look_choice == LookChoice::Custom {
-            ui.add_space(4.0);
-            curve_editor(ui, &mut self.custom_points, 236.0);
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("straight").clicked() {
-                    self.custom_points = vec![[0.0, 0.0], [1.0, 1.0]];
-                }
-                if ui.button("S-curve").clicked() {
-                    self.custom_points = vec![[0.0, 0.0], [0.25, 0.20], [0.5, 0.5], [0.75, 0.80], [1.0, 1.0]];
-                }
-                if ui.button("Load…").clicked() {
-                    self.start_dialog(DialogPurpose::LoadLook, None);
-                }
-                if ui.button("Save…").clicked() {
-                    let dir = self.look_dir.clone();
-                    self.dialog.config_mut().initial_directory = dir;
-                    self.start_dialog(DialogPurpose::SaveLook, Some(format!("{}.json", self.custom_name)));
-                }
-            });
-            ui.label(
-                RichText::new("Points apply after gamma 2.2 encoding (x = encoded input, y = output).")
-                    .weak(),
-            );
-        }
+        self.zones_section(ui);
+
+        ui.add_space(10.0);
+        ui.separator();
+        self.dodge_burn_section(ui);
+
+        ui.add_space(10.0);
+        ui.separator();
+        self.print_section(ui);
 
         ui.add_space(10.0);
         ui.separator();
         ui.heading("View");
         ui.checkbox(&mut self.show_mask, "show mask (white = chroma treated as texture)");
+        ui.checkbox(&mut self.dnb_overlay, "show dodge & burn shapes");
         ui.horizontal(|ui| {
             if ui.button("fit").clicked() {
                 self.zoom = 1.0;
@@ -1157,8 +1382,418 @@ impl App {
             ui.label(RichText::new("scroll to zoom, drag to pan, double-click toggles").weak());
         });
         ui.label(
-            RichText::new("The preview is never sharpened: it shows the negative as the TIFF gets it.")
+            RichText::new(
+                "The preview is the picture before size, border and sharpening: mix, placing, \
+                 dodge & burn and curve, exactly as the TIFF gets them.",
+            )
+            .weak(),
+        );
+    }
+
+    /// Placing and the one curve: a preset look, the zone bar, or free points.
+    fn zones_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Zones");
+        let mut place = self.edit.recipe.place;
+        if ui
+            .add(egui::Slider::new(&mut place, -3.0..=3.0).text("place (stops)").fixed_decimals(2))
+            .on_hover_text(
+                "Exposure placing before the curve: +1 moves every zone one zone up (brighter). \
+                 The curve then decides where each zone prints.",
+            )
+            .changed()
+        {
+            self.edit.recipe.place = place;
+        }
+        ui.add_space(4.0);
+        let mode = self.curve_mode();
+        let mut pick: Option<CurveMode> = None;
+        ui.horizontal_wrapped(|ui| {
+            for i in 0..self.looks.len() {
+                let name = capitalise(&self.looks[i].name.replace('_', "-"));
+                let label = if self.looks[i].encoding == LookEncoding::Gamma22 {
+                    name
+                } else {
+                    format!("{name} (linear)")
+                };
+                let hover = match self.looks[i].name.as_str() {
+                    "neutral" => "Plain gamma 2.2 encoding, no tone curve".to_string(),
+                    "reference" => {
+                        "The tone rendering of the monochrome reference camera, fitted from its own JPEG"
+                            .to_string()
+                    }
+                    _ => self.looks[i]
+                        .fitted_against
+                        .clone()
+                        .map(|f| format!("fitted against {f}"))
+                        .unwrap_or_default(),
+                };
+                if ui.selectable_label(mode == CurveMode::Preset(i), label).on_hover_text(hover).clicked() {
+                    pick = Some(CurveMode::Preset(i));
+                }
+            }
+            if ui
+                .selectable_label(mode == CurveMode::Zones, "Zones")
+                .on_hover_text(
+                    "The zone system as the print curve: one node per zone on the encoded zone centres. \
+                     Switching from another curve samples it on those nodes.",
+                )
+                .clicked()
+            {
+                pick = Some(CurveMode::Zones);
+            }
+            if ui
+                .selectable_label(mode == CurveMode::Custom, "Custom")
+                .on_hover_text("Free control points (PCHIP), the same interpolation as the print path")
+                .clicked()
+            {
+                pick = Some(CurveMode::Custom);
+            }
+        });
+        match pick {
+            Some(CurveMode::Preset(i)) => self.edit.recipe.curve = self.looks[i].clone(),
+            Some(CurveMode::Zones) if mode != CurveMode::Zones => {
+                let c = &self.edit.recipe.curve;
+                self.edit.recipe.curve = if mimizan_core::curve::Curve::from_look(c).is_identity() {
+                    zone::default_look()
+                } else {
+                    zone::look_on_zone_nodes(c)
+                };
+            }
+            Some(CurveMode::Custom) if mode != CurveMode::Custom => {
+                let mut c = self.edit.recipe.curve.clone();
+                c.name = "custom".into();
+                if c.encoding != LookEncoding::Gamma22 {
+                    // The editor works in the encoded domain.
+                    c = zone::look_on_zone_nodes(&c);
+                    c.name = "custom".into();
+                }
+                self.edit.recipe.curve = c;
+            }
+            _ => {}
+        }
+        ui.add_space(4.0);
+        let width = ui.available_width().min(300.0);
+        match self.curve_mode() {
+            CurveMode::Zones => {
+                self.hover_zone = zone_bar(ui, &mut self.edit.recipe.curve, width);
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("grade").weak());
+                    for n in -2..=2 {
+                        let label = match n {
+                            0 => "N".to_string(),
+                            n if n > 0 => format!("N+{n}"),
+                            n => format!("N{n}"),
+                        };
+                        let g = zone::grade(n);
+                        let same = self.edit.recipe.curve.points == g.points;
+                        if ui
+                            .selectable_label(same, label)
+                            .on_hover_text(format!(
+                                "Node preset: mid zones spread by {:.3} around Zone V. Only the nodes count afterwards.",
+                                zone::GRADE_FACTOR.powi(n)
+                            ))
+                            .clicked()
+                        {
+                            self.edit.recipe.curve = g;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let c = &mut self.edit.recipe.curve;
+                    let n = c.points.len();
+                    let mut fog = c.points[0][1];
+                    let mut white = c.points[n - 1][1];
+                    ui.label(RichText::new("fog").weak());
+                    if ui
+                        .add(egui::DragValue::new(&mut fog).range(0.0..=0.5).speed(0.002).fixed_decimals(3))
+                        .changed()
+                    {
+                        zone::set_output(c, 0, fog);
+                    }
+                    ui.label(RichText::new("paper white").weak());
+                    if ui
+                        .add(egui::DragValue::new(&mut white).range(0.5..=1.0).speed(0.002).fixed_decimals(3))
+                        .changed()
+                    {
+                        zone::set_output(c, n - 1, white);
+                    }
+                });
+                curve_plot(ui, &self.edit.recipe.curve.points, egui::vec2(width, 90.0));
+                ui.label(
+                    RichText::new(
+                        "Scene below, print above; drag a handle to move where that zone prints. \
+                         Hover a zone to see its pixels. Untouched, the bar equals the neutral look exactly.",
+                    )
+                    .weak(),
+                );
+            }
+            CurveMode::Custom => {
+                curve_editor(ui, &mut self.edit.recipe.curve.points, width.min(236.0));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("straight").clicked() {
+                        self.edit.recipe.curve.points = vec![[0.0, 0.0], [1.0, 1.0]];
+                    }
+                    if ui.button("S-curve").clicked() {
+                        self.edit.recipe.curve.points =
+                            vec![[0.0, 0.0], [0.25, 0.20], [0.5, 0.5], [0.75, 0.80], [1.0, 1.0]];
+                    }
+                    if ui.button("Load…").clicked() {
+                        self.start_dialog(DialogPurpose::LoadLook, None);
+                    }
+                    if ui.button("Save…").clicked() {
+                        let dir = self.look_dir.clone();
+                        self.dialog.config_mut().initial_directory = dir;
+                        let name = self.edit.recipe.curve.name.clone();
+                        self.start_dialog(DialogPurpose::SaveLook, Some(format!("{name}.json")));
+                    }
+                });
+                ui.label(
+                    RichText::new("Points apply after gamma 2.2 encoding (x = encoded input, y = output).")
+                        .weak(),
+                );
+            }
+            CurveMode::Preset(_) => {
+                curve_plot(ui, &self.edit.recipe.curve.points, egui::vec2(width, 90.0));
+            }
+        }
+    }
+
+    /// Dodge & burn: local placing shapes, placed and moved in the viewport.
+    fn dodge_burn_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Dodge & burn");
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.dnb_placing == Some(Placing::Disc), "+ disc")
+                .on_hover_text("Then click in the picture to place a soft disc")
+                .clicked()
+            {
+                self.dnb_placing = (self.dnb_placing != Some(Placing::Disc)).then_some(Placing::Disc);
+                self.dnb_gradient_start = None;
+            }
+            if ui
+                .selectable_label(self.dnb_placing == Some(Placing::Gradient), "+ gradient")
+                .on_hover_text("Then drag in the picture from full effect to no effect")
+                .clicked()
+            {
+                self.dnb_placing = (self.dnb_placing != Some(Placing::Gradient)).then_some(Placing::Gradient);
+                self.dnb_gradient_start = None;
+            }
+            if self.dnb_placing.is_some() {
+                ui.label(RichText::new("click in the picture (Esc cancels)").weak());
+            }
+        });
+        let shapes = &mut self.edit.recipe.dodge_burn;
+        if shapes.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Local placing before the curve: positive stops dodge (brighter), negative burn (darker). \
+                     Coordinates are fractions of the picture, so the shapes follow a resize.",
+                )
                 .weak(),
+            );
+            return;
+        }
+        let mut remove: Option<usize> = None;
+        for (i, shape) in shapes.iter_mut().enumerate() {
+            let selected = self.dnb_selected == Some(i);
+            let (kind, ev_now) = match *shape {
+                Burn::Radial { ev, .. } => ("disc", ev),
+                Burn::Gradient { ev, .. } => ("gradient", ev),
+            };
+            ui.horizontal(|ui| {
+                if ui.selectable_label(selected, format!("{} {kind}", i + 1)).clicked() {
+                    self.dnb_selected = if selected { None } else { Some(i) };
+                }
+                let mut ev = ev_now;
+                if ui
+                    .add(egui::Slider::new(&mut ev, -EV_LIMIT..=EV_LIMIT).fixed_decimals(2).suffix(" EV"))
+                    .changed()
+                {
+                    shape.set_ev(ev);
+                }
+                if ui.small_button("×").on_hover_text("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if selected {
+                if let Burn::Radial { radius, feather, .. } = shape {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("radius").weak());
+                        ui.add(egui::DragValue::new(radius).range(0.01..=1.0).speed(0.002).fixed_decimals(3))
+                            .on_hover_text("Fraction of the long edge; or drag the ring in the picture");
+                        ui.label(RichText::new("feather").weak());
+                        ui.add(egui::DragValue::new(feather).range(0.0..=1.0).speed(0.005).fixed_decimals(2))
+                            .on_hover_text("0: hard edge, 1: the whole disc is the transition");
+                    });
+                }
+            }
+        }
+        if let Some(i) = remove {
+            shapes.remove(i);
+            self.dnb_selected = match self.dnb_selected {
+                Some(s) if s == i => None,
+                Some(s) if s > i => Some(s - 1),
+                s => s,
+            };
+        }
+    }
+
+    /// The print: size, resolution, border, resampling and sharpening. The
+    /// export renders exactly this recipe in one pass.
+    fn print_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Print");
+        let mut mode = self.size_mode;
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut mode, SizeMode::Native, "native").on_hover_text("The negative's pixels");
+            ui.selectable_value(&mut mode, SizeMode::Paper, "paper")
+                .on_hover_text("Fit into a paper size at the dpi");
+            ui.selectable_value(&mut mode, SizeMode::LongEdge, "long edge")
+                .on_hover_text("Longest edge in pixels");
+        });
+        self.size_mode = mode;
+        match mode {
+            SizeMode::Paper => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.paper_cm[0])
+                            .range(1.0..=300.0)
+                            .speed(0.1)
+                            .suffix(" cm"),
+                    );
+                    ui.label("×");
+                    ui.add(
+                        egui::DragValue::new(&mut self.paper_cm[1])
+                            .range(1.0..=300.0)
+                            .speed(0.1)
+                            .suffix(" cm"),
+                    );
+                    ui.label(RichText::new("at").weak());
+                    ui.add(
+                        egui::DragValue::new(&mut self.edit.recipe.dpi)
+                            .range(36.0..=1200.0)
+                            .speed(1.0)
+                            .suffix(" dpi"),
+                    );
+                    if ui.small_button("⇄").on_hover_text("Swap width and height").clicked() {
+                        self.paper_cm.swap(0, 1);
+                    }
+                });
+            }
+            SizeMode::LongEdge => {
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut self.long_edge_px)
+                            .range(16..=20000)
+                            .speed(4.0)
+                            .suffix(" px"),
+                    );
+                    ui.label(RichText::new("at").weak());
+                    ui.add(
+                        egui::DragValue::new(&mut self.edit.recipe.dpi)
+                            .range(36.0..=1200.0)
+                            .speed(1.0)
+                            .suffix(" dpi"),
+                    );
+                });
+            }
+            SizeMode::Native => {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("dpi for the border").weak());
+                    ui.add(egui::DragValue::new(&mut self.edit.recipe.dpi).range(36.0..=1200.0).speed(1.0));
+                });
+            }
+        }
+        self.sync_size();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("border").weak());
+            ui.add(
+                egui::DragValue::new(&mut self.edit.recipe.border_mm)
+                    .range(0.0..=100.0)
+                    .speed(0.2)
+                    .suffix(" mm"),
+            )
+            .on_hover_text("Paper white around the picture, taken from the paper size");
+            ui.label(RichText::new("resample").weak());
+            let r = &mut self.edit.recipe.resample;
+            egui::ComboBox::from_id_salt("resample").selected_text(r.name()).show_ui(ui, |ui| {
+                for k in ResampleKernel::ALL {
+                    ui.selectable_value(r, k, k.name()).on_hover_text(match k {
+                        ResampleKernel::Lanczos3 => "Sharpest; rings at hard edges (the benchmark default)",
+                        ResampleKernel::Mitchell => {
+                            "Mitchell–Netravali B=C=⅓: slight softness, little ringing"
+                        }
+                        ResampleKernel::CatmullRom => "Interpolating cubic; rings like a short Lanczos",
+                        ResampleKernel::BSpline => "No overshoot at all, visibly soft",
+                    });
+                }
+            });
+        });
+        let s = &mut self.edit.recipe.sharpen;
+        let mut kind = match s {
+            Sharpen::Off => 0,
+            Sharpen::Usm { .. } => 1,
+            Sharpen::Deconv { .. } => 2,
+            Sharpen::Screen { .. } => 3,
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("sharpen").weak());
+            ui.selectable_value(&mut kind, 0, "off");
+            ui.selectable_value(&mut kind, 1, "USM")
+                .on_hover_text("Unsharp mask for the viewing distance (radius from size and dpi)");
+            ui.selectable_value(&mut kind, 2, "deconvolution")
+                .on_hover_text("Richardson–Lucy against the measured sensor PSF, then optional USM");
+            ui.selectable_value(&mut kind, 3, "screen")
+                .on_hover_text("Invert the known resampling and display losses, gain capped");
+        });
+        let current = match s {
+            Sharpen::Off => 0,
+            Sharpen::Usm { .. } => 1,
+            Sharpen::Deconv { .. } => 2,
+            Sharpen::Screen { .. } => 3,
+        };
+        if kind != current {
+            let sc = mimizan_core::screen::ScreenSharpen::default();
+            *s = match kind {
+                1 => Sharpen::Usm { amount: 0.5 },
+                2 => Sharpen::Deconv { passes: 10, usm_amount: 0.0 },
+                3 => Sharpen::Screen { amount: sc.amount, max_gain: sc.max_gain },
+                _ => Sharpen::Off,
+            };
+        }
+        match s {
+            Sharpen::Usm { amount } => {
+                ui.add(egui::Slider::new(amount, 0.0..=2.0).text("amount").fixed_decimals(2));
+            }
+            Sharpen::Deconv { passes, usm_amount } => {
+                ui.add(egui::Slider::new(passes, 1..=60).text("passes"));
+                ui.add(egui::Slider::new(usm_amount, 0.0..=2.0).text("USM after").fixed_decimals(2));
+            }
+            Sharpen::Screen { amount, max_gain } => {
+                ui.add(egui::Slider::new(amount, 0.0..=1.5).text("amount").fixed_decimals(2));
+                ui.add(egui::Slider::new(max_gain, 1.0..=4.0).text("max gain").fixed_decimals(2));
+            }
+            Sharpen::Off => {}
+        }
+        if let Some(l) = self.print_layout() {
+            let (uw, uh) = self.export_size();
+            let txt = if l.border_px > 0 {
+                format!(
+                    "{uw} × {uh} → {} × {} px picture + {} px border = {} × {} px",
+                    l.image_w, l.image_h, l.border_px, l.out_w, l.out_h
+                )
+            } else if (l.image_w, l.image_h) != (uw, uh) {
+                format!("{uw} × {uh} → {} × {} px", l.image_w, l.image_h)
+            } else {
+                format!("{uw} × {uh} px, no size step")
+            };
+            ui.label(RichText::new(txt).weak());
+        }
+        ui.label(
+            RichText::new(
+                "Export… writes this recipe as a 16-bit TIFF in one pass, plus a screen JPEG of the same picture.",
+            )
+            .weak(),
         );
     }
 
@@ -1167,22 +1802,36 @@ impl App {
         if self.session.is_none() {
             return "Open a RAW file first.".into();
         }
-        let look = match self.look_choice {
-            LookChoice::Preset(_) => capitalise(&self.current_look().name.replace('_', "-")),
-            LookChoice::Custom => format!("custom curve \"{}\"", self.custom_name),
+        let look = match self.curve_mode() {
+            CurveMode::Preset(_) => capitalise(&self.current_look().name.replace('_', "-")),
+            CurveMode::Zones => "zone".to_string(),
+            CurveMode::Custom => format!("custom curve \"{}\"", self.current_look().name),
         };
         let (uw, uh) = self.export_size();
+        let (ow, oh) = self.print_layout().map(|l| (l.out_w, l.out_h)).unwrap_or((uw, uh));
         let (jw, jh) = mimizan_core::resize::fit_dims(uw, uh, SCREEN_LONG_EDGE, SCREEN_LONG_EDGE);
-        let rot = if self.rotation != 0 {
-            format!(", rotated {}°", 90 * self.rotation as u16)
+        let rot = if self.rotation() != 0 {
+            format!(", rotated {}°", 90 * self.rotation() as u16)
         } else {
             String::new()
         };
+        let r = &self.edit.recipe;
+        let local = if r.has_local_work() || !r.dodge_burn.is_empty() {
+            format!(", place {:+.2}, {} shape(s)", r.place, r.dodge_burn.len())
+        } else {
+            String::new()
+        };
+        let sharpen = match r.sharpen {
+            Sharpen::Off => "unsharpened".to_string(),
+            Sharpen::Usm { amount } => format!("USM {amount:.2}"),
+            Sharpen::Deconv { passes, .. } => format!("deconvolution {passes} passes"),
+            Sharpen::Screen { .. } => "screen compensation".to_string(),
+        };
         format!(
-            "Writes two files with the {look} look{rot}:\n\
-             <name>.tif  {uw} x {uh} px, 16 bit, gamma 2.2 grey ICC, unsharpened — for further work\n\
-             <name>_{SCREEN_LONG_EDGE}px.jpg  {jw} x {jh} px, quality 100 — screen compensation for a 1:1 view \
-             (the known resampling and display losses inverted, gain capped at 2x; nothing to adjust)"
+            "Writes two files with the {look} curve{rot}{local}:\n\
+             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, {sharpen} — the print, recipe in the description\n\
+             <name>_{SCREEN_LONG_EDGE}px.jpg  {jw} x {jh} px, quality 100 — the same picture with screen compensation \
+             for a 1:1 view (no border, no print sharpening)"
         )
     }
 
@@ -1191,7 +1840,7 @@ impl App {
         let response = ui.allocate_rect(avail, Sense::click_and_drag());
         let painter = ui.painter_at(avail);
         painter.rect_filled(avail, 0.0, Color32::from_gray(28));
-        let Some(tex) = &self.texture else {
+        let Some(tex) = self.texture.as_ref().map(|t| t.id()) else {
             if self.session.is_none() {
                 painter.text(
                     avail.center(),
@@ -1227,7 +1876,15 @@ impl App {
                 }
             }
         }
-        if response.dragged() {
+        // The dodge & burn tool sees the picture where it is now; a drag it
+        // takes does not pan.
+        let tool_rect = {
+            let size = Vec2::new(tw as f32, th as f32) * fit * self.zoom;
+            let max_pan = ((size - avail.size()) * 0.5).max(Vec2::ZERO);
+            Rect::from_center_size(avail.center() + self.pan.clamp(-max_pan, max_pan), size)
+        };
+        let took_drag = self.dodge_burn_tool(ui, &response, tool_rect);
+        if response.dragged() && !took_drag {
             self.pan += response.drag_delta();
         }
         let (uw, uh) = self.export_size();
@@ -1259,7 +1916,7 @@ impl App {
         self.pan = self.pan.clamp(-max_pan, max_pan);
         let center = avail.center() + self.pan;
         let rect = Rect::from_center_size(center, size);
-        painter.image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
         // Magnification in screen pixels per negative pixel.
         let mag = size.x * ppp / uw.max(1) as f32;
@@ -1291,6 +1948,10 @@ impl App {
             );
         }
 
+        if self.dnb_overlay && !self.show_mask {
+            self.draw_shapes(&painter, rect, response.hover_pos());
+        }
+
         if self.session.is_some() {
             let txt = if self.detail_rect.is_some() {
                 format!("{:.0} % · full-resolution negative pixels, unsharpened", 100.0 * mag)
@@ -1305,6 +1966,246 @@ impl App {
             painter.galley(pos, galley, Color32::from_gray(220));
         }
     }
+
+    /// Place, select and move dodge & burn shapes in the viewport. `rect` is
+    /// the whole picture in screen points. Returns true when the tool used
+    /// the pointer drag (so the panel must not pan).
+    fn dodge_burn_tool(&mut self, ui: &mut egui::Ui, response: &egui::Response, rect: Rect) -> bool {
+        if self.show_mask || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return false;
+        }
+        let norm = |p: Pos2| -> [f64; 2] {
+            [
+                (((p.x - rect.left()) / rect.width()) as f64).clamp(0.0, 1.0),
+                (((p.y - rect.top()) / rect.height()) as f64).clamp(0.0, 1.0),
+            ]
+        };
+        let to_screen = |x: f64, y: f64| {
+            Pos2::new(rect.left() + x as f32 * rect.width(), rect.top() + y as f32 * rect.height())
+        };
+        let long_px = rect.width().max(rect.height());
+
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.dnb_placing = None;
+            self.dnb_gradient_start = None;
+        }
+        if self.dnb_placing.is_some() && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        match self.dnb_placing {
+            Some(Placing::Disc) => {
+                if response.clicked() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        let [x, y] = norm(p);
+                        self.edit.recipe.dodge_burn.push(Burn::Radial {
+                            x,
+                            y,
+                            radius: 0.15,
+                            feather: 0.5,
+                            ev: 0.5,
+                        });
+                        self.dnb_selected = Some(self.edit.recipe.dodge_burn.len() - 1);
+                        self.dnb_placing = None;
+                    }
+                }
+                false
+            }
+            Some(Placing::Gradient) => {
+                if response.drag_started() {
+                    let origin =
+                        ui.input(|i| i.pointer.press_origin()).or_else(|| response.interact_pointer_pos());
+                    self.dnb_gradient_start = origin.map(norm);
+                }
+                if response.drag_stopped() {
+                    if let (Some([x0, y0]), Some(p)) =
+                        (self.dnb_gradient_start.take(), response.interact_pointer_pos())
+                    {
+                        let [x1, y1] = norm(p);
+                        if (x1 - x0).abs() > 1e-6 || (y1 - y0).abs() > 1e-6 {
+                            self.edit.recipe.dodge_burn.push(Burn::Gradient { x0, y0, x1, y1, ev: -0.5 });
+                            self.dnb_selected = Some(self.edit.recipe.dodge_burn.len() - 1);
+                        }
+                        self.dnb_placing = None;
+                    }
+                }
+                true
+            }
+            None => {
+                if !self.dnb_overlay {
+                    return false;
+                }
+                // Grab a part of the selected shape where the button went down.
+                if response.drag_started() {
+                    self.dnb_grab = None;
+                    if let (Some(i), Some(p)) = (
+                        self.dnb_selected,
+                        ui.input(|i| i.pointer.press_origin()).or_else(|| response.interact_pointer_pos()),
+                    ) {
+                        if let Some(b) = self.edit.recipe.dodge_burn.get(i) {
+                            self.dnb_grab = match *b {
+                                Burn::Radial { x, y, radius, .. } => {
+                                    let c = to_screen(x, y);
+                                    let d = c.distance(p);
+                                    let r = radius as f32 * long_px;
+                                    if d < 12.0 {
+                                        Some(ShapeGrab::Centre)
+                                    } else if (d - r).abs() < 8.0 {
+                                        Some(ShapeGrab::Radius)
+                                    } else if d < r {
+                                        Some(ShapeGrab::Centre)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                Burn::Gradient { x0, y0, x1, y1, .. } => {
+                                    let (s, e) = (to_screen(x0, y0), to_screen(x1, y1));
+                                    if s.distance(p) < 12.0 {
+                                        Some(ShapeGrab::Start)
+                                    } else if e.distance(p) < 12.0 {
+                                        Some(ShapeGrab::End)
+                                    } else if segment_distance(p, s, e) < 8.0 {
+                                        Some(ShapeGrab::Centre)
+                                    } else {
+                                        None
+                                    }
+                                }
+                            };
+                        }
+                    }
+                }
+                let mut took = false;
+                if let (Some(g), Some(i)) = (self.dnb_grab, self.dnb_selected) {
+                    took = true;
+                    if response.dragged() {
+                        let delta = response.drag_delta();
+                        let dn = [(delta.x / rect.width()) as f64, (delta.y / rect.height()) as f64];
+                        let ptr = response.interact_pointer_pos();
+                        if let Some(b) = self.edit.recipe.dodge_burn.get_mut(i) {
+                            match (b, g) {
+                                (Burn::Radial { x, y, .. }, ShapeGrab::Centre) => {
+                                    *x = (*x + dn[0]).clamp(0.0, 1.0);
+                                    *y = (*y + dn[1]).clamp(0.0, 1.0);
+                                }
+                                (Burn::Radial { x, y, radius, .. }, ShapeGrab::Radius) => {
+                                    if let Some(p) = ptr {
+                                        let d = to_screen(*x, *y).distance(p) / long_px;
+                                        *radius = (d as f64).clamp(0.01, 2.0);
+                                    }
+                                }
+                                (Burn::Gradient { x0, y0, x1, y1, .. }, ShapeGrab::Centre) => {
+                                    *x0 = (*x0 + dn[0]).clamp(0.0, 1.0);
+                                    *y0 = (*y0 + dn[1]).clamp(0.0, 1.0);
+                                    *x1 = (*x1 + dn[0]).clamp(0.0, 1.0);
+                                    *y1 = (*y1 + dn[1]).clamp(0.0, 1.0);
+                                }
+                                (Burn::Gradient { x0, y0, .. }, ShapeGrab::Start) => {
+                                    if let Some(p) = ptr {
+                                        [*x0, *y0] = norm(p);
+                                    }
+                                }
+                                (Burn::Gradient { x1, y1, .. }, ShapeGrab::End) => {
+                                    if let Some(p) = ptr {
+                                        [*x1, *y1] = norm(p);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                if response.drag_stopped() {
+                    self.dnb_grab = None;
+                }
+                // A plain click selects the shape under the pointer.
+                if response.clicked() {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        let hit = self.edit.recipe.dodge_burn.iter().position(|b| match *b {
+                            Burn::Radial { x, y, radius, .. } => {
+                                to_screen(x, y).distance(p) <= radius as f32 * long_px
+                            }
+                            Burn::Gradient { x0, y0, x1, y1, .. } => {
+                                segment_distance(p, to_screen(x0, y0), to_screen(x1, y1)) < 8.0
+                            }
+                        });
+                        if hit.is_some() || self.dnb_selected.is_some() {
+                            self.dnb_selected = hit;
+                        }
+                    }
+                }
+                took
+            }
+        }
+    }
+
+    /// Outlines of the shapes over the picture; the selected one in orange.
+    fn draw_shapes(&self, painter: &egui::Painter, rect: Rect, hover: Option<Pos2>) {
+        let to_screen = |x: f64, y: f64| {
+            Pos2::new(rect.left() + x as f32 * rect.width(), rect.top() + y as f32 * rect.height())
+        };
+        let long_px = rect.width().max(rect.height());
+        let font = egui::FontId::proportional(11.0);
+        for (i, b) in self.edit.recipe.dodge_burn.iter().enumerate() {
+            let selected = self.dnb_selected == Some(i);
+            let colour =
+                if selected { Color32::from_rgb(255, 170, 60) } else { Color32::from_white_alpha(150) };
+            let faint = colour.linear_multiply(0.5);
+            let label = format!("{} {:+.2}", i + 1, b.ev());
+            match *b {
+                Burn::Radial { x, y, radius, feather, .. } => {
+                    let c = to_screen(x, y);
+                    let r = radius as f32 * long_px;
+                    painter.circle_stroke(c, r, egui::Stroke::new(if selected { 2.0 } else { 1.0 }, colour));
+                    let inner = r * (1.0 - feather as f32);
+                    if inner > 1.0 && feather > 0.0 {
+                        painter.circle_stroke(c, inner, egui::Stroke::new(1.0, faint));
+                    }
+                    painter.circle_filled(c, 3.0, colour);
+                    painter.text(
+                        c + Vec2::new(6.0, -6.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        label,
+                        font.clone(),
+                        colour,
+                    );
+                }
+                Burn::Gradient { x0, y0, x1, y1, .. } => {
+                    let (s, e) = (to_screen(x0, y0), to_screen(x1, y1));
+                    painter.line_segment([s, e], egui::Stroke::new(if selected { 2.0 } else { 1.0 }, colour));
+                    // Perpendicular ticks mark the two ends: 0 (hollow) and 1 (filled).
+                    let d = (e - s).normalized();
+                    let n = Vec2::new(-d.y, d.x) * 14.0;
+                    painter.line_segment([s - n, s + n], egui::Stroke::new(1.0, faint));
+                    painter.line_segment([e - n, e + n], egui::Stroke::new(1.0, colour));
+                    painter.circle_stroke(s, 4.0, egui::Stroke::new(1.5, colour));
+                    painter.circle_filled(e, 4.0, colour);
+                    let mid = Pos2::new((s.x + e.x) * 0.5, (s.y + e.y) * 0.5);
+                    painter.text(
+                        mid + Vec2::new(6.0, -6.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        label,
+                        font.clone(),
+                        colour,
+                    );
+                }
+            }
+        }
+        if let (Some([x0, y0]), Some(p)) = (self.dnb_gradient_start, hover) {
+            let s = to_screen(x0, y0);
+            painter.line_segment([s, p], egui::Stroke::new(1.5, Color32::from_rgb(255, 170, 60)));
+            painter.circle_stroke(s, 4.0, egui::Stroke::new(1.5, Color32::from_rgb(255, 170, 60)));
+        }
+    }
+}
+
+/// Distance from `p` to the segment `a`–`b`, in points.
+fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let len2 = ab.length_sq();
+    if len2 <= 1e-6 {
+        return a.distance(p);
+    }
+    let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+    (a + ab * t).distance(p)
 }
 
 fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
@@ -1613,8 +2514,44 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.preview_panel(ui));
 
+        self.edit_keys(&ctx);
+        self.commit_history(&ctx);
         self.request_preview_if_needed();
         self.flush_converter_redevelop();
         self.strip_keys(&ctx);
+    }
+}
+
+impl App {
+    /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Delete removes the
+    /// selected shape. Not while a text field has the keyboard.
+    fn edit_keys(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let (undo, redo, del) = ctx.input_mut(|i| {
+            let undo =
+                i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
+            let redo = i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::Z,
+            )) || i
+                .consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y));
+            let del = i.key_pressed(egui::Key::Delete);
+            (undo, redo, del)
+        });
+        if undo {
+            self.undo();
+        }
+        if redo {
+            self.redo();
+        }
+        if del {
+            if let Some(i) = self.dnb_selected.take() {
+                if i < self.edit.recipe.dodge_burn.len() {
+                    self.edit.recipe.dodge_burn.remove(i);
+                }
+            }
+        }
     }
 }

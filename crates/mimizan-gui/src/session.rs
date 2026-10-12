@@ -3,16 +3,19 @@
 //! weights can be re-mixed without separating again) and a downscaled,
 //! upright copy of the separation for the interactive preview.
 
+use mimizan_core::burn::{self, Burn};
 use mimizan_core::calib::{CameraFile, LookFile};
+use mimizan_core::cfa::Color;
 use mimizan_core::curve::Curve;
-use mimizan_core::decode::RawFrame;
+use mimizan_core::decode::{RawFrame, SensorKind};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
-use mimizan_core::print::{orient, rotate_gray8_cw};
+use mimizan_core::print::{orient, rotate_gray8_cw, rotated, upright_pixel};
 use mimizan_core::resize::{fit_dims, resize};
 use mimizan_core::separate::{MaskMode, Separation};
+use mimizan_core::zone;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -107,6 +110,86 @@ pub struct Session {
     pub camera_file_path: Option<PathBuf>,
     pub develop: DevelopParams,
     pub preview: PreviewPlanes,
+    /// The four CFA channels of the frame as shot; fixed for the session.
+    pub raw_hist: RawHistogram,
+}
+
+/// Histogram of the four sensor channels (one per 2x2 tile position) over
+/// the active area, normalised by black and white level and binned on a
+/// gamma-2.2 axis like the negative histogram. Nothing but the frame goes
+/// in, so it is computed once per file.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawHistogram {
+    /// Tile positions (0,0), (1,0), (0,1), (1,1), as `RawFrame::black_tile`.
+    pub bins: [[u32; 256]; 4],
+    pub colors: [Color; 4],
+    /// Pixels at or above the white level, per channel.
+    pub clipped: [usize; 4],
+    pub total: [usize; 4],
+}
+
+impl RawHistogram {
+    pub fn empty() -> Self {
+        Self { bins: [[0; 256]; 4], colors: [Color::G; 4], clipped: [0; 4], total: [0; 4] }
+    }
+
+    pub fn of_frame(frame: &RawFrame) -> Self {
+        let crop = frame.crop;
+        let (x0, y0) = (crop.x, crop.y);
+        let (x1, y1) = ((crop.x + crop.w).min(frame.width), (crop.y + crop.h).min(frame.height));
+        if x1 <= x0 || y1 <= y0 {
+            return Self::empty();
+        }
+        let lut: Vec<u8> =
+            (0..65536).map(|i| ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
+        type RowCounts = ([[u32; 256]; 4], [usize; 4], [usize; 4]);
+        let parts: Vec<RowCounts> = (y0..y1)
+            .into_par_iter()
+            .map(|y| {
+                let mut bins = [[0u32; 256]; 4];
+                let mut clipped = [0usize; 4];
+                let mut total = [0usize; 4];
+                let base = y * frame.width;
+                for x in x0..x1 {
+                    let t = (y & 1) * 2 + (x & 1);
+                    let black = frame.black_at(x, y);
+                    let white = frame.white_at(x, y);
+                    let v = (frame.data.get(base + x) - black) / (white - black).max(1.0);
+                    let q = (v.clamp(0.0, 1.0) * 65535.0).round() as usize;
+                    bins[t][lut[q] as usize] += 1;
+                    clipped[t] += (v >= 1.0) as usize;
+                    total[t] += 1;
+                }
+                (bins, clipped, total)
+            })
+            .collect();
+        let mut out = Self::empty();
+        for (bins, clipped, total) in parts {
+            for t in 0..4 {
+                for (o, v) in out.bins[t].iter_mut().zip(bins[t].iter()) {
+                    *o += v;
+                }
+                out.clipped[t] += clipped[t];
+                out.total[t] += total[t];
+            }
+        }
+        // Tile position t = (y & 1) * 2 + (x & 1) in absolute sensor coordinates.
+        if let SensorKind::Bayer(phase) = frame.kind {
+            for t in 0..4 {
+                out.colors[t] = phase.color_at(t & 1, t >> 1);
+            }
+        }
+        out
+    }
+
+    /// Fraction of a channel's pixels at the white level.
+    pub fn clipped_frac(&self, t: usize) -> f64 {
+        if self.total[t] == 0 {
+            0.0
+        } else {
+            self.clipped[t] as f64 / self.total[t] as f64
+        }
+    }
 }
 
 impl Session {
@@ -181,14 +264,30 @@ pub fn preview_planes(neg: &Negative) -> PreviewPlanes {
 }
 
 /// Everything the preview depends on besides the session. The preview is the
-/// negative: mix and curve, never any sharpening.
+/// negative: mix, placing, dodge & burn and curve in the recipe's order,
+/// never any sharpening or resampling.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewParams {
     pub weights: Weights,
     pub look: LookFile,
+    /// Placing in stops before the curve (`Recipe::place`).
+    pub place: f64,
+    /// Local placing, in the coordinates of the upright, rotated picture.
+    pub dodge_burn: Vec<Burn>,
     pub show_mask: bool,
     /// Extra clockwise quarter turns on top of the file's orientation.
     pub rotation: u8,
+    /// Scene zone (0 … X) whose pixels the fit preview marks, if any.
+    pub hover_zone: Option<u8>,
+}
+
+/// The parts of a view the full-resolution histograms depend on.
+type HistKey = (Weights, LookFile, f64, Vec<Burn>, u8);
+
+impl ViewParams {
+    fn hist_key(&self) -> HistKey {
+        (self.weights, self.look.clone(), self.place, self.dodge_burn.clone(), self.rotation)
+    }
 }
 
 /// A window of the full-resolution negative, in upright (and rotated)
@@ -240,13 +339,14 @@ fn crop(p: &Plane, r: DetailRect) -> Plane {
 }
 
 /// Render `rect` of the negative at full resolution: crop the separation in
-/// the sensor frame, mix, curve (or the mask), then orient the small crop.
+/// the sensor frame, mix, orient the small crop, then place, dodge & burn
+/// (in whole-picture coordinates) and curve (or the mask).
 /// The rectangle is clamped to the image; the returned `rect` is the one
 /// actually rendered.
 pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<DetailImage> {
     let sep = s.separation();
     let (sw, sh) = (sep.lum.width, sep.lum.height);
-    let orientation = mimizan_core::print::rotated(s.negative.orientation, v.rotation);
+    let orientation = rotated(s.negative.orientation, v.rotation);
     let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
     if rect.x >= uw || rect.y >= uh {
         return None;
@@ -259,7 +359,7 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
     };
     let src = source_rect(orientation, sw, sh, rect);
     let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let plane = if v.show_mask {
+    let upright = if v.show_mask {
         let n = &s.negative;
         let mut m = Plane::zeros(src.w, src.h);
         m.data.par_chunks_mut(src.w).enumerate().for_each(|(y, row)| {
@@ -268,7 +368,7 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
                 *o = f64::from(n.mask8[base + x]) / 255.0;
             }
         });
-        m
+        orient(&m, orientation)
     } else {
         let small = Separation {
             lum: crop(&sep.lum, src),
@@ -279,10 +379,10 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
             phase: sep.phase,
             computed: sep.computed,
         };
-        let mixed = mix(&small, &v.weights);
+        let mut mixed = orient(&mix(&small, &v.weights), orientation);
+        burn::apply_window(&mut mixed, v.place, &v.dodge_burn, (uw, uh), (rect.x, rect.y));
         Curve::from_look(&v.look).apply(&mixed)
     };
-    let upright = orient(&plane, orientation);
     debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
     let gray: Vec<u8> = upright.data.par_iter().map(|&x| to_u8(x)).collect();
     Some(DetailImage { rect: DetailRect { w: upright.width, h: upright.height, ..rect }, gray })
@@ -355,12 +455,20 @@ impl Histogram {
     }
 
     /// Histograms of the full-resolution negative in one pass: the linear mix
-    /// on a gamma-2.2 axis, and the mix after `curve` (what the TIFF gets).
+    /// on a gamma-2.2 axis (the scan, before any placing), and the mix after
+    /// placing, dodge & burn and `curve` (what the TIFF gets). `local` is
+    /// (place, shapes, orientation of the picture the shapes refer to).
     /// Values are quantised to 16 bits first, so the clipping counts are the
     /// TIFF's own 0 and 65535 pixels. Nothing is downscaled: a resampled copy
     /// rings at edges (false black and white) and averages isolated clipped
     /// pixels away, so its histogram ends are wrong by an order of magnitude.
-    pub fn of_separation(sep: &Separation, w: &Weights, curve: &Curve) -> (Self, Self) {
+    pub fn of_separation(
+        sep: &Separation,
+        w: &Weights,
+        curve: &Curve,
+        local: (f64, &[Burn], u16),
+    ) -> (Self, Self) {
+        let (place, burns, orientation) = local;
         // 16-bit input -> 8-bit bin, for both encodings.
         let lut_neg: Vec<u8> =
             (0..65536).map(|i| ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
@@ -371,8 +479,14 @@ impl Histogram {
         let k1 = w.g - w.r - w.b;
         let k2 = 2.0 * (w.r - w.b);
         let width = sep.lum.width;
+        let height = sep.lum.height;
+        let active: Vec<Burn> = burns.iter().copied().filter(|b| b.ev() != 0.0).collect();
+        let global = 2f64.powf(place);
+        let (uw, uh) = if matches!(orientation, 5..=8) { (height, width) } else { (width, height) };
+        let (uwf, uhf) = (uw as f64, uh as f64);
+        let long = uwf.max(uhf);
         // Row-ordered partial counts, merged deterministically.
-        let parts: Vec<Counts> = (0..sep.lum.height)
+        let parts: Vec<Counts> = (0..height)
             .into_par_iter()
             .map(|y| {
                 let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
@@ -381,11 +495,21 @@ impl Histogram {
                     let m = l[x] + k1 * c1[x] + k2 * c2[x];
                     let q = q16(m);
                     c.neg[lut_neg[q] as usize] += 1;
-                    c.view[lut_view[q] as usize] += 1;
                     c.neg_low += (q == 0) as usize;
                     c.neg_high += (q == 65535) as usize;
-                    if view_clips[q] {
-                        if lut_view[q] == 0 {
+                    let placed = if active.is_empty() {
+                        m * global
+                    } else {
+                        let (ux, uy) = upright_pixel(orientation, width, height, x, y);
+                        let (nx, ny) = ((ux as f64 + 0.5) / uwf, (uy as f64 + 0.5) / uhf);
+                        let e =
+                            active.iter().fold(place, |e, b| e + b.ev() * b.weight(nx, ny, uwf, uhf, long));
+                        m * 2f64.powf(e)
+                    };
+                    let qv = q16(placed);
+                    c.view[lut_view[qv] as usize] += 1;
+                    if view_clips[qv] {
+                        if lut_view[qv] == 0 {
                             c.view_low += 1;
                         } else {
                             c.view_high += 1;
@@ -399,7 +523,7 @@ impl Histogram {
         for c in parts {
             all.add(&c);
         }
-        let total = width * sep.lum.height;
+        let total = width * height;
         (
             Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
             Self::from_bins(all.view, total, all.view_low, all.view_high),
@@ -466,14 +590,18 @@ pub struct PreviewImage {
     /// Quarter turns this image was rendered with (`ViewParams::rotation`).
     pub rotation: u8,
     pub gray: Vec<u8>,
+    /// 255 where the curve's input lies in `ViewParams::hover_zone`, same
+    /// layout as `gray`; `None` when no zone is hovered.
+    pub zone_mask: Option<Vec<u8>>,
     pub hist_view: Histogram,
     pub hist_negative: Histogram,
 }
 
 /// Full-resolution histograms kept between renders: they depend on the
-/// weights and the look only, not on rotation or the mask view.
+/// weights, the look, placing and the shapes, not on the mask view or the
+/// hovered zone.
 pub struct HistCache {
-    key: Option<(*const Session, Weights, LookFile)>,
+    key: Option<(*const Session, HistKey)>,
     hists: (Histogram, Histogram),
 }
 
@@ -485,16 +613,23 @@ impl Default for HistCache {
 
 impl HistCache {
     fn get(&mut self, s: &Session, v: &ViewParams, curve: &Curve) -> (Histogram, Histogram) {
-        let key = (s as *const Session, v.weights, v.look.clone());
+        let key = (s as *const Session, v.hist_key());
         if self.key.as_ref() != Some(&key) {
-            self.hists = Histogram::of_separation(s.separation(), &v.weights, curve);
+            let orientation = rotated(s.negative.orientation, v.rotation);
+            self.hists = Histogram::of_separation(
+                s.separation(),
+                &v.weights,
+                curve,
+                (v.place, &v.dodge_burn, orientation),
+            );
             self.key = Some(key);
         }
         self.hists.clone()
     }
 }
 
-/// 8-bit grey preview of the whole negative: mix and curve (or the mask).
+/// 8-bit grey preview of the whole negative: mix, place, dodge & burn and
+/// curve (or the mask), in the picture's final orientation.
 pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> PreviewImage {
     let pp = &s.preview;
     let (w, h) = (pp.sep.lum.width, pp.sep.lum.height);
@@ -508,6 +643,7 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
             height,
             rotation: v.rotation,
             gray,
+            zone_mask: None,
             hist_view,
             hist_negative: Histogram::empty(),
         };
@@ -515,11 +651,37 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
     let curve = Curve::from_look(&v.look);
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.get(s, v, &curve);
-    let mixed = mix(&pp.sep, &v.weights);
+    // The shapes live in the rotated picture, so turn first, then place.
+    let mut mixed = orient(&mix(&pp.sep, &v.weights), rotated(1, v.rotation));
+    burn::apply(&mut mixed, v.place, &v.dodge_burn);
+    let zone_mask = v.hover_zone.map(|k| {
+        let (lo, hi) = (k as f64 - 5.5, k as f64 - 4.5);
+        mixed
+            .data
+            .par_iter()
+            .map(|&l| {
+                let st = zone::stops(l);
+                // The outer zones take everything beyond them.
+                let inside = (st >= lo || k == 0) && (st < hi || k as usize == zone::ZONES - 1);
+                if inside {
+                    255
+                } else {
+                    0
+                }
+            })
+            .collect()
+    });
     let plane = curve.apply(&mixed);
     let gray: Vec<u8> = plane.data.par_iter().map(|&x| to_u8(x)).collect();
-    let (width, height, gray) = rotate_gray8_cw(w, h, &gray, v.rotation);
-    PreviewImage { width, height, rotation: v.rotation, gray, hist_view, hist_negative }
+    PreviewImage {
+        width: plane.width,
+        height: plane.height,
+        rotation: v.rotation,
+        gray,
+        zone_mask,
+        hist_view,
+        hist_negative,
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +748,7 @@ mod histogram_tests {
         )))
         .unwrap();
         let curve = Curve::from_look(&look);
-        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve);
+        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve, (0.0, &[], 1));
 
         let mixed = mix(&sep, &wts);
         let mut en = [0u32; 256];
@@ -609,5 +771,42 @@ mod histogram_tests {
         assert_eq!((view.low, view.high), (vl, vh));
         assert!(nl > 0 && nh > 0, "sweep must clip at both ends");
         assert_eq!(neg.total, w * h);
+    }
+
+    fn sweep(w: usize, h: usize) -> Separation {
+        let mut lum = Plane::zeros(w, h);
+        for (i, l) in lum.data.iter_mut().enumerate() {
+            *l = 0.9 * i as f64 / (w * h - 1) as f64;
+        }
+        Separation {
+            lum,
+            c1: Plane::zeros(w, h),
+            c2: Plane::zeros(w, h),
+            mask_max: Plane::zeros(1, 1),
+            rounds: 1,
+            phase: BayerPhase::RGGB,
+            computed: 0.0,
+        }
+    }
+
+    /// With shapes, the view histogram must equal the histogram of the
+    /// picture the export renders: orient, place, dodge & burn, curve.
+    #[test]
+    fn of_separation_with_shapes_matches_the_rendered_picture() {
+        let sep = sweep(40, 24);
+        let wts = Weights::default();
+        let curve = Curve::from_look(&LookFile::neutral());
+        let burns = [Burn::Radial { x: 0.7, y: 0.3, radius: 0.3, feather: 0.5, ev: 1.0 }];
+        for o in [1u16, 6, 8] {
+            let (_, view) = Histogram::of_separation(&sep, &wts, &curve, (-0.4, &burns, o));
+            let mut pic = orient(&mix(&sep, &wts), o);
+            burn::apply(&mut pic, -0.4, &burns);
+            let mut ev = [0u32; 256];
+            for &l in &pic.data {
+                let lin = q16(l) as f64 / 65535.0;
+                ev[(curve.eval(lin) * 255.0).round() as usize] += 1;
+            }
+            assert_eq!(view.bins, ev, "orientation {o}");
+        }
     }
 }

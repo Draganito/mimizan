@@ -198,6 +198,22 @@ pub fn orient(p: &Plane, orientation: u16) -> Plane {
     out
 }
 
+/// Where source pixel (`sx`, `sy`) of a `w` x `h` plane lands after
+/// `orient(_, orientation)`: the inverse of the lookup inside `orient`.
+#[inline]
+pub fn upright_pixel(orientation: u16, w: usize, h: usize, sx: usize, sy: usize) -> (usize, usize) {
+    match orientation {
+        2 => (w - 1 - sx, sy),
+        3 => (w - 1 - sx, h - 1 - sy),
+        4 => (sx, h - 1 - sy),
+        5 => (sy, sx),
+        6 => (h - 1 - sy, sx),
+        7 => (h - 1 - sy, w - 1 - sx),
+        8 => (sy, w - 1 - sx),
+        _ => (sx, sy),
+    }
+}
+
 /// The orientation that equals `orientation` followed by a 90° clockwise
 /// turn, i.e. `orient(orient(p, o), 6) == orient(p, rotate_cw(o))`.
 /// Unknown (0) is treated as upright.
@@ -726,6 +742,22 @@ mod tests {
             let r = orient(&p, o);
             assert_eq!((rw, rh), (r.width, r.height));
             assert_eq!(rg, r.data.iter().map(|&v| v as u8).collect::<Vec<_>>());
+        }
+    }
+
+    /// `upright_pixel` is the inverse of the lookup `orient` performs.
+    #[test]
+    fn upright_pixel_inverts_orient() {
+        let (w, h) = (4, 3);
+        let p = Plane::from_vec(w, h, (0..12).map(|i| i as f64).collect());
+        for o in 1..=8u16 {
+            let up = orient(&p, o);
+            for sy in 0..h {
+                for sx in 0..w {
+                    let (ux, uy) = upright_pixel(o, w, h, sx, sy);
+                    assert_eq!(up.at(ux, uy), p.at(sx, sy), "orientation {o} at {sx},{sy}");
+                }
+            }
         }
     }
 }

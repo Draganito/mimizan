@@ -4,10 +4,10 @@
 
 use crate::session::{
     preview_planes, render_detail, render_preview, DetailImage, DetailRect, DevelopParams, HistCache,
-    PreviewImage, Session, ViewParams,
+    PreviewImage, RawHistogram, Session, ViewParams,
 };
 use anyhow::{Context, Result};
-use mimizan_core::calib::{CameraFile, LookFile};
+use mimizan_core::calib::CameraFile;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::print::{self as pr, PrintParams, PrintSize, PrintSource};
@@ -30,13 +30,15 @@ pub enum Job {
         session: Arc<Session>,
         develop: DevelopParams,
     },
-    /// One export, two files: `path` (16-bit TIFF, full resolution, look
-    /// applied, unsharpened) and `<stem>_<px>px.jpg` (long edge `screen_px`,
-    /// screen compensation, quality 100).
+    /// One export, two files: `path` (16-bit TIFF, the recipe rendered in one
+    /// pass against the negative: curve, placing, shapes, size, border and
+    /// sharpening as set) and `<stem>_<px>px.jpg` (the same picture without
+    /// border or print sharpening, long edge `screen_px`, screen compensation,
+    /// quality 100).
     Export {
         session: Arc<Session>,
         weights: Weights,
-        look: LookFile,
+        recipe: Recipe,
         path: PathBuf,
         screen_px: usize,
         /// TIFF orientation to apply (the file's, plus the user's turns).
@@ -83,8 +85,8 @@ impl Heavy {
                         Job::Redevelop { session, develop } => {
                             redevelop(&session, develop, &status).map(|s| Event::Opened(Arc::new(s)))
                         }
-                        Job::Export { session, weights, look, path, screen_px, orientation } => {
-                            export(&session, weights, look, &path, screen_px, orientation, &status)
+                        Job::Export { session, weights, recipe, path, screen_px, orientation } => {
+                            export(&session, weights, recipe, &path, screen_px, orientation, &status)
                         }
                     };
                     let ev = match r {
@@ -156,8 +158,9 @@ fn develop_frame(
     status("building preview".into());
     let t = Instant::now();
     let preview = preview_planes(&negative);
-    info!("preview planes {} ms", t.elapsed().as_millis());
-    Ok(Session { path, frame, negative, camera_file, camera_file_path, develop, preview })
+    let raw_hist = RawHistogram::of_frame(&frame);
+    info!("preview planes + raw histogram {} ms", t.elapsed().as_millis());
+    Ok(Session { path, frame, negative, camera_file, camera_file_path, develop, preview, raw_hist })
 }
 
 /// JPEG path next to the TIFF: `<stem>_<px>px.jpg`.
@@ -169,13 +172,14 @@ pub fn jpeg_path(tiff: &Path, screen_px: usize) -> PathBuf {
 fn export(
     s: &Session,
     weights: Weights,
-    look: LookFile,
+    recipe: Recipe,
     path: &Path,
     screen_px: usize,
     orientation: u16,
     status: &dyn Fn(String),
 ) -> Result<Event> {
     let t = Instant::now();
+    recipe.validate()?;
     status("mixing".into());
     let plane = mix(s.separation(), &weights);
     let mask = s.mask_plane();
@@ -190,8 +194,8 @@ fn export(
         description: serde_json::to_value(&info).ok(),
     };
 
-    // 1. Full resolution, look applied, nothing sharpened: the file to work on.
-    let tiff_params = PrintParams::with_look(look.clone());
+    // 1. The print: the recipe in one pass against the negative.
+    let tiff_params = PrintParams { recipe: recipe.clone(), ..Default::default() };
     status("rendering TIFF".into());
     let tiff = pr::render_planes(&src, &tiff_params);
     status(format!("writing {}", path.display()));
@@ -199,15 +203,17 @@ fn export(
     let (width, height) = (tiff.info.width, tiff.info.height);
     drop(tiff);
 
-    // 2. Screen JPEG: long edge, exact compensation of the known losses.
+    // 2. Screen JPEG: the same picture (curve, placing, shapes) at the
+    // screen's long edge with exact compensation of the known losses; the
+    // border and print sharpening belong to the print.
     let jpeg = jpeg_path(path, screen_px);
-    let s = ScreenSharpen::default();
+    let sc = ScreenSharpen::default();
     let jpeg_params = PrintParams {
         recipe: Recipe {
-            curve: look,
             size: Some(PrintSize::LongEdgePx(screen_px)),
-            sharpen: Sharpen::Screen { amount: s.amount, max_gain: s.max_gain },
-            ..Recipe::default()
+            border_mm: 0.0,
+            sharpen: Sharpen::Screen { amount: sc.amount, max_gain: sc.max_gain },
+            ..recipe
         },
         ..Default::default()
     };

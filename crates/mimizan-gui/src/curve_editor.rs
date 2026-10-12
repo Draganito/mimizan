@@ -8,6 +8,34 @@ use mimizan_core::curve::Pchip;
 
 const MIN_DX: f64 = 0.02;
 
+/// Read-only plot of the PCHIP through `points` (encoded in, encoded out)
+/// with the nodes marked: what the zone bar's node set means as a curve.
+pub fn curve_plot(ui: &mut Ui, points: &[[f64; 2]], size: egui::Vec2) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+    let to_screen = |p: [f64; 2]| -> Pos2 {
+        pos2(rect.left() + p[0] as f32 * rect.width(), rect.bottom() - p[1] as f32 * rect.height())
+    };
+    painter.rect_filled(rect, 3.0, visuals.extreme_bg_color);
+    let grid = Stroke::new(1.0, visuals.weak_text_color().linear_multiply(0.4));
+    painter.line_segment([rect.left_bottom(), rect.right_top()], grid);
+    if points.len() >= 2 {
+        let pchip = Pchip::new(points);
+        let n = 96;
+        let pts: Vec<Pos2> = (0..=n)
+            .map(|k| {
+                let x = k as f64 / n as f64;
+                to_screen([x, pchip.eval(x).clamp(0.0, 1.0)])
+            })
+            .collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(1.5, visuals.text_color())));
+    }
+    for p in points {
+        painter.circle_filled(to_screen(*p), 2.5, visuals.text_color());
+    }
+}
+
 /// Returns true when the points changed.
 pub fn curve_editor(ui: &mut Ui, points: &mut Vec<[f64; 2]>, size: f32) -> bool {
     let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::click_and_drag());

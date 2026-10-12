@@ -10,9 +10,11 @@ mod app;
 mod browser;
 mod convert;
 mod curve_editor;
+mod edit;
 mod histogram;
 mod session;
 mod worker;
+mod zone_bar;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
