@@ -69,7 +69,7 @@ impl Default for DevelopParams {
         Self {
             wb: WhiteBalance::AsShot,
             mask: MaskMode::Dubois,
-            fix_defects: true,
+            fix_defects: false,
             reconstruct: false,
             converter: Converter::Mimizan,
         }

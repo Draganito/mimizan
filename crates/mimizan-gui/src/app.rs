@@ -209,7 +209,7 @@ impl App {
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
             mask_mode: DevelopParams::default().mask,
-            fix_defects: true,
+            fix_defects: DevelopParams::default().fix_defects,
             reconstruct: false,
             converter: Converter::Mimizan,
             converter_attempt: None,
@@ -1967,7 +1967,7 @@ impl App {
                     if resp.hovered() {
                         painter.rect_filled(frame, 0.0, Color32::from_white_alpha(10));
                     }
-                    draw_folder(
+                    let flap = draw_folder(
                         painter,
                         frame.shrink2(Vec2::new(tile_w * 0.18, img_h * 0.16)),
                         resp.hovered(),
@@ -1978,12 +1978,13 @@ impl App {
                         None => "…".to_string(),
                     };
                     if !count.is_empty() {
+                        // On the front flap, dark on the light card.
                         painter.text(
-                            Pos2::new(frame.center().x, frame.bottom() - img_h * 0.16),
+                            flap.center(),
                             egui::Align2::CENTER_CENTER,
                             count,
                             egui::FontId::proportional(11.0),
-                            Color32::from_gray(200),
+                            Color32::from_rgb(50, 38, 18),
                         );
                     }
                     painter.text(
@@ -2163,7 +2164,9 @@ impl App {
 }
 
 /// A folder as the file managers draw it: tab, body, a lighter front flap.
-fn draw_folder(painter: &egui::Painter, r: Rect, hovered: bool) {
+/// Paints a folder icon into `r` and returns its front flap, the place for a
+/// label.
+fn draw_folder(painter: &egui::Painter, r: Rect, hovered: bool) -> Rect {
     let back = if hovered { Color32::from_rgb(150, 120, 70) } else { Color32::from_rgb(120, 96, 56) };
     let front = if hovered { Color32::from_rgb(205, 170, 100) } else { Color32::from_rgb(180, 146, 84) };
     let tab_w = r.width() * 0.38;
@@ -2178,11 +2181,9 @@ fn draw_folder(painter: &egui::Painter, r: Rect, hovered: bool) {
         3.0,
         back,
     );
-    painter.rect_filled(
-        Rect::from_min_max(Pos2::new(r.left(), r.top() + tab_h + r.height() * 0.22), r.right_bottom()),
-        3.0,
-        front,
-    );
+    let flap = Rect::from_min_max(Pos2::new(r.left(), r.top() + tab_h + r.height() * 0.22), r.right_bottom());
+    painter.rect_filled(flap, 3.0, front);
+    flap
 }
 
 /// `DSC_0001_very_long_name.NEF` -> `DSC_0001_…name.NEF` within `max` chars.

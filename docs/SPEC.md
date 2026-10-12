@@ -57,6 +57,9 @@ Nachbar-Median entfernt (gemessen: 8 % aller Photosites der Z f-Probe).
 Ein Defekt liegt außerhalb des Nachbar-Wertebereichs, eine Kante nicht. Gesättigte Photosites und ihre
 Nachbarn sind von der Defektregel ausgenommen. Die Defektkarte wird gezählt
 und geloggt (Anzahl, Anteil, Zeilenhäufungen als PDAF-Hinweis).
+Die Reparatur ersetzt gemessene Werte; in der GUI ist sie deshalb per Default
+aus (Development → *repair defects*), die CLI hält sie an (`--no-defects`
+schaltet ab).
 
 **Kanalabgleich.** Nach Normierung und Defektregel wird jede Photosite mit
 dem Multiplikator ihres Kanals `k_R, k_G = 1, k_B` multipliziert
