@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.6.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.7.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -592,12 +592,20 @@ stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$.
 
 ### 7.3 Output stage (for completeness)
 
-Order: mix → size → curve → [deconvolution →] USM *or* screen
-compensation → file. Resizing is separable Lanczos-3 in f64 with the kernel
-stretched by the scale factor when shrinking. The curve is a monotone PCHIP
-through points in $[0,1]^2$ after $x^{1/2.2}$ encoding (`neutral` is pure
-gamma 2.2; `reference` is fitted from a grey wedge against a monochrome
-camera's JPEG by weighted isotonic regression). USM radius
+Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
+carries as JSON): mix → orientation → size → placing and dodge & burn
+(multiplicative, $L' = L\cdot 2^{p + \sum_i e_i m_i}$ with soft masks
+$m_i \in [0,1]$, so a local exposure change keeps the curve's meaning) →
+curve → paper border → [deconvolution →] USM *or* screen compensation →
+file. Resizing is separable in f64 with the kernel stretched by the scale
+factor when shrinking; the kernel is a parameter (Lanczos-3 default,
+Mitchell, Catmull-Rom, cubic B-spline) and the screen compensation below
+uses the chosen kernel's transfer. The curve is a monotone PCHIP through
+points in $[0,1]^2$ after $x^{1/2.2}$ encoding (`neutral` is pure gamma
+2.2; `reference` is fitted from a grey wedge against a monochrome camera's
+JPEG by weighted isotonic regression; the *zone curve* puts one node on
+each encoded zone centre $Z_k = 0.18\cdot 2^{k-5}$ and is bit-identical to
+`neutral` while no node is moved). USM radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$ (one
 arc-minute at viewing distance $d$), Gaussian $\sigma = r_{\mathrm{px}}$,
 masked as in 7.2. Deconvolution is Richardson–Lucy with the same Gaussian
@@ -605,7 +613,7 @@ PSF, $e_{k+1} = e_k \cdot G \circledast \big(b / (G \circledast e_k)\big)$,
 $e_0 = \max(b, 0)$, 1–10 passes, every pixel, before the USM. Screen
 compensation is a 9-tap least-squares FIR fit to the Wiener inverse
 $T(f) = (1+\epsilon) M(f) / (M(f)^2 + \epsilon)$, $\epsilon = 1/(4 g_{\max}^2)$,
-$g_{\max} = 2$, of the known Lanczos × pixel-aperture transfer
+$g_{\max} = 2$, of the known resampler × pixel-aperture transfer
 $M(f) = L(f)\,\mathrm{sinc}(f)$, weight $1/(f + 0.1)$ over $f \in [0, 0.5]$,
 normalised to unit DC gain. None of this is part of the method's claim.
 

@@ -480,6 +480,96 @@ focused window). eframe then neither repaints nor runs `App::logic`, so a
 running export finishes but its log line appears when the window is shown
 again. X11/XWayland (`WAYLAND_DISPLAY= mimizan-gui`) does not have this.
 
+## Phase 7 — the print as a recipe (0.7.0)
+
+Everything the printer decides is one serialisable `Recipe` (placing in
+stops, curve, dodge & burn shapes, resampling kernel, size, dpi, border,
+sharpening; SPEC §9) that `print::render_planes` applies in one pass over
+the f64 planes: orient → size → place and dodge & burn → curve → border →
+sharpen. The TIFF's `ImageDescription` carries the recipe, `mimizan print
+--write-recipe` writes it, `--recipe` reads it back with flags as
+overrides, the GUI edits it directly and keeps it as `<file>.recipe.json`
+next to the RAW. Core 92 lib tests + 6 CLI acceptance tests, among them the
+whitepaper's checks: the untouched zone bar is bit-identical to `neutral`,
+a moved node changes only its two neighbouring intervals, clamping keeps
+the nodes ordered with a 1e-4 gap, placing −1 stop halves the linear value
+before the curve, a radial burn with feather 0 is a hard disc, the gradient
+weight is 0 at its start and 1 at its end, the mask sidecar is padded with
+"no sharpening" under the border.
+
+Z f negative (6048×4032), `print --grade 1 --place -0.33 --burn
+radial:0.5,0.5,0.35,0.5,-0.5 --burn gradient:0.5,0,0.5,0.4,0.7 --size
+30x40cm --dpi 300 --border-mm 15 --usm-amount 0.5`: 4724×3267 px
+(4370×2913 picture + 177 px border; the paper keeps its width, its height
+follows the picture), render 0.81–0.89 s, write 50 ms, 30.9 MB. Two runs
+of the same recipe differ in no pixel; the only differing bytes of the two
+files are the `"ms"` render time in the description. Same recipe, `--size
+2048px --border-mm 0 --screen 1`: 2048×1365 in 0.53 s.
+
+### Resampling kernels (`--resample`)
+
+Appendix A.2 of the zone-system whitepaper asks for a "cubic B=0, C=1"
+kernel in place of Lanczos-3 to avoid overshoot. That pair is not
+Catmull-Rom (B=0, C=½) but the Keys cubic with a = −1, and it overshoots
+*more* than Lanczos-3 (same step test in a reference script: 9.4 / 13.0 /
+14.1 % at the three scales below); every interpolating cubic with C > 0
+has negative lobes. The overshoot-free member of the family is the
+B-spline (B=1, C=0), and it is also the softest, so the recipe offers the
+family and keeps the default. Measured with `resize::step_overshoot`
+(unit step through the real `resize_with`, 64 px, three scales) and the
+kernel MTF that the screen compensation uses:
+
+| kernel | overshoot ×0.61 | ×1.37 | ×2.0 | MTF 0.25 c/px | 0.40 | 0.50 |
+|---|---|---|---|---|---|---|
+| lanczos3 (default) | 8.6 % | 9.7 % | 10.3 % | 1.01 | 0.82 | 0.50 |
+| catmull-rom (B=0, C=½) | 4.6 % | 4.9 % | 7.0 % | 0.94 | 0.72 | 0.49 |
+| mitchell (B=⅓, C=⅓) | 2.0 % | 2.9 % | 2.3 % | 0.85 | 0.59 | 0.38 |
+| b-spline (B=1, C=0) | 0.0 % | 0.0 % | 0.0 % | 0.66 | 0.33 | 0.16 |
+
+Lanczos-3 stays the default: the benchmark numbers in this file, the
+reference fit and the screen compensation table were measured with it, and
+the overshoot at a hard edge is a resampling property that the paper border
+(added *after* the size step, so it never meets the kernel) does not
+suffer from. The kernel is a recipe field, so a picture with hard graphic
+edges can switch to `b-spline` and record that choice. The screen
+compensation derives its target from `ResampleKernel::mtf` of the chosen
+kernel; with the B-spline the 9-tap FIR under the 2× gain cap recovers only
+part of its deeper roll-off (an open limit, not hidden).
+
+### GUI as a darkroom
+
+The GUI edits the recipe (`Edit { weights, recipe, rotation }`) with an
+undo history (commits when pointer and keyboard are idle, 200 steps,
+Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y) and three floating translucent panels over
+the picture (Analysis, Enlarger, Print; Tab hides them, egui-only, no
+blur, so the glow backend and every driver stays sufficient). The zone bar
+is the whitepaper's split bar: print row above, scene row below, lines
+from each scene zone to where it prints, handles under the print row
+dragged on the log axis, double click puts a node back, hovering a zone
+tints its pixels in the preview (mask computed with the preview). Dodge &
+burn: shapes are drawn in the viewport (disc: centre drag then radius;
+gradient: start then end), stored in normalised coordinates of the upright
+picture, so the preview, the 1:1 window (`burn::apply_window` on the
+cropped full-resolution tile with whole-picture coordinates) and the
+export all evaluate the same mask. Preview order is orient → place/burn →
+curve on the downscaled linear mix, i.e. the zooming stays what the export
+writes, except for the sharpening/compensation and the resampler — both
+belong to the output size and are stated as such on the export button.
+Three histograms: print (after place, burns, curve, full resolution, the
+weights taken per pixel through `print::upright_pixel`), negative (plain
+mix) and raw (the four CFA positions of the `RawFrame`, computed once per
+session, with per-channel clipping). The film strip shows the folder as
+negatives with perforation (toggle to positives). Export writes TIFF =
+recipe, JPEG = recipe with `LongEdgePx(screen)`, no border and screen
+compensation.
+
+Unattended check env vars: `MIMIZAN_SCREENSHOT=out.png` (quit after the
+first preview), `MIMIZAN_SCREENSHOT_CUSTOM=1` (custom curve editor on),
+`MIMIZAN_SCREENSHOT_ZONES=1` (zone bar on, grade N+1),
+`MIMIZAN_SCREENSHOT_1TO1=1` (wait for the 1:1 window),
+`MIMIZAN_WINDOW=WxH` (inner size in points; default 1360×860, which is the
+size the default panel positions were laid out for).
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156

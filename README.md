@@ -256,7 +256,7 @@ the same, so there the estimator, not the detector, is the limit).
 | binary          | purpose |
 |-----------------|---------|
 | `mimizan`      | CLI: `info`, `dump`, `negative`, `print`, `calibrate`, `synth`, `measure`, `bench` |
-| `mimizan-gui`  | Desktop app: open a RAW, judge mix and look interactively, export TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
+| `mimizan-gui`  | Desktop darkroom: open a RAW, judge mix, placing, zone curve and dodge & burn interactively, export the print recipe as TIFF + screen JPEG. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
 
 Supported input: Bayer RAWs that [rawler](https://crates.io/crates/rawler)
 decodes (verified: Nikon Z f NEF). Monochrome sensors (DNG without a colour
@@ -278,7 +278,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.6.0-1_amd64.deb
+sudo apt install ./mimizan_0.7.0-1_amd64.deb
 mimizan --version
 ```
 
@@ -319,6 +319,15 @@ mimizan print photo_neg.tif -o photo_2048.jpg --size 2048px --screen 1.0 --look 
 # Richardson-Lucy instead of a halo: 5 passes invert a Gaussian of the USM radius on every pixel
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --deconv 5
 
+# The zone system as the print curve: grade N+1, placed a third of a stop down,
+# a disc dodged half a stop at (0.3, 0.6), a gradient burning the top edge,
+# 20 mm paper-white border, B-spline resampling; the recipe is written too
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --grade 1 --place -0.33 \
+  --burn radial:0.3,0.6,0.2,0.5,0.5 --burn gradient:0.5,0.4,0.5,0.0,-0.7 \
+  --border-mm 20 --resample b-spline --write-recipe photo.recipe.json
+# ... and the same print again, from the recipe alone
+mimizan print photo_neg.tif -o photo_print.tif --recipe photo.recipe.json
+
 # The benchmark of the section above (writes docs/KODAK.md and docs/kodak/*.png)
 mimizan bench kodak --images testdata/kodak
 mimizan bench kodak --images testdata/kodak --scale 2 --report docs/KODAK_2X.md --strips docs/kodak2x --out out/kodak2x
@@ -340,6 +349,28 @@ Gaussian PSF of the USM radius, N passes (1..10), on every pixel, no mask. It
 undoes blur instead of drawing a halo around it, and it brings back the
 noise the blur had hidden; the PSF is an assumption, not a measurement, so
 this is sharpening by inversion, not restoration (SPEC §9). USM may follow it.
+
+A print is a **recipe**, not a stack of edits: one parameter set (JSON,
+`--recipe` / `--write-recipe`, and the same JSON in the TIFF's description)
+that `mimizan print` renders in one pass against the negative, so there is
+exactly one quantisation and the same recipe gives the same bytes. The
+recipe holds, in the order the pipeline applies them: the **placing**
+(`--place`, stops; `L ← L·2^place`, the darkroom's exposure), **dodge &
+burn** shapes (`--burn radial:x,y,radius,feather,ev` and
+`--burn gradient:x0,y0,x1,y1,ev`; local placing by a geometric mask, positive
+ev brighter, negative darker, coordinates as fractions of the upright picture
+so a recipe means the same place at any size), the **curve** (a look, a custom
+curve, or the **zone curve** `--grade N`: one PCHIP node per zone on the
+encoded zone centres `Z_k = 0.18·2^(k−5)`, grade presets spread the mid zones
+around Zone V by 1.25 per grade; the untouched zone curve is bit-identical to
+`neutral`), the **size step** (`--size`, `--dpi`, `--resample lanczos3 |
+mitchell | catmull-rom | b-spline`: Lanczos-3 stays the default and the
+benchmark kernel; B-spline is the only one without overshoot, and visibly
+soft), the **border** (`--border-mm`, paper white = the curve's value at
+linear 1, taken from the paper size), and the **sharpening** (USM,
+deconvolution or screen compensation; the compensation filter is derived
+from the chosen kernel's MTF). Nothing in the recipe reads the picture:
+there is no tone equaliser and no content-adaptive mask (SPEC §9).
 
 `mimizan negative` picks `cameras/<make>_<model>.json` by the camera in the
 file (noise model, default mix weights, default USM amount). Without a camera
@@ -365,50 +396,80 @@ grain are unchanged by any weighting (fine detail comes from `L̂` alone);
 a filter adds only band-limited chroma noise, 19–21 % σ on smooth areas
 for the red filter, far less for yellow or orange.
 
-The GUI is deliberately small: open or drop a RAW, choose the mix from one
-row of presets (*Native*, *Panchromatic* = the camera file's calibrated
-weights, and the filters *Yellow 8* … *Blue 47* in front of it) or move
-the R/B sliders freely, pick a look (`neutral`, `reference`, or draw a
-custom curve), turn the picture in 90° steps if the camera's orientation
-tag is wrong (`⟳ 90°`), press *Export*. Every export writes two files with
-the current mix and look: `<name>.tif` (16 bit, full resolution, gamma 2.2
-grey ICC, unsharpened: the file to continue with in an editor) and
-`<name>_2048px.jpg` (2048 px long edge, quality 100, one channel, the
-screen compensation above). There is no print or export panel: paper size,
-dpi and viewing-distance sharpening belong to the editor that prints; the
-CLI keeps them (`mimizan print --size 30x40cm --usm-amount …`). The preview
-is never sharpened: it shows the negative as the TIFF gets it, and once you
-zoom past the fit-to-window preview (scroll, `1:1`, or a double click) the
-visible window is rendered from the full-resolution separation, pixel for
-pixel, so the negative can be judged, carrier residue included. The left
-column shows the file's exposure (ISO, time, aperture, focal length, lens)
-from EXIF. The *Development* fold defaults to Mimizan with the Dubois
-separation (`mask: Dubois`); the fixed estimator, the block mask and
-reconstruction stay one click away. The same fold can switch to AMaZE, RCD,
-DCB or LMMSE. That recomputes the picture at once and leaves the Mimizan
-path untouched; weights, filters and the look apply to either. A
-histogram (256 bins, linear or log) is computed from the full-resolution
-negative, never from the preview copy: either after the look curve (what the
-TIFF gets) or the linear mix on a gamma-2.2 axis. The black/white readout
+The GUI is a darkroom: the picture fills the window and three translucent
+panels float over it (move them by the title, collapse them with a click,
+close them and bring them back from the toolbar, `Tab` hides all three).
+They are plain egui on glow — alpha and a shadow, no blur — so the app looks
+the same on a machine without a GPU driver. *Analysis* (left) shows the
+file's exposure from EXIF, the histograms and the *Development* fold.
+*Enlarger* (right) holds everything that exposes the print: the mix from
+one row of presets (*Native*, *Panchromatic* = the camera file's calibrated
+weights, and the filters *Yellow 8* … *Blue 47* in front of it) or the R/B
+sliders, the *place* slider (stops, the exposure), the curve — a look
+(`neutral`, `reference`), the **zone bar**, or a custom curve — and *dodge
+& burn*. *Print* (bottom) is the paper: native size, a paper size at a dpi
+or a long edge, the border, the resampling kernel and the sharpening, with
+the output size it adds up to.
+
+The zone bar is the paper's split bar: eleven zones on one logarithmic axis
+with Zone V in the middle, the print above, the scene below, a line from
+each scene zone to where it prints. Drag a handle to move that zone's
+output (the curve stays monotone; the neighbours clamp it), double-click
+to put it back, hover a zone and its pixels light up in the preview; *fog*
+and *paper white* are the two end handles. The grade buttons N−2 … N+2 are
+node presets, nothing more: after a click only the nodes count. Switching
+from a look to *Zones* samples that look on the zone nodes. Dodge & burn
+shapes are placed in the picture (*+ disc* then click, *+ gradient* then
+drag from no effect to full effect), moved by their centre, resized by the
+ring or the end points, set in EV in the panel; `Delete` removes the
+selected one. The outline overlay can be hidden under *view*.
+
+Everything the panels set is one **development** (weights, turns and the
+recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole
+states, one step per released drag. The export (*Export…*) renders exactly
+this recipe in one pass against the negative and writes two files:
+`<name>.tif` (16 bit, gamma 2.2 grey ICC, the recipe in the TIFF
+description, size, border and sharpening as set — the print) and
+`<name>_2048px.jpg` (the same picture without border or print sharpening,
+2048 px long edge, quality 100, the screen compensation above). *Recipe*
+saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
+back when the file is opened again) or anywhere else, and loads one; the
+same JSON drives `mimizan print --recipe`. The preview is the picture before
+size, border and sharpening — mix, placing, shapes and curve exactly as the
+TIFF gets them — and once you zoom past the fit-to-window preview (scroll,
+`1:1`, or a double click) the visible window is rendered from the
+full-resolution separation, pixel for pixel, shapes included, so the
+negative can be judged, carrier residue included. The *Development* fold
+defaults to Mimizan with the Dubois separation (`mask: Dubois`); the fixed
+estimator, the block mask and reconstruction stay one click away. The same
+fold can switch to AMaZE, RCD, DCB or LMMSE; that recomputes the picture
+at once and leaves the Mimizan path untouched. Three histograms (256 bins,
+linear or log), all from the full-resolution data, never from the preview
+copy: *print* (after placing, shapes and the curve: what the TIFF gets),
+*negative* (the linear mix on a gamma-2.2 axis) and *raw* (the four sensor
+channels R, G1, G2, B as shot, each against its own black and white level,
+with the fraction at the white level per channel). The black/white readout
 counts the pixels that are 0 or 65535 in the 16-bit output, i.e. the TIFF's
 own clipping. Exports run in a background thread; the preview (a downscaled
 copy of the separation) updates in milliseconds. `Reset` returns the
-controls to the camera-file defaults and keeps the negative.
+development to the camera-file defaults and keeps the negative.
 
-The strip at the bottom is the folder browser: *Folder…* (or dropping a
-folder, or opening any file) lists the folder's RAW files as grey
-thumbnails, sorted by name or file date, with a breadcrumb to walk up.
-Each thumbnail is the mosaic binned to grey with the file's balance and
-the camera file's weights — the same mix the development would produce,
-not the camera's embedded JPEG, which carries the camera's tone curve and
-was measured to take as long to decode (250–430 ms against 340–420 ms for
-the mosaic on a Z f file). Thumbnails are made for the visible tiles first
-on a third worker thread and cached in `~/.cache/mimizan/thumbs`
-(8-bit PNG keyed by path, size and modification time). A click opens the
-file, `←`/`→` open the neighbours, `B` hides and shows the strip; hovering
-shows camera, exposure and capture time. The last folder, the sort order
-and the strip state are kept in `~/.config/mimizan/gui.json`. Nothing is
-rated, deleted or written next to the RAWs.
+The strip at the bottom is the folder browser, drawn as film: *Folder…*
+(or dropping a folder, or opening any file) lists the folder's RAW files
+as frames with perforation, sorted by name or file date, with a breadcrumb
+to walk up. The frames are shown as negatives (the *negative* toggle shows
+them as prints instead). Each thumbnail is the mosaic binned to grey with
+the file's balance and the camera file's weights — the same mix the
+development would produce, not the camera's embedded JPEG, which carries
+the camera's tone curve and was measured to take as long to decode (250–430
+ms against 340–420 ms for the mosaic on a Z f file). Thumbnails are made for
+the visible tiles first on a third worker thread and cached in
+`~/.cache/mimizan/thumbs` (8-bit PNG keyed by path, size and modification
+time). A click opens the file, `←`/`→` open the neighbours, `B` hides and
+shows the strip; hovering shows camera, exposure and capture time. The last
+folder, the sort order, the strip and panel state are kept in
+`~/.config/mimizan/gui.json`. Nothing is rated or deleted; the only file
+ever written next to a RAW is the recipe you ask for.
 
 ## Calibration
 

@@ -544,28 +544,110 @@ Kein Prozentwert ohne eine dieser Messungen.
 
 ## 9. Ausgang (Druck und Bildschirm)
 
-Reihenfolge: Mischung → Größe → Kurve → [Entfaltung →] USM *oder*
-Bildschirmkompensation → Datei.
+Reihenfolge: Mischung → Orientierung → Größe → Platzierung und
+Abwedeln/Nachbelichten → Kurve → Rand → [Entfaltung →] USM *oder*
+Bildschirmkompensation → Datei. Ein Durchgang in f64, eine Quantisierung
+am Ende.
 
+- **Rezept [Ergänzung, Zonensystem-Whitepaper §5 und Anhang A]**: Der
+  Druck ist ein Parametersatz, keine Folge von Bearbeitungen. `Recipe`
+  (`recipe.rs`, `schema: 1`) hält `place`, `curve` (eine Look-Datei
+  inline), `dodge_burn`, `resample`, `size`, `dpi`, `border_mm`, `sharpen`
+  (`{"mode":"off"}` | `usm` | `deconv` | `screen`). Felder mit
+  Default-Wert werden nicht geschrieben; das leere Rezept
+  `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
+  ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`). Das
+  Rezept steht als JSON in der `ImageDescription` des Druck-TIFFs und in
+  `--write-recipe`; `--recipe` liest es, Flags auf der Kommandozeile
+  überschreiben einzelne Felder. Die GUI-Historie ist eine Liste solcher
+  Zustände (plus Gewichte und Drehung), nie von Pixeln. Nichts im Rezept
+  liest das Bild: keine inhaltsabhängige Maske, kein Tone-Equalizer (§1,
+  §10 des Whitepapers).
 - **Orientierung**: Das Negativ trägt die RAW-Orientierung nur als Tag
   (§7). Der Druck dreht zuerst Pixel und Sidecar-Maske aufrecht
   (Orientierung 1–8), danach steht im Druck-TIFF `Orientation = 1`.
 - **Größe**: Ziel `--size <B>x<H><cm|mm|in>` plus `--dpi`; Zielpixel =
   Zoll·DPI, Bild wird eingepasst (Seitenverhältnis bleibt). Die Angabe
   ist das Papier, nicht die Bildlage: Ein Querformat auf „30x40cm“ wird
-  in 40×30 cm eingepasst. Lanczos-3 separabel in f64; beim Verkleinern
-  wird der Kern mit dem Skalenfaktor gestreckt (das ist der Tiefpass
-  vorher), Ränder gefaltet (Gewichte außerhalb werden auf den Randpixel
-  gelegt, Summe exakt 1). Niemals über Zielpixel hinaus skalieren. Die
-  Maske wird mit demselben Kern mitskaliert. Ohne `--size` bleibt die
+  in 40×30 cm eingepasst. Mit `--border-mm` wird der Rand vorher vom
+  Papier abgezogen (Zielbox = Papier − 2·Rand), das Bild in den Rest
+  eingepasst. Kern `--resample` (Rezeptfeld `resample`), separabel in f64:
+  `lanczos3` (Default, der Kern aller Benchmark-Zahlen), `mitchell`
+  (Mitchell–Netravali B = C = ⅓), `catmull-rom` (B = 0, C = ½) und
+  `b-spline` (B = 1, C = 0). Beim Verkleinern wird der Kern mit dem
+  Skalenfaktor gestreckt (das ist der Tiefpass vorher), Ränder gefaltet
+  (Gewichte außerhalb werden auf den Randpixel gelegt, Summe exakt 1).
+  Niemals über Zielpixel hinaus skalieren. Die Maske wird mit Lanczos-3
+  mitskaliert (sie ist ein Gewichtsfeld). Ohne `--size` bleibt die
   Pixelzahl des Negativs. Alternativ `--size <N>px`: lange Kante in
   Pixeln (Einpassen in ein Quadrat N×N), für den Bildschirm.
-- **Kurve**: `look/*.json` mit monotonen Stützstellen in [0,1]² (Eingang
-  linear, Ausgang kodiert), interpoliert mit PCHIP (monoton). Preset
+  **[Abweichung zu Anhang A.2]**: Der dort empfohlene „Cubic B = 0,
+  C = 1“ ist kein Catmull-Rom (das ist C = ½) und überschwingt an einer
+  Kante stärker als Lanczos-3 (RESULTS.md, Tabelle der Kernüberschwinger);
+  allein der B-Spline ist überschwingfrei und dafür sichtbar weich. Der
+  Kern ist deshalb ein Parameter des Rezepts, kein Ersatz des Defaults.
+- **Platzierung [Ergänzung, Whitepaper Gl. 1]** (`--place <stops>`,
+  Rezeptfeld `place`, |place| ≤ 5): `L ← L · 2^place` auf der linearen
+  Luminanz nach der Größe, vor der Kurve. `place = 0` lässt jeden Wert
+  unangetastet (kein Rechenschritt).
+- **Abwedeln und Nachbelichten [Ergänzung, Anhang A, wie umgesetzt]**
+  (`--burn radial:x,y,radius,feather,ev`, `--burn gradient:x0,y0,x1,y1,ev`,
+  wiederholbar; Rezeptfeld `dodge_burn`): lokale Platzierung,
+
+      L'(x, y) = L(x, y) · 2^(place + Σ_i ev_i · m_i(x, y)),   m_i ∈ [0; 1]
+
+  Masken rein geometrisch: Scheibe (Gewicht 1 innerhalb
+  `radius·(1 − feather)`, 0 außerhalb `radius`, Smoothstep dazwischen)
+  und Gerade (0 bei `(x0,y0)`, 1 bei `(x1,y1)`, Smoothstep entlang der
+  Strecke, konstant jenseits der Enden — die Kartenkante der Dunkelkammer).
+  Koordinaten normiert auf das aufrechte Bild (Pixelmitte `(i + 0,5)/w`),
+  Radius als Bruchteil der langen Kante, Abstände in Einheiten der langen
+  Kante (die Scheibe ist in Pixeln rund). Vorzeichen wie `place`: positives
+  `ev` platziert heller (Abwedeln), negatives dunkler (Nachbelichten),
+  |ev| ≤ 5. **[Abweichung zu Anhang A.1/A.3]**: Der Anhang rechnet D&B
+  nach der Kurve im kodierten Raum; hier liegt es davor, multiplikativ
+  auf der linearen Luminanz, weil nur so ein EV ein Stop bleibt, die
+  Schulter der Kurve einen nachbelichteten Himmel wie jedes andere Licht
+  behandelt und nichts additiv über Papierweiß geschoben werden kann.
+  Vorschau, 1:1-Fenster und Druck werten dieselben normierten Koordinaten
+  aus (`burn::apply_window` für Ausschnitte).
+- **Kurve**: `look/*.json` mit monotonen Stützstellen in [0,1]², PCHIP
+  (Fritsch–Carlson, monoton). `encoding = gamma22` (Default): Eingang
+  und Ausgang kodiert, d. h. `u = clamp(L,0,1)^(1/2,2)`, `v = PCHIP(u)`;
+  `encoding = none`: Stützstellen auf der linearen Achse. Preset
   `neutral`: reine Gamma-2,2-Kodierung. Preset `reference`: durch
   `calibrate wedge` aus dem Graukeil der Referenz-Monochromkamera (lineares
-  DNG gegen ihr eigenes Kamera-JPEG) gefittet, RESULTS.md. Druck-TIFF
-  bekommt ein Grau-ICC mit Gamma 2,2.
+  DNG gegen ihr eigenes Kamera-JPEG) gefittet, RESULTS.md. Identität
+  (keine Kurve wird gerechnet) ist erkannt, wenn erster Punkt (0,0),
+  letzter (1,1) und alle `x = y`. Druck-TIFF bekommt ein Grau-ICC mit
+  Gamma 2,2.
+- **Zonenkurve [Ergänzung, Whitepaper §3–4]** (`--grade <n>`, GUI
+  „Zones“): ein Look namens `zones` mit den Stützstellen auf den
+  kodierten Zonenmitten `Z_k = 0,18 · 2^(k−5)`, k = 0 … VII (VIII und
+  darüber liegen über dem Clip; Zone V = 0,18 = Graukarte, eine Zone =
+  ein Stop), dazu die Endpunkte (0, y₀) = Schleier und (1, y₁) =
+  Papierweiß. Kodierte Zonenmitten nach der Formel: 0,0949 / 0,1301 /
+  0,1782 / 0,2442 / 0,3347 / 0,4587 / 0,6285 / 0,8613. **[Hinweis]**: Die
+  Tabellenwerte im Whitepaper (0,100 / 0,137 / 0,187 …) stimmen nicht mit
+  `x^(1/2,2)` überein; die Formel ist normativ. Unangetastet ist die
+  Zonenkurve bit-identisch zu `neutral`. Ein Zug am Knoten k ändert
+  dessen Ausgabewert; `zone::set_output` klemmt ihn zwischen die
+  Nachbarn (Mindestabstand 10⁻⁴), so dass die Kurve monoton bleibt. Grade
+  N+n: die mittleren Knoten um Zone V mit dem Faktor 1,25ⁿ gespreizt
+  (n < 0 gestaucht), danach nur noch Knoten, kein zweiter Filter. Ein
+  anderer Look wird mit `look_on_zone_nodes` auf die Zonenknoten
+  abgetastet (die „zweite Quelle derselben Punkte“ des Whitepapers).
+  **[Abweichung zu Whitepaper §4]**: Ein Zug an Knoten k ändert bei
+  Fritsch–Carlson nicht nur die beiden angrenzenden Intervalle, sondern
+  (über die Steigungen der Nachbarknoten) je zwei Intervalle pro Seite;
+  die Werte an den Nachbarknoten selbst bleiben. Die GUI-Vorschau
+  wertet die Kurve über eine 16-Bit-LUT aus, der Export exakt in f64.
+- **Rand [Ergänzung, Anhang B.3]** (`--border-mm`, Rezeptfeld
+  `border_mm`): nach der Kurve wird das Bild in ein Papierfeld der Breite
+  `round(border_mm / 25,4 · DPI)` Pixel je Seite gelegt, gefüllt mit
+  Papierweiß = Kurvenwert bei linear 1 (bei `neutral` 1,0); die Maske wird
+  mit 0 aufgefüllt, damit keine Schärfung in den Rand läuft. Das
+  Bildschirm-JPEG der GUI bekommt keinen Rand.
 - **USM**: Radius in Pixel
 
       r_px = usm_k · d_mm · DPI,   usm_k = 1,15·10⁻⁵ (Default)
@@ -597,10 +679,13 @@ Bildschirmkompensation → Datei.
   solange > 0.
 - **Bildschirmkompensation [Ergänzung]** (`--screen <amount>`, ersetzt die
   USM): Für ein Bild, das 1:1 auf einem Bildschirm steht, sind die
-  Verluste bekannt und nicht vom Betrachter abhängig: die Lanczos-3-
-  Verkleinerung mit MTF `L(f)` (Fourier-Transformierte des auf 1
-  normierten Kerns in Ausgabepixeln; 1,01 bei 0,2 c/px, 0,99 bei 0,3,
-  0,82 bei 0,4, 0,50 bei 0,5) und die Pixelapertur des Displays
+  Verluste bekannt und nicht vom Betrachter abhängig: die Verkleinerung
+  mit der MTF `L(f)` des gewählten Kerns (`ResampleKernel::mtf`,
+  Fourier-Transformierte des auf 1 normierten Kerns in Ausgabepixeln; für
+  Lanczos-3 1,01 bei 0,2 c/px, 0,99 bei 0,3, 0,82 bei 0,4, 0,50 bei 0,5;
+  ein weicherer Kern wie der B-Spline hat eine tiefere MTF, die der
+  9-Tap-FIR unter der Verstärkungsgrenze nur zum Teil zurückholt) und die
+  Pixelapertur des Displays
   (100 % Füllfaktor, `A(f) = sinc(f) = sin(πf)/(πf)`, 0,637 bei Nyquist).
   Bekannte Übertragung `M(f) = L(f)·A(f)` (0,985 / 0,947 / 0,849 / 0,623
   bei 0,1 / 0,2 / 0,3 / 0,4 c/px); ohne Verkleinerung nur `A(f)`.
@@ -624,9 +709,9 @@ Bildschirmkompensation → Datei.
   Betrachtungsabstand, Display-ppi.
 - **Datei**: 16-Bit-TIFF mit Kurve und Gamma-2,2-Grau-ICC (bei
   `encoding = none` lineares ICC), `XResolution/YResolution` = DPI,
-  `ImageDescription` = JSON mit Quelle, Look, Größe, USM- bzw.
-  Kompensationsparametern (Taps, Antwort bei 0,25 und 0,40 c/px) und
-  der Beschreibung des Negativs. Endet `-o` auf `.jpg`/`.jpeg`, wird nur
+  `ImageDescription` = JSON mit Quelle, dem vollständigen Rezept, Größe
+  und Rand in Pixeln, USM- bzw. Kompensationsparametern (Taps, Antwort
+  bei 0,25 und 0,40 c/px) und der Beschreibung des Negativs. Endet `-o` auf `.jpg`/`.jpeg`, wird nur
   das JPEG geschrieben (Bildschirm). `--proof` schreibt zusätzlich ein
   8-Bit-Grau-JPEG derselben Pixel in voller Druckauflösung, Qualität 100
   (ein Kanal, kein Chroma-Subsampling), mit demselben Grau-ICC wie das

@@ -2633,6 +2633,9 @@ impl App {
     /// (mix, placing, curve, dodge & burn) right, print at the bottom centre. Each is a window the user can
     /// move, collapse (click the title) or close; the toolbar brings it back.
     fn glass_panels(&mut self, ctx: &egui::Context, stage: Rect) {
+        // Side panels open at the stage's height (egui's default window
+        // height of 420 pt would cut the histogram and the dodge & burn
+        // section); the user can shorten them, the content scrolls.
         let max_h = (stage.height() - 2.0 * PANEL_GAP).max(120.0);
         let mut open = self.panels;
         egui::Window::new("Analysis")
@@ -2641,6 +2644,7 @@ impl App {
             .default_pos(stage.left_top() + Vec2::splat(PANEL_GAP))
             .default_width(PANEL_W)
             .max_width(PANEL_W)
+            .default_height(max_h)
             .max_height(max_h)
             .resizable([false, true])
             .vscroll(true)
@@ -2652,6 +2656,7 @@ impl App {
             .default_pos(stage.right_top() + Vec2::new(-PANEL_W - PANEL_GAP - 12.0, PANEL_GAP))
             .default_width(PANEL_W)
             .max_width(PANEL_W)
+            .default_height(max_h)
             .max_height(max_h)
             .resizable([false, true])
             .vscroll(true)
