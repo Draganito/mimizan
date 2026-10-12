@@ -286,6 +286,27 @@ pub struct Layout {
     pub usm_radius_px: f64,
 }
 
+/// Paper box, in pixels, whose fitted picture is exactly `picture_w` pixels
+/// wide. The height is that same scale, `round(img_h · picture_w / img_w)`,
+/// and `border` pixels of paper sit outside the picture on every side.
+///
+/// The inner height is `ceil`, not the rounded height: `fit_dims` takes the
+/// tighter side, and a ceil keeps the width the tighter one, so the rounded
+/// height still fits inside the box.
+pub fn box_for_picture_width(img_w: usize, img_h: usize, picture_w: usize, border: usize) -> (usize, usize) {
+    let picture_w = picture_w.max(1);
+    let inner_h = (picture_w as f64 * img_h as f64 / img_w.max(1) as f64).ceil().max(1.0) as usize;
+    (picture_w.saturating_add(2 * border), inner_h.saturating_add(2 * border))
+}
+
+/// Paper box, in pixels, whose fitted picture is exactly `picture_h` pixels
+/// tall. Mirror of [`box_for_picture_width`].
+pub fn box_for_picture_height(img_w: usize, img_h: usize, picture_h: usize, border: usize) -> (usize, usize) {
+    let picture_h = picture_h.max(1);
+    let inner_w = (picture_h as f64 * img_w as f64 / img_h.max(1) as f64).ceil().max(1.0) as usize;
+    (inner_w.saturating_add(2 * border), picture_h.saturating_add(2 * border))
+}
+
 /// Layout for a negative of `w×h` (before orientation). The border is taken
 /// from the paper box before the fit, so picture plus border never exceeds
 /// the size asked for.
@@ -546,6 +567,64 @@ mod tests {
         assert_eq!(layout(4000, 3000, 1, &big).image_w, 24000);
         assert_eq!(layout(4000, 3000, 1, &PrintParams::default()).image_w, 4000);
         assert!(is_jpeg_path(Path::new("a/b.JPG")) && !is_jpeg_path(Path::new("a/b.tif")));
+    }
+
+    /// The GUI's centimetre fields describe the picture. The box they write
+    /// is that picture plus the border, and `layout` must give the picture
+    /// back: the side the user typed, exactly, and the other side from the
+    /// one scale `fit_dims` uses.
+    #[test]
+    fn box_for_picture_round_trips_through_layout() {
+        let dpi = 300.0;
+        let cases = [(5504, 8256), (4032, 3024), (100, 99), (5, 4), (3, 5), (1, 1), (8256, 5504)];
+        let pictures = [2, 3, 10, 50, 1772, 2400];
+        let borders = [0, 1, 3, 15, 177];
+        for (img_w, img_h) in cases {
+            for picture in pictures {
+                for border in borders {
+                    check_picture_box(img_w, img_h, picture, border, dpi, true);
+                    check_picture_box(img_w, img_h, picture, border, dpi, false);
+                }
+            }
+        }
+    }
+
+    fn check_picture_box(
+        img_w: usize,
+        img_h: usize,
+        picture: usize,
+        border: usize,
+        dpi: f64,
+        drive_width: bool,
+    ) {
+        let (bw, bh) = if drive_width {
+            box_for_picture_width(img_w, img_h, picture, border)
+        } else {
+            box_for_picture_height(img_w, img_h, picture, border)
+        };
+        let p = PrintParams {
+            recipe: Recipe {
+                size: Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi }),
+                dpi,
+                border_mm: border as f64 / dpi * 25.4,
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(p.recipe.border_px(), border, "border px must survive the mm round trip");
+        let lay = layout(img_w, img_h, 1, &p);
+        let (got, other, along) =
+            if drive_width { (lay.image_w, lay.image_h, img_h) } else { (lay.image_h, lay.image_w, img_w) };
+        assert_eq!(
+            got,
+            picture,
+            "{img_w}x{img_h} drive {} = {picture} border {border}",
+            if drive_width { "width" } else { "height" }
+        );
+        let expect = (along as f64 * picture as f64 / (if drive_width { img_w } else { img_h }) as f64)
+            .round() as usize;
+        assert_eq!(other, expect.max(1), "the other side is the one scale");
+        assert_eq!((lay.out_w, lay.out_h), (lay.image_w + 2 * border, lay.image_h + 2 * border));
     }
 
     /// The border is taken from the paper, filled with the curve's white,

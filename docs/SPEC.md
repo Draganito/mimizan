@@ -582,7 +582,14 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   `b-spline` (B = 1, C = 0). Beim Verkleinern wird der Kern mit dem
   Skalenfaktor gestreckt (das ist der Tiefpass vorher), Ränder gefaltet
   (Gewichte außerhalb werden auf den Randpixel gelegt, Summe exakt 1).
-  Niemals über Zielpixel hinaus skalieren. Die Maske wird mit Lanczos-3
+  Niemals über Zielpixel hinaus skalieren. Die GUI zeigt nicht diese
+  Kiste, sondern das Bild: die beiden Zentimeter sind gekoppelt, eine Seite
+  setzt die andere über das Seitenverhältnis des aufrechten Negativs (eine
+  Skala, `round` auf der mitlaufenden Seite), und der Rand wird außen
+  addiert. Das Rezept speichert weiterhin die Kiste, also Bild plus Rand,
+  damit `layout` genau diese Bildpixel zurückgibt (`box_for_picture_width`,
+  `box_for_picture_height`). Die Kommandozeile `--size` bleibt die Kiste;
+  der Rand wird dort wie bisher vorher abgezogen. Die Maske wird mit Lanczos-3
   mitskaliert (sie ist ein Gewichtsfeld). Ohne `--size` bleibt die
   Pixelzahl des Negativs. Eine Pixelgröße (`<N>px`, lange Kante) gab es
   bis 0.9.0 für den Bildschirm; sie ist mit der Bildschirmausgabe

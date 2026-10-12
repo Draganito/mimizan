@@ -278,7 +278,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.1-1_amd64.deb
+sudo apt install ./mimizan_0.10.2-1_amd64.deb
 mimizan --version
 ```
 
@@ -398,13 +398,16 @@ editing step: the mix from one drop-down (*Native*, *Panchromatic* =
 the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
 47* in front of it) or the R and B fields, the zone bar and the two exposures
 *soft* and *hard*. *Print* is the output step
-and nothing else: native size or a paper size at a dpi, the border, the
-resampling kernel and the sharpening, the output size it adds up to, and
-the *Export…* button. The border is part of the preview: the sheet
-(picture plus border in paper white, in the print's proportion) is what
-is fitted into the stage, so a 20 mm border on 30×40 cm is judged as it
-will print. The border is drawn, not rendered — the picture under it is
-still the one before size and sharpening.
+and nothing else: native pixels, or the picture in centimetres at a dpi,
+the border, the resampling kernel and the sharpening, the output size it
+adds up to, and the *Export…* button. The two centimetre fields are the
+picture, and they are one proportion: type the short side and the long
+side follows the negative, and the other way round, a single scale. The
+border is paper white added around those centimetres, and it is part of
+the preview: the sheet (picture plus border, in the print's proportion)
+is what is fitted into the stage, so 20 mm around a picture 40 cm on the
+long side is judged as it will print. The border is drawn, not rendered —
+the picture under it is still the one before size and sharpening.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to

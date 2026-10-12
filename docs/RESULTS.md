@@ -704,6 +704,40 @@ border pixels (a flat value would only add a bar at paper white). The
 8-bit grey of the painted rectangle is the same value the texture carries
 for paper white, both through egui's sRGB path.
 
+### The paper fields are the picture (0.10.2)
+
+The two centimetre fields were a paper box. `layout` fits the negative
+into that box after taking the border off it, so a 2:3 negative in a
+30×40 cm box at 300 dpi (0 mm border) is written as 3149×4724 px: the
+40 cm side limits, and the 30 cm side is not in the file. The fields
+still read 30.0 × 40.0. The swap button exchanged the box, which does
+not change a fit that already rotates the box to the picture. Nothing
+about the resampling was wrong. `fit_dims` is one scale,
+`min(box_w / img_w, box_h / img_h)`, each side rounded, the box rotated
+when its orientation disagrees with the picture. The confusion was that
+the numbers on screen were the box and the file was the picture.
+
+The fields are now the picture. Editing one side sets the other from the
+upright negative, `other = round(along · typed / driven)`, and the border
+is added outside those centimetres. The recipe still stores the box the
+core fits into, because that contract (SPEC §9, `--size` on the CLI, old
+recipes) is unchanged: the border is still subtracted before the fit, and
+a loose box still fits the same way. The GUI writes the box as the
+picture plus twice the border, through `box_for_picture_width` and
+`box_for_picture_height`. The inner side that was not typed is `ceil` of
+the exact scale, which is enough to keep the typed side the tighter one,
+so `layout` returns that side exactly and the other side as the one
+`round`. A test walks both drivers over portrait, landscape, near-square
+and square negatives, with and without a border, at 300 dpi, including
+the millimetre round trip of the border (`border_px` comes back equal).
+The first time *paper* is chosen the long side is 40 cm and the short
+side follows; after that the fields remember the picture. A loaded
+recipe keeps its box and the fields show the picture that box produces,
+so opening an old 30×40 cm recipe does not change a pixel. Changing the
+border or the dpi keeps the centimetres and rebuilds the box around
+them. The resampling kernel, the single quantisation and the preview
+proportion are untouched.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156

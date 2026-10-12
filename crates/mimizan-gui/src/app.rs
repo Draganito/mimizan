@@ -14,7 +14,7 @@ use mimizan_core::deconv::DECONV_ITERATIONS;
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
-use mimizan_core::print::PrintSize;
+use mimizan_core::print::{box_for_picture_height, box_for_picture_width, PrintSize};
 use mimizan_core::recipe::{Recipe, Sharpen, USM_MAX};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
@@ -28,6 +28,13 @@ use std::sync::Arc;
 enum SizeMode {
     Native,
     Paper,
+}
+
+/// Which centimetre field the user is editing. The other follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PictureSide {
+    Width,
+    Height,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,20 +374,60 @@ impl App {
             None => SizeMode::Native,
             Some(PrintSize::Physical { .. }) => SizeMode::Paper,
         };
-        if let Some(PrintSize::Physical { width_in, height_in }) = self.edit.recipe.size {
-            self.paper_cm = [width_in * 2.54, height_in * 2.54];
+        if self.edit.recipe.size.is_some() {
+            if let Some(cm) = self.picture_cm() {
+                self.paper_cm = cm;
+            }
         }
     }
 
-    /// `Recipe::size` from the export section's choice.
-    fn sync_size(&mut self) {
-        self.edit.recipe.size = match self.size_mode {
-            SizeMode::Native => None,
-            SizeMode::Paper => Some(PrintSize::Physical {
-                width_in: self.paper_cm[0] / 2.54,
-                height_in: self.paper_cm[1] / 2.54,
-            }),
+    /// The picture's size in centimetres, from the layout the recipe produces.
+    fn picture_cm(&self) -> Option<[f64; 2]> {
+        let l = self.print_layout()?;
+        let dpi = self.edit.recipe.dpi;
+        if dpi <= 0.0 {
+            return None;
+        }
+        Some([l.image_w as f64 / dpi * 2.54, l.image_h as f64 / dpi * 2.54])
+    }
+
+    /// Write a paper box whose picture is the centimetre field on `side`,
+    /// the other side following at the same scale, the border outside it.
+    /// Then show the centimetres the file actually has.
+    fn apply_picture(&mut self, side: PictureSide) {
+        let (uw, uh) = self.export_size();
+        let dpi = self.edit.recipe.dpi;
+        if uw == 0 || uh == 0 || dpi <= 0.0 {
+            return;
+        }
+        let b = self.edit.recipe.border_px();
+        let (bw, bh) = match side {
+            PictureSide::Width => {
+                let px = (self.paper_cm[0] / 2.54 * dpi).round().max(1.0) as usize;
+                box_for_picture_width(uw, uh, px, b)
+            }
+            PictureSide::Height => {
+                let px = (self.paper_cm[1] / 2.54 * dpi).round().max(1.0) as usize;
+                box_for_picture_height(uw, uh, px, b)
+            }
         };
+        self.edit.recipe.size =
+            Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi });
+        if let Some(cm) = self.picture_cm() {
+            self.paper_cm = cm;
+        }
+    }
+
+    /// First paper size: 40 cm on the long side, the short side from the negative.
+    fn set_long_edge_cm(&mut self, long_cm: f64) {
+        let (uw, uh) = self.export_size();
+        if uh >= uw && uh > 0 {
+            self.paper_cm = [long_cm * uw as f64 / uh as f64, long_cm];
+            self.apply_picture(PictureSide::Height);
+        } else if uw > 0 {
+            self.paper_cm = [long_cm, long_cm * uh as f64 / uw as f64];
+            self.apply_picture(PictureSide::Width);
+        }
     }
 
     fn undo(&mut self) {
@@ -1442,49 +1489,84 @@ impl App {
         self.size_mode = mode;
         match mode {
             SizeMode::Paper => {
+                // Entering paper with no size yet. The struct default 30×40 is a
+                // loose box, so the first time takes 40 cm on the long side;
+                // coming back keeps the picture the fields already show.
+                if self.edit.recipe.size.is_none() && self.export_size().0 > 0 {
+                    if self.paper_cm == [30.0, 40.0] {
+                        self.set_long_edge_cm(40.0);
+                    } else {
+                        self.apply_picture(PictureSide::Width);
+                    }
+                }
+                let dpi_before = self.edit.recipe.dpi;
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut self.paper_cm[0])
-                            .range(1.0..=300.0)
-                            .speed(0.1)
-                            .suffix(" cm"),
-                    );
+                    let width = ui
+                        .add(
+                            egui::DragValue::new(&mut self.paper_cm[0])
+                                .range(0.1..=2000.0)
+                                .speed(0.1)
+                                .fixed_decimals(1)
+                                .suffix(" cm"),
+                        )
+                        .on_hover_text(
+                            "Width of the picture. The height follows the negative, one scale for both sides. The border is added around this.",
+                        );
                     ui.label("×");
-                    ui.add(
-                        egui::DragValue::new(&mut self.paper_cm[1])
-                            .range(1.0..=300.0)
-                            .speed(0.1)
-                            .suffix(" cm"),
-                    );
+                    let height = ui
+                        .add(
+                            egui::DragValue::new(&mut self.paper_cm[1])
+                                .range(0.1..=2000.0)
+                                .speed(0.1)
+                                .fixed_decimals(1)
+                                .suffix(" cm"),
+                        )
+                        .on_hover_text(
+                            "Height of the picture. The width follows the negative, one scale for both sides. The border is added around this.",
+                        );
                     ui.label(RichText::new("at").weak());
-                    ui.add(
+                    let dpi = ui.add(
                         egui::DragValue::new(&mut self.edit.recipe.dpi)
                             .range(36.0..=1200.0)
                             .speed(1.0)
                             .suffix(" dpi"),
                     );
-                    if ui.small_button("⇄").on_hover_text("Swap width and height").clicked() {
-                        self.paper_cm.swap(0, 1);
+                    if width.changed() {
+                        self.apply_picture(PictureSide::Width);
+                    } else if height.changed() {
+                        self.apply_picture(PictureSide::Height);
+                    } else if dpi.changed() && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
+                        self.apply_picture(PictureSide::Width);
+                    } else if let Some(cm) = self.picture_cm() {
+                        self.paper_cm = cm;
                     }
                 });
             }
             SizeMode::Native => {
+                self.edit.recipe.size = None;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("dpi for the border").weak());
                     ui.add(egui::DragValue::new(&mut self.edit.recipe.dpi).range(36.0..=1200.0).speed(1.0));
                 });
             }
         }
-        self.sync_size();
+        let border_before = self.edit.recipe.border_mm;
         ui.horizontal(|ui| {
             ui.label(RichText::new("border").weak());
-            ui.add(
-                egui::DragValue::new(&mut self.edit.recipe.border_mm)
-                    .range(0.0..=100.0)
-                    .speed(0.2)
-                    .suffix(" mm"),
-            )
-            .on_hover_text("Paper white around the picture, taken from the paper size");
+            let border = ui
+                .add(
+                    egui::DragValue::new(&mut self.edit.recipe.border_mm)
+                        .range(0.0..=100.0)
+                        .speed(0.2)
+                        .suffix(" mm"),
+                )
+                .on_hover_text("Paper white around the picture, added outside the centimetres above");
+            if self.size_mode == SizeMode::Paper
+                && border.changed()
+                && (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON
+            {
+                self.apply_picture(PictureSide::Width);
+            }
             ui.label(RichText::new("resample").weak());
             let r = &mut self.edit.recipe.resample;
             egui::ComboBox::from_id_salt("resample").selected_text(r.name()).show_ui(ui, |ui| {
