@@ -377,6 +377,12 @@ pub struct Persisted {
     pub sort: Sort,
     /// Strip shown; `None` on a fresh install means "yes".
     pub strip: Option<bool>,
+    /// Strip tiles shown as negatives (the film), not as the print.
+    #[serde(default)]
+    pub strip_negative: Option<bool>,
+    /// Floating panels shown: analysis, enlarger, print. `None` means all.
+    #[serde(default)]
+    pub panels: Option<[bool; 3]>,
 }
 
 /// `$XDG_CONFIG_HOME/mimizan/gui.json` or `~/.config/mimizan/gui.json`.

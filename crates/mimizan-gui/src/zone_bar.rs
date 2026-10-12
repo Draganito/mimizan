@@ -186,22 +186,6 @@ pub fn zone_bar(ui: &mut Ui, look: &mut LookFile, width: f32) -> Option<u8> {
             painter.text(p, align, label, FontId::proportional(10.0), visuals.weak_text_color());
         }
     }
-    // Axis legend between the rows.
-    painter.text(
-        pos2(rect.left() + 2.0, print_row.bottom() + 1.0),
-        Align2::LEFT_TOP,
-        "print",
-        FontId::proportional(9.5),
-        visuals.weak_text_color(),
-    );
-    painter.text(
-        pos2(rect.left() + 2.0, scene_row.top() - 1.0),
-        Align2::LEFT_BOTTOM,
-        "scene",
-        FontId::proportional(9.5),
-        visuals.weak_text_color(),
-    );
-
     if let Some(i) = hover_handle {
         let v = look.points[i][1];
         let what = if i == 0 {

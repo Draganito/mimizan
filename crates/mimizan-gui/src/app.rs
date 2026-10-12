@@ -96,6 +96,13 @@ pub struct App {
     folder_generation: u64,
     sort: Sort,
     show_strip: bool,
+    /// Strip tiles inverted (the film), not the print.
+    strip_negative: bool,
+    /// Floating panels shown: analysis, enlarger, print.
+    panels: [bool; 3],
+    /// Print panel: measured size, and whether the user has moved it.
+    print_size: Option<Vec2>,
+    print_pinned: bool,
     /// Priority list last sent to the thumbnail worker.
     last_wanted: Vec<PathBuf>,
     /// Keyboard moved the selection: bring the tile into view once.
@@ -240,6 +247,10 @@ impl App {
             folder_generation: 0,
             sort: persisted.sort,
             show_strip: persisted.strip.unwrap_or(true),
+            strip_negative: persisted.strip_negative.unwrap_or(true),
+            panels: persisted.panels.unwrap_or([true; 3]),
+            print_size: None,
+            print_pinned: false,
             last_wanted: Vec::new(),
             scroll_to_selected: false,
             current_path: None,
@@ -309,6 +320,8 @@ impl App {
             folder: self.folder.as_ref().map(|f| f.path.clone()),
             sort: self.sort,
             strip: Some(self.show_strip),
+            strip_negative: Some(self.strip_negative),
+            panels: Some(self.panels),
         }
         .save();
     }
@@ -920,10 +933,23 @@ impl App {
             }
             if ui
                 .selectable_label(self.show_strip, "Strip")
-                .on_hover_text("Show or hide the folder strip (B). ←/→ open the neighbouring file.")
+                .on_hover_text("Show or hide the film strip (B). ←/→ open the neighbouring file.")
                 .clicked()
             {
                 self.toggle_strip();
+            }
+            for (i, (name, hover)) in [
+                ("Analysis", "File, histograms, development (Tab hides every panel)"),
+                ("Enlarger", "Mix (the filter), placing (the exposure), the curve (the grade), dodge & burn"),
+                ("Print", "Size, border, sharpening, view"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
+                    self.panels[i] = !self.panels[i];
+                    self.persist();
+                }
             }
             let has = self.session.is_some();
             let export_hover = self.export_hover_text();
@@ -1009,9 +1035,9 @@ impl App {
         });
     }
 
-    fn file_column(&mut self, ui: &mut egui::Ui) {
-        ui.heading("File");
-        ui.add_space(4.0);
+    /// Left panel: what the file is, the histograms, the development
+    /// settings that recompute the negative, the log.
+    fn analysis_panel(&mut self, ui: &mut egui::Ui) {
         let Some(s) = self.session.clone() else {
             ui.label("Open a RAW file or drop it here.");
             ui.add_space(8.0);
@@ -1113,6 +1139,7 @@ impl App {
 
         ui.add_space(10.0);
         ui.separator();
+        self.histogram_section(ui);
         ui.collapsing("Development", |ui| {
             ui.label(RichText::new("Changes here recompute the picture.").weak());
             egui::ComboBox::from_label("converter").selected_text(self.converter.label()).show_ui(ui, |ui| {
@@ -1184,14 +1211,12 @@ impl App {
             }
         });
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(4.0);
+        ui.collapsing("Log", |ui| {
             egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
-                for line in self.log.iter().rev().take(12).rev() {
+                for line in self.log.iter().rev().take(30).rev() {
                     ui.label(RichText::new(line).small().weak());
                 }
             });
-            ui.separator();
         });
     }
 
@@ -1329,10 +1354,10 @@ impl App {
         }
     }
 
-    fn controls_column(&mut self, ui: &mut egui::Ui) {
+    /// Right panel: the negative's mix, placing and the curve, dodge & burn.
+    fn zones_panel(&mut self, ui: &mut egui::Ui) {
         // The zone bar sets this again while the pointer is over it.
         self.hover_zone = None;
-        self.histogram_section(ui);
         ui.heading("Mix");
         let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
         self.mix_presets(ui);
@@ -1361,17 +1386,16 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.dodge_burn_section(ui);
+    }
 
-        ui.add_space(10.0);
-        ui.separator();
+    /// Bottom panel: the print's size, border and sharpening; the view.
+    fn print_panel(&mut self, ui: &mut egui::Ui) {
         self.print_section(ui);
 
-        ui.add_space(10.0);
+        ui.add_space(6.0);
         ui.separator();
-        ui.heading("View");
-        ui.checkbox(&mut self.show_mask, "show mask (white = chroma treated as texture)");
-        ui.checkbox(&mut self.dnb_overlay, "show dodge & burn shapes");
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("view").weak());
             if ui.button("fit").clicked() {
                 self.zoom = 1.0;
                 self.pan = Vec2::ZERO;
@@ -1379,14 +1403,15 @@ impl App {
             if ui.button("1:1").on_hover_text("One negative pixel per screen pixel").clicked() {
                 self.zoom_to_1to1 = true;
             }
-            ui.label(RichText::new("scroll to zoom, drag to pan, double-click toggles").weak());
-        });
-        ui.label(
-            RichText::new(
-                "The preview is the picture before size, border and sharpening: mix, placing, \
-                 dodge & burn and curve, exactly as the TIFF gets them.",
-            )
-            .weak(),
+            ui.checkbox(&mut self.show_mask, "mask")
+                .on_hover_text("Show the sharpening mask: white = chroma treated as texture");
+            ui.checkbox(&mut self.dnb_overlay, "shapes").on_hover_text("Show the dodge & burn outlines");
+        })
+        .response
+        .on_hover_text(
+            "Scroll to zoom, drag to pan, double-click toggles fit and 1:1. The preview is the picture \
+             before size, border and sharpening: mix, placing, dodge & burn and curve, exactly as the TIFF \
+             gets them.",
         );
     }
 
@@ -1789,12 +1814,6 @@ impl App {
             };
             ui.label(RichText::new(txt).weak());
         }
-        ui.label(
-            RichText::new(
-                "Export… writes this recipe as a 16-bit TIFF in one pass, plus a screen JPEG of the same picture.",
-            )
-            .weak(),
-        );
     }
 
     /// What one export writes, for the toolbar button.
@@ -2216,11 +2235,35 @@ fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
     }
 }
 
-/// Strip: folder bar, tiles, horizontal scrollbar.
-const STRIP_HEIGHT: f32 = 196.0;
+/// Strip: folder bar, film tiles, horizontal scrollbar. A tile is one frame
+/// of film: a perforation band above and below the picture, the name as
+/// the edge print underneath.
+const STRIP_HEIGHT: f32 = 214.0;
 const TILE_W: f32 = 150.0;
-const TILE_IMG_H: f32 = 112.0;
-const TILE_H: f32 = TILE_IMG_H + 20.0;
+const TILE_IMG_H: f32 = 108.0;
+const PERF_H: f32 = 13.0;
+const EDGE_H: f32 = 17.0;
+const TILE_H: f32 = PERF_H + TILE_IMG_H + PERF_H + EDGE_H;
+const FILM_BASE: Color32 = Color32::from_rgb(16, 15, 14);
+const FILM_HOLE: Color32 = Color32::from_rgb(38, 38, 40);
+
+/// Perforation holes along a band.
+fn draw_perforation(painter: &egui::Painter, band: Rect) {
+    let (hole_w, hole_h, pitch) = (8.0, 6.0, 15.0);
+    let n = (band.width() / pitch).floor().max(1.0);
+    let start = band.left() + (band.width() - (n - 1.0) * pitch) * 0.5;
+    for i in 0..n as usize {
+        let c = Pos2::new(start + i as f32 * pitch, band.center().y);
+        let r = Rect::from_center_size(c, Vec2::new(hole_w, hole_h));
+        painter.rect_filled(r, 1.5, FILM_HOLE);
+        painter.rect_stroke(
+            r,
+            1.5,
+            egui::Stroke::new(1.0, Color32::from_white_alpha(10)),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
 
 impl App {
     /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
@@ -2286,6 +2329,19 @@ impl App {
                 if ui.small_button("×").on_hover_text("Hide the strip (B)").clicked() {
                     self.toggle_strip();
                 }
+                if ui
+                    .selectable_label(self.strip_negative, "negative")
+                    .on_hover_text("Show the frames as the film holds them (inverted), or as the print")
+                    .clicked()
+                {
+                    self.strip_negative = !self.strip_negative;
+                    if let Some(f) = &mut self.folder {
+                        for e in &mut f.entries {
+                            e.texture = None;
+                        }
+                    }
+                    self.persist();
+                }
                 let mut sort = self.sort;
                 egui::ComboBox::from_id_salt("strip-sort").selected_text(sort.label()).width(70.0).show_ui(
                     ui,
@@ -2328,6 +2384,7 @@ impl App {
         let idle = self.busy.is_none();
         let current = self.current_path.clone();
         let generation = folder.generation;
+        let negative = self.strip_negative;
         let scroll_to = std::mem::take(&mut self.scroll_to_selected);
         let mut clicked: Option<PathBuf> = None;
         // (distance from the viewport centre, index) of tiles that still
@@ -2337,8 +2394,14 @@ impl App {
         egui::ScrollArea::horizontal().id_salt("strip-scroll").show(ui, |ui| {
             let clip = ui.clip_rect();
             let centre = clip.center().x;
+            // The film base runs under every frame.
+            let film = Rect::from_min_size(
+                ui.cursor().min,
+                Vec2::new(ui.available_width().max(clip.width()), TILE_H),
+            );
+            ui.painter().rect_filled(film, 0.0, FILM_BASE);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.spacing_mut().item_spacing.x = 0.0;
                 for (i, e) in folder.entries.iter_mut().enumerate() {
                     let (rect, resp) = ui.allocate_exact_size(Vec2::new(TILE_W, TILE_H), Sense::click());
                     let is_current = current.as_deref() == Some(e.path.as_path());
@@ -2356,9 +2419,16 @@ impl App {
                     }
                     if e.texture.is_none() {
                         if let Some(t) = &e.thumb {
-                            let img = ColorImage::from_gray([t.width, t.height], &t.gray);
+                            let img = if negative {
+                                ColorImage::from_gray_iter(
+                                    [t.width, t.height],
+                                    t.gray.iter().map(|&g| 255 - g),
+                                )
+                            } else {
+                                ColorImage::from_gray([t.width, t.height], &t.gray)
+                            };
                             e.texture = Some(ctx.load_texture(
-                                format!("thumb-{generation}-{i}"),
+                                format!("thumb-{generation}-{i}-{}", negative as u8),
                                 img,
                                 TextureOptions::LINEAR,
                             ));
@@ -2366,15 +2436,24 @@ impl App {
                     }
                     let painter = ui.painter();
                     let vis = ui.visuals();
-                    let bg = if is_current {
-                        vis.selection.bg_fill.gamma_multiply(0.35)
-                    } else if resp.hovered() {
-                        vis.widgets.hovered.bg_fill
-                    } else {
-                        vis.widgets.noninteractive.bg_fill
-                    };
-                    painter.rect_filled(rect, 4.0, bg);
-                    let img_rect = Rect::from_min_size(rect.min, Vec2::new(TILE_W, TILE_IMG_H)).shrink(3.0);
+                    painter.rect_filled(rect, 0.0, FILM_BASE);
+                    // Perforation above and below the frame.
+                    draw_perforation(painter, Rect::from_min_size(rect.min, Vec2::new(TILE_W, PERF_H)));
+                    draw_perforation(
+                        painter,
+                        Rect::from_min_size(
+                            Pos2::new(rect.left(), rect.top() + PERF_H + TILE_IMG_H),
+                            Vec2::new(TILE_W, PERF_H),
+                        ),
+                    );
+                    let frame = Rect::from_min_size(
+                        Pos2::new(rect.left(), rect.top() + PERF_H),
+                        Vec2::new(TILE_W, TILE_IMG_H),
+                    );
+                    let img_rect = frame.shrink2(Vec2::new(5.0, 2.0));
+                    if resp.hovered() && !is_current {
+                        painter.rect_filled(frame, 0.0, Color32::from_white_alpha(10));
+                    }
                     match &e.texture {
                         Some(tex) => {
                             let [w, h] = tex.size();
@@ -2402,22 +2481,32 @@ impl App {
                             );
                         }
                     }
+                    // Frame separator.
+                    painter.line_segment(
+                        [rect.right_top(), rect.right_bottom()],
+                        egui::Stroke::new(1.0, Color32::from_white_alpha(8)),
+                    );
                     if is_current {
                         painter.rect_stroke(
-                            rect,
-                            4.0,
-                            egui::Stroke::new(2.0, vis.selection.stroke.color),
+                            frame.shrink(1.0),
+                            2.0,
+                            egui::Stroke::new(2.0, Color32::from_rgb(255, 170, 60)),
                             egui::StrokeKind::Inside,
                         );
                     }
-                    let label_pos = Pos2::new(rect.center().x, rect.max.y - 10.0);
+                    // Edge print: the name in the film's orange.
+                    let label_pos = Pos2::new(rect.center().x, rect.max.y - EDGE_H * 0.5);
                     let name = truncate_middle(&e.name, 20);
                     painter.text(
                         label_pos,
                         egui::Align2::CENTER_CENTER,
                         name,
-                        egui::FontId::proportional(11.5),
-                        if is_current { vis.strong_text_color() } else { vis.text_color() },
+                        egui::FontId::proportional(11.0),
+                        if is_current {
+                            Color32::from_rgb(255, 190, 90)
+                        } else {
+                            Color32::from_rgb(170, 130, 70)
+                        },
                     );
                     let resp = resp.on_hover_ui(|ui| {
                         ui.label(RichText::new(&e.name).strong());
@@ -2504,15 +2593,16 @@ impl eframe::App for App {
             egui::Panel::bottom("strip")
                 .resizable(false)
                 .exact_size(STRIP_HEIGHT)
+                .frame(egui::Frame::new().fill(FILM_BASE).inner_margin(egui::Margin::symmetric(6, 0)))
                 .show(ui, |ui| self.strip_panel(ui));
         }
-        egui::Panel::left("file").resizable(true).default_size(310.0).min_size(240.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.file_column(ui));
-        });
-        egui::Panel::right("controls").resizable(true).default_size(310.0).min_size(260.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| self.controls_column(ui));
-        });
-        egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.preview_panel(ui));
+        // The picture fills what is left; the panels float over it.
+        let stage = egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| self.preview_panel(ui))
+            .response
+            .rect;
+        self.glass_panels(&ctx, stage);
 
         self.edit_keys(&ctx);
         self.commit_history(&ctx);
@@ -2522,12 +2612,96 @@ impl eframe::App for App {
     }
 }
 
+/// Width of the side panels, points.
+const PANEL_W: f32 = 318.0;
+/// Gap between the stage edge and a panel.
+const PANEL_GAP: f32 = 12.0;
+
+/// The dark translucent glass the panels are made of. Plain alpha, no
+/// blur: it has to look the same on every GPU driver and in software.
+fn glass_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(14, 14, 16, 222))
+        .stroke(egui::Stroke::new(1.0, Color32::from_white_alpha(20)))
+        .corner_radius(10.0)
+        .inner_margin(12.0)
+        .shadow(egui::Shadow { offset: [0, 6], blur: 26, spread: 0, color: Color32::from_black_alpha(150) })
+}
+
 impl App {
+    /// The three floating panels over the stage: analysis left, enlarger
+    /// (mix, placing, curve, dodge & burn) right, print at the bottom centre. Each is a window the user can
+    /// move, collapse (click the title) or close; the toolbar brings it back.
+    fn glass_panels(&mut self, ctx: &egui::Context, stage: Rect) {
+        let max_h = (stage.height() - 2.0 * PANEL_GAP).max(120.0);
+        let mut open = self.panels;
+        egui::Window::new("Analysis")
+            .frame(glass_frame())
+            .open(&mut open[0])
+            .default_pos(stage.left_top() + Vec2::splat(PANEL_GAP))
+            .default_width(PANEL_W)
+            .max_width(PANEL_W)
+            .max_height(max_h)
+            .resizable([false, true])
+            .vscroll(true)
+            .constrain_to(stage)
+            .show(ctx, |ui| self.analysis_panel(ui));
+        egui::Window::new("Enlarger")
+            .frame(glass_frame())
+            .open(&mut open[1])
+            .default_pos(stage.right_top() + Vec2::new(-PANEL_W - PANEL_GAP - 12.0, PANEL_GAP))
+            .default_width(PANEL_W)
+            .max_width(PANEL_W)
+            .max_height(max_h)
+            .resizable([false, true])
+            .vscroll(true)
+            .constrain_to(stage)
+            .show(ctx, |ui| self.zones_panel(ui));
+        // The print panel sits at the bottom centre, above the strip, until
+        // the user drags it somewhere; its height is only known after a
+        // frame, so the position follows the measured size.
+        // (No scroll area here: a window that may grow to the stage's
+        // height is constrained as if it did, and would sit at the top.)
+        let mut print = egui::Window::new("Print")
+            .frame(glass_frame())
+            .open(&mut open[2])
+            .default_width(460.0)
+            .max_width(460.0)
+            .resizable(false)
+            .constrain_to(stage);
+        if !self.print_pinned {
+            let size = self.print_size.unwrap_or(Vec2::new(484.0, 330.0));
+            // egui's title-bar drag mode re-applies the stored position over
+            // `current_pos`; drag-anywhere mode does not, and the first drag
+            // pins the window anyway.
+            print = print.drag_area(egui::WindowDrag::Anywhere).current_pos(Pos2::new(
+                stage.center().x - size.x * 0.5,
+                (stage.bottom() - PANEL_GAP - size.y).max(stage.top() + PANEL_GAP),
+            ));
+        }
+        if let Some(r) = print.show(ctx, |ui| self.print_panel(ui)) {
+            self.print_size = Some(r.response.rect.size());
+            if r.response.dragged() {
+                self.print_pinned = true;
+            }
+        }
+        if open != self.panels {
+            self.panels = open;
+            self.persist();
+        }
+    }
+
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Delete removes the
-    /// selected shape. Not while a text field has the keyboard.
+    /// selected shape; Tab hides or shows every panel. Not while a text
+    /// field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
             return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            let any = self.panels.iter().any(|&p| p);
+            self.panels = [!any; 3];
+            self.persist();
         }
         let (undo, redo, del) = ctx.input_mut(|i| {
             let undo =
