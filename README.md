@@ -1,12 +1,12 @@
 # Mimizan Lab
 
 Linear monochrome negatives straight from Bayer RAW: no demosaicing, no
-hidden tone curve, every step measured. **Experimental.**
+hidden tone curve, every step measured.
 
 A colour sensor records luminance and chrominance in one mosaic. Mimizan Lab
 estimates the luminance `L` directly from that mosaic (Alleysson/Dubois
-frequency separation) and writes a 16-bit linear negative plus a print path
-(size, curve, USM). Everything is `f64`, deterministic, and measured on
+frequency separation) and writes a 16-bit linear negative, then a print:
+placing, split-grade paper, size and border. Everything is `f64`, deterministic, and measured on
 synthetic scenes with known ground truth and, since the Kodak benchmark
 below, against the demosaicers it competes with.
 
@@ -311,10 +311,13 @@ mimizan info photo.nef
 mimizan negative photo.nef -o photo_neg.tif
 #   writes photo_neg.tif (16 bit linear) and photo_neg.mask.tif
 
-# Negative -> print file, 30x40 cm at 300 dpi, neutral look, mild USM
-mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --usm-amount 0.5 --look look/neutral.json
+# Negative -> print on the neutral look (the measurement pipeline's tone)
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --look look/neutral.json
 
-# Richardson-Lucy instead of a halo: 5 passes invert a Gaussian of the USM radius on every pixel
+# Scale compensation of that enlargement: USM of the resample blur
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --usm-amount 0.5
+
+# The same compensation as Richardson–Lucy, 5 passes of that blur
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --deconv 5
 
 # A split-grade print: half a stop less hard light (open shadows), a third of a
@@ -347,19 +350,19 @@ that `mimizan print` renders in one pass against the negative, so there is
 exactly one quantisation and the same recipe gives the same bytes. The
 recipe holds, in the order the pipeline applies them: the **placing**
 (`--place`, stops; `L ← L·2^place`, the darkroom's exposure), the **paper** (`--paper
-SOFT,HARD`: there is no tone curve; the print is what a multigrade paper
+SOFT,HARD`: the print is what a multigrade paper
 gives after a soft exposure (filter 00) and a hard one (filter 5) through
 a gamma-0.6 negative of the scene, each pass a normal CDF in log exposure
 with the width of its ISO range and the two sharing the silver, `D/Dmax =
 1 − (1−a)(1−b)`; the two exposures in stops of time from the base print are
-the only tone parameters, so a kink, a local steepening or a zone squeezed
+the tone parameters, so a kink, a local steepening or a zone squeezed
 to nothing cannot be expressed — more soft light greys the highlights,
-less hard light opens the shadows; the CLI also still takes any look file
-with `--look` for the measurement pipeline), the **size step** (`--size`, `--dpi`, `--resample b-spline |
+less hard light opens the shadows; `--look` takes a look file
+for the measurement pipeline), the **size step** (`--size`, `--dpi`, `--resample b-spline |
 lanczos3 | mitchell | catmull-rom`: B-spline is the default, the only one
 without overshoot; Lanczos-3 stays the benchmark kernel), the **border** (`--border-mm`, unexposed paper, taken from the
 paper size), and the **scale compensation** (USM or deconvolution of the
-enlargement; the desktop GUI leaves it off, the CLI and the phone still
+enlargement; the desktop GUI leaves it off, the CLI and the phone
 set it). Nothing in the recipe reads the picture:
 there is no tone equaliser and no content-adaptive mask (SPEC §9).
 
@@ -430,8 +433,7 @@ highlights; a drag on the bar moves both so that the tone under the
 pointer follows the pointer — one more or less second under the
 enlarger. The line under the sliders names the single grade this pair
 equals and the scene stops the paper holds; *base* goes back. Hover a
-zone and its pixels light up in the preview. There is no local work:
-no dodging, no burning, no shape in the picture — the print is the
+zone and its pixels light up in the preview. The print is the
 negative, one placing and two exposures, as a straight print is. *fit*,
 *1:1* and the mask sit in the toolbar.
 
@@ -466,7 +468,7 @@ copy of the separation) updates in milliseconds. `Reset` returns the
 development to the camera-file defaults and keeps the negative.
 
 The strip at the bottom is the folder browser, drawn as film, and the
-only way in: there is no open button. It starts in the last folder (on a
+only way in. It starts in the last folder (on a
 first start in the pictures folder, else home), and a folder or a RAW
 file dropped on the window or given on the command line takes it there.
 It lists the folder's RAW files
