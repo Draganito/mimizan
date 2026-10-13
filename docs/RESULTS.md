@@ -745,17 +745,19 @@ while enlarging. The width is `σ = k·s` print pixels, `s` the long-side
 scale and `k` fitted per kernel on the 10–90 % ramp of a step at `s = 8`
 (Lanczos-3 0.281, Catmull–Rom 0.275, Mitchell 0.330, B-spline 0.515).
 USM uses that Gaussian, masked where the sidecar is at least 0.8 and
-below 1.0; Richardson–Lucy uses the same Gaussian on every pixel, and
-the GUI starts it at 3 passes. At native size and when shrinking, `σ`
+below 1.0; Richardson–Lucy uses the same Gaussian on every pixel. The
+phone starts deconvolution at 3 passes. At native size and when shrinking, `σ`
 is 0 and the pass is a copy. The one-arc-minute radius is still written
 as `usm_radius_px` and is not applied. The print default kernel is the
 B-spline; Lanczos-3 remains what `resize` and the benchmark numbers use.
 The mask resample stays Lanczos-3, and only runs when a USM will read it.
 
-Under the scale controls, ✛ and a click open a 160×160 box of that spot
-of the print, one screen pixel per print pixel, the same pixels the TIFF
-gets. Dragging inside the box moves the spot and the crosshair follows.
-A failed render keeps the previous box.
+The desktop *Print* window does not offer the step. It sets `sharpen`
+to off, so the 1:1 box, the TIFF and a recipe saved there agree. The
+CLI and the phone still set it. ✛ and a click open a box of that spot
+as wide as the panel, one screen pixel per print pixel, the same pixels
+the TIFF gets. Dragging inside the box moves the spot and the crosshair
+follows. A failed render keeps the previous box.
 
 ## Real samples
 

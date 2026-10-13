@@ -12,12 +12,11 @@ use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
 use egui_file_dialog::FileDialog;
-use mimizan_core::deconv::{DECONV_DEFAULT_PASSES, DECONV_ITERATIONS};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::print::{box_for_picture_height, box_for_picture_width, PrintSize};
-use mimizan_core::recipe::{Recipe, Sharpen, USM_MAX};
+use mimizan_core::recipe::{Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
 use mimizan_core::tone::Tone;
@@ -116,7 +115,10 @@ pub struct App {
     loupe_sent: u64,
     loupe_shown: u64,
     /// Last request, so an unchanged frame does not send another.
-    loupe_key: Option<(usize, Weights, Recipe, u16, [f64; 2])>,
+    /// The last number is the box side in print pixels.
+    loupe_key: Option<(usize, Weights, Recipe, u16, [f64; 2], usize)>,
+    /// Box side asked for this frame, in print pixels (one screen pixel each).
+    loupe_px: usize,
     loupe_tex: Option<TextureHandle>,
     loupe_size: [usize; 2],
 
@@ -232,6 +234,7 @@ impl App {
             loupe_sent: 0,
             loupe_shown: 0,
             loupe_key: None,
+            loupe_px: 0,
             loupe_tex: None,
             loupe_size: [0, 0],
             zoom_to_1to1: false,
@@ -582,7 +585,10 @@ impl App {
 
     fn load_recipe(&mut self, path: &Path) {
         match Recipe::load(path) {
-            Ok(r) => {
+            Ok(mut r) => {
+                // The desktop print does not sharpen. The file may still
+                // name the step; the phone and the CLI keep using it.
+                r.sharpen = Sharpen::Off;
                 let mut e = self.edit.clone();
                 e.recipe = r;
                 self.set_edit(e);
@@ -675,7 +681,7 @@ impl App {
                 } else {
                     // Same controls are not sent again. The previous box stays
                     // up; the next change of size, dpi or kernel asks once more.
-                    self.log("sharpen box failed");
+                    self.log("print box failed");
                 }
             }
         }
@@ -928,7 +934,7 @@ impl App {
                     "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
                 ),
                 (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
-                (1, "Print", "3 · The print: size, border, scale, export"),
+                (1, "Print", "3 · The print: size, border, export"),
             ] {
                 if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
                     self.panels[i] = !self.panels[i];
@@ -1425,39 +1431,39 @@ impl App {
         self.hover_zone = zone_bar(ui, &mut split, width);
         ui.add_space(4.0);
         let slider_w = (width - 170.0).max(120.0);
-        let exposure = |ui: &mut egui::Ui, label: &str, filter: &str, v: &mut f64, hint: &str| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().slider_width = slider_w;
+        // One column per part. "soft"/"hard" and "filter 00"/"filter 5" are
+        // different widths; without the grid the second track starts later.
+        ui.spacing_mut().slider_width = slider_w;
+        egui::Grid::new("paper_exposures").num_columns(3).show(ui, |ui| {
+            let exposure = |ui: &mut egui::Ui, label: &str, filter: &str, v: &mut f64, hint: &str| {
                 ui.label(RichText::new(label).weak()).on_hover_text(hint);
-                let changed = ui
-                    .add(
-                        egui::Slider::new(v, -SLIDER_STOPS..=SLIDER_STOPS)
-                            .fixed_decimals(2)
-                            .step_by(1.0 / 12.0)
-                            .suffix(" stops"),
-                    )
-                    .on_hover_text(hint)
-                    .changed();
+                ui.add(
+                    egui::Slider::new(v, -SLIDER_STOPS..=SLIDER_STOPS)
+                        .fixed_decimals(2)
+                        .step_by(1.0 / 12.0)
+                        .suffix(" stops"),
+                )
+                .on_hover_text(hint);
                 ui.label(RichText::new(filter).weak().small());
-                changed
-            });
-        };
-        exposure(
-            ui,
-            "soft",
-            "filter 00",
-            &mut split.soft,
-            "The soft exposure, in stops of time from the base print. More soft light greys the \
-             highlights and hardly touches the shadows: the highlights' exposure.",
-        );
-        exposure(
-            ui,
-            "hard",
-            "filter 5",
-            &mut split.hard,
-            "The hard exposure, in stops of time from the base print. More hard light deepens the \
-             shadows and the mid tones with them, the highlights stay: the shadows' exposure.",
-        );
+                ui.end_row();
+            };
+            exposure(
+                ui,
+                "soft",
+                "filter 00",
+                &mut split.soft,
+                "The soft exposure, in stops of time from the base print. More soft light greys the \
+                 highlights and hardly touches the shadows: the highlights' exposure.",
+            );
+            exposure(
+                ui,
+                "hard",
+                "filter 5",
+                &mut split.hard,
+                "The hard exposure, in stops of time from the base print. More hard light deepens the \
+                 shadows and the mid tones with them, the highlights stay: the shadows' exposure.",
+            );
+        });
         if split != *self.edit.recipe.curve.as_paper().unwrap() {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }
@@ -1522,13 +1528,25 @@ impl App {
         );
     }
 
-    /// The print: size, resolution, border, resampling and sharpening. The
-    /// export renders exactly this recipe in one pass.
+    /// The desktop print does not sharpen. A loaded recipe may still name
+    /// the step; the phone and the CLI keep using it. Assigned only when
+    /// it is not already off, so the history stays still.
+    fn clear_desktop_sharpen(&mut self) {
+        if self.edit.recipe.sharpen != Sharpen::Off {
+            self.edit.recipe.sharpen = Sharpen::Off;
+        }
+    }
+
+    /// The print: size, resolution, border and resampling. The desktop
+    /// export does not sharpen; that stays in the core for the phone.
+    /// The 1:1 box is the print pixels, for judging the size step.
     fn print_section(&mut self, ui: &mut egui::Ui) {
+        self.clear_desktop_sharpen();
         ui.heading("Print");
         let mut mode = self.size_mode;
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut mode, SizeMode::Native, "native").on_hover_text("The negative's pixels");
+            ui.selectable_value(&mut mode, SizeMode::Native, "native")
+                .on_hover_text("The negative's pixels, printed at the dpi below");
             ui.selectable_value(&mut mode, SizeMode::Paper, "paper")
                 .on_hover_text("Fit into a paper size at the dpi");
         });
@@ -1591,8 +1609,14 @@ impl App {
             SizeMode::Native => {
                 self.edit.recipe.size = None;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("dpi for the border").weak());
-                    ui.add(egui::DragValue::new(&mut self.edit.recipe.dpi).range(36.0..=1200.0).speed(1.0));
+                    ui.label(RichText::new("dpi").weak());
+                    ui.add(
+                        egui::DragValue::new(&mut self.edit.recipe.dpi)
+                            .range(36.0..=1200.0)
+                            .speed(1.0)
+                            .suffix(" dpi"),
+                    )
+                    .on_hover_text("Written into the TIFF. These pixels print at this size.");
                 });
             }
         }
@@ -1606,7 +1630,7 @@ impl App {
                         .speed(0.2)
                         .suffix(" mm"),
                 )
-                .on_hover_text("Paper white around the picture, added outside the centimetres above");
+                .on_hover_text("Paper white around the picture");
             if self.size_mode == SizeMode::Paper
                 && border.changed()
                 && (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON
@@ -1628,42 +1652,6 @@ impl App {
                 }
             });
         });
-        let s = &mut self.edit.recipe.sharpen;
-        let mut kind = match s {
-            Sharpen::Off => 0,
-            Sharpen::Usm { .. } => 1,
-            Sharpen::Deconv { .. } => 2,
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("scale").weak());
-            ui.selectable_value(&mut kind, 0, "off");
-            ui.selectable_value(&mut kind, 1, "USM")
-                .on_hover_text("Puts back the enlargement blur. Native size and reductions stay.");
-            ui.selectable_value(&mut kind, 2, "deconvolution")
-                .on_hover_text("Richardson–Lucy of that blur, then optional USM. More passes ring.");
-        });
-        let current = match s {
-            Sharpen::Off => 0,
-            Sharpen::Usm { .. } => 1,
-            Sharpen::Deconv { .. } => 2,
-        };
-        if kind != current {
-            *s = match kind {
-                1 => Sharpen::Usm { amount: 0.5 },
-                2 => Sharpen::Deconv { passes: DECONV_DEFAULT_PASSES, usm_amount: 0.0 },
-                _ => Sharpen::Off,
-            };
-        }
-        match s {
-            Sharpen::Usm { amount } => {
-                ui.add(egui::Slider::new(amount, 0.0..=USM_MAX).text("amount").fixed_decimals(2));
-            }
-            Sharpen::Deconv { passes, usm_amount } => {
-                ui.add(egui::Slider::new(passes, 1..=DECONV_ITERATIONS as u32).text("passes"));
-                ui.add(egui::Slider::new(usm_amount, 0.0..=USM_MAX).text("USM after").fixed_decimals(2));
-            }
-            Sharpen::Off => {}
-        }
         self.sharpen_loupe(ui);
         if let Some(l) = self.print_layout() {
             let (uw, uh) = self.export_size();
@@ -1678,13 +1666,23 @@ impl App {
                 format!("{uw} × {uh} px, no size step")
             };
             ui.label(RichText::new(txt).weak());
+            let dpi = self.edit.recipe.dpi;
+            if dpi > 0.0 {
+                let cm = |px: usize| px as f64 / dpi * 2.54;
+                let sheet = format!("{:.1} × {:.1} cm", cm(l.out_w), cm(l.out_h));
+                let sheet = if l.border_px > 0 { format!("{sheet}, border included") } else { sheet };
+                ui.label(RichText::new(sheet).weak());
+            }
         }
     }
 
-    /// The 1:1 box under the sharpening controls, and the crosshair that
-    /// chooses its centre. The box is print pixels, after size and sharpening.
+    /// The 1:1 box, as wide as this panel. Print pixels after the size
+    /// step, the same ones the TIFF gets, with no sharpening.
     fn sharpen_loupe(&mut self, ui: &mut egui::Ui) {
-        let detail = self.print_layout().map(|l| (l.resample_sigma_px, l.enlargement));
+        let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
+        let side = (ui.available_width() * ppp).round() as usize;
+        self.loupe_px = side.clamp(64, 960);
+        let scale = self.print_layout().map(|l| l.enlargement);
         ui.horizontal(|ui| {
             let aim = ui
                 .selectable_label(self.sharpen_aim, "✛")
@@ -1694,12 +1692,8 @@ impl App {
             if aim.clicked() {
                 self.sharpen_aim = !self.sharpen_aim;
             }
-            if let Some((sigma, scale)) = detail {
-                let text = if sigma > 0.0 {
-                    format!("σ {sigma:.2} px · {scale:.2}×")
-                } else {
-                    "no enlargement".into()
-                };
+            if let Some(scale) = scale {
+                let text = if scale > 1.0 { format!("{scale:.2}×") } else { "no enlargement".into() };
                 ui.label(RichText::new(text).weak());
             }
         });
@@ -1758,6 +1752,7 @@ impl App {
             self.edit.recipe.clone(),
             self.export_orientation(),
             [nx, ny],
+            self.loupe_px,
         );
         if self.loupe_key.as_ref() == Some(&key) {
             return;
@@ -1771,6 +1766,7 @@ impl App {
             orientation: self.export_orientation(),
             nx,
             ny,
+            view: self.loupe_px,
             generation: self.loupe_sent,
         });
     }
@@ -1794,14 +1790,9 @@ impl App {
         };
         let r = &self.edit.recipe;
         let local = if r.place != 0.0 { format!(", place {:+.2}", r.place) } else { String::new() };
-        let sharpen = match r.sharpen {
-            Sharpen::Off => "scale off".to_string(),
-            Sharpen::Usm { amount } => format!("USM {amount:.2}"),
-            Sharpen::Deconv { passes, .. } => format!("deconvolution, {passes} passes"),
-        };
         format!(
             "Writes the print on the {look}{rot}{local}:\n\
-             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, {sharpen}, recipe in the description"
+             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, no sharpening, recipe in the description"
         )
     }
 
@@ -2497,6 +2488,7 @@ impl eframe::App for App {
         self.dock_windows(&ctx, &docks);
 
         self.edit_keys(&ctx);
+        self.clear_desktop_sharpen();
         self.commit_history(&ctx);
         self.request_preview_if_needed();
         self.flush_converter_redevelop();

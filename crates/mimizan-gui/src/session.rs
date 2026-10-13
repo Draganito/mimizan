@@ -389,17 +389,14 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
     Some(DetailImage { rect: DetailRect { w: upright.width, h: upright.height, ..rect }, gray })
 }
 
-/// Print pixels across the loupe, one screen pixel each.
-pub const LOUPE_PX: usize = 160;
-
-/// One box of the print at 1:1: the same resize, paper and sharpening the
-/// TIFF gets, on a tile around `(nx, ny)`.
 pub struct SharpenLoupe {
     pub gray: Vec<u8>,
     pub width: usize,
     pub height: usize,
 }
 
+/// One box of the print at 1:1: the same resize and paper the TIFF gets,
+/// on a tile around `(nx, ny)`. `view` is the box side in print pixels.
 pub fn render_sharpen_loupe(
     s: &Session,
     weights: &Weights,
@@ -407,13 +404,15 @@ pub fn render_sharpen_loupe(
     orientation: u16,
     nx: f64,
     ny: f64,
+    view: usize,
 ) -> SharpenLoupe {
+    let view = view.clamp(1, 4096);
     let params = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
     let sep = s.separation();
     let (sensor_w, sensor_h) = (sep.lum.width, sep.lum.height);
     let (full_w, full_h) =
         if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
-    let (sx, sy, ex, ey) = loupe_source_rect(full_w, full_h, &params, nx, ny, LOUPE_PX);
+    let (sx, sy, ex, ey) = loupe_source_rect(full_w, full_h, &params, nx, ny, view);
     // USM is the only step that reads the mask, and only then is the crop
     // wide enough for its Lanczos-3 resample.
     let want_mask = recipe.sharpen.usm_amount() > 0.0;
@@ -449,7 +448,7 @@ pub fn render_sharpen_loupe(
         full_w,
         full_h,
     });
-    let plane = sharpen_window(window, mask_window, &params, nx, ny, LOUPE_PX);
+    let plane = sharpen_window(window, mask_window, &params, nx, ny, view);
     let gray = plane.data.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
     SharpenLoupe { gray, width: plane.width, height: plane.height }
 }

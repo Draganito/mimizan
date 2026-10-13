@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.3-1_amd64.deb
+sudo apt install ./mimizan_0.10.4-1_amd64.deb
 mimizan --version
 ```
 
@@ -359,7 +359,8 @@ with `--look` for the measurement pipeline), the **size step** (`--size`, `--dpi
 lanczos3 | mitchell | catmull-rom`: B-spline is the default, the only one
 without overshoot; Lanczos-3 stays the benchmark kernel), the **border** (`--border-mm`, unexposed paper, taken from the
 paper size), and the **scale compensation** (USM or deconvolution of the
-enlargement). Nothing in the recipe reads the picture:
+enlargement; the desktop GUI leaves it off, the CLI and the phone still
+set it). Nothing in the recipe reads the picture:
 there is no tone equaliser and no content-adaptive mask (SPEC §9).
 
 `mimizan negative` picks `cameras/<make>_<model>.json` by the camera in the
@@ -400,8 +401,8 @@ editing step: the mix from one drop-down (*Native*, *Panchromatic* =
 the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
 47* in front of it) or the R and B fields, the zone bar and the two exposures
 *soft* and *hard*. *Print* is the output step
-and nothing else: native pixels, or the picture in centimetres at a dpi,
-the border, the resampling kernel and the scale compensation, the output size it
+and nothing else: native pixels (the sheet in centimetres at that dpi, border included), or the picture in centimetres at a dpi,
+the border and the resampling kernel, the output size it
 adds up to, and the *Export…* button. The two centimetre fields are the
 picture, and they are one proportion: type the short side and the long
 side follows the negative, and the other way round, a single scale. The
@@ -409,11 +410,11 @@ border is paper white added around those centimetres, and it is part of
 the preview: the sheet (picture plus border, in the print's proportion)
 is what is fitted into the stage, so 20 mm around a picture 40 cm on the
 long side is judged as it will print. The border is drawn, not rendered —
-the picture under it is still the one before size and scale compensation. Under the
-scale controls, ✛ and a click in the picture open a 1:1 box of that
-spot of the print, resized exactly as the TIFF, so the
-radius and the amount can be judged before the export. Dragging inside
-the box moves the spot, and the crosshair on the picture follows.
+the picture under it is still the one before the size step. ✛ and a click
+in the picture open a 1:1 box of that spot, as wide as the panel, resized
+exactly as the TIFF and with no sharpening, so the size step can be judged
+before the export. Dragging inside the box moves the spot, and the
+crosshair on the picture follows.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to
@@ -440,11 +441,11 @@ states, one step per released drag. The export (*Export…* in the Print
 window) renders exactly
 this recipe in one pass against the negative and writes one file:
 `<name>.tif` (16 bit, gamma 2.2 grey ICC, the recipe in the TIFF
-description, size, border and scale compensation as set — the print). *Recipe*
+description, size and border as set, with no sharpening — the print). *Recipe*
 saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
 back when the file is opened again) or anywhere else, and loads one; the
 same JSON drives `mimizan print --recipe`. The preview is the picture before
-size and scale compensation — mix, placing and the paper exactly as the TIFF gets
+the size step — mix, placing and the paper exactly as the TIFF gets
 them — and once you zoom past the fit-to-window preview (scroll,
 `1:1`, or a double click) the visible window is rendered from the
 full-resolution separation, pixel for pixel, so the

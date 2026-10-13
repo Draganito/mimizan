@@ -1,7 +1,7 @@
 //! Background threads. `Heavy` decodes, separates and exports (seconds);
 //! `Preview` re-mixes the downscaled separation (milliseconds) and always
-//! works on the newest request only. `Loupe` renders one sharpened print
-//! box the same way.
+//! works on the newest request only. `Loupe` renders one print box the
+//! same way, the pixels the TIFF gets.
 
 use crate::session::{
     preview_planes, render_detail, render_preview, render_sharpen_loupe, DetailImage, DetailRect,
@@ -31,8 +31,8 @@ pub enum Job {
         develop: DevelopParams,
     },
     /// One export, one file: `path` (16-bit TIFF, the recipe rendered in one
-    /// pass against the negative: placing, paper or look, size, border and
-    /// sharpening as set).
+    /// pass against the negative: placing, paper or look, size and border.
+    /// The desktop GUI sends sharpening off).
     Export {
         session: Arc<Session>,
         weights: Weights,
@@ -284,6 +284,8 @@ pub struct LoupeRequest {
     pub orientation: u16,
     pub nx: f64,
     pub ny: f64,
+    /// Box side in print pixels. One screen pixel each.
+    pub view: usize,
     pub generation: u64,
 }
 
@@ -320,6 +322,7 @@ impl Loupe {
                             req.orientation,
                             req.nx,
                             req.ny,
+                            req.view,
                         )
                     }));
                     let image = match rendered {

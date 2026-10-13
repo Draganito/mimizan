@@ -594,7 +594,8 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   `box_for_picture_height`). Die Kommandozeile `--size` bleibt die Kiste;
   der Rand wird dort wie bisher vorher abgezogen. Die Maske wird mit Lanczos-3
   mitskaliert (sie ist ein Gewichtsfeld). Ohne `--size` bleibt die
-  Pixelzahl des Negativs. Eine Pixelgröße (`<N>px`, lange Kante) gab es
+  Pixelzahl des Negativs. `dpi` steht trotzdem in der Datei; die GUI
+  zeigt die Bogengröße, Bild plus Rand, in cm. Eine Pixelgröße (`<N>px`, lange Kante) gab es
   bis 0.9.0 für den Bildschirm; sie ist mit der Bildschirmausgabe
   gestrichen (unten).
   **[Abweichung zu Anhang A.2]**: Der dort empfohlene „Cubic B = 0,
@@ -710,7 +711,10 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   **und < 1,0** ist: 255 markiert gesättigte Photosites. Ohne Sidecar mit
   Warnung überall. Gauß-Kern, Länge 2·⌈3σ⌉+1, Rand reflect-101, auf dem
   kodierten Wert nach der Kurve.
-  Entfaltung (`--deconv <N>`, N ∈ [1; 10], aus ohne Flag, GUI startet mit 3):
+  Entfaltung (`--deconv <N>`, N ∈ [1; 10], aus ohne Flag; die Mobile-App
+  startet mit 3). Die Desktop-GUI setzt `sharpen` auf aus: die 1:1-Box,
+  der Export und ein dort gespeichertes Rezept enthalten den Schritt
+  nicht. Kommandozeile und Mobile-App setzen ihn weiter.
   Richardson–Lucy mit derselben Gauß-PSF,
 
       e_{k+1} = e_k · G ⊛ ( b / (G ⊛ e_k) ),   e_0 = max(b, 0)
