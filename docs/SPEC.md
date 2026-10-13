@@ -358,9 +358,12 @@ Kohärenz-Tiefpässe laufen in den Puffern ihrer Operanden mit einer
 Scratch-Ebene für den Zeilenpass, die Zeilenpässe des Mosaiks teilen eine
 Ebene.
 
-### 5.6 Nichtlineare Rekonstruktion (`--reconstruct`, Checkbox, Default aus)
+### 5.6 Nichtlineare Rekonstruktion (`--reconstruct`)
 
-**[Erweiterung, gemessen]** (RESULTS „Reconstruct“). Alles bis hier ist
+**[Erweiterung, gemessen]** (RESULTS „Reconstruct“). Bibliothek und Kommando
+lassen den Schritt aus, bis `--reconstruct` gesetzt ist. Die GUI startet mit
+der Checkbox an (Development → *reconstruct the last octave*); Ausschalten
+und *Apply* stellt den linearen Weg wieder her. Alles bis hier ist
 linear: jedes Ausgabepixel ist eine Summe gemessener Werte mit Gewichten,
 die nicht vom Bildinhalt an dieser Stelle abhängen (5.5 wählt zwischen zwei
 solchen Summen, erfindet aber keine). Die Grenze dieses Weges ist die
@@ -577,9 +580,9 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   in 40×30 cm eingepasst. Mit `--border-mm` wird der Rand vorher vom
   Papier abgezogen (Zielbox = Papier − 2·Rand), das Bild in den Rest
   eingepasst. Kern `--resample` (Rezeptfeld `resample`), separabel in f64:
-  `lanczos3` (Default, der Kern aller Benchmark-Zahlen), `mitchell`
-  (Mitchell–Netravali B = C = ⅓), `catmull-rom` (B = 0, C = ½) und
-  `b-spline` (B = 1, C = 0). Beim Verkleinern wird der Kern mit dem
+  `b-spline` (Default, B = 1, C = 0), `lanczos3` (der Kern der
+  Benchmark-Zahlen), `mitchell` (Mitchell–Netravali B = C = ⅓) und
+  `catmull-rom` (B = 0, C = ½). Beim Verkleinern wird der Kern mit dem
   Skalenfaktor gestreckt (das ist der Tiefpass vorher), Ränder gefaltet
   (Gewichte außerhalb werden auf den Randpixel gelegt, Summe exakt 1).
   Niemals über Zielpixel hinaus skalieren. Die GUI zeigt nicht diese
@@ -693,34 +696,33 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   zeigt den Rand in der Vorschau: eingepasst wird der Bogen (Bild plus
   Rand), der Rand ist in Papierweiß gemalt, nicht gerechnet (ein flacher
   Wert), in der Proportion `border_px / image_w` des Drucks.
-- **USM**: Radius in Pixel
-
-      r_px = usm_k · d_mm · DPI,   usm_k = 1,15·10⁻⁵ (Default)
-
-  Herleitung: 1 Bogenminute = 2,9·10⁻⁴ rad; 2,9·10⁻⁴ / 25,4 mm/in =
-  1,15·10⁻⁵ px pro (mm·DPI). Beispiel 400 mm, 300 DPI → 1,4 px.
-  **[Abweichung]**: Die Whitepaper-Formel `(d·DPI·4)/10 000` ergibt 48 px
-  für dasselbe Beispiel. `d_mm` kommt aus `--distance-mm`, sonst die
-  Druckdiagonale. `usm_amount` ∈ [0; 1,5]; Default aus der Kameradatei,
-  die im Negativ genannt ist, sonst 0. USM nur dort, wo die
-  Sidecar-Maske ≥ 0,8 (204/255) **und < 1,0** ist: 255 markiert
-  gesättigte Photosites, dort darf kein Halo entstehen. Ohne Sidecar wird
-  USM mit Warnung überall angewendet. Gauß-Kern mit σ = r_px, Länge
-  2·⌈3σ⌉+1, Rand reflect-101. Die USM arbeitet auf dem kodierten Wert
-  (nach der Kurve), weil der Schärfeeindruck wahrnehmungsbezogen ist.
-- **Entfaltung [Ergänzung]** (`--deconv <N>`, N ∈ [1; 10], aus ohne Flag):
-  Richardson–Lucy mit Gauß-PSF, σ = r_px (derselbe Radius wie die USM),
+- **Skalierungskompensation** (`--usm-amount`, `--deconv <N>`, Rezeptfeld
+  `sharpen`): Ausgleich der Unschärfe, die der Kern beim Vergrößern
+  hinzufügt. Beim Vergrößern ist `s` das Verhältnis der langen Seiten,
+  Bildpixel / Negativpixel. Für `s > 1` hat der Skalierer eine Unschärfe
+  `σ = k · s` in Druckpixeln. `k` ist je Kern an der 10–90-%-Rampe einer
+  Kante gemessen (Lanczos-3 0,281, Catmull–Rom 0,275, Mitchell 0,330,
+  B-Spline 0,515). USM und Richardson–Lucy benutzen dieses σ. Bei nativer
+  Größe und beim Verkleinern ist σ = 0, der Schritt ist dann bitgleich
+  zum ungeschärften Druck.
+  USM: `out = x + amount·(x − Gauß(σ))`, `amount` ∈ [0; 1,5], Default aus
+  der Kameradatei, sonst 0. Nur dort, wo die Sidecar-Maske ≥ 0,8 (204/255)
+  **und < 1,0** ist: 255 markiert gesättigte Photosites. Ohne Sidecar mit
+  Warnung überall. Gauß-Kern, Länge 2·⌈3σ⌉+1, Rand reflect-101, auf dem
+  kodierten Wert nach der Kurve.
+  Entfaltung (`--deconv <N>`, N ∈ [1; 10], aus ohne Flag, GUI startet mit 3):
+  Richardson–Lucy mit derselben Gauß-PSF,
 
       e_{k+1} = e_k · G ⊛ ( b / (G ⊛ e_k) ),   e_0 = max(b, 0)
 
-  N Durchgänge, auf dem kodierten Wert vor der USM, auf **jedem** Pixel —
-  die Sidecar-Maske greift hier nicht, weil die Inverse keinen Halo
-  aufbaut, sondern die Unschärfe zurückrechnet; dafür bringt sie das
-  Rauschen zurück, das die Unschärfe genommen hat. Die PSF ist nicht
-  gemessen, sondern die Annahme „Betrachter-Unschärfe = USM-Radius“;
-  der Schritt ist damit eine Schärfung durch Inversion, keine Restaurierung.
-  Eine USM kann danach noch folgen (`--usm-amount`). Die
-  Dateibeschreibung nennt `deconvolution_iterations`, solange > 0.
+  auf **jedem** Pixel — die Maske greift hier nicht. Die PSF ist die
+  gemessene Rampe des Skalierers, keine gemessene Optik. Mehr als wenige
+  Durchgänge fängt an zu ringeln. Eine USM derselben Breite kann danach
+  folgen. Die Dateibeschreibung nennt `resample_sigma_px` und, solange
+  > 0, `deconvolution_iterations`. Sie nennt außerdem `usm_radius_px` =
+  `usm_k · d_mm · DPI` mit `usm_k = 1,15·10⁻⁵` (eine Bogenminute;
+  400 mm, 300 DPI → 1,4 px). Diese Zahl wird nur mitgeschrieben,
+  `--usm-k` und `--distance-mm` ändern sie. Angewendet wird sie nicht.
 - **Bildschirmausgabe [Abweichung, entfernt in 0.10.0]**: Bis 0.9.0 gab
   es `--screen <amount>` (eine 9-Tap-FIR als Wiener-Inverse der bekannten
   Übertragung Verkleinerungskern × Pixelapertur, Verstärkung auf 2

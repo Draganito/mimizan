@@ -121,8 +121,8 @@ enum Cmd {
         /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it)
         #[arg(long)]
         size: Option<String>,
-        /// Resampling kernel: lanczos3 (default, sharpest) | catmull-rom |
-        /// mitchell | b-spline (no overshoot, softest)
+        /// Resampling kernel: b-spline (default, no overshoot) | lanczos3 |
+        /// catmull-rom | mitchell
         #[arg(long, value_name = "KERNEL")]
         resample: Option<String>,
         /// Paper border around the picture, mm, filled with paper white
@@ -130,20 +130,21 @@ enum Cmd {
         border_mm: Option<f64>,
         #[arg(long)]
         dpi: Option<f64>,
-        /// USM amount (0 = off); default from the camera file named in the negative, else 0
+        /// Scale compensation: USM amount of the enlargement blur (0 = off).
+        /// Native size and reductions stay. Default from the camera file, else 0.
         #[arg(long)]
         usm_amount: Option<f64>,
-        /// USM radius constant: r_px = usm_k * distance_mm * dpi
+        /// Recorded arc minute: r_px = usm_k * distance_mm * dpi. Not applied.
         #[arg(long, default_value_t = mimizan_core::usm::USM_K)]
         usm_k: f64,
-        /// Viewing distance in mm; default: print diagonal
+        /// Viewing distance in mm recorded with the print; default: the diagonal
         #[arg(long)]
         distance_mm: Option<f64>,
         /// Ignore the .mask.tif sidecar (USM everywhere)
         #[arg(long)]
         no_mask: bool,
-        /// Richardson-Lucy passes (1..10) before the USM: inverts a Gaussian of
-        /// the USM radius on every pixel, mask ignored. Off without the flag.
+        /// Scale compensation: Richardson–Lucy passes (1..10) of that blur,
+        /// before the USM. Native size and reductions stay.
         #[arg(long, value_name = "PASSES")]
         deconv: Option<u32>,
         /// Directory with cameras/*.json for the USM default

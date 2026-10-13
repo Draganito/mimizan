@@ -19,15 +19,17 @@ use std::path::Path;
 /// Largest USM amount a recipe accepts (the GUI slider ends here too).
 pub const USM_MAX: f64 = 1.5;
 
-/// What sharpens the print after the curve, if anything.
+/// Scale compensation after the curve: the enlargement blur, if any.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 pub enum Sharpen {
     #[default]
     Off,
-    /// Unsharp mask, radius from the viewing model, masked by the sidecar.
+    /// Unsharp mask of the enlargement blur, masked by the sidecar.
+    /// Native size and reductions have no such blur, so the amount does nothing.
     Usm { amount: f64 },
-    /// Richardson–Lucy, `passes` (1..10) on every pixel, then an optional USM.
+    /// Richardson–Lucy of the enlargement blur, `passes` (1..10) on every
+    /// pixel, then an optional USM of that same blur.
     Deconv {
         passes: u32,
         #[serde(default)]
@@ -206,7 +208,7 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         // Zero place, no size, no border are omitted.
         assert!(!json.contains("place") && !json.contains("border"));
-        assert!(json.contains(r#""resample":"lanczos3""#), "{json}");
+        assert!(json.contains(r#""resample":"b-spline""#), "{json}");
         assert!(json.contains(r#""sharpen":{"mode":"off"}"#), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);

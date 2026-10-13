@@ -10,10 +10,13 @@ use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
 use crate::plane::Plane;
 use crate::recipe::{Recipe, Sharpen};
-use crate::resize::{fit_dims, resize_with, ResampleKernel};
+use crate::resize::{
+    enlargement_scale, enlargement_sigma, fit_dims, resize_rect, resize_with, PixelRect, PlaneWindow,
+    ResampleKernel,
+};
 use crate::tiffin::{read_gray, read_mask8};
 use crate::tiffout::{write_gray16, TiffMeta};
-use crate::usm::{radius_px, unsharp, USM_K};
+use crate::usm::{kernel_radius, radius_px, unsharp, USM_K};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -112,7 +115,12 @@ pub struct PrintInfo {
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub border_px: usize,
     pub usm_amount: f64,
+    /// One arc minute at the viewing distance, in print pixels. Recorded
+    /// only: sharpening uses [`Self::resample_sigma_px`].
     pub usm_radius_px: f64,
+    /// Gaussian σ of the enlargement, in print pixels. Zero at native size
+    /// and when shrinking. USM and Richardson–Lucy use this.
+    pub resample_sigma_px: f64,
     pub usm_masked: bool,
     /// Richardson–Lucy iterations when that path ran; omitted when it did not.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -282,7 +290,11 @@ pub struct Layout {
     pub out_h: usize,
     /// Viewing distance, mm (given, or the sheet diagonal).
     pub viewing_mm: f64,
-    /// USM radius, pixels.
+    /// Long-side scale, destination / source. Above 1 when the picture is enlarged.
+    pub enlargement: f64,
+    /// Blur the resampler added, print pixels. Zero unless `enlargement > 1`.
+    pub resample_sigma_px: f64,
+    /// One arc minute at `viewing_mm`, print pixels. Recorded, not applied.
     pub usm_radius_px: f64,
 }
 
@@ -327,6 +339,8 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
         let diag_in = ((out_w as f64 / r.dpi).powi(2) + (out_h as f64 / r.dpi).powi(2)).sqrt();
         diag_in * 25.4
     });
+    let enlargement = enlargement_scale(w, h, image_w, image_h);
+    let enlargement_px = enlargement_sigma(w, h, image_w, image_h, r.resample);
     Layout {
         image_w,
         image_h,
@@ -334,6 +348,8 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
         out_w,
         out_h,
         viewing_mm,
+        enlargement,
+        resample_sigma_px: enlargement_px,
         usm_radius_px: radius_px(p.usm_k, viewing_mm, r.dpi),
     }
 }
@@ -343,6 +359,185 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
 pub fn geometry(w: usize, h: usize, orientation: u16, p: &PrintParams) -> (usize, usize, f64, f64) {
     let l = layout(w, h, orientation, p);
     (l.image_w, l.image_h, l.viewing_mm, l.usm_radius_px)
+}
+
+/// How far, in print pixels, a sharpened sample can see.
+///
+/// One Richardson–Lucy iteration widens the dependence by two Gaussian
+/// radii (the estimate is blurred, then the ratio is blurred again). USM
+/// adds one more radius. The loupe keeps this much real image around the
+/// box, so the centre matches the full print.
+pub fn sharpen_halo(sigma: f64, passes: usize, usm: bool) -> usize {
+    if sigma <= 0.0 || (passes == 0 && !usm) {
+        return 0;
+    }
+    let kr = kernel_radius(sigma);
+    let mut halo = 0;
+    if passes > 0 {
+        halo += 2 * passes * kr;
+    }
+    if usm {
+        halo += kr;
+    }
+    halo
+}
+
+/// Where the loupe sits on the sheet, and which picture pixels have to be
+/// resampled so the sharpening around that box sees real neighbours.
+struct LoupeGeom {
+    /// Box origin on the sheet (picture plus border).
+    view_x: usize,
+    view_y: usize,
+    view_w: usize,
+    view_h: usize,
+    /// Sheet rectangle the sharpening kernel reads, clamped to the sheet.
+    tile_x: usize,
+    tile_y: usize,
+    tile_w: usize,
+    tile_h: usize,
+    /// Picture pixels inside the tile, in picture coordinates. Empty when
+    /// the tile is only border.
+    pic_x: usize,
+    pic_y: usize,
+    pic_w: usize,
+    pic_h: usize,
+    border: usize,
+    image_w: usize,
+    image_h: usize,
+}
+
+fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> LoupeGeom {
+    let (image_w, image_h, border) = (lay.image_w, lay.image_h, lay.border_px);
+    let (sheet_w, sheet_h) = (lay.out_w, lay.out_h);
+    let vw = view.min(sheet_w).max(1);
+    let vh = view.min(sheet_h).max(1);
+    let pick_x = (nx.clamp(0.0, 1.0) * image_w.saturating_sub(1) as f64).round() as isize + border as isize;
+    let pick_y = (ny.clamp(0.0, 1.0) * image_h.saturating_sub(1) as f64).round() as isize + border as isize;
+    let mut left = pick_x - vw as isize / 2;
+    let mut top = pick_y - vh as isize / 2;
+    left = left.clamp(0, sheet_w as isize - vw as isize);
+    top = top.clamp(0, sheet_h as isize - vh as isize);
+    let passes = sharpen.deconv_passes() as usize;
+    let usm = sharpen.usm_amount() > 0.0;
+    let halo = if lay.resample_sigma_px > 0.0 && (passes > 0 || usm) {
+        sharpen_halo(lay.resample_sigma_px, passes, usm)
+    } else {
+        0
+    } as isize;
+    let tile_x = (left - halo).max(0) as usize;
+    let tile_y = (top - halo).max(0) as usize;
+    let tile_r = (left + vw as isize + halo).min(sheet_w as isize) as usize;
+    let tile_b = (top + vh as isize + halo).min(sheet_h as isize) as usize;
+    let pic_x0 = border;
+    let pic_y0 = border;
+    let pic_x1 = border + image_w;
+    let pic_y1 = border + image_h;
+    let ix0 = tile_x.max(pic_x0);
+    let iy0 = tile_y.max(pic_y0);
+    let ix1 = tile_r.min(pic_x1);
+    let iy1 = tile_b.min(pic_y1);
+    let (pic_x, pic_y, pic_w, pic_h) = if ix0 < ix1 && iy0 < iy1 {
+        (ix0 - border, iy0 - border, ix1 - ix0, iy1 - iy0)
+    } else {
+        (0, 0, 0, 0)
+    };
+    LoupeGeom {
+        view_x: left as usize,
+        view_y: top as usize,
+        view_w: vw,
+        view_h: vh,
+        tile_x,
+        tile_y,
+        tile_w: tile_r - tile_x,
+        tile_h: tile_b - tile_y,
+        pic_x,
+        pic_y,
+        pic_w,
+        pic_h,
+        border,
+        image_w,
+        image_h,
+    }
+}
+
+/// Upright source pixels the loupe resamples. When USM is on, the mask is
+/// resampled with Lanczos-3 (wider than the other kernels) and that span is
+/// united with the picture kernel, so one crop feeds both. `(0, 0, 0, 0)`
+/// when the box lies entirely on the border.
+pub fn loupe_source_rect(
+    full_w: usize,
+    full_h: usize,
+    p: &PrintParams,
+    nx: f64,
+    ny: f64,
+    view: usize,
+) -> (usize, usize, usize, usize) {
+    let lay = layout(full_w, full_h, 1, p);
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
+    if g.pic_w == 0 || g.pic_h == 0 {
+        return (0, 0, 0, 0);
+    }
+    let span = |kernel| {
+        let rect = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
+        crate::resize::source_coverage(full_w, full_h, g.image_w, g.image_h, kernel, rect)
+    };
+    let (x0, y0, x1, y1) = span(p.recipe.resample);
+    if p.recipe.sharpen.usm_amount() > 0.0 {
+        let (mx0, my0, mx1, my1) = span(ResampleKernel::Lanczos3);
+        (x0.min(mx0), y0.min(my0), x1.max(mx1), y1.max(my1))
+    } else {
+        (x0, y0, x1, y1)
+    }
+}
+
+/// The print pixels of one box: resize, place, tone, then the same
+/// Richardson–Lucy and USM as [`render_planes`], on a tile padded by
+/// [`sharpen_halo`]. `linear` and `mask` are the upright negative (orientation
+/// already applied) and must cover [`loupe_source_rect`].
+pub fn sharpen_window(
+    linear: PlaneWindow<'_>,
+    mask: Option<PlaneWindow<'_>>,
+    p: &PrintParams,
+    nx: f64,
+    ny: f64,
+    view: usize,
+) -> Plane {
+    let lay = layout(linear.full_w, linear.full_h, 1, p);
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
+    let tone = p.recipe.curve.compile();
+    let white = tone.white();
+    let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
+    let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
+    if g.pic_w > 0 && g.pic_h > 0 {
+        let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
+        let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic);
+        crate::tone::render(&mut picture, p.recipe.place, &tone);
+        let ox = g.pic_x + g.border - g.tile_x;
+        let oy = g.pic_y + g.border - g.tile_y;
+        for y in 0..g.pic_h {
+            tile.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(picture.row(y));
+        }
+        // The print resamples the mask with Lanczos-3, which is wider than
+        // Mitchell, Catmull–Rom and the B-spline. Only do it when a USM will
+        // read the mask: the crop from `loupe_source_rect` includes those
+        // taps only then. Resampling it anyway reads off the window.
+        if p.recipe.sharpen.usm_amount() > 0.0 {
+            if let (Some(m), Some(dst)) = (mask, mask_tile.as_mut()) {
+                let resampled = resize_rect(m, g.image_w, g.image_h, ResampleKernel::Lanczos3, pic);
+                for y in 0..g.pic_h {
+                    dst.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(resampled.row(y));
+                }
+            }
+        }
+    }
+    tile = apply_sharpen(tile, mask_tile.as_ref(), &p.recipe, &lay).0;
+    let mut out = Plane::zeros(g.view_w, g.view_h);
+    let ox = g.view_x - g.tile_x;
+    let oy = g.view_y - g.tile_y;
+    for y in 0..g.view_h {
+        out.row_mut(y).copy_from_slice(&tile.row(oy + y)[ox..ox + g.view_w]);
+    }
+    out
 }
 
 /// Surround `p` with `b` pixels of `value` on every side. The mask gets 0
@@ -359,6 +554,23 @@ pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
     out
 }
 
+/// Richardson–Lucy and USM at the enlargement σ. A width of zero leaves
+/// the plane as it is.
+fn apply_sharpen(mut plane: Plane, mask: Option<&Plane>, recipe: &Recipe, lay: &Layout) -> (Plane, usize) {
+    let detail = lay.resample_sigma_px;
+    let mut deconv_n = 0usize;
+    let passes = recipe.sharpen.deconv_passes() as usize;
+    if passes > 0 && detail > 0.0 {
+        deconv_n = passes.min(DECONV_ITERATIONS);
+        plane = richardson_lucy(&plane, detail, deconv_n);
+    }
+    let amount = recipe.sharpen.usm_amount();
+    if amount > 0.0 && detail > 0.0 {
+        plane = unsharp(&plane, detail, amount, mask);
+    }
+    (plane, deconv_n)
+}
+
 /// The one pass on in-memory planes. `info.ms` covers this call only.
 pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     let t = Instant::now();
@@ -373,7 +585,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     }
 
     let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
-    let (tw, th, d_mm, r_px) = (lay.image_w, lay.image_h, lay.viewing_mm, lay.usm_radius_px);
+    let (tw, th) = (lay.image_w, lay.image_h);
     if (tw, th) != (plane.width, plane.height) {
         info!("resize {}x{} -> {}x{} ({})", plane.width, plane.height, tw, th, r.resample.name());
         plane = resize_with(&plane, tw, th, r.resample);
@@ -400,30 +612,22 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         }
     }
 
-    let mut deconv_n = 0usize;
-    match r.sharpen {
-        Sharpen::Off => {}
-        Sharpen::Usm { .. } | Sharpen::Deconv { .. } => {
-            let passes = r.sharpen.deconv_passes();
-            if passes > 0 && r_px > 0.0 {
-                deconv_n = (passes as usize).clamp(1, DECONV_ITERATIONS);
-                info!("richardson-lucy {deconv_n} iterations, sigma {r_px:.2} px, no mask");
-                plane = richardson_lucy(&plane, r_px, deconv_n);
-            }
-            let amount = r.sharpen.usm_amount();
-            if amount > 0.0 {
-                info!(
-                    "usm amount {:.2}, radius {:.2} px (d = {:.0} mm), masked: {}",
-                    amount,
-                    r_px,
-                    d_mm,
-                    mask.is_some()
-                );
-                plane = unsharp(&plane, r_px, amount, mask.as_ref());
-            }
-        }
+    let (plane, deconv_n) = apply_sharpen(plane, mask.as_ref(), r, &lay);
+    if deconv_n > 0 {
+        info!(
+            "richardson-lucy {deconv_n} iterations, enlargement sigma {:.2} px, no mask",
+            lay.resample_sigma_px
+        );
     }
-
+    if r.sharpen.usm_amount() > 0.0 && lay.resample_sigma_px > 0.0 {
+        info!(
+            "usm amount {:.2}, enlargement sigma {:.2} px ({:.2}×), masked: {}",
+            r.sharpen.usm_amount(),
+            lay.resample_sigma_px,
+            lay.enlargement,
+            mask.is_some()
+        );
+    }
     let info = PrintInfo {
         mimizan: env!("CARGO_PKG_VERSION"),
         stage: "print",
@@ -438,7 +642,8 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         recipe: r.clone(),
         border_px: lay.border_px,
         usm_amount: r.sharpen.usm_amount(),
-        usm_radius_px: r_px,
+        usm_radius_px: lay.usm_radius_px,
+        resample_sigma_px: lay.resample_sigma_px,
         usm_masked: mask.is_some(),
         deconvolution_iterations: deconv_n as u32,
         ms: t.elapsed().as_millis(),
@@ -523,33 +728,36 @@ mod tests {
             name: "step".into(),
             description: None,
         };
-        // 400 mm at 300 DPI is the spec's 1.4 px USM radius.
-        let plain = PrintParams { viewing_distance_mm: Some(400.0), ..Default::default() };
-        let base = render_planes(&src, &plain);
-        let deconv = PrintParams {
+        // Native size has no enlargement blur, so the detail pass is a copy.
+        // This print is enlarged, and the mask is black everywhere: deconvolution
+        // still runs, USM does not.
+        let enlarge = |sharpen| PrintParams {
             recipe: Recipe {
-                sharpen: Sharpen::Deconv { passes: crate::deconv::DECONV_ITERATIONS as u32, usm_amount: 0.0 },
+                sharpen,
+                dpi: 100.0,
+                size: Some(PrintSize::Physical { width_in: 2.0, height_in: 1.0 }),
                 ..Recipe::default()
             },
-            viewing_distance_mm: Some(400.0),
             ..Default::default()
         };
+        let base = render_planes(&src, &enlarge(Sharpen::Off));
+        let deconv =
+            enlarge(Sharpen::Deconv { passes: crate::deconv::DECONV_ITERATIONS as u32, usm_amount: 0.0 });
         let out = render_planes(&src, &deconv);
+        assert!(out.info.resample_sigma_px > 0.0);
         assert_eq!(out.info.deconvolution_iterations, crate::deconv::DECONV_ITERATIONS as u32);
         assert!(!out.info.usm_masked);
-        let contrast = |p: &Plane| p.at(32, 16) - p.at(31, 16);
+        let contrast = |p: &Plane| {
+            let row = p.row(p.height / 2);
+            row.windows(2).map(|w| w[1] - w[0]).fold(0.0_f64, f64::max)
+        };
         assert!(
             contrast(&out.plane) > contrast(&base.plane),
             "deconv {:.4} base {:.4}",
             contrast(&out.plane),
             contrast(&base.plane)
         );
-        let usm = PrintParams {
-            recipe: Recipe { sharpen: Sharpen::Usm { amount: 1.0 }, ..Recipe::default() },
-            viewing_distance_mm: Some(400.0),
-            ..Default::default()
-        };
-        let masked = render_planes(&src, &usm);
+        let masked = render_planes(&src, &enlarge(Sharpen::Usm { amount: 1.0 }));
         assert_eq!(masked.plane.data, base.plane.data);
     }
 
@@ -760,6 +968,307 @@ mod tests {
                     let (ux, uy) = upright_pixel(o, w, h, sx, sy);
                     assert_eq!(up.at(ux, uy), p.at(sx, sy), "orientation {o} at {sx},{sy}");
                 }
+            }
+        }
+    }
+
+    /// The loupe is the same pixels as the full print, including a resize,
+    /// a border (paper white under the kernel) and both sharpening steps.
+    #[test]
+    fn sharpen_window_matches_the_full_print() {
+        let (w, h) = (36, 24);
+        let mut plane = Plane::zeros(w, h);
+        let mut mask = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, 0.15 + 0.7 * x as f64 / w as f64 + if y > 12 { 0.1 } else { 0.0 });
+                mask.set(x, y, if x > 4 && x < 30 { 0.9 } else { 0.2 });
+            }
+        }
+        let mut recipe = Recipe::on_paper();
+        recipe.dpi = 100.0;
+        recipe.border_mm = 1.0;
+        recipe.size = Some(PrintSize::Physical { width_in: 0.22, height_in: 0.22 });
+        recipe.resample = ResampleKernel::Lanczos3;
+        recipe.sharpen = Sharpen::Deconv { passes: 2, usm_amount: 0.6 };
+        recipe.place = 0.25;
+        let params = PrintParams { recipe, ..PrintParams::default() };
+        let full = render_planes(
+            &PrintSource {
+                plane: &plane,
+                mask: Some(&mask),
+                orientation: 1,
+                name: "t".into(),
+                description: None,
+            },
+            &params,
+        );
+        let lay = layout(w, h, 1, &params);
+        for (nx, ny) in [(0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.1, 0.85)] {
+            let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 11);
+            assert!(ex > sx && ey > sy);
+            let mut lc = Plane::zeros(ex - sx, ey - sy);
+            let mut mc = Plane::zeros(ex - sx, ey - sy);
+            for y in 0..lc.height {
+                for x in 0..lc.width {
+                    lc.set(x, y, plane.at(sx + x, sy + y));
+                    mc.set(x, y, mask.at(sx + x, sy + y));
+                }
+            }
+            let got = sharpen_window(
+                PlaneWindow { plane: &lc, origin_x: sx, origin_y: sy, full_w: w, full_h: h },
+                Some(PlaneWindow { plane: &mc, origin_x: sx, origin_y: sy, full_w: w, full_h: h }),
+                &params,
+                nx,
+                ny,
+                11,
+            );
+            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 11);
+            for y in 0..got.height {
+                for x in 0..got.width {
+                    let expect = full.plane.at(g.view_x + x, g.view_y + y);
+                    let v = got.at(x, y);
+                    assert!((v - expect).abs() < 1e-9, "at {nx},{ny} +{x},{y}: {v} vs {expect}");
+                }
+            }
+        }
+    }
+
+    /// Size, dpi and a kernel narrower than Lanczos-3 must not read outside
+    /// the crop. The mask resample is Lanczos-3 and only runs for USM; doing
+    /// it for every kernel walks off the window and kills the loupe thread.
+    #[test]
+    fn loupe_follows_size_dpi_and_kernel() {
+        let (w, h) = (48, 32);
+        let mut plane = Plane::zeros(w, h);
+        let mut mask = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, ((x * 3 + y * 5) % 17) as f64 / 16.0);
+                mask.set(x, y, if x > 2 { 0.9 } else { 0.1 });
+            }
+        }
+        let points = [(0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.08, 0.92)];
+        let sharpens = [
+            Sharpen::Off,
+            Sharpen::Usm { amount: 0.5 },
+            Sharpen::Deconv { passes: 2, usm_amount: 0.0 },
+            Sharpen::Deconv { passes: 1, usm_amount: 0.25 },
+        ];
+        for kernel in ResampleKernel::ALL {
+            for (dpi, width_in) in [(100.0, 0.3), (300.0, 1.2), (600.0, 0.15)] {
+                for sharpen in sharpens {
+                    let mut recipe = Recipe::on_paper();
+                    recipe.dpi = dpi;
+                    recipe.resample = kernel;
+                    recipe.sharpen = sharpen;
+                    recipe.border_mm = 2.0;
+                    recipe.size =
+                        Some(PrintSize::Physical { width_in, height_in: width_in * h as f64 / w as f64 });
+                    let params = PrintParams { recipe, ..PrintParams::default() };
+                    let full = render_planes(
+                        &PrintSource {
+                            plane: &plane,
+                            mask: Some(&mask),
+                            orientation: 1,
+                            name: "t".into(),
+                            description: None,
+                        },
+                        &params,
+                    );
+                    let lay = layout(w, h, 1, &params);
+                    for (nx, ny) in points {
+                        let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 16);
+                        let (lc, mc) = if ex > sx && ey > sy {
+                            let mut lc = Plane::zeros(ex - sx, ey - sy);
+                            let mut mc = Plane::zeros(ex - sx, ey - sy);
+                            for y in 0..lc.height {
+                                for x in 0..lc.width {
+                                    lc.set(x, y, plane.at(sx + x, sy + y));
+                                    mc.set(x, y, mask.at(sx + x, sy + y));
+                                }
+                            }
+                            (lc, mc)
+                        } else {
+                            (plane.clone(), mask.clone())
+                        };
+                        let origin_x = if ex > sx { sx } else { 0 };
+                        let origin_y = if ey > sy { sy } else { 0 };
+                        let got = sharpen_window(
+                            PlaneWindow { plane: &lc, origin_x, origin_y, full_w: w, full_h: h },
+                            Some(PlaneWindow { plane: &mc, origin_x, origin_y, full_w: w, full_h: h }),
+                            &params,
+                            nx,
+                            ny,
+                            16,
+                        );
+                        let g = loupe_geom(&lay, sharpen, nx, ny, 16);
+                        assert_eq!((got.width, got.height), (g.view_w, g.view_h));
+                        for y in 0..got.height {
+                            for x in 0..got.width {
+                                let expect = full.plane.at(g.view_x + x, g.view_y + y);
+                                let v = got.at(x, y);
+                                assert!(
+                                    (v - expect).abs() < 1e-9,
+                                    "{kernel:?} {dpi} dpi {sharpen:?} at {nx},{ny} +{x},{y}: {v} vs {expect}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn step_source() -> Plane {
+        let (w, h) = (32usize, 8usize);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in w / 2..w {
+                plane.set(x, y, 1.0);
+            }
+        }
+        plane
+    }
+
+    /// 32×8 enlarged to 100×25 (3.125×) at 300 dpi, viewed from 2 m so the
+    /// arc-minute radius is several pixels and the enlargement σ is not.
+    fn enlarged_step(sharpen: Sharpen) -> (Plane, Layout) {
+        let plane = step_source();
+        let params = PrintParams {
+            recipe: Recipe {
+                sharpen,
+                dpi: 300.0,
+                resample: ResampleKernel::BSpline,
+                size: Some(PrintSize::Physical { width_in: 100.0 / 300.0, height_in: 25.0 / 300.0 }),
+                ..Recipe::default()
+            },
+            viewing_distance_mm: Some(2000.0),
+            ..Default::default()
+        };
+        let out = render_planes(
+            &PrintSource {
+                plane: &plane,
+                mask: None,
+                orientation: 1,
+                name: "step".into(),
+                description: None,
+            },
+            &params,
+        );
+        let lay = layout(plane.width, plane.height, 1, &params);
+        (out.plane, lay)
+    }
+
+    fn flats_and_edge(row: &[f64]) -> (f64, f64, usize) {
+        let left = row[..8].iter().sum::<f64>() / 8.0;
+        let right = row[row.len() - 8..].iter().sum::<f64>() / 8.0;
+        let mid = 0.5 * (left + right);
+        let mut edge = 1usize;
+        for i in 1..row.len() {
+            if (row[i - 1] - mid) * (row[i] - mid) <= 0.0 {
+                edge = i;
+                break;
+            }
+        }
+        (left, right, edge)
+    }
+
+    #[test]
+    fn native_and_downscale_sharpening_copies_the_picture() {
+        let plane = step_source();
+        let run = |sharpen, size: Option<PrintSize>| {
+            let params = PrintParams {
+                recipe: Recipe { sharpen, size, ..Recipe::default() },
+                viewing_distance_mm: Some(2000.0),
+                ..Default::default()
+            };
+            render_planes(
+                &PrintSource {
+                    plane: &plane,
+                    mask: None,
+                    orientation: 1,
+                    name: "step".into(),
+                    description: None,
+                },
+                &params,
+            )
+            .plane
+        };
+        let native = run(Sharpen::Off, None);
+        assert_eq!(run(Sharpen::Usm { amount: 1.5 }, None).data, native.data);
+        assert_eq!(run(Sharpen::Deconv { passes: 10, usm_amount: 1.0 }, None).data, native.data);
+        let small = Some(PrintSize::Physical { width_in: 0.05, height_in: 0.02 });
+        let shrunk = run(Sharpen::Off, small);
+        assert_eq!(run(Sharpen::Usm { amount: 1.5 }, small).data, shrunk.data);
+        assert_eq!(run(Sharpen::Deconv { passes: 10, usm_amount: 0.5 }, small).data, shrunk.data);
+    }
+
+    #[test]
+    fn enlargement_sharpening_stays_on_the_edge() {
+        let (plain, lay) = enlarged_step(Sharpen::Off);
+        assert!(lay.enlargement > 3.0 && lay.enlargement < 3.3, "{}", lay.enlargement);
+        assert!((lay.resample_sigma_px - 0.515 * lay.enlargement).abs() < 1e-9);
+        assert!(lay.usm_radius_px > 6.0, "arc-minute radius {}", lay.usm_radius_px);
+        assert!(lay.resample_sigma_px < 2.0, "detail σ {}", lay.resample_sigma_px);
+
+        let row = plain.row(plain.height / 2);
+        let (left, right, edge) = flats_and_edge(row);
+        let step = right - left;
+        let width = |samples: &[f64]| {
+            let (_, _, e) = flats_and_edge(samples);
+            let mut lo = e;
+            let mut hi = e;
+            let a = left + 0.1 * step;
+            let b = left + 0.9 * step;
+            while lo > 0 && samples[lo] > a {
+                lo -= 1;
+            }
+            while hi + 1 < samples.len() && samples[hi] < b {
+                hi += 1;
+            }
+            hi - lo
+        };
+        let plain_w = width(row);
+
+        let (deconv, _) = enlarged_step(Sharpen::Deconv { passes: 3, usm_amount: 0.0 });
+        let drow = deconv.row(deconv.height / 2);
+        assert!(width(drow) < plain_w, "deconv {} vs plain {}", width(drow), plain_w);
+        for dx in [12, 16] {
+            for x in [edge - dx, edge + dx] {
+                assert!(
+                    (drow[x] - row[x]).abs() < 0.02 * step,
+                    "deconv halo at {x} (edge {edge}): {} vs {}",
+                    drow[x],
+                    row[x]
+                );
+            }
+        }
+
+        let (usm, _) = enlarged_step(Sharpen::Usm { amount: 0.5 });
+        let urow = usm.row(usm.height / 2);
+        let mut peak_at = 0usize;
+        let mut peak = 0.0;
+        for (i, (u, p)) in urow.iter().zip(row).enumerate() {
+            let d = (u - p).abs();
+            if d > peak {
+                peak = d;
+                peak_at = i;
+            }
+        }
+        // The boost sits on the shoulder of the ramp, a few pixels off the
+        // 50 % point. A viewing-distance halo of ~7 px would still be up
+        // well past that.
+        assert!((peak_at as isize - edge as isize).abs() <= 6, "peak at {peak_at}, edge {edge}");
+        for dx in [14, 18] {
+            for x in [edge - dx, edge + dx] {
+                assert!(
+                    (urow[x] - row[x]).abs() < 0.01 * step,
+                    "usm halo at {x} (edge {edge}, σ {:.2}): {} vs {}",
+                    lay.resample_sigma_px,
+                    urow[x],
+                    row[x]
+                );
             }
         }
     }

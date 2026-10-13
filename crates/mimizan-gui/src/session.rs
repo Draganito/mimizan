@@ -10,8 +10,9 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
-use mimizan_core::print::{orient, rotate_gray8_cw, rotated};
-use mimizan_core::resize::{fit_dims, resize};
+use mimizan_core::print::{loupe_source_rect, orient, rotate_gray8_cw, rotated, sharpen_window, PrintParams};
+use mimizan_core::recipe::Recipe;
+use mimizan_core::resize::{fit_dims, resize, PlaneWindow};
 use mimizan_core::separate::{MaskMode, Separation};
 use mimizan_core::tone::{self, Tone, ToneMap};
 use mimizan_core::zone;
@@ -30,9 +31,11 @@ pub struct DevelopParams {
     pub wb: WhiteBalance,
     pub mask: MaskMode,
     pub fix_defects: bool,
-    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`): off by
-    /// default, because a pixel that passes through it is computed, not measured.
-    /// Ignored unless `converter` is [`Converter::Mimizan`].
+    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). The
+    /// desktop program starts with it on. The library and the command stay
+    /// off until `--reconstruct` is passed, because a pixel that passes
+    /// through it is computed, not measured. Ignored unless `converter` is
+    /// [`Converter::Mimizan`].
     pub reconstruct: bool,
     pub converter: Converter,
 }
@@ -70,7 +73,7 @@ impl Default for DevelopParams {
             wb: WhiteBalance::AsShot,
             mask: MaskMode::Dubois,
             fix_defects: false,
-            reconstruct: false,
+            reconstruct: true,
             converter: Converter::Mimizan,
         }
     }
@@ -386,6 +389,84 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
     Some(DetailImage { rect: DetailRect { w: upright.width, h: upright.height, ..rect }, gray })
 }
 
+/// Print pixels across the loupe, one screen pixel each.
+pub const LOUPE_PX: usize = 160;
+
+/// One box of the print at 1:1: the same resize, paper and sharpening the
+/// TIFF gets, on a tile around `(nx, ny)`.
+pub struct SharpenLoupe {
+    pub gray: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
+
+pub fn render_sharpen_loupe(
+    s: &Session,
+    weights: &Weights,
+    recipe: &Recipe,
+    orientation: u16,
+    nx: f64,
+    ny: f64,
+) -> SharpenLoupe {
+    let params = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
+    let sep = s.separation();
+    let (sensor_w, sensor_h) = (sep.lum.width, sep.lum.height);
+    let (full_w, full_h) =
+        if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
+    let (sx, sy, ex, ey) = loupe_source_rect(full_w, full_h, &params, nx, ny, LOUPE_PX);
+    // USM is the only step that reads the mask, and only then is the crop
+    // wide enough for its Lanczos-3 resample.
+    let want_mask = recipe.sharpen.usm_amount() > 0.0;
+    let (linear, mask) = if ex > sx && ey > sy {
+        let upright_rect = DetailRect { x: sx, y: sy, w: ex - sx, h: ey - sy };
+        let sensor = source_rect(orientation, sensor_w, sensor_h, upright_rect);
+        let mixed = mix(
+            &Separation {
+                lum: crop(&sep.lum, sensor),
+                c1: crop(&sep.c1, sensor),
+                c2: crop(&sep.c2, sensor),
+                mask_max: Plane::zeros(1, 1),
+                rounds: sep.rounds,
+                phase: sep.phase,
+                computed: sep.computed,
+            },
+            weights,
+        );
+        let mask = want_mask.then(|| orient(&crop_mask(s, sensor), orientation));
+        (orient(&mixed, orientation), mask)
+    } else {
+        (Plane::zeros(1, 1), None)
+    };
+    let window = if ex > sx && ey > sy {
+        PlaneWindow { plane: &linear, origin_x: sx, origin_y: sy, full_w, full_h }
+    } else {
+        PlaneWindow { plane: &linear, origin_x: 0, origin_y: 0, full_w, full_h }
+    };
+    let mask_window = mask.as_ref().map(|m| PlaneWindow {
+        plane: m,
+        origin_x: window.origin_x,
+        origin_y: window.origin_y,
+        full_w,
+        full_h,
+    });
+    let plane = sharpen_window(window, mask_window, &params, nx, ny, LOUPE_PX);
+    let gray = plane.data.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
+    SharpenLoupe { gray, width: plane.width, height: plane.height }
+}
+
+fn crop_mask(s: &Session, r: DetailRect) -> Plane {
+    let n = &s.negative;
+    let mut out = Plane::zeros(r.w, r.h);
+    for y in 0..r.h {
+        let base = (r.y + y) * n.plane.width + r.x;
+        let row = out.row_mut(y);
+        for (x, o) in row.iter_mut().enumerate() {
+            *o = f64::from(n.mask8[base + x]) / 255.0;
+        }
+    }
+    out
+}
+
 /// 256-bin histogram of an 8-bit view plus the clipped fractions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Histogram {
@@ -680,6 +761,15 @@ mod tests {
             assert_eq!((got.width, got.height), (r.w, r.h), "orientation {o}");
             assert_eq!(got.data, expected, "orientation {o}");
         }
+    }
+
+    /// The desktop program starts with the last octave reconstructed. The
+    /// library default stays off; this is the GUI's own switch.
+    #[test]
+    fn reconstruct_starts_on() {
+        let p = DevelopParams::default();
+        assert!(p.reconstruct);
+        assert!(p.negative_params(None).separate.reconstruct.is_some());
     }
 }
 

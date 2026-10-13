@@ -1,10 +1,11 @@
-//! Two background threads. `Heavy` decodes, separates and exports (seconds);
+//! Background threads. `Heavy` decodes, separates and exports (seconds);
 //! `Preview` re-mixes the downscaled separation (milliseconds) and always
-//! works on the newest request only.
+//! works on the newest request only. `Loupe` renders one sharpened print
+//! box the same way.
 
 use crate::session::{
-    preview_planes, render_detail, render_preview, DetailImage, DetailRect, DevelopParams, HistCache,
-    PreviewImage, RawHistogram, Session, ViewParams,
+    preview_planes, render_detail, render_preview, render_sharpen_loupe, DetailImage, DetailRect,
+    DevelopParams, HistCache, PreviewImage, RawHistogram, Session, SharpenLoupe, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -271,5 +272,95 @@ impl Preview {
             all.push(r);
         }
         all
+    }
+}
+
+/// One 1:1 box of the print. Coalesced like the preview: a slider drag
+/// keeps only the newest point and recipe.
+pub struct LoupeRequest {
+    pub session: Arc<Session>,
+    pub weights: Weights,
+    pub recipe: Recipe,
+    pub orientation: u16,
+    pub nx: f64,
+    pub ny: f64,
+    pub generation: u64,
+}
+
+pub struct LoupeResult {
+    pub generation: u64,
+    pub image: SharpenLoupe,
+}
+
+pub struct Loupe {
+    tx: Sender<LoupeRequest>,
+    rx: Receiver<LoupeResult>,
+}
+
+impl Loupe {
+    pub fn spawn(ctx: egui::Context) -> Self {
+        let (tx, reqs) = channel::<LoupeRequest>();
+        let (results, rx) = channel::<LoupeResult>();
+        thread::Builder::new()
+            .name("mimizan-loupe".into())
+            .spawn(move || {
+                while let Ok(mut req) = reqs.recv() {
+                    while let Ok(newer) = reqs.try_recv() {
+                        req = newer;
+                    }
+                    let generation = req.generation;
+                    // A panic used to kill this thread. The box then kept the
+                    // last texture forever, and every later size, dpi or
+                    // kernel change looked frozen.
+                    let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        render_sharpen_loupe(
+                            &req.session,
+                            &req.weights,
+                            &req.recipe,
+                            req.orientation,
+                            req.nx,
+                            req.ny,
+                        )
+                    }));
+                    let image = match rendered {
+                        Ok(image) => image,
+                        Err(payload) => {
+                            tracing::error!("loupe render failed: {}", panic_message(&payload));
+                            SharpenLoupe { gray: Vec::new(), width: 0, height: 0 }
+                        }
+                    };
+                    if results.send(LoupeResult { generation, image }).is_err() {
+                        break;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .expect("spawn loupe worker");
+        Self { tx, rx }
+    }
+
+    pub fn request(&self, r: LoupeRequest) {
+        let _ = self.tx.send(r);
+    }
+
+    /// The newest finished box since the last poll. Older ones are dropped:
+    /// a slider drag may have completed several, and only the latest matches
+    /// the controls.
+    pub fn poll(&self) -> Option<LoupeResult> {
+        let mut last = None;
+        while let Ok(r) = self.rx.try_recv() {
+            last = Some(r);
+        }
+        last
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }

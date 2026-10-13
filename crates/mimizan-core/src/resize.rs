@@ -1,7 +1,7 @@
 //! Separable resampling in f64 (SPEC section 9, "Größe").
 //!
-//! The kernel is a parameter ([`ResampleKernel`]); Lanczos-3 is the default
-//! and what [`resize`] uses. When shrinking, the kernel is stretched by the
+//! The kernel is a parameter ([`ResampleKernel`]). The print default is the
+//! B-spline; [`resize`] still uses Lanczos-3, which is the bench kernel. When shrinking, the kernel is stretched by the
 //! scale factor so it acts as the anti-alias low-pass at the same time (the
 //! standard "support scales with the footprint" rule). Weights are normalised
 //! per output sample so the DC gain is exactly one everywhere, including at
@@ -24,8 +24,7 @@ use std::f64::consts::PI;
 #[serde(rename_all = "kebab-case")]
 pub enum ResampleKernel {
     /// Windowed sinc, support 3: the sharpest (MTF 0.82 at 0.4 c/px), about
-    /// 6 % overshoot at a step. The default and the bench's kernel.
-    #[default]
+    /// 6 % overshoot at a step. The bench's kernel.
     Lanczos3,
     /// Mitchell–Netravali B = C = 1/3: the compromise of that paper, 1.6 %
     /// overshoot, MTF 0.59 at 0.4 c/px.
@@ -35,6 +34,8 @@ pub enum ResampleKernel {
     CatmullRom,
     /// Cubic B-spline (B = 1, C = 0): no negative lobe, no overshoot at any
     /// edge, MTF 0.33 at 0.4 c/px. Not interpolating (it smooths at scale 1).
+    /// The print default.
+    #[default]
     BSpline,
 }
 
@@ -54,6 +55,20 @@ impl ResampleKernel {
     pub fn parse(s: &str) -> Option<Self> {
         let t = s.trim().to_ascii_lowercase();
         Self::ALL.iter().copied().find(|k| k.name() == t || k.name().replace('-', "") == t.replace('-', ""))
+    }
+
+    /// Gaussian σ of this kernel's ramp when it enlarges, in destination
+    /// pixels per unit of enlargement. A step scaled by `s` matches a
+    /// Gaussian blur of the nearest-neighbour step at `σ = k · s`, fitted on
+    /// the 10–90 % width at `s = 8`. Lanczos and Catmull–Rom are the
+    /// narrowest, the B-spline the widest.
+    pub fn enlargement_k(self) -> f64 {
+        match self {
+            Self::Lanczos3 => 0.281,
+            Self::Mitchell => 0.330,
+            Self::CatmullRom => 0.275,
+            Self::BSpline => 0.515,
+        }
     }
 
     /// Half-width of the support in source pixels (at scale 1).
@@ -133,12 +148,20 @@ struct Taps {
 }
 
 fn build_taps(src_len: usize, dst_len: usize, kernel: ResampleKernel) -> Taps {
+    taps_range(src_len, dst_len, kernel, 0, dst_len)
+}
+
+/// Taps for destination samples `i0..i1` only. The weights are those of a
+/// resize of the full length, so a window matches the same pixels of
+/// [`resize_with`].
+fn taps_range(src_len: usize, dst_len: usize, kernel: ResampleKernel, i0: usize, i1: usize) -> Taps {
     let scale = src_len as f64 / dst_len as f64; // > 1 when shrinking
     let stretch = scale.max(1.0);
     let support = kernel.support() * stretch;
-    let mut start = Vec::with_capacity(dst_len);
-    let mut weights = Vec::with_capacity(dst_len);
-    for i in 0..dst_len {
+    let n = i1.saturating_sub(i0);
+    let mut start = Vec::with_capacity(n);
+    let mut weights = Vec::with_capacity(n);
+    for i in i0..i1 {
         // Centre of destination pixel i mapped into source coordinates.
         let centre = (i as f64 + 0.5) * scale - 0.5;
         let lo = (centre - support).floor() as isize;
@@ -209,6 +232,237 @@ pub fn resize(src: &Plane, dst_w: usize, dst_h: usize) -> Plane {
     resize_with(src, dst_w, dst_h, ResampleKernel::Lanczos3)
 }
 
+/// A rectangle of a larger plane. `plane` holds pixels `[origin_x, origin_y)`
+/// of an image that is `full_w × full_h`. Resampling a window reads through
+/// this, with the same weights as the full image.
+#[derive(Clone, Copy)]
+pub struct PlaneWindow<'a> {
+    pub plane: &'a Plane,
+    pub origin_x: usize,
+    pub origin_y: usize,
+    pub full_w: usize,
+    pub full_h: usize,
+}
+
+impl<'a> PlaneWindow<'a> {
+    /// The whole plane, origin at 0.
+    pub fn full(plane: &'a Plane) -> Self {
+        Self { plane, origin_x: 0, origin_y: 0, full_w: plane.width, full_h: plane.height }
+    }
+
+    #[inline]
+    fn at(self, x: usize, y: usize) -> f64 {
+        self.plane.at(x - self.origin_x, y - self.origin_y)
+    }
+}
+
+/// A rectangle in pixel indices.
+#[derive(Clone, Copy, Debug)]
+pub struct PixelRect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// Source pixels a resize of the full image reads for `rect`. An axis that
+/// is not resampled (`src == dst`) reads the destination index itself. The
+/// span is what a crop must cover for [`resize_rect`] to match [`resize_with`].
+pub fn source_coverage(
+    full_w: usize,
+    full_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    kernel: ResampleKernel,
+    rect: PixelRect,
+) -> (usize, usize, usize, usize) {
+    let (x0, x1) = axis_span(full_w, dst_w, kernel, rect.x, rect.x + rect.w);
+    let (y0, y1) = axis_span(full_h, dst_h, kernel, rect.y, rect.y + rect.h);
+    (x0, y0, x1, y1)
+}
+
+fn axis_span(src_len: usize, dst_len: usize, kernel: ResampleKernel, i0: usize, i1: usize) -> (usize, usize) {
+    if i0 >= i1 {
+        return (i0, i0);
+    }
+    if src_len == dst_len {
+        return (i0, i1);
+    }
+    let taps = taps_range(src_len, dst_len, kernel, i0, i1);
+    let mut a = usize::MAX;
+    let mut b = 0usize;
+    for (s, w) in taps.start.iter().zip(&taps.weights) {
+        a = a.min(*s);
+        b = b.max(s + w.len());
+    }
+    (a, b)
+}
+
+/// Destination pixels `[dx, dx+dw) × [dy, dy+dh)` of [`resize_with`] on the
+/// full image. `src` must cover [`source_coverage`] of that rectangle.
+pub fn resize_rect(
+    src: PlaneWindow<'_>,
+    dst_w: usize,
+    dst_h: usize,
+    kernel: ResampleKernel,
+    rect: PixelRect,
+) -> Plane {
+    let (dx, dy, dw, dh) = (rect.x, rect.y, rect.w, rect.h);
+    assert!(dw > 0 && dh > 0, "window must be non-empty");
+    if dst_w == src.full_w && dst_h == src.full_h {
+        let mut out = Plane::zeros(dw, dh);
+        for y in 0..dh {
+            for x in 0..dw {
+                out.set(x, y, src.at(dx + x, dy + y));
+            }
+        }
+        return out;
+    }
+    let rows_first = src.full_h * dst_w + dst_w * dst_h <= src.full_w * dst_h + dst_w * dst_h;
+    if rows_first {
+        let (sy0, sy1) = axis_span(src.full_h, dst_h, kernel, dy, dy + dh);
+        let mid = resize_rows_window(src, dst_w, kernel, dx, dx + dw, sy0, sy1);
+        if dst_h == src.full_h {
+            mid
+        } else {
+            resize_cols_partial(&mid, sy0, src.full_h, dst_h, kernel, dy, dy + dh)
+        }
+    } else {
+        let (sx0, sx1) = axis_span(src.full_w, dst_w, kernel, dx, dx + dw);
+        let mid = resize_cols_window(src, dst_h, kernel, sx0, sx1, dy, dy + dh);
+        if dst_w == src.full_w {
+            mid
+        } else {
+            resize_rows_partial(&mid, sx0, src.full_w, dst_w, kernel, dx, dx + dw)
+        }
+    }
+}
+
+fn resize_rows_window(
+    src: PlaneWindow<'_>,
+    dst_w: usize,
+    kernel: ResampleKernel,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+) -> Plane {
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let mut out = Plane::zeros(w, h);
+    if dst_w == src.full_w {
+        for y in 0..h {
+            for x in 0..w {
+                out.set(x, y, src.at(x0 + x, y0 + y));
+            }
+        }
+        return out;
+    }
+    let taps = taps_range(src.full_w, dst_w, kernel, x0, x1);
+    for y in 0..h {
+        let row = out.row_mut(y);
+        let sy = y0 + y;
+        for (x, o) in row.iter_mut().enumerate() {
+            let st = taps.start[x];
+            let weights = &taps.weights[x];
+            let mut acc = 0.0;
+            for (k, wk) in weights.iter().enumerate() {
+                acc += wk * src.at(st + k, sy);
+            }
+            *o = acc;
+        }
+    }
+    out
+}
+
+fn resize_cols_window(
+    src: PlaneWindow<'_>,
+    dst_h: usize,
+    kernel: ResampleKernel,
+    x0: usize,
+    x1: usize,
+    y0: usize,
+    y1: usize,
+) -> Plane {
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let mut out = Plane::zeros(w, h);
+    if dst_h == src.full_h {
+        for y in 0..h {
+            for x in 0..w {
+                out.set(x, y, src.at(x0 + x, y0 + y));
+            }
+        }
+        return out;
+    }
+    let taps = taps_range(src.full_h, dst_h, kernel, y0, y1);
+    for (i, row) in out.data.chunks_mut(w).enumerate() {
+        let st = taps.start[i];
+        let weights = &taps.weights[i];
+        for (k, wk) in weights.iter().enumerate() {
+            let sy = st + k;
+            for (x, o) in row.iter_mut().enumerate() {
+                *o += wk * src.at(x0 + x, sy);
+            }
+        }
+    }
+    out
+}
+
+/// Vertical resize of a plane whose rows are absolute source rows `mid_y0..`.
+fn resize_cols_partial(
+    mid: &Plane,
+    mid_y0: usize,
+    src_h: usize,
+    dst_h: usize,
+    kernel: ResampleKernel,
+    y0: usize,
+    y1: usize,
+) -> Plane {
+    let taps = taps_range(src_h, dst_h, kernel, y0, y1);
+    let w = mid.width;
+    let mut out = Plane::zeros(w, y1 - y0);
+    for (i, row) in out.data.chunks_mut(w).enumerate() {
+        let st = taps.start[i];
+        let weights = &taps.weights[i];
+        for (k, wk) in weights.iter().enumerate() {
+            let s = mid.row(st + k - mid_y0);
+            for x in 0..w {
+                row[x] += wk * s[x];
+            }
+        }
+    }
+    out
+}
+
+/// Horizontal resize of a plane whose columns are absolute source columns `mid_x0..`.
+fn resize_rows_partial(
+    mid: &Plane,
+    mid_x0: usize,
+    src_w: usize,
+    dst_w: usize,
+    kernel: ResampleKernel,
+    x0: usize,
+    x1: usize,
+) -> Plane {
+    let taps = taps_range(src_w, dst_w, kernel, x0, x1);
+    let mut out = Plane::zeros(x1 - x0, mid.height);
+    for y in 0..mid.height {
+        let s = mid.row(y);
+        let row = out.row_mut(y);
+        for (x, o) in row.iter_mut().enumerate() {
+            let st = taps.start[x];
+            let weights = &taps.weights[x];
+            let mut acc = 0.0;
+            for (k, wk) in weights.iter().enumerate() {
+                acc += wk * s[st + k - mid_x0];
+            }
+            *o = acc;
+        }
+    }
+    out
+}
+
 /// Resample to exactly `dst_w × dst_h` with `kernel`. Rows first when
 /// shrinking in x more than in y (fewer operations), otherwise columns first.
 /// An unchanged size returns a copy, whatever the kernel (the B-spline would
@@ -262,6 +516,36 @@ pub fn fit_dims(w: usize, h: usize, box_w: usize, box_h: usize) -> (usize, usize
     (dw, dh)
 }
 
+/// Long-side scale `destination / source`. Greater than 1 when the picture
+/// is enlarged.
+pub fn enlargement_scale(src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> f64 {
+    let src = if src_w >= src_h { src_w } else { src_h };
+    let dst = if src_w >= src_h { dst_w } else { dst_h };
+    if src == 0 {
+        1.0
+    } else {
+        dst as f64 / src as f64
+    }
+}
+
+/// Blur the resampler adds when it enlarges, in destination pixels.
+/// Zero at native size and when shrinking: there the picture is the sensor,
+/// or the kernel is the anti-alias low-pass.
+pub fn enlargement_sigma(
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+    kernel: ResampleKernel,
+) -> f64 {
+    let s = enlargement_scale(src_w, src_h, dst_w, dst_h);
+    if s <= 1.0 {
+        0.0
+    } else {
+        kernel.enlargement_k() * s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +572,45 @@ mod tests {
         assert_eq!(fit_dims(6000, 4000, 4500, 3000), (4500, 3000));
         // 3:2 image on 4:5 paper: the long side limits.
         assert_eq!(fit_dims(6000, 4000, 2400, 3000), (3000, 2000));
+    }
+
+    #[test]
+    fn a_window_matches_the_full_resize() {
+        let (w, h) = (41, 27);
+        let mut src = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                src.set(x, y, ((x * 17 + y * 9) % 64) as f64 / 63.0);
+            }
+        }
+        for kernel in ResampleKernel::ALL {
+            for (dw, dh) in [(19, 13), (60, 40), (41, 14), (10, 27)] {
+                let full = resize_with(&src, dw, dh, kernel);
+                for (dx, dy, ww, hh) in [(0, 0, 5, 4), (dw - 6, dh - 5, 6, 5), (dw / 3, dh / 4, 7, 6)] {
+                    let rect = PixelRect { x: dx, y: dy, w: ww, h: hh };
+                    let got = resize_rect(PlaneWindow::full(&src), dw, dh, kernel, rect);
+                    for y in 0..hh {
+                        for x in 0..ww {
+                            assert_eq!(
+                                got.at(x, y),
+                                full.at(dx + x, dy + y),
+                                "{kernel:?} {dw}x{dh} at {dx},{dy}"
+                            );
+                        }
+                    }
+                    let (sx, sy, ex, ey) = source_coverage(w, h, dw, dh, kernel, rect);
+                    let mut crop = Plane::zeros(ex - sx, ey - sy);
+                    for y in 0..crop.height {
+                        for x in 0..crop.width {
+                            crop.set(x, y, src.at(sx + x, sy + y));
+                        }
+                    }
+                    let win = PlaneWindow { plane: &crop, origin_x: sx, origin_y: sy, full_w: w, full_h: h };
+                    let from_crop = resize_rect(win, dw, dh, kernel, rect);
+                    assert_eq!(from_crop.data, got.data);
+                }
+            }
+        }
     }
 
     #[test]
@@ -386,5 +709,96 @@ mod tests {
                 assert!((out.at(x, y) - 0.5).abs() < 1e-3, "{}", out.at(x, y));
             }
         }
+    }
+
+    /// The stored `enlargement_k` is the 10–90 % fit. It has to stay put
+    /// across scales: the kernel is not stretched when enlarging, so σ grows
+    /// with `s`.
+    #[test]
+    fn enlargement_k_matches_the_fitted_ramp() {
+        for kernel in ResampleKernel::ALL {
+            let k = kernel.enlargement_k();
+            assert!((fit_k(kernel, 8.0) - k).abs() < 0.01, "{kernel:?} at 8×");
+            assert!((fit_k(kernel, 4.0) - k).abs() < 0.025, "{kernel:?} at 4×");
+            assert_eq!(enlargement_sigma(32, 8, 32, 8, kernel), 0.0);
+            assert_eq!(enlargement_sigma(32, 8, 16, 4, kernel), 0.0);
+            let s = enlargement_sigma(32, 8, 100, 25, kernel);
+            assert!((s - k * 100.0 / 32.0).abs() < 1e-12, "{s}");
+        }
+    }
+
+    fn fit_k(kernel: ResampleKernel, s: f64) -> f64 {
+        let src_w = 32usize;
+        let dst_w = (src_w as f64 * s).round() as usize;
+        let mut src = Plane::zeros(src_w, 1);
+        for x in src_w / 2..src_w {
+            src.set(x, 0, 1.0);
+        }
+        let resized = resize_with(&src, dst_w, 1, kernel);
+        let mut nn = Plane::zeros(dst_w, 1);
+        for x in 0..dst_w {
+            let sx = ((x as f64 + 0.5) * src_w as f64 / dst_w as f64).floor() as usize;
+            nn.set(x, 0, src.at(sx.min(src_w - 1), 0));
+        }
+        let target = rise_width(&resized.data);
+        let mut lo = 0.05;
+        let mut hi = s * 3.0;
+        for _ in 0..48 {
+            let mid = 0.5 * (lo + hi);
+            let blurred = crate::usm::gaussian_blur(&nn, mid);
+            if rise_width(&blurred.data) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (0.5 * (lo + hi)) / s
+    }
+
+    /// Width from the 10 % level to the 90 % level, measured from the 50 %
+    /// crossing so a ringing lobe away from the edge does not count.
+    fn rise_width(data: &[f64]) -> f64 {
+        let mut cross = None;
+        for i in 0..data.len().saturating_sub(1) {
+            let (a, b) = (data[i], data[i + 1]);
+            if (a - 0.5) * (b - 0.5) <= 0.0 && b != a {
+                let t = (0.5 - a) / (b - a);
+                cross = Some(i as f64 + t);
+                break;
+            }
+        }
+        let edge = cross.expect("step crosses 0.5");
+        let level = |want: f64, dir: f64| -> f64 {
+            let mut x = edge;
+            loop {
+                let i = x.floor() as isize;
+                if i < 0 || i + 1 >= data.len() as isize {
+                    break;
+                }
+                let (a, b) = (data[i as usize], data[(i + 1) as usize]);
+                let v = a + (b - a) * (x - i as f64);
+                if (dir < 0.0 && v <= want) || (dir > 0.0 && v >= want) {
+                    // Step back one sample and interpolate.
+                    let prev = x - dir;
+                    let j = prev.floor() as isize;
+                    if j < 0 || j + 1 >= data.len() as isize {
+                        return x;
+                    }
+                    let (c, d) = (data[j as usize], data[(j + 1) as usize]);
+                    let vp = c + (d - c) * (prev - j as f64);
+                    let den = v - vp;
+                    if den.abs() < 1e-12 {
+                        return x;
+                    }
+                    return prev + dir * (want - vp) / den;
+                }
+                x += dir;
+                if x < 1.0 || x > data.len() as f64 - 2.0 {
+                    break;
+                }
+            }
+            x
+        };
+        level(0.9, 1.0) - level(0.1, -1.0)
     }
 }

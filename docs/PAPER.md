@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.2
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.3
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -424,7 +424,10 @@ that depend on *local energy*, never on the value being estimated. Hence:
 
 ---
 
-## 5. Nonlinear reconstruction of the last octave (`--reconstruct`, off by default)
+## 5. Nonlinear reconstruction of the last octave (`--reconstruct`)
+
+The library and the command leave this step off until `--reconstruct` is
+set. The desktop program starts with the checkbox on.
 
 Where luminance lies near the carriers, no linear filter can separate it
 from chrominance. Demosaicers resolve this with an assumption — colour
@@ -615,12 +618,16 @@ exposure is the pair that puts the grey card at $D = 0.67$ and the clip
 at $D = 0.10$, and a look (monotone PCHIP through points in $[0,1]^2$
 after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a
 grey wedge against a monochrome camera's JPEG) remains for the
-measurement pipeline. USM radius
-$r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$ (one
-arc-minute at viewing distance $d$), Gaussian $\sigma = r_{\mathrm{px}}$,
-masked as in 7.2. Deconvolution is Richardson–Lucy with the same Gaussian
-PSF, $e_{k+1} = e_k \cdot G \circledast \big(b / (G \circledast e_k)\big)$,
-$e_0 = \max(b, 0)$, 1–10 passes, every pixel, before the USM. There is no
+measurement pipeline. Scale compensation of an enlargement uses
+$\sigma = k\,s$ print pixels, $s$ the long-side scale and $k$ fitted per
+kernel to the 10–90 % ramp of a step (Lanczos-3 0.281, Catmull–Rom 0.275,
+Mitchell 0.330, B-spline 0.515). USM is
+$x + a(x - G_\sigma \ast x)$, masked as in 7.2; Richardson–Lucy inverts
+that same Gaussian, 1–10 passes, every pixel, before the USM. At native
+size and when shrinking, $\sigma = 0$ and that pass is a copy. The file
+still records the one-arc-minute radius
+$r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
+that number is not applied. There is no
 output for screens: the display's losses are not known to the printer,
 and the print is one file. None of this is part of the method's claim.
 

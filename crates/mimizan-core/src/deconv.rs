@@ -1,16 +1,21 @@
 //! Richardson–Lucy deconvolution with a Gaussian PSF.
 //!
 //! Applied to every pixel the same way: no saturation mask, no local noise
-//! weight. The blur width is the print-geometry radius USM would have used,
-//! so this is that blur inverted rather than boosted.
+//! weight. The blur width is the enlargement blur of the resample kernel
+//! (`enlargement_sigma`), so this inverts the size step rather than a
+//! viewing-distance halo.
 
 use crate::plane::Plane;
 use crate::usm::gaussian_blur;
 use rayon::prelude::*;
 
 /// Iterations for the optional print path. Enough to undo a ~1.5 px blur
-/// and to show the noise the inverse brings back.
+/// and to show the noise the inverse brings back. The GUI starts at
+/// [`DECONV_DEFAULT_PASSES`]; more than a few on a matched kernel begins to ring.
 pub const DECONV_ITERATIONS: usize = 10;
+
+/// Passes the GUI selects when deconvolution is switched on.
+pub const DECONV_DEFAULT_PASSES: u32 = 3;
 
 /// `estimate ← estimate · blur(image / blur(estimate))`, `iterations` times.
 /// The PSF is symmetric, so the correction blur is the same Gaussian.

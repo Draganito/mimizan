@@ -14,8 +14,13 @@ pub fn radius_px(usm_k: f64, viewing_distance_mm: f64, dpi: f64) -> f64 {
     usm_k * viewing_distance_mm * dpi
 }
 
+/// Half-width of the Gaussian, in pixels: the blur reads `±kernel_radius`.
+pub fn kernel_radius(sigma: f64) -> usize {
+    (3.0 * sigma).ceil().max(1.0) as usize
+}
+
 fn gauss_kernel(sigma: f64) -> Vec<f64> {
-    let r = (3.0 * sigma).ceil().max(1.0) as usize;
+    let r = kernel_radius(sigma);
     let mut k: Vec<f64> = (0..=2 * r)
         .map(|i| {
             let t = i as f64 - r as f64;

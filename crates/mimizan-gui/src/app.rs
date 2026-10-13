@@ -6,11 +6,13 @@ use crate::browser::{self, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{Converter, DetailRect, DevelopParams, Histogram, Session, ViewParams};
-use crate::worker::{Event, Heavy, Job, Preview, PreviewRequest};
+use crate::worker::{Event, Heavy, Job, Loupe, LoupeRequest, Preview, PreviewRequest};
 use crate::zone_bar::zone_bar;
-use egui::{Color32, ColorImage, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2};
+use egui::{
+    Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
+};
 use egui_file_dialog::FileDialog;
-use mimizan_core::deconv::DECONV_ITERATIONS;
+use mimizan_core::deconv::{DECONV_DEFAULT_PASSES, DECONV_ITERATIONS};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
@@ -106,6 +108,17 @@ pub struct App {
     // Export section
     size_mode: SizeMode,
     paper_cm: [f64; 2],
+    /// Crosshair armed: the next click in the picture sets the loupe.
+    sharpen_aim: bool,
+    /// Where the loupe looks, as a fraction of the upright picture.
+    sharpen_at: Option<[f64; 2]>,
+    loupe: Loupe,
+    loupe_sent: u64,
+    loupe_shown: u64,
+    /// Last request, so an unchanged frame does not send another.
+    loupe_key: Option<(usize, Weights, Recipe, u16, [f64; 2])>,
+    loupe_tex: Option<TextureHandle>,
+    loupe_size: [usize; 2],
 
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
@@ -213,12 +226,20 @@ impl App {
             hover_zone: None,
             size_mode: SizeMode::Native,
             paper_cm: [30.0, 40.0],
+            sharpen_aim: false,
+            sharpen_at: None,
+            loupe: Loupe::spawn(cc.egui_ctx.clone()),
+            loupe_sent: 0,
+            loupe_shown: 0,
+            loupe_key: None,
+            loupe_tex: None,
+            loupe_size: [0, 0],
             zoom_to_1to1: false,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
             mask_mode: DevelopParams::default().mask,
             fix_defects: DevelopParams::default().fix_defects,
-            reconstruct: false,
+            reconstruct: DevelopParams::default().reconstruct,
             converter: Converter::Mimizan,
             converter_attempt: None,
             show_mask: false,
@@ -598,6 +619,11 @@ impl App {
                     ));
                     self.session = Some(s);
                     if fresh {
+                        self.sharpen_aim = false;
+                        self.sharpen_at = None;
+                        self.loupe_key = None;
+                        self.loupe_tex = None;
+                        self.loupe_size = [0, 0];
                         self.reset(true);
                         // A recipe saved next to the file comes back with it.
                         if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
@@ -630,6 +656,26 @@ impl App {
                 Event::Failed(e) => {
                     self.log(format!("error: {e}"));
                     self.busy = None;
+                }
+            }
+        }
+        if let Some(r) = self.loupe.poll() {
+            if r.generation == self.loupe_sent {
+                self.loupe_shown = r.generation;
+                if r.image.width > 0
+                    && r.image.height > 0
+                    && r.image.gray.len() == r.image.width * r.image.height
+                {
+                    let w = r.image.width;
+                    let h = r.image.height;
+                    let pixels: Vec<Color32> = r.image.gray.iter().copied().map(Color32::from_gray).collect();
+                    let image = ColorImage::new([w, h], pixels);
+                    self.loupe_tex = Some(ctx.load_texture("sharpen-loupe", image, TextureOptions::NEAREST));
+                    self.loupe_size = [w, h];
+                } else {
+                    // Same controls are not sent again. The previous box stays
+                    // up; the next change of size, dpi or kernel asks once more.
+                    self.log("sharpen box failed");
                 }
             }
         }
@@ -882,7 +928,7 @@ impl App {
                     "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
                 ),
                 (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
-                (1, "Print", "3 · The print: size, border, sharpening, export"),
+                (1, "Print", "3 · The print: size, border, scale, export"),
             ] {
                 if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
                     self.panels[i] = !self.panels[i];
@@ -968,7 +1014,7 @@ impl App {
                 self.zoom_to_1to1 = true;
             }
             ui.checkbox(&mut self.show_mask, "mask")
-                .on_hover_text("Show the sharpening mask: white = chroma treated as texture");
+                .on_hover_text("USM mask: white = chroma treated as texture");
             // Status text takes only what is left and is cut, never painted
             // over the buttons.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1572,12 +1618,12 @@ impl App {
             egui::ComboBox::from_id_salt("resample").selected_text(r.name()).show_ui(ui, |ui| {
                 for k in ResampleKernel::ALL {
                     ui.selectable_value(r, k, k.name()).on_hover_text(match k {
-                        ResampleKernel::Lanczos3 => "Sharpest; rings at hard edges (the benchmark default)",
+                        ResampleKernel::Lanczos3 => "Sharpest; rings at hard edges. The benchmark kernel",
                         ResampleKernel::Mitchell => {
                             "Mitchell–Netravali B=C=⅓: slight softness, little ringing"
                         }
                         ResampleKernel::CatmullRom => "Interpolating cubic; rings like a short Lanczos",
-                        ResampleKernel::BSpline => "No overshoot at all, visibly soft",
+                        ResampleKernel::BSpline => "Default. No overshoot, visibly soft",
                     });
                 }
             });
@@ -1589,12 +1635,12 @@ impl App {
             Sharpen::Deconv { .. } => 2,
         };
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("sharpen").weak());
+            ui.label(RichText::new("scale").weak());
             ui.selectable_value(&mut kind, 0, "off");
             ui.selectable_value(&mut kind, 1, "USM")
-                .on_hover_text("Unsharp mask for the viewing distance (radius from size and dpi)");
+                .on_hover_text("Puts back the enlargement blur. Native size and reductions stay.");
             ui.selectable_value(&mut kind, 2, "deconvolution")
-                .on_hover_text("Richardson–Lucy against a Gaussian of the USM radius (an assumption, not a measured PSF), then optional USM");
+                .on_hover_text("Richardson–Lucy of that blur, then optional USM. More passes ring.");
         });
         let current = match s {
             Sharpen::Off => 0,
@@ -1604,7 +1650,7 @@ impl App {
         if kind != current {
             *s = match kind {
                 1 => Sharpen::Usm { amount: 0.5 },
-                2 => Sharpen::Deconv { passes: 10, usm_amount: 0.0 },
+                2 => Sharpen::Deconv { passes: DECONV_DEFAULT_PASSES, usm_amount: 0.0 },
                 _ => Sharpen::Off,
             };
         }
@@ -1618,6 +1664,7 @@ impl App {
             }
             Sharpen::Off => {}
         }
+        self.sharpen_loupe(ui);
         if let Some(l) = self.print_layout() {
             let (uw, uh) = self.export_size();
             let txt = if l.border_px > 0 {
@@ -1632,6 +1679,100 @@ impl App {
             };
             ui.label(RichText::new(txt).weak());
         }
+    }
+
+    /// The 1:1 box under the sharpening controls, and the crosshair that
+    /// chooses its centre. The box is print pixels, after size and sharpening.
+    fn sharpen_loupe(&mut self, ui: &mut egui::Ui) {
+        let detail = self.print_layout().map(|l| (l.resample_sigma_px, l.enlargement));
+        ui.horizontal(|ui| {
+            let aim = ui
+                .selectable_label(self.sharpen_aim, "✛")
+                .on_hover_text(
+                    "Click the picture. The box is that spot, one pixel per screen pixel, as the TIFF. Drag to move.",
+                );
+            if aim.clicked() {
+                self.sharpen_aim = !self.sharpen_aim;
+            }
+            if let Some((sigma, scale)) = detail {
+                let text = if sigma > 0.0 {
+                    format!("σ {sigma:.2} px · {scale:.2}×")
+                } else {
+                    "no enlargement".into()
+                };
+                ui.label(RichText::new(text).weak());
+            }
+        });
+        let mut drag = None;
+        if self.sharpen_at.is_none() {
+            ui.label(RichText::new("Click ✛, then a point in the picture.").weak());
+        } else if let Some(tex) = &self.loupe_tex {
+            let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
+            let [w, h] = self.loupe_size;
+            let size = Vec2::new(w as f32 / ppp, h as f32 / ppp);
+            let (rect, resp) = ui.allocate_exact_size(size, Sense::drag());
+            if resp.dragged() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else if resp.hovered() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+            }
+            let id = tex.id();
+            ui.painter().image(id, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            if resp.dragged() {
+                drag = Some((resp.drag_delta(), ppp));
+            }
+            let updating = self.loupe_shown != self.loupe_sent;
+            let note = if updating {
+                format!("{w} × {h} print px · 1:1 · drag to move · updating")
+            } else {
+                format!("{w} × {h} print px · 1:1 · drag to move")
+            };
+            ui.label(RichText::new(note).small().weak());
+        } else {
+            ui.label(RichText::new("rendering the print box…").weak());
+        }
+        if let Some((delta, ppp)) = drag {
+            // The picture follows the hand. One screen pixel is one print pixel.
+            self.nudge_loupe(delta, ppp);
+        }
+        self.request_loupe();
+    }
+
+    /// Move the loupe centre by a drag. `delta` is in points; the box is one
+    /// print pixel per screen pixel, and the picture follows the pointer.
+    fn nudge_loupe(&mut self, delta: Vec2, ppp: f32) {
+        let Some(l) = self.print_layout() else { return };
+        let Some(at) = self.sharpen_at.as_mut() else { return };
+        let iw = (l.image_w.saturating_sub(1) as f64).max(1.0);
+        let ih = (l.image_h.saturating_sub(1) as f64).max(1.0);
+        at[0] = (at[0] - f64::from(delta.x * ppp) / iw).clamp(0.0, 1.0);
+        at[1] = (at[1] - f64::from(delta.y * ppp) / ih).clamp(0.0, 1.0);
+    }
+
+    fn request_loupe(&mut self) {
+        let Some([nx, ny]) = self.sharpen_at else { return };
+        let Some(session) = self.session.clone() else { return };
+        let key = (
+            Arc::as_ptr(&session) as usize,
+            self.weights(),
+            self.edit.recipe.clone(),
+            self.export_orientation(),
+            [nx, ny],
+        );
+        if self.loupe_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.loupe_key = Some(key);
+        self.loupe_sent = self.loupe_sent.wrapping_add(1);
+        self.loupe.request(LoupeRequest {
+            session,
+            weights: self.weights(),
+            recipe: self.edit.recipe.clone(),
+            orientation: self.export_orientation(),
+            nx,
+            ny,
+            generation: self.loupe_sent,
+        });
     }
 
     /// What one export writes, for the toolbar button.
@@ -1654,9 +1795,9 @@ impl App {
         let r = &self.edit.recipe;
         let local = if r.place != 0.0 { format!(", place {:+.2}", r.place) } else { String::new() };
         let sharpen = match r.sharpen {
-            Sharpen::Off => "unsharpened".to_string(),
+            Sharpen::Off => "scale off".to_string(),
             Sharpen::Usm { amount } => format!("USM {amount:.2}"),
-            Sharpen::Deconv { passes, .. } => format!("deconvolution {passes} passes"),
+            Sharpen::Deconv { passes, .. } => format!("deconvolution, {passes} passes"),
         };
         format!(
             "Writes the print on the {look}{rot}{local}:\n\
@@ -1667,6 +1808,9 @@ impl App {
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(avail, Sense::click_and_drag());
+        if self.sharpen_aim {
+            response.clone().on_hover_cursor(CursorIcon::Crosshair);
+        }
         let painter = ui.painter_at(avail);
         painter.rect_filled(avail, 0.0, Color32::from_gray(28));
         let Some(tex) = self.texture.as_ref().map(|t| t.id()) else {
@@ -1734,7 +1878,7 @@ impl App {
             self.pan *= zoom_1to1 / self.zoom;
             self.zoom = zoom_1to1;
         }
-        if response.double_clicked() {
+        if response.double_clicked() && !self.sharpen_aim {
             // Toggle between fit and 1:1 about the pointer.
             let old = self.zoom;
             self.zoom = if (self.zoom - 1.0).abs() < 1e-3 { zoom_1to1 } else { 1.0 };
@@ -1759,6 +1903,31 @@ impl App {
             painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
         }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        if self.sharpen_aim && response.clicked() {
+            if let Some(ptr) = response.interact_pointer_pos() {
+                if rect.contains(ptr) && rect.width() > 0.0 && rect.height() > 0.0 {
+                    self.sharpen_at = Some([
+                        ((ptr.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64,
+                        ((ptr.y - rect.top()) / rect.height()).clamp(0.0, 1.0) as f64,
+                    ]);
+                    self.sharpen_aim = false;
+                    self.loupe_key = None;
+                }
+            }
+        }
+        if let Some([nx, ny]) = self.sharpen_at {
+            let p = Pos2::new(rect.left() + nx as f32 * rect.width(), rect.top() + ny as f32 * rect.height());
+            let mark = Color32::from_rgb(255, 210, 60);
+            let arm = 7.0;
+            painter.line_segment(
+                [Pos2::new(p.x - arm, p.y), Pos2::new(p.x + arm, p.y)],
+                egui::Stroke::new(1.0, mark),
+            );
+            painter.line_segment(
+                [Pos2::new(p.x, p.y - arm), Pos2::new(p.x, p.y + arm)],
+                egui::Stroke::new(1.0, mark),
+            );
+        }
 
         // Magnification in screen pixels per negative pixel.
         let mag = size.x * ppp / uw.max(1) as f32;
@@ -1792,7 +1961,7 @@ impl App {
 
         if self.session.is_some() {
             let txt = if self.detail_rect.is_some() {
-                format!("{:.0} % · full-resolution negative pixels, unsharpened", 100.0 * mag)
+                format!("{:.0} % · full-resolution negative pixels, before scale", 100.0 * mag)
             } else {
                 format!("{:.0} % of full size", 100.0 * mag)
             };
@@ -2019,6 +2188,11 @@ impl App {
         let tile_h = (ui.available_height() - ui.spacing().scroll.allocated_width()).max(60.0);
         let img_h = (tile_h - 2.0 * PERF_H - EDGE_H).max(30.0);
         let tile_w = (img_h * TILE_W / TILE_IMG_H).round();
+        // The frames scroll on one axis. A vertical wheel over them moves
+        // that axis, the same travel as the bar (egui sums both wheel axes
+        // when only one direction is enabled). Over the picture the wheel
+        // still zooms.
+        ui.style_mut().always_scroll_the_only_direction = true;
         egui::ScrollArea::horizontal().id_salt("strip-scroll").show(ui, |ui| {
             let clip = ui.clip_rect();
             let centre = clip.center().x;

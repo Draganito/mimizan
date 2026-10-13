@@ -75,7 +75,8 @@ sensor (`docs/RESULTS.md`, "Z f negative against the reference camera":
 of that sensor at 0.5 c/px).
 
 **The checkbox: `--reconstruct` (GUI: "reconstruct the last octave",
-default off) is the highest mean in both photographic conditions, and
+on when the program starts; the command stays off until the flag is given)
+is the highest mean in both photographic conditions, and
 second on the table everyone else publishes.** Lens-like 51.93 dB,
 band-limited 51.96 dB. On lens-like pictures DCB is still the best single
 method on 12 of 24 and reconstruct on 9; the mean lead over DCB is +0.46 dB,
@@ -278,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.2-1_amd64.deb
+sudo apt install ./mimizan_0.10.3-1_amd64.deb
 mimizan --version
 ```
 
@@ -332,11 +333,13 @@ mimizan bench kodak --raw testdata/*.nef --report docs/KODAK_ZF.md --strips docs
 mimizan bench kodak --raw testdata/*.nef --scale 2 --report docs/KODAK_ZF_SOFT.md --strips docs/kodak_zf_soft --out out/zf_soft
 ```
 
-`--deconv N` is the other way to sharpen a print: Richardson–Lucy with a
-Gaussian PSF of the USM radius, N passes (1..10), on every pixel, no mask. It
-undoes blur instead of drawing a halo around it, and it brings back the
-noise the blur had hidden; the PSF is an assumption, not a measurement, so
-this is sharpening by inversion, not restoration (SPEC §9). USM may follow it.
+`--deconv N` compensates an enlargement: Richardson–Lucy
+with a Gaussian of the resample kernel's ramp, N passes (1..10), on every
+pixel, no mask. The width is `k` times the long-side scale (B-spline
+`k = 0.515`, Lanczos-3 `0.281`), so it undoes the size step. A few passes
+steepen the edge; more starts to ring. USM of that same width may follow.
+Native size and a reduction are left untouched, because there is no
+enlargement blur to undo (SPEC §9).
 
 A print is a **recipe**, not a stack of edits: one parameter set (JSON,
 `--recipe` / `--write-recipe`, and the same JSON in the TIFF's description)
@@ -352,12 +355,11 @@ with the width of its ISO range and the two sharing the silver, `D/Dmax =
 the only tone parameters, so a kink, a local steepening or a zone squeezed
 to nothing cannot be expressed — more soft light greys the highlights,
 less hard light opens the shadows; the CLI also still takes any look file
-with `--look` for the measurement pipeline), the **size step** (`--size`, `--dpi`, `--resample lanczos3 |
-mitchell | catmull-rom | b-spline`: Lanczos-3 stays the default and the
-benchmark kernel; B-spline is the only one without overshoot, and visibly
-soft), the **border** (`--border-mm`, unexposed paper, taken from the
-paper size), and the **sharpening** (USM or deconvolution, both for the
-print's viewing distance). Nothing in the recipe reads the picture:
+with `--look` for the measurement pipeline), the **size step** (`--size`, `--dpi`, `--resample b-spline |
+lanczos3 | mitchell | catmull-rom`: B-spline is the default, the only one
+without overshoot; Lanczos-3 stays the benchmark kernel), the **border** (`--border-mm`, unexposed paper, taken from the
+paper size), and the **scale compensation** (USM or deconvolution of the
+enlargement). Nothing in the recipe reads the picture:
 there is no tone equaliser and no content-adaptive mask (SPEC §9).
 
 `mimizan negative` picks `cameras/<make>_<model>.json` by the camera in the
@@ -399,7 +401,7 @@ the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
 47* in front of it) or the R and B fields, the zone bar and the two exposures
 *soft* and *hard*. *Print* is the output step
 and nothing else: native pixels, or the picture in centimetres at a dpi,
-the border, the resampling kernel and the sharpening, the output size it
+the border, the resampling kernel and the scale compensation, the output size it
 adds up to, and the *Export…* button. The two centimetre fields are the
 picture, and they are one proportion: type the short side and the long
 side follows the negative, and the other way round, a single scale. The
@@ -407,7 +409,11 @@ border is paper white added around those centimetres, and it is part of
 the preview: the sheet (picture plus border, in the print's proportion)
 is what is fitted into the stage, so 20 mm around a picture 40 cm on the
 long side is judged as it will print. The border is drawn, not rendered —
-the picture under it is still the one before size and sharpening.
+the picture under it is still the one before size and scale compensation. Under the
+scale controls, ✛ and a click in the picture open a 1:1 box of that
+spot of the print, resized exactly as the TIFF, so the
+radius and the amount can be judged before the export. Dragging inside
+the box moves the spot, and the crosshair on the picture follows.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to
@@ -434,18 +440,18 @@ states, one step per released drag. The export (*Export…* in the Print
 window) renders exactly
 this recipe in one pass against the negative and writes one file:
 `<name>.tif` (16 bit, gamma 2.2 grey ICC, the recipe in the TIFF
-description, size, border and sharpening as set — the print). *Recipe*
+description, size, border and scale compensation as set — the print). *Recipe*
 saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
 back when the file is opened again) or anywhere else, and loads one; the
 same JSON drives `mimizan print --recipe`. The preview is the picture before
-size and sharpening — mix, placing and the paper exactly as the TIFF gets
+size and scale compensation — mix, placing and the paper exactly as the TIFF gets
 them — and once you zoom past the fit-to-window preview (scroll,
 `1:1`, or a double click) the visible window is rendered from the
 full-resolution separation, pixel for pixel, so the
 negative can be judged, carrier residue included. The *Development* fold
 defaults to Mimizan with the Dubois separation (`mask: Dubois`); the fixed
-estimator, the block mask and reconstruction are there, and *Apply* recomputes
-with them. The same
+estimator and the block mask are there, and reconstruction starts on.
+*Apply* recomputes with them. The same
 fold can switch to AMaZE, RCD, DCB or LMMSE; that recomputes the picture
 at once and leaves the Mimizan path untouched. Three histograms (256 bins,
 linear or log), all from the full-resolution data, never from the preview
@@ -477,7 +483,9 @@ ms against 340–420 ms for the mosaic on a Z f file). Thumbnails are made for
 the visible tiles first on a third worker thread and cached in
 `~/.cache/mimizan/thumbs` (8-bit PNG keyed by path, size and modification
 time). A click opens the file, `←`/`→` open the neighbours, `B` hides and
-shows the strip; hovering shows camera, exposure and capture time. The last
+shows the strip. The mouse wheel over the frames moves them left and right,
+the same travel as the bar under them; over the picture the wheel still
+zooms. Hovering a frame shows camera, exposure and capture time. The last
 folder, the sort order, the strip and panel state are kept in
 `~/.config/mimizan/gui.json`. Nothing is rated or deleted; the only file
 ever written next to a RAW is the recipe you ask for.

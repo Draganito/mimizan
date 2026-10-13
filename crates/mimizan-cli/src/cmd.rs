@@ -285,8 +285,8 @@ pub fn print(a: &PrintArgs) -> Result<()> {
     pr::write(&out, &a.out, &p)?;
     if out.info.deconvolution_iterations > 0 {
         info!(
-            "richardson-lucy: {} passes, sigma {:.2} px, every pixel",
-            out.info.deconvolution_iterations, out.info.usm_radius_px
+            "richardson-lucy: {} passes, enlargement sigma {:.2} px, every pixel",
+            out.info.deconvolution_iterations, out.info.resample_sigma_px
         );
     }
     info!(

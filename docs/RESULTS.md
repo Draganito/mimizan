@@ -521,17 +521,17 @@ kernel MTF that the screen compensation uses:
 
 | kernel | overshoot ×0.61 | ×1.37 | ×2.0 | MTF 0.25 c/px | 0.40 | 0.50 |
 |---|---|---|---|---|---|---|
-| lanczos3 (default) | 8.6 % | 9.7 % | 10.3 % | 1.01 | 0.82 | 0.50 |
+| lanczos3 | 8.6 % | 9.7 % | 10.3 % | 1.01 | 0.82 | 0.50 |
 | catmull-rom (B=0, C=½) | 4.6 % | 4.9 % | 7.0 % | 0.94 | 0.72 | 0.49 |
 | mitchell (B=⅓, C=⅓) | 2.0 % | 2.9 % | 2.3 % | 0.85 | 0.59 | 0.38 |
-| b-spline (B=1, C=0) | 0.0 % | 0.0 % | 0.0 % | 0.66 | 0.33 | 0.16 |
+| b-spline (B=1, C=0, print default) | 0.0 % | 0.0 % | 0.0 % | 0.66 | 0.33 | 0.16 |
 
-Lanczos-3 stays the default: the benchmark numbers in this file, the
-reference fit and the screen compensation table were measured with it, and
+The print default is the B-spline. The benchmark numbers in this file, the
+reference fit and the screen compensation table were measured with Lanczos-3, and
 the overshoot at a hard edge is a resampling property that the paper border
 (added *after* the size step, so it never meets the kernel) does not
-suffer from. The kernel is a recipe field, so a picture with hard graphic
-edges can switch to `b-spline` and record that choice. The screen
+suffer from. The kernel is a recipe field, so a picture can switch to
+`lanczos3` and record that choice. The screen
 compensation derives its target from `ResampleKernel::mtf` of the chosen
 kernel; with the B-spline the 9-tap FIR under the 2× gain cap recovers only
 part of its deeper roll-off (an open limit, not hidden).
@@ -737,6 +737,25 @@ so opening an old 30×40 cm recipe does not change a pixel. Changing the
 border or the dpi keeps the centimetres and rebuilds the box around
 them. The resampling kernel, the single quantisation and the preview
 proportion are untouched.
+
+### Scale compensation, and the B-spline as the print default (0.10.3)
+
+After the size step the print can put back the blur the resampler added
+while enlarging. The width is `σ = k·s` print pixels, `s` the long-side
+scale and `k` fitted per kernel on the 10–90 % ramp of a step at `s = 8`
+(Lanczos-3 0.281, Catmull–Rom 0.275, Mitchell 0.330, B-spline 0.515).
+USM uses that Gaussian, masked where the sidecar is at least 0.8 and
+below 1.0; Richardson–Lucy uses the same Gaussian on every pixel, and
+the GUI starts it at 3 passes. At native size and when shrinking, `σ`
+is 0 and the pass is a copy. The one-arc-minute radius is still written
+as `usm_radius_px` and is not applied. The print default kernel is the
+B-spline; Lanczos-3 remains what `resize` and the benchmark numbers use.
+The mask resample stays Lanczos-3, and only runs when a USM will read it.
+
+Under the scale controls, ✛ and a click open a 160×160 box of that spot
+of the print, one screen pixel per print pixel, the same pixels the TIFF
+gets. Dragging inside the box moves the spot and the crosshair follows.
+A failed render keeps the previous box.
 
 ## Real samples
 
@@ -1121,7 +1140,7 @@ temporary example (star refinement, patch statistics, carrier demodulation)
 that is not part of the crate.
 
 
-## Reconstruct — the optional nonlinear step (`--reconstruct`, GUI checkbox, default off)
+## Reconstruct — the optional nonlinear step (`--reconstruct`; the GUI checkbox starts on, the command stays off)
 
 Everything above is linear: every output pixel is a weighted sum of
 measured values whose weights do not depend on the content at that pixel
