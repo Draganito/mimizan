@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.4-1_amd64.deb
+sudo apt install ./mimizan_0.10.5-1_amd64.deb
 mimizan --version
 ```
 
@@ -408,7 +408,7 @@ and nothing else: native pixels (the sheet in centimetres at that dpi, border in
 the border and the resampling kernel, the output size it
 adds up to, and the *Export…* button. The two centimetre fields are the
 picture, and they are one proportion: type the short side and the long
-side follows the negative, and the other way round, a single scale. The
+side follows the picture, and the other way round, a single scale. The
 border is paper white added around those centimetres, and it is part of
 the preview: the sheet (picture plus border, in the print's proportion)
 is what is fitted into the stage, so 20 mm around a picture 40 cm on the
@@ -435,7 +435,12 @@ enlarger. The line under the sliders names the single grade this pair
 equals and the scene stops the paper holds; *base* goes back. Hover a
 zone and its pixels light up in the preview. The print is the
 negative, one placing and two exposures, as a straight print is. *fit*,
-*1:1* and the mask sit in the toolbar.
+*1:1* and the mask sit in the toolbar. *Crop*, next to them, frames the
+negative to a darkroom ratio (4×5, 5×7, 8×10, 11×14, 16×20, 20×24, or
+1:1). The corners scale the frame, the line and the inside move it, and
+the dimmed area outside pans the view. *Apply*, or Enter, makes that
+window the picture: whole pixels and no resample, and the histograms,
+the centimetres, the 1:1 box and the export use only it.
 
 Everything the panels set is one **development** (weights, turns and the
 recipe) with a history: `Ctrl+Z` / `Ctrl+Shift+Z` undo and redo whole

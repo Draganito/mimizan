@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.4
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.5
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -597,12 +597,12 @@ stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$.
 ### 7.3 Output stage (for completeness)
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
-carries as JSON): mix → orientation → size → placing and tone in one
+carries as JSON): mix → orientation → crop window (whole pixels of the
+upright negative; omitted, the full frame) → size → placing and tone in one
 step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
 paper border → [deconvolution →] USM → file. Resizing is separable in
 f64 with the kernel stretched by the scale factor when shrinking; the
-kernel is a parameter (Lanczos-3 default, Mitchell, Catmull-Rom, cubic
-B-spline). The tone is a *paper*, not a curve: a
+kernel is a parameter (B-spline default, Lanczos-3, Mitchell, Catmull-Rom). The tone is a *paper*, not a curve: a
 variable-contrast paper exposed in two passes (split grade), modelled as
 two emulsion components whose silver fractions are normal CDFs in
 log exposure, $a = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from

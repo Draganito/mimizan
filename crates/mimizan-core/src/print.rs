@@ -1,5 +1,5 @@
 //! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
-//! one pass. Upright -> size -> place -> curve -> border ->
+//! one pass. Upright -> crop window -> size -> place -> curve -> border ->
 //! [Richardson–Lucy ->] USM -> one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
@@ -9,7 +9,7 @@ use crate::deconv::{richardson_lucy, DECONV_ITERATIONS};
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
 use crate::plane::Plane;
-use crate::recipe::{Recipe, Sharpen};
+use crate::recipe::{CropRect, Recipe, Sharpen};
 use crate::resize::{
     enlargement_scale, enlargement_sigma, fit_dims, resize_rect, resize_with, PixelRect, PlaneWindow,
     ResampleKernel,
@@ -319,12 +319,47 @@ pub fn box_for_picture_height(img_w: usize, img_h: usize, picture_h: usize, bord
     (inner_w.saturating_add(2 * border), picture_h.saturating_add(2 * border))
 }
 
+/// The crop window inside an upright image, or the whole image.
+pub fn source_window(full_w: usize, full_h: usize, crop: Option<CropRect>) -> (usize, usize, usize, usize) {
+    match crop {
+        Some(c) => {
+            let c = c.sanitized(full_w as u32, full_h as u32);
+            (c.x as usize, c.y as usize, c.w as usize, c.h as usize)
+        }
+        None => (0, 0, full_w, full_h),
+    }
+}
+
+/// Shift a full-image window into crop coordinates. The plane itself is unchanged.
+fn window_frame<'a>(src: PlaneWindow<'a>, ox: usize, oy: usize, sw: usize, sh: usize) -> PlaneWindow<'a> {
+    PlaneWindow {
+        plane: src.plane,
+        origin_x: src.origin_x.saturating_sub(ox),
+        origin_y: src.origin_y.saturating_sub(oy),
+        full_w: sw,
+        full_h: sh,
+    }
+}
+
+/// Copy the window out of `p`. `c` is already inside the plane.
+pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
+    let c = c.sanitized(p.width as u32, p.height as u32);
+    let (x, y, w, h) = (c.x as usize, c.y as usize, c.w as usize, c.h as usize);
+    let mut out = Plane::zeros(w, h);
+    for row in 0..h {
+        out.row_mut(row).copy_from_slice(&p.row(y + row)[x..x + w]);
+    }
+    out
+}
+
 /// Layout for a negative of `w×h` (before orientation). The border is taken
 /// from the paper box before the fit, so picture plus border never exceeds
 /// the size asked for.
 pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let r = &p.recipe;
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
+    // The fit and the enlargement are measured from the crop window.
+    let (_, _, w, h) = source_window(w, h, r.crop);
     let b = r.border_px();
     let (image_w, image_h) = match r.size {
         Some(sz) => {
@@ -472,6 +507,7 @@ pub fn loupe_source_rect(
     ny: f64,
     view: usize,
 ) -> (usize, usize, usize, usize) {
+    let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
     let lay = layout(full_w, full_h, 1, p);
     let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
     if g.pic_w == 0 || g.pic_h == 0 {
@@ -479,15 +515,16 @@ pub fn loupe_source_rect(
     }
     let span = |kernel| {
         let rect = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
-        crate::resize::source_coverage(full_w, full_h, g.image_w, g.image_h, kernel, rect)
+        crate::resize::source_coverage(sw, sh, g.image_w, g.image_h, kernel, rect)
     };
     let (x0, y0, x1, y1) = span(p.recipe.resample);
-    if p.recipe.sharpen.usm_amount() > 0.0 {
+    let (x0, y0, x1, y1) = if p.recipe.sharpen.usm_amount() > 0.0 {
         let (mx0, my0, mx1, my1) = span(ResampleKernel::Lanczos3);
         (x0.min(mx0), y0.min(my0), x1.max(mx1), y1.max(my1))
     } else {
         (x0, y0, x1, y1)
-    }
+    };
+    (x0 + ox, y0 + oy, x1 + ox, y1 + oy)
 }
 
 /// The print pixels of one box: resize, place, tone, then the same
@@ -502,12 +539,17 @@ pub fn sharpen_window(
     ny: f64,
     view: usize,
 ) -> Plane {
+    let (ox, oy, sw, sh) = source_window(linear.full_w, linear.full_h, p.recipe.crop);
     let lay = layout(linear.full_w, linear.full_h, 1, p);
     let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
     let tone = p.recipe.curve.compile();
     let white = tone.white();
     let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
     let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
+    // The plane window is in full-image coordinates. The resize maps the
+    // crop, so its coordinate system is the window.
+    let linear = window_frame(linear, ox, oy, sw, sh);
+    let mask = mask.map(|m| window_frame(m, ox, oy, sw, sh));
     if g.pic_w > 0 && g.pic_h > 0 {
         let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
         let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic);
@@ -581,6 +623,13 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     if p.sharpens() {
         if let Some(m) = src.mask {
             mask = Some(orient(m, src.orientation));
+        }
+    }
+    if let Some(c) = r.crop {
+        let c = c.sanitized(plane.width as u32, plane.height as u32);
+        plane = window_plane(&plane, c);
+        if let Some(m) = mask.take() {
+            mask = Some(window_plane(&m, c));
         }
     }
 
@@ -709,6 +758,24 @@ mod tests {
         assert!(PrintSize::parse("0x40cm").is_err());
         assert!(PrintSize::parse("2048px").is_err());
         assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
+    }
+
+    #[test]
+    fn native_crop_is_the_window() {
+        let full = Plane::from_vec(3, 2, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+        let cut = Plane::from_vec(2, 2, vec![0.2, 0.3, 0.5, 0.6]);
+        let recipe =
+            Recipe { crop: Some(crate::recipe::CropRect { x: 1, y: 0, w: 2, h: 2 }), ..Recipe::on_paper() };
+        let via = render_planes(
+            &PrintSource { plane: &full, mask: None, orientation: 1, name: "full".into(), description: None },
+            &PrintParams { recipe: recipe.clone(), ..Default::default() },
+        );
+        let direct = render_planes(
+            &PrintSource { plane: &cut, mask: None, orientation: 1, name: "cut".into(), description: None },
+            &PrintParams { recipe: Recipe { crop: None, ..recipe }, ..Default::default() },
+        );
+        assert_eq!((via.plane.width, via.plane.height), (2, 2));
+        assert_eq!(via.plane.data, direct.plane.data);
     }
 
     #[test]

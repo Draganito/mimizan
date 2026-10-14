@@ -126,6 +126,10 @@ pub struct Recipe {
     pub border_mm: f64,
     #[serde(default)]
     pub sharpen: Sharpen,
+    /// Window on the upright negative, whole pixels, before the size step.
+    /// `None` is the full frame. Old recipes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crop: Option<CropRect>,
 }
 
 impl Default for Recipe {
@@ -139,7 +143,141 @@ impl Default for Recipe {
             dpi: default_dpi(),
             border_mm: 0.0,
             sharpen: Sharpen::Off,
+            crop: None,
         }
+    }
+}
+
+/// Which corner of a crop window is being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CropCorner {
+    Nw,
+    Ne,
+    Se,
+    Sw,
+}
+
+/// A window on the upright negative, in whole pixels. The origin is the
+/// top-left. Nothing here resamples: the size step is the only resize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CropRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl CropRect {
+    /// Pull the window back inside `img_w`×`img_h`. A zero image is left as it is.
+    pub fn sanitized(self, img_w: u32, img_h: u32) -> Self {
+        if img_w == 0 || img_h == 0 {
+            return self;
+        }
+        let w = self.w.max(1).min(img_w);
+        let h = self.h.max(1).min(img_h);
+        Self { x: self.x.min(img_w - w), y: self.y.min(img_h - h), w, h }
+    }
+
+    /// 90° clockwise inside an image of `w`×`h`. The image becomes `h`×`w`.
+    pub fn rotate_cw(self, w: u32, h: u32) -> Self {
+        Self { x: h.saturating_sub(self.y.saturating_add(self.h)), y: self.x, w: self.h, h: self.w }
+            .sanitized(h, w)
+    }
+
+    /// `quarters` clockwise turns. `w`×`h` is the image the rectangle is in now.
+    pub fn turned(self, quarters: u8, w: u32, h: u32) -> Self {
+        let mut c = self;
+        let (mut w, mut h) = (w, h);
+        for _ in 0..quarters % 4 {
+            c = c.rotate_cw(w, h);
+            std::mem::swap(&mut w, &mut h);
+        }
+        c
+    }
+
+    /// Largest window of aspect `aspect_w`:`aspect_h` that fits in the image,
+    /// centered. The caller orients the two sides (long with long).
+    pub fn inscribed(img_w: u32, img_h: u32, aspect_w: u32, aspect_h: u32) -> Self {
+        let img_w = img_w.max(1);
+        let img_h = img_h.max(1);
+        let aw = u64::from(aspect_w.max(1));
+        let ah = u64::from(aspect_h.max(1));
+        let (cw, ch) = if u64::from(img_w) * ah >= u64::from(img_h) * aw {
+            let ch = img_h;
+            let cw = (u64::from(ch) * aw / ah) as u32;
+            (cw.max(1).min(img_w), ch)
+        } else {
+            let cw = img_w;
+            let ch = (u64::from(cw) * ah / aw) as u32;
+            (cw, ch.max(1).min(img_h))
+        };
+        Self { x: (img_w - cw) / 2, y: (img_h - ch) / 2, w: cw, h: ch }
+    }
+
+    /// Move, keeping the size, staying inside the image.
+    pub fn shift(self, dx: i32, dy: i32, img_w: u32, img_h: u32) -> Self {
+        let x = (self.x as i32 + dx).clamp(0, img_w as i32 - self.w as i32);
+        let y = (self.y as i32 + dy).clamp(0, img_h as i32 - self.h as i32);
+        Self { x: x as u32, y: y as u32, ..self }
+    }
+
+    /// Drag `corner` to `pointer` in image pixels. The opposite corner stays.
+    /// The window keeps `aspect` (`width`, `height`) and stays inside.
+    pub fn scale_corner(
+        self,
+        corner: CropCorner,
+        pointer: (i32, i32),
+        img_w: u32,
+        img_h: u32,
+        aspect: (u32, u32),
+    ) -> Self {
+        let (px, py) = pointer;
+        let aw = i64::from(aspect.0.max(1));
+        let ah = i64::from(aspect.1.max(1));
+        let (fx, fy, sx, sy) = match corner {
+            CropCorner::Se => (self.x as i64, self.y as i64, 1i64, 1i64),
+            CropCorner::Nw => ((self.x + self.w) as i64, (self.y + self.h) as i64, -1, -1),
+            CropCorner::Ne => (self.x as i64, (self.y + self.h) as i64, 1, -1),
+            CropCorner::Sw => ((self.x + self.w) as i64, self.y as i64, -1, 1),
+        };
+        let max_w = match corner {
+            CropCorner::Se | CropCorner::Ne => i64::from(img_w) - fx,
+            CropCorner::Nw | CropCorner::Sw => fx,
+        }
+        .max(1);
+        let max_h = match corner {
+            CropCorner::Se | CropCorner::Sw => i64::from(img_h) - fy,
+            CropCorner::Nw | CropCorner::Ne => fy,
+        }
+        .max(1);
+        let pw = (sx * (i64::from(px) - fx)).clamp(1, max_w);
+        let ph = (sy * (i64::from(py) - fy)).clamp(1, max_h);
+        let mut w = pw;
+        let mut h = w * ah / aw;
+        if h > ph {
+            h = ph;
+            w = h * aw / ah;
+        }
+        w = w.clamp(1, max_w);
+        h = (w * ah / aw).clamp(1, max_h);
+        w = (h * aw / ah).clamp(1, max_w);
+        let min_w = if img_w >= 8 { 8 } else { 1 };
+        let min_h = if img_h >= 8 { 8 } else { 1 };
+        if w < i64::from(min_w) || h < i64::from(min_h) {
+            w = i64::from(min_w).min(max_w);
+            h = (w * ah / aw).clamp(1, max_h);
+            if h < i64::from(min_h) {
+                h = i64::from(min_h).min(max_h);
+                w = (h * aw / ah).clamp(1, max_w);
+            }
+        }
+        let (x, y) = match corner {
+            CropCorner::Se => (fx, fy),
+            CropCorner::Nw => (fx - w, fy - h),
+            CropCorner::Ne => (fx, fy - h),
+            CropCorner::Sw => (fx - w, fy),
+        };
+        Self { x: x.max(0) as u32, y: y.max(0) as u32, w: w as u32, h: h as u32 }.sanitized(img_w, img_h)
     }
 }
 
@@ -171,6 +309,11 @@ impl Recipe {
         }
         if !(self.border_mm.is_finite() && self.border_mm >= 0.0) {
             return Err(Error::Invalid("border must be zero or positive".into()));
+        }
+        if let Some(c) = self.crop {
+            if c.w == 0 || c.h == 0 {
+                return Err(Error::Invalid("crop must cover at least one pixel".into()));
+            }
         }
         self.sharpen.validate()
     }
@@ -258,5 +401,39 @@ mod tests {
         assert!(Sharpen::Usm { amount: 1.6 }.validate().is_err());
         assert!(!Sharpen::Deconv { passes: 3, usm_amount: 0.0 }.uses_mask());
         assert!(Sharpen::Deconv { passes: 3, usm_amount: 0.3 }.uses_mask());
+    }
+
+    #[test]
+    fn crop_turns_and_fits() {
+        let r = CropRect { x: 10, y: 20, w: 30, h: 40 };
+        let back = r.turned(4, 100, 80);
+        assert_eq!(back, r.sanitized(100, 80));
+        let once = r.rotate_cw(100, 80);
+        assert_eq!(once, CropRect { x: 20, y: 10, w: 40, h: 30 });
+        assert_eq!(once.turned(3, 80, 100), r);
+
+        // 8×10 in a 100×80 landscape: long side across, so 10:8, width-limited.
+        let fit = CropRect::inscribed(100, 80, 10, 8);
+        assert_eq!(fit.h, 80);
+        assert_eq!(fit.w, 100);
+        assert_eq!(fit.x, 0);
+
+        // 8×10 on a square, long side across: 10 wide, 8 tall.
+        let sq = CropRect::inscribed(100, 100, 10, 8);
+        assert_eq!((sq.w, sq.h), (100, 80));
+        assert_eq!(sq.y, 10);
+
+        let square = CropRect::inscribed(90, 40, 1, 1);
+        assert_eq!((square.w, square.h), (40, 40));
+
+        let moved = fit.shift(5, -3, 100, 80);
+        assert_eq!(moved.y, 0);
+        assert!(moved.x <= 100 - moved.w);
+
+        let shrunk = sq.scale_corner(CropCorner::Se, (sq.x as i32 + 50, sq.y as i32 + 80), 100, 100, (10, 8));
+        assert_eq!(shrunk.x, sq.x);
+        assert_eq!(shrunk.y, sq.y);
+        assert!(shrunk.w < sq.w);
+        assert_eq!(shrunk.w * 8, shrunk.h * 10);
     }
 }

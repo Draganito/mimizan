@@ -548,7 +548,8 @@ Kein Prozentwert ohne eine dieser Messungen.
 
 ## 9. Ausgang (Druck)
 
-Reihenfolge: Mischung → Orientierung → Größe → Platzierung und Tonwert
+Reihenfolge: Mischung → Orientierung → Fenster (`crop`, ganze Pixel;
+fehlt das Feld, das ganze Negativ) → Größe → Platzierung und Tonwert
 (Papier oder Look) in einem Schritt → Rand → [Entfaltung →] USM → Datei.
 Ein Durchgang in f64, eine Quantisierung am Ende.
 
@@ -558,9 +559,11 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   Papier mit seinen zwei Belichtungen
   `{"paper":"multigrade","soft":s,"hard":h}` oder eine Look-Datei inline;
   `tone.rs`, in JSON ohne Tag unterscheidbar am Feld `paper` bzw.
-  `points`), `resample`, `size`, `dpi`, `border_mm`,
+  `points`), `resample`, `size`, `dpi`, `border_mm`, `crop`
+  (Fenster `x,y,w,h` in ganzen Pixeln, aufrecht nach der Datei-Orientierung
+  und vor den Vierteldrehungen; fehlt es, das ganze Negativ),
   `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Weggelassen werden
-  `place` (0), `size` (nativ) und `border_mm` (0); `schema`, `resample` und
+  `place` (0), `size` (nativ), `border_mm` (0) und `crop` (ganzes Negativ); `schema`, `resample` und
   `sharpen` stehen immer in der Datei. Das leere Rezept
   `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
   ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`); die GUI
@@ -587,14 +590,17 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   (Gewichte außerhalb werden auf den Randpixel gelegt, Summe exakt 1).
   Niemals über Zielpixel hinaus skalieren. Die GUI zeigt nicht diese
   Kiste, sondern das Bild: die beiden Zentimeter sind gekoppelt, eine Seite
-  setzt die andere über das Seitenverhältnis des aufrechten Negativs (eine
+  setzt die andere über das Seitenverhältnis des Bildes (das Fenster,
+  wenn ein `crop` gesetzt ist, sonst das aufrechte Negativ; eine
   Skala, `round` auf der mitlaufenden Seite), und der Rand wird außen
   addiert. Das Rezept speichert weiterhin die Kiste, also Bild plus Rand,
   damit `layout` genau diese Bildpixel zurückgibt (`box_for_picture_width`,
   `box_for_picture_height`). Die Kommandozeile `--size` bleibt die Kiste;
   der Rand wird dort wie bisher vorher abgezogen. Die Maske wird mit Lanczos-3
   mitskaliert (sie ist ein Gewichtsfeld). Ohne `--size` bleibt die
-  Pixelzahl des Negativs. `dpi` steht trotzdem in der Datei; die GUI
+  Pixelzahl des Negativs. Ein `crop` im Rezept (x, y, w, h, aufrecht nach
+  der Datei-Orientierung, vor den Vierteldrehungen) ersetzt diese Fläche
+  durch das Fenster: ganze Pixel, keine neue Abtastung. `dpi` steht trotzdem in der Datei; die GUI
   zeigt die Bogengröße, Bild plus Rand, in cm. Eine Pixelgröße (`<N>px`, lange Kante) gab es
   bis 0.9.0 für den Bildschirm; sie ist mit der Bildschirmausgabe
   gestrichen (unten).

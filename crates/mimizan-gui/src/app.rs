@@ -16,7 +16,7 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::print::{box_for_picture_height, box_for_picture_width, PrintSize};
-use mimizan_core::recipe::{Recipe, Sharpen};
+use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
 use mimizan_core::tone::Tone;
@@ -36,6 +36,88 @@ enum SizeMode {
 enum PictureSide {
     Width,
     Height,
+}
+
+/// US darkroom paper, as a ratio. The long side follows the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaperFormat {
+    R4x5,
+    R5x7,
+    R8x10,
+    R11x14,
+    R16x20,
+    R20x24,
+    Square,
+}
+
+impl PaperFormat {
+    const ALL: [Self; 7] =
+        [Self::R4x5, Self::R5x7, Self::R8x10, Self::R11x14, Self::R16x20, Self::R20x24, Self::Square];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::R4x5 => "4×5",
+            Self::R5x7 => "5×7",
+            Self::R8x10 => "8×10",
+            Self::R11x14 => "11×14",
+            Self::R16x20 => "16×20",
+            Self::R20x24 => "20×24",
+            Self::Square => "1:1",
+        }
+    }
+
+    fn parts(self) -> (u32, u32) {
+        match self {
+            Self::R4x5 => (4, 5),
+            Self::R5x7 => (5, 7),
+            Self::R8x10 => (8, 10),
+            Self::R11x14 => (11, 14),
+            Self::R16x20 => (16, 20),
+            Self::R20x24 => (20, 24),
+            Self::Square => (1, 1),
+        }
+    }
+
+    /// Long side of the format along the long side of the image.
+    fn oriented(self, img_w: u32, img_h: u32) -> (u32, u32) {
+        let (a, b) = self.parts();
+        if img_w >= img_h {
+            if a >= b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        } else if a >= b {
+            (b, a)
+        } else {
+            (a, b)
+        }
+    }
+
+    fn nearest(img_w: u32, img_h: u32, cw: u32, ch: u32) -> Self {
+        Self::ALL
+            .into_iter()
+            .min_by_key(|f| {
+                let (a, b) = f.oriented(img_w, img_h);
+                (i64::from(cw) * i64::from(b) - i64::from(ch) * i64::from(a)).abs()
+            })
+            .unwrap_or(Self::R8x10)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CropHit {
+    Move,
+    Corner(CropCorner),
+}
+
+#[derive(Clone, Copy)]
+struct CropDrag {
+    hit: CropHit,
+    origin: CropRect,
+    /// Press position, in the upright picture's pixels.
+    start_x: f32,
+    start_y: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +245,12 @@ pub struct App {
     hist_log: bool,
     zoom: f32,
     pan: Vec2,
+    /// The orange easel is up. The draft is not the picture until Apply.
+    crop_open: bool,
+    crop_format: PaperFormat,
+    /// Draft window, in file-upright pixels (before the user's turns).
+    crop_draft: CropRect,
+    crop_drag: Option<CropDrag>,
 
     dialog: FileDialog,
     dialog_purpose: DialogPurpose,
@@ -265,6 +353,10 @@ impl App {
             hist_log: false,
             zoom: 1.0,
             pan: Vec2::ZERO,
+            crop_open: false,
+            crop_format: PaperFormat::R8x10,
+            crop_draft: CropRect { x: 0, y: 0, w: 1, h: 1 },
+            crop_drag: None,
             dialog: FileDialog::new(),
             dialog_purpose: DialogPurpose::Export,
             cameras_dir,
@@ -419,7 +511,7 @@ impl App {
     /// the other side following at the same scale, the border outside it.
     /// Then show the centimetres the file actually has.
     fn apply_picture(&mut self, side: PictureSide) {
-        let (uw, uh) = self.export_size();
+        let (uw, uh) = self.picture_size();
         let dpi = self.edit.recipe.dpi;
         if uw == 0 || uh == 0 || dpi <= 0.0 {
             return;
@@ -444,7 +536,7 @@ impl App {
 
     /// First paper size: 40 cm on the long side, the short side from the negative.
     fn set_long_edge_cm(&mut self, long_cm: f64) {
-        let (uw, uh) = self.export_size();
+        let (uw, uh) = self.picture_size();
         if uh >= uw && uh > 0 {
             self.paper_cm = [long_cm * uw as f64 / uh as f64, long_cm];
             self.apply_picture(PictureSide::Height);
@@ -457,12 +549,14 @@ impl App {
     fn undo(&mut self) {
         if let Some(e) = self.history.undo().cloned() {
             self.set_edit(e);
+            self.close_crop();
         }
     }
 
     fn redo(&mut self) {
         if let Some(e) = self.history.redo().cloned() {
             self.set_edit(e);
+            self.close_crop();
         }
     }
 
@@ -500,6 +594,8 @@ impl App {
             show_mask: self.show_mask,
             rotation: self.edit.rotation,
             hover_zone: self.hover_zone,
+            // While the easel is up the whole negative is shown.
+            crop: if self.crop_open { None } else { r.crop },
         }
     }
 
@@ -509,8 +605,7 @@ impl App {
         mimizan_core::print::rotated(base, self.rotation())
     }
 
-    /// Size of the picture before the print's size step (upright, after the
-    /// user's turns).
+    /// Size of the whole negative, upright, after the user's turns.
     fn export_size(&self) -> (usize, usize) {
         let Some(s) = &self.session else { return (0, 0) };
         let (w, h) = s.upright_size();
@@ -521,16 +616,178 @@ impl App {
         }
     }
 
+    /// File-upright size, before the user's turns.
+    fn file_size(&self) -> (u32, u32) {
+        let Some(s) = &self.session else { return (0, 0) };
+        let (w, h) = s.upright_size();
+        (w as u32, h as u32)
+    }
+
+    /// The recipe with its window turned into the current upright picture.
+    fn print_recipe(&self) -> Recipe {
+        let mut recipe = self.edit.recipe.clone();
+        if let Some(c) = recipe.crop {
+            let (fw, fh) = self.file_size();
+            recipe.crop = Some(c.turned(self.rotation(), fw, fh));
+        }
+        recipe
+    }
+
+    /// The window the print is made from (upright, after the user's turns).
+    fn picture_size(&self) -> (usize, usize) {
+        let (w, h) = self.export_size();
+        match self.print_recipe().crop {
+            Some(c) => (c.w as usize, c.h as usize),
+            None => (w, h),
+        }
+    }
+
     /// Output size of the print TIFF (after size step and border).
     fn print_layout(&self) -> Option<mimizan_core::print::Layout> {
         let (w, h) = self.export_size();
         if w == 0 || h == 0 {
             return None;
         }
-        let params =
-            mimizan_core::print::PrintParams { recipe: self.edit.recipe.clone(), ..Default::default() };
+        let params = mimizan_core::print::PrintParams { recipe: self.print_recipe(), ..Default::default() };
         // Already upright: orientation 1.
         Some(mimizan_core::print::layout(w, h, 1, &params))
+    }
+
+    fn close_crop(&mut self) {
+        self.crop_open = false;
+        self.crop_drag = None;
+    }
+
+    /// Crop on: the whole negative, with the committed window or a fresh 8×10.
+    fn arm_crop(&mut self) {
+        let (fw, fh) = self.file_size();
+        if fw == 0 || fh == 0 {
+            return;
+        }
+        if let Some(c) = self.edit.recipe.crop {
+            let c = c.sanitized(fw, fh);
+            self.crop_format = PaperFormat::nearest(fw, fh, c.w, c.h);
+            self.crop_draft = c;
+        } else {
+            let (a, b) = self.crop_format.oriented(fw, fh);
+            self.crop_draft = CropRect::inscribed(fw, fh, a, b);
+        }
+        self.crop_open = true;
+        self.crop_drag = None;
+        self.sharpen_aim = false;
+        self.sharpen_at = None;
+        self.loupe_key = None;
+    }
+
+    fn reinscribe(&mut self) {
+        let (fw, fh) = self.file_size();
+        if fw == 0 || fh == 0 {
+            return;
+        }
+        let (a, b) = self.crop_format.oriented(fw, fh);
+        self.crop_draft = CropRect::inscribed(fw, fh, a, b);
+        self.crop_drag = None;
+    }
+
+    fn apply_crop(&mut self) {
+        let (fw, fh) = self.file_size();
+        if fw == 0 || fh == 0 {
+            return;
+        }
+        self.edit.recipe.crop = Some(self.crop_draft.sanitized(fw, fh));
+        self.close_crop();
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
+        self.sharpen_at = None;
+        self.loupe_key = None;
+        self.sharpen_aim = false;
+        if self.edit.recipe.size.is_some() {
+            self.apply_picture(PictureSide::Width);
+        }
+    }
+
+    /// Draft window in the picture currently on screen, and that picture's size.
+    fn turned_window(&self) -> Option<(CropRect, u32, u32)> {
+        if !self.crop_open {
+            return None;
+        }
+        let (fw, fh) = self.file_size();
+        if fw == 0 || fh == 0 {
+            return None;
+        }
+        let q = self.rotation() % 4;
+        let (uw, uh) = if q % 2 == 1 { (fh, fw) } else { (fw, fh) };
+        Some((self.crop_draft.turned(q, fw, fh).sanitized(uw, uh), uw, uh))
+    }
+
+    fn store_turned(&mut self, shown: CropRect) {
+        let (fw, fh) = self.file_size();
+        let q = self.rotation() % 4;
+        let (uw, uh) = if q % 2 == 1 { (fh, fw) } else { (fw, fh) };
+        let back = (4 - q) % 4;
+        self.crop_draft = shown.turned(back, uw, uh).sanitized(fw, fh);
+    }
+
+    fn crop_interact(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect) {
+        // The preview senses clicks as well as drags, so `dragged()` stays false
+        // until the pointer has moved a few points. Hitting the frame only then
+        // misses it, and the picture pans instead. A press inside the frame owns the
+        // gesture from that frame.
+        let down_on = response.is_pointer_button_down_on();
+        if !down_on {
+            self.crop_drag = None;
+        }
+        let Some((shown, uw, uh)) = self.turned_window() else { return };
+        let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) else { return };
+        if rect.width() <= 1.0 || rect.height() <= 1.0 || uw == 0 || uh == 0 {
+            return;
+        }
+        let (px, py) = image_pos(ptr, rect, uw, uh);
+        let px_per_pt = uw as f32 / rect.width();
+        let (corner_slop, edge_slop) = (10.0 * px_per_pt, 8.0 * px_per_pt);
+        if down_on && ui.input(|i| i.pointer.primary_pressed()) {
+            let at = ui.input(|i| i.pointer.press_origin()).unwrap_or(ptr);
+            let (sx, sy) = image_pos(at, rect, uw, uh);
+            if let Some(hit) = hit_crop(sx, sy, shown, corner_slop, edge_slop) {
+                self.crop_drag = Some(CropDrag { hit, origin: shown, start_x: sx, start_y: sy });
+            }
+        }
+        if let Some(drag) = self.crop_drag {
+            let (aw, ah) = self.crop_format.oriented(uw, uh);
+            let dx = (px - drag.start_x).round() as i32;
+            let dy = (py - drag.start_y).round() as i32;
+            self.store_turned(moved_crop(drag.origin, drag.hit, dx, dy, uw, uh, (aw, ah)));
+            ui.ctx().set_cursor_icon(crop_cursor(drag.hit, true));
+        } else if let Some(hit) = hit_crop(px, py, shown, corner_slop, edge_slop) {
+            response.clone().on_hover_cursor(crop_cursor(hit, false));
+        }
+    }
+
+    fn paint_crop(&self, painter: &egui::Painter, rect: Rect) {
+        let Some((shown, uw, uh)) = self.turned_window() else { return };
+        if uw == 0 || uh == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let x = rect.left() + shown.x as f32 / uw as f32 * rect.width();
+        let y = rect.top() + shown.y as f32 / uh as f32 * rect.height();
+        let w = shown.w as f32 / uw as f32 * rect.width();
+        let h = shown.h as f32 / uh as f32 * rect.height();
+        let frame = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
+        let dim = Color32::from_black_alpha(150);
+        let (left, right, top, bottom) = (rect.left(), rect.right(), rect.top(), rect.bottom());
+        let fl = frame.left().clamp(left, right);
+        let fr = frame.right().clamp(left, right);
+        let ft = frame.top().clamp(top, bottom);
+        let fb = frame.bottom().clamp(top, bottom);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(left, top), Pos2::new(fl, bottom)), 0.0, dim);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(fr, top), Pos2::new(right, bottom)), 0.0, dim);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(fl, top), Pos2::new(fr, ft)), 0.0, dim);
+        painter.rect_filled(Rect::from_min_max(Pos2::new(fl, fb), Pos2::new(fr, bottom)), 0.0, dim);
+        let orange = Color32::from_rgb(232, 120, 24);
+        painter.rect_stroke(frame, 0.0, egui::Stroke::new(2.0, orange), egui::StrokeKind::Inside);
+        for p in [frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom()] {
+            painter.rect_filled(Rect::from_center_size(p, Vec2::splat(12.0)), 1.0, orange);
+        }
     }
 
     fn start_export(&mut self) {
@@ -574,6 +831,7 @@ impl App {
         self.hover_zone = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
+        self.close_crop();
     }
 
     /// Recipe file next to the RAW: `<name>.recipe.json`.
@@ -592,6 +850,7 @@ impl App {
                 let mut e = self.edit.clone();
                 e.recipe = r;
                 self.set_edit(e);
+                self.close_crop();
                 self.log(format!("loaded recipe {}", path.display()));
             }
             Err(e) => self.log(format!("recipe not loaded: {e}")),
@@ -902,7 +1161,7 @@ impl App {
                     self.heavy.send(Job::Export {
                         session: Arc::clone(s),
                         weights: self.weights(),
-                        recipe: self.edit.recipe.clone(),
+                        recipe: self.print_recipe(),
                         path,
                         orientation: self.export_orientation(),
                     });
@@ -942,6 +1201,40 @@ impl App {
                 }
             }
             let has = self.session.is_some();
+            let mut crop_on = self.crop_open;
+            if ui
+                .add_enabled(has, egui::Checkbox::new(&mut crop_on, "Crop"))
+                .on_hover_text("Frame the negative. Apply makes that window the picture.")
+                .changed()
+            {
+                if crop_on {
+                    self.arm_crop();
+                } else {
+                    self.close_crop();
+                }
+            }
+            ui.add_enabled_ui(has && self.crop_open, |ui| {
+                egui::ComboBox::from_id_salt("crop_format").selected_text(self.crop_format.label()).show_ui(
+                    ui,
+                    |ui| {
+                        for f in PaperFormat::ALL {
+                            if ui.selectable_value(&mut self.crop_format, f, f.label()).clicked() {
+                                self.reinscribe();
+                            }
+                        }
+                    },
+                );
+            });
+            if ui
+                .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
+                .on_hover_text(
+                    "Keep this window (Enter). The print, the histograms and the export use only it.",
+                )
+                .clicked()
+            {
+                self.apply_crop();
+            }
+            ui.separator();
             if ui
                 .add_enabled(has, egui::Button::new("⟳ 90°"))
                 .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
@@ -1654,7 +1947,7 @@ impl App {
         });
         self.sharpen_loupe(ui);
         if let Some(l) = self.print_layout() {
-            let (uw, uh) = self.export_size();
+            let (uw, uh) = self.picture_size();
             let txt = if l.border_px > 0 {
                 format!(
                     "{uw} × {uh} → {} × {} px picture + {} px border = {} × {} px",
@@ -1762,7 +2055,7 @@ impl App {
         self.loupe.request(LoupeRequest {
             session,
             weights: self.weights(),
-            recipe: self.edit.recipe.clone(),
+            recipe: self.print_recipe(),
             orientation: self.export_orientation(),
             nx,
             ny,
@@ -1824,7 +2117,7 @@ impl App {
         // its picture (`layout`), so it keeps its proportion at any size and
         // dpi. A flat value, so it is painted under the picture, not
         // rendered into it; the mask view is not a print and has none.
-        let (border_tex, white) = if self.show_mask {
+        let (border_tex, white) = if self.show_mask || self.crop_open {
             (0.0, 0)
         } else {
             let b = self
@@ -1857,10 +2150,7 @@ impl App {
                 }
             }
         }
-        if response.dragged() {
-            self.pan += response.drag_delta();
-        }
-        let (uw, uh) = self.export_size();
+        let (uw, uh) = if self.crop_open { self.export_size() } else { self.picture_size() };
         let ppp = ui.pixels_per_point();
         // Zoom at which one negative pixel is one screen pixel.
         let zoom_1to1 = (uw as f32 / (tw as f32 * fit * ppp)).clamp(1.0, MAX_ZOOM);
@@ -1888,13 +2178,19 @@ impl App {
         // Keep the sheet covering the viewport when zoomed, centred otherwise.
         let max_pan = ((size + Vec2::splat(2.0 * border_pts) - avail.size()) * 0.5).max(Vec2::ZERO);
         self.pan = self.pan.clamp(-max_pan, max_pan);
-        let center = avail.center() + self.pan;
-        let rect = Rect::from_center_size(center, size);
+        let mut rect = Rect::from_center_size(avail.center() + self.pan, size);
+        if self.crop_open {
+            self.crop_interact(ui, &response, rect);
+        }
+        if response.dragged() && self.crop_drag.is_none() {
+            self.pan = (self.pan + response.drag_delta()).clamp(-max_pan, max_pan);
+            rect = Rect::from_center_size(avail.center() + self.pan, size);
+        }
         if border_pts > 0.0 {
             painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
         }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        if self.sharpen_aim && response.clicked() {
+        if self.sharpen_aim && !self.crop_open && response.clicked() {
             if let Some(ptr) = response.interact_pointer_pos() {
                 if rect.contains(ptr) && rect.width() > 0.0 && rect.height() > 0.0 {
                     self.sharpen_at = Some([
@@ -1950,6 +2246,10 @@ impl App {
             );
         }
 
+        if self.crop_open {
+            self.paint_crop(&painter, rect);
+        }
+
         if self.session.is_some() {
             let txt = if self.detail_rect.is_some() {
                 format!("{:.0} % · full-resolution negative pixels, before scale", 100.0 * mag)
@@ -1963,6 +2263,78 @@ impl App {
             painter.rect_filled(bg, 3.0, Color32::from_black_alpha(150));
             painter.galley(pos, galley, Color32::from_gray(220));
         }
+    }
+}
+
+fn image_pos(ptr: Pos2, rect: Rect, uw: u32, uh: u32) -> (f32, f32) {
+    ((ptr.x - rect.left()) / rect.width() * uw as f32, (ptr.y - rect.top()) / rect.height() * uh as f32)
+}
+
+/// `corner` and `edge` are half-widths in image pixels. Corners win. Anywhere
+/// else inside the frame, including the stroke, moves the window. Outside it
+/// the picture pans.
+fn hit_crop(px: f32, py: f32, r: CropRect, corner: f32, edge: f32) -> Option<CropHit> {
+    let (x, y, w, h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+    let corners = [
+        (x, y, CropCorner::Nw),
+        (x + w, y, CropCorner::Ne),
+        (x + w, y + h, CropCorner::Se),
+        (x, y + h, CropCorner::Sw),
+    ];
+    for (cx, cy, which) in corners {
+        if (px - cx).abs() <= corner && (py - cy).abs() <= corner {
+            return Some(CropHit::Corner(which));
+        }
+    }
+    let inside = px >= x - edge && px <= x + w + edge && py >= y - edge && py <= y + h + edge;
+    if inside {
+        Some(CropHit::Move)
+    } else {
+        None
+    }
+}
+
+fn corner_xy(r: CropRect, corner: CropCorner) -> (i32, i32) {
+    let (x, y, w, h) = (r.x as i32, r.y as i32, r.w as i32, r.h as i32);
+    match corner {
+        CropCorner::Nw => (x, y),
+        CropCorner::Ne => (x + w, y),
+        CropCorner::Se => (x + w, y + h),
+        CropCorner::Sw => (x, y + h),
+    }
+}
+
+/// Move or scale `origin` by a pointer delta. A zero delta leaves it where it
+/// was grabbed: the corner follows the movement, it does not jump to the pointer.
+fn moved_crop(
+    origin: CropRect,
+    hit: CropHit,
+    dx: i32,
+    dy: i32,
+    img_w: u32,
+    img_h: u32,
+    aspect: (u32, u32),
+) -> CropRect {
+    match hit {
+        CropHit::Move => origin.shift(dx, dy, img_w, img_h),
+        CropHit::Corner(c) => {
+            let (cx, cy) = corner_xy(origin, c);
+            origin.scale_corner(c, (cx + dx, cy + dy), img_w, img_h, aspect)
+        }
+    }
+}
+
+fn crop_cursor(hit: CropHit, dragging: bool) -> CursorIcon {
+    match hit {
+        CropHit::Move => {
+            if dragging {
+                CursorIcon::Grabbing
+            } else {
+                CursorIcon::Grab
+            }
+        }
+        CropHit::Corner(CropCorner::Nw | CropCorner::Se) => CursorIcon::ResizeNwSe,
+        CropHit::Corner(CropCorner::Ne | CropCorner::Sw) => CursorIcon::ResizeNeSw,
     }
 }
 
@@ -2619,10 +2991,13 @@ impl App {
     }
 
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
-    /// every panel. Not while a text field has the keyboard.
+    /// every panel. Enter keeps the crop. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
         if ctx.egui_wants_keyboard_input() {
             return;
+        }
+        if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+            self.apply_crop();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
             let any = self.panels.iter().any(|&p| p);
@@ -2645,5 +3020,52 @@ impl App {
         if redo {
             self.redo();
         }
+    }
+}
+
+#[cfg(test)]
+mod crop_drag_tests {
+    use super::{hit_crop, moved_crop, CropHit};
+    use mimizan_core::recipe::{CropCorner, CropRect};
+
+    #[test]
+    fn grabbing_does_not_jump() {
+        let origin = CropRect::inscribed(100, 100, 10, 8);
+        let hits = [
+            CropHit::Move,
+            CropHit::Corner(CropCorner::Nw),
+            CropHit::Corner(CropCorner::Ne),
+            CropHit::Corner(CropCorner::Se),
+            CropHit::Corner(CropCorner::Sw),
+        ];
+        for hit in hits {
+            assert_eq!(moved_crop(origin, hit, 0, 0, 100, 100, (10, 8)), origin);
+        }
+    }
+
+    #[test]
+    fn the_frame_follows_the_pointer() {
+        let origin = CropRect { x: 10, y: 12, w: 40, h: 32 };
+        let next = moved_crop(origin, CropHit::Move, 5, -3, 100, 100, (10, 8));
+        assert_eq!(next, CropRect { x: 15, y: 9, w: 40, h: 32 });
+    }
+
+    #[test]
+    fn inside_the_frame_moves_it_and_outside_pans() {
+        let r = CropRect { x: 10, y: 20, w: 40, h: 30 };
+        assert_eq!(hit_crop(30.0, 35.0, r, 4.0, 3.0), Some(CropHit::Move));
+        assert_eq!(hit_crop(8.0, 35.0, r, 4.0, 3.0), Some(CropHit::Move));
+        assert_eq!(hit_crop(0.0, 0.0, r, 4.0, 3.0), None);
+        assert_eq!(hit_crop(10.0, 20.0, r, 4.0, 3.0), Some(CropHit::Corner(CropCorner::Nw)));
+    }
+
+    #[test]
+    fn a_corner_follows_the_movement() {
+        let origin = CropRect::inscribed(100, 100, 10, 8);
+        let next = moved_crop(origin, CropHit::Corner(CropCorner::Se), -20, -16, 100, 100, (10, 8));
+        assert_eq!(next.x, origin.x);
+        assert_eq!(next.y, origin.y);
+        assert_eq!(next.w, origin.w - 20);
+        assert_eq!(next.h, origin.h - 16);
     }
 }

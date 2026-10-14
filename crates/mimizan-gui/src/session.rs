@@ -10,8 +10,8 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
-use mimizan_core::print::{loupe_source_rect, orient, rotate_gray8_cw, rotated, sharpen_window, PrintParams};
-use mimizan_core::recipe::Recipe;
+use mimizan_core::print::{loupe_source_rect, orient, rotated, sharpen_window, window_plane, PrintParams};
+use mimizan_core::recipe::{CropRect, Recipe};
 use mimizan_core::resize::{fit_dims, resize, PlaneWindow};
 use mimizan_core::separate::{MaskMode, Separation};
 use mimizan_core::tone::{self, Tone, ToneMap};
@@ -277,17 +277,21 @@ pub struct ViewParams {
     pub show_mask: bool,
     /// Extra clockwise quarter turns on top of the file's orientation.
     pub rotation: u8,
+    /// Window on the file-upright negative. `None` is the whole frame.
+    /// The preview turns it with `rotation` before cutting.
+    pub crop: Option<CropRect>,
     /// Scene zone (0 … X) whose pixels the fit preview marks, if any.
     pub hover_zone: Option<u8>,
 }
 
 /// The parts of a view the full-resolution histograms depend on (the
-/// orientation is not one of them: a histogram does not turn).
-type HistKey = (Weights, Tone, f64);
+/// orientation is not one of them: a histogram does not turn). The crop
+/// is, because it chooses which grains are counted.
+type HistKey = (Weights, Tone, f64, Option<CropRect>);
 
 impl ViewParams {
     fn hist_key(&self) -> HistKey {
-        (self.weights, self.tone.clone(), self.place)
+        (self.weights, self.tone.clone(), self.place, self.crop)
     }
 }
 
@@ -349,6 +353,23 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
     let (sw, sh) = (sep.lum.width, sep.lum.height);
     let orientation = rotated(s.negative.orientation, v.rotation);
     let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
+    // A committed crop: `rect` is in the window. Shift it onto the full upright.
+    let (rect, origin) = match v.crop {
+        Some(c) => {
+            let (fw, fh) = s.upright_size();
+            let t = c.turned(v.rotation, fw as u32, fh as u32).sanitized(uw as u32, uh as u32);
+            (
+                DetailRect {
+                    x: rect.x.saturating_add(t.x as usize),
+                    y: rect.y.saturating_add(t.y as usize),
+                    w: rect.w,
+                    h: rect.h,
+                },
+                (t.x as usize, t.y as usize),
+            )
+        }
+        None => (rect, (0, 0)),
+    };
     if rect.x >= uw || rect.y >= uh {
         return None;
     }
@@ -386,7 +407,15 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
     };
     debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
     let gray: Vec<u8> = upright.data.par_iter().map(|&x| to_u8(x)).collect();
-    Some(DetailImage { rect: DetailRect { w: upright.width, h: upright.height, ..rect }, gray })
+    Some(DetailImage {
+        rect: DetailRect {
+            x: rect.x.saturating_sub(origin.0),
+            y: rect.y.saturating_sub(origin.1),
+            w: upright.width,
+            h: upright.height,
+        },
+        gray,
+    })
 }
 
 pub struct SharpenLoupe {
@@ -539,7 +568,13 @@ impl Histogram {
     /// 65535 pixels. Nothing is downscaled: a resampled copy rings at edges
     /// (false black and white) and averages isolated clipped pixels away, so
     /// its histogram ends are wrong by an order of magnitude.
-    pub fn of_separation(sep: &Separation, w: &Weights, tone: &ToneMap, place: f64) -> (Self, Self) {
+    pub fn of_separation(
+        sep: &Separation,
+        w: &Weights,
+        tone: &ToneMap,
+        place: f64,
+        window: Option<(usize, usize, usize, usize)>,
+    ) -> (Self, Self) {
         // 16-bit input -> 8-bit bin, for both encodings.
         let lut_neg: Vec<u8> =
             (0..65536).map(|i| ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
@@ -551,14 +586,22 @@ impl Histogram {
         let k2 = 2.0 * (w.r - w.b);
         let width = sep.lum.width;
         let height = sep.lum.height;
+        let (x0, y0, x1, y1) = match window {
+            Some((x, y, w, h)) => {
+                let x0 = x.min(width);
+                let y0 = y.min(height);
+                (x0, y0, (x + w).min(width).max(x0), (y + h).min(height).max(y0))
+            }
+            None => (0, 0, width, height),
+        };
         let global = 2f64.powf(place);
         // Row-ordered partial counts, merged deterministically.
-        let parts: Vec<Counts> = (0..height)
+        let parts: Vec<Counts> = (y0..y1)
             .into_par_iter()
             .map(|y| {
                 let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
                 let mut c = Counts::default();
-                for x in 0..width {
+                for x in x0..x1 {
                     let m = l[x] + k1 * c1[x] + k2 * c2[x];
                     let q = q16(m);
                     c.neg[lut_neg[q] as usize] += 1;
@@ -582,7 +625,7 @@ impl Histogram {
         for c in parts {
             all.add(&c);
         }
-        let total = width * height;
+        let total = (x1 - x0) * (y1 - y0);
         (
             Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
             Self::from_bins(all.view, total, all.view_low, all.view_high),
@@ -674,26 +717,51 @@ impl HistCache {
     fn get(&mut self, s: &Session, v: &ViewParams, tone: &ToneMap) -> (Histogram, Histogram) {
         let key = (s as *const Session, v.hist_key());
         if self.key.as_ref() != Some(&key) {
-            self.hists = Histogram::of_separation(s.separation(), &v.weights, tone, v.place);
+            let window = v.crop.map(|c| {
+                let (fw, fh) = s.upright_size();
+                let c = c.sanitized(fw as u32, fh as u32);
+                let (sw, sh) = (s.separation().lum.width, s.separation().lum.height);
+                let r = source_rect(
+                    s.negative.orientation,
+                    sw,
+                    sh,
+                    DetailRect { x: c.x as usize, y: c.y as usize, w: c.w as usize, h: c.h as usize },
+                );
+                (r.x, r.y, r.w, r.h)
+            });
+            self.hists = Histogram::of_separation(s.separation(), &v.weights, tone, v.place, window);
             self.key = Some(key);
         }
         self.hists.clone()
     }
 }
 
+/// Scale a full-resolution upright window onto the preview plane.
+fn scale_crop(c: CropRect, scale: f64, dst_w: usize, dst_h: usize) -> CropRect {
+    let x = (f64::from(c.x) * scale).round().max(0.0) as u32;
+    let y = (f64::from(c.y) * scale).round().max(0.0) as u32;
+    let w = (f64::from(c.w) * scale).round().max(1.0) as u32;
+    let h = (f64::from(c.h) * scale).round().max(1.0) as u32;
+    CropRect { x, y, w, h }.sanitized(dst_w as u32, dst_h as u32)
+}
+
 /// 8-bit grey preview of the whole negative: mix, place and tone (or the
 /// mask), in the picture's final orientation.
 pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> PreviewImage {
     let pp = &s.preview;
-    let (w, h) = (pp.sep.lum.width, pp.sep.lum.height);
     let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     if v.show_mask {
-        let gray: Vec<u8> = pp.mask.data.par_iter().map(|&m| to_u8(m)).collect();
+        let mut plane = orient(&pp.mask, rotated(1, v.rotation));
+        if let Some(c) = v.crop {
+            let (fw, fh) = s.upright_size();
+            let turned = c.turned(v.rotation, fw as u32, fh as u32);
+            plane = window_plane(&plane, scale_crop(turned, s.preview.scale, plane.width, plane.height));
+        }
+        let gray: Vec<u8> = plane.data.par_iter().map(|&m| to_u8(m)).collect();
         let hist_view = Histogram::of_bytes(&gray);
-        let (width, height, gray) = rotate_gray8_cw(w, h, &gray, v.rotation);
         return PreviewImage {
-            width,
-            height,
+            width: plane.width,
+            height: plane.height,
             rotation: v.rotation,
             gray,
             zone_mask: None,
@@ -705,6 +773,12 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.get(s, v, &tone_map);
     let mut mixed = orient(&mix(&pp.sep, &v.weights), rotated(1, v.rotation));
+    if let Some(c) = v.crop {
+        let (fw, fh) = s.upright_size();
+        let turned = c.turned(v.rotation, fw as u32, fh as u32);
+        let scaled = scale_crop(turned, s.preview.scale, mixed.width, mixed.height);
+        mixed = window_plane(&mixed, scaled);
+    }
     let zone_mask = v.hover_zone.map(|k| {
         // The scene zone after placing.
         let (lo, hi) = (k as f64 - 5.5, k as f64 - 4.5);
@@ -810,7 +884,7 @@ mod histogram_tests {
         )))
         .unwrap();
         let curve = Tone::Look(look).compile();
-        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve, 0.0);
+        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve, 0.0, None);
 
         let mixed = mix(&sep, &wts);
         let mut en = [0u32; 256];
@@ -860,7 +934,7 @@ mod histogram_tests {
         for (tone, place) in
             [(Tone::Look(LookFile::neutral()).compile(), -0.4), (Tone::paper().compile(), 0.2)]
         {
-            let (_, view) = Histogram::of_separation(&sep, &wts, &tone, place);
+            let (_, view) = Histogram::of_separation(&sep, &wts, &tone, place, None);
             let mut pic = mix(&sep, &wts);
             tone::place(&mut pic, place);
             let mut ev = [0u32; 256];

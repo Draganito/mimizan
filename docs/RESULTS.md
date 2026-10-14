@@ -759,6 +759,18 @@ as wide as the panel, one screen pixel per print pixel, the same pixels
 the TIFF gets. Dragging inside the box moves the spot and the crosshair
 follows. A failed render keeps the previous box.
 
+### The crop window is the picture (0.10.5)
+
+`crop` in the recipe is a window on the upright negative, whole pixels,
+after the file orientation and before the user's quarter turns. Omitted,
+it is the full frame. The print mixes, orients, and cuts that window.
+Size, paper and border then run on those pixels alone; the cut does not
+resample. A render of a cropped plane matches a render of that rectangle
+by itself with the same paper (`native_crop_is_the_window`). The desktop
+toolbar frames it (4×5, 5×7, 8×10, 11×14, 16×20, 20×24, or 1:1); the
+corners scale, the line and the inside move it, and *Apply* or Enter
+writes one history step. `mimizan print` reads the same field.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156
