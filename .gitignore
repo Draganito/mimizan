@@ -8,3 +8,5 @@
 # build artefacts of dist/make_release.sh
 dist/*.deb
 dist/*.tar.gz
+# typst binary fetched by docs/make_handbook_pdf.py
+docs/.cache/

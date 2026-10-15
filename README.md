@@ -50,6 +50,7 @@ Free software, GPL-3.0-or-later.
 
 ## Go further
 
+- [Handbook](docs/HANDBOOK.md) — why the darkroom is built this way, in four chapters ([booklet](docs/handbook.pdf))
 - [Detailed README](DETAILED.md) — the session in full, install, command line, and where the measurements stand
 - [The method](docs/PAPER.md) — the signal, the formulas, the constants
 - [The specification](docs/SPEC.md) — the contract

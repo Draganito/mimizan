@@ -40,7 +40,8 @@ way these files were shot, the aim is met. The numbers are under
 
 ![Mimizan Lab GUI](docs/gui.png)
 
-Documents: [`docs/PAPER.md`](docs/PAPER.md) (the method as a paper: signal
+Documents: [`docs/HANDBOOK.md`](docs/HANDBOOK.md) (why the darkroom is built this way, four chapters; the same text set as [`docs/handbook.pdf`](docs/handbook.pdf)),
+[`docs/PAPER.md`](docs/PAPER.md) (the method as a paper: signal
 model, every formula and constant of the core, evaluation; English),
 [`docs/SPEC.md`](docs/SPEC.md) (the contract: every formula and
 default), [`docs/RESULTS.md`](docs/RESULTS.md) (measurements per
@@ -587,7 +588,7 @@ crates/mimizan-demosaic  AMaZE, RCD, DCB, LMMSE via librtprocess (GPL-3.0-or-lat
 third_party/librtprocess  vendored RawTherapee demosaic library
 cameras/               per-camera JSON (noise, weights, USM; star MTF optional)
 look/                  look curves (PCHIP points over gamma-2.2 encoded values)
-docs/                  SPEC.md, PAPER.md, RESULTS.md, KODAK*.md + kodak*/ and kodak-field/ (benchmark reports and crops), VISION_ENTRY.md, whitepaper, screenshot
+docs/                  HANDBOOK.md, handbook.pdf, SPEC.md, PAPER.md, RESULTS.md, KODAK*.md + kodak*/ and kodak-field/ (benchmark reports and crops), VISION_ENTRY.md, whitepaper, screenshot
 dist/                  release packaging (cargo-deb + tarball)
 testdata/              RAW samples and Kodak pictures, not in git (see testdata/README.md)
 ```
