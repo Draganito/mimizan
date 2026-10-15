@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.5-1_amd64.deb
+sudo apt install ./mimizan_0.10.6-1_amd64.deb
 mimizan --version
 ```
 
@@ -395,7 +395,7 @@ steps: *Negative* on the left, *Enlarger* in the middle at the bottom,
 *Print* on the right. The side windows always stand full height at their
 edge, the Enlarger sits at the bottom between them above the film strip,
 and the picture is fitted into the free area in between, never hidden
-behind a window; close a window from its title bar or the toolbar and the
+behind a window; close a window from the × on its heading or the toolbar and the
 picture takes the space (`Tab` hides all three). They are plain egui on
 glow — alpha and a shadow, no blur — so the app looks the same on a machine
 without a GPU driver. *Negative* is the judging step: the file's exposure
@@ -413,11 +413,16 @@ border is paper white added around those centimetres, and it is part of
 the preview: the sheet (picture plus border, in the print's proportion)
 is what is fitted into the stage, so 20 mm around a picture 40 cm on the
 long side is judged as it will print. The border is drawn, not rendered —
-the picture under it is still the one before the size step. ✛ and a click
-in the picture open a 1:1 box of that spot, as wide as the panel, resized
-exactly as the TIFF and with no sharpening, so the size step can be judged
-before the export. Dragging inside the box moves the spot, and the
-crosshair on the picture follows.
+the picture under it is still the one before the size step. With a file
+open, a 1:1 box of the centre is always there, as wide as the panel,
+resized exactly as the TIFF and with no sharpening, so the size step can
+be judged before the export. ✛ and a click move that spot. Dragging
+inside the box moves it too, and the crosshair on the picture follows.
+*Compare*, next to ✛, opens the same spot for Mimizan and for AMaZE, RCD,
+DCB and LMMSE, native pixels with no size step, so the enlargement cannot
+hide the difference. Pan and zoom move every panel together; a double
+click returns to 1:1. It does not change the recipe or the converter.
+A monochrome file has no Compare.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to

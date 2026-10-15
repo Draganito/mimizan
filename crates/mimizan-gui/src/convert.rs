@@ -96,6 +96,20 @@ pub fn develop(
     Ok(Negative { plane, mask8, orientation, info, saturated, separation })
 }
 
+/// Demosaic one even Bayer tile and store it as a separation the mixer
+/// already understands. `raw` is the balanced mosaic of this tile.
+pub(crate) fn separate_tile(
+    method: Method,
+    width: usize,
+    height: usize,
+    raw: &[f64],
+    phase: BayerPhase,
+) -> Result<Separation, String> {
+    let rgb = mimizan_demosaic::demosaic(method, width, height, raw, cfa_codes(phase))
+        .map_err(|e| e.to_string())?;
+    Ok(separation_from_rgb(&rgb.r, &rgb.g, &rgb.b, width, height, phase))
+}
+
 fn cfa_codes(phase: BayerPhase) -> [[u32; 2]; 2] {
     let tile = phase.tile();
     let code = |c: Color| match c {

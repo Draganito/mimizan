@@ -771,6 +771,17 @@ toolbar frames it (4×5, 5×7, 8×10, 11×14, 16×20, 20×24, or 1:1); the
 corners scale, the line and the inside move it, and *Apply* or Enter
 writes one history step. `mimizan print` reads the same field.
 
+### The same spot, five ways (0.10.6)
+
+With a file open the 1:1 box is always there, centred until ✛ or a drag
+moves it. *Compare* shows that spot for Mimizan and for AMaZE, RCD, DCB
+and LMMSE: mix, place and tone, native pixels, no size step, so the
+enlargement kernel is not in the comparison. The panels pan and zoom
+together; a double click is 1:1. The window does not write the recipe
+and does not change the converter in the menu. A monochrome file has no
+comparison. The three docks and Compare use one heading line (the name
+and ×) instead of a window title bar.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156

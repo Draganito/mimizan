@@ -313,7 +313,7 @@ pub struct DetailImage {
 
 /// Map a rectangle of the upright image (after `orientation`) back to the
 /// sensor frame of a `w`×`h` source, using the same table as `orient`.
-fn source_rect(orientation: u16, w: usize, h: usize, r: DetailRect) -> DetailRect {
+pub(crate) fn source_rect(orientation: u16, w: usize, h: usize, r: DetailRect) -> DetailRect {
     let map = |ox: usize, oy: usize| -> (usize, usize) {
         match orientation {
             2 => (w - 1 - ox, oy),
@@ -341,6 +341,42 @@ fn crop(p: &Plane, r: DetailRect) -> Plane {
         row.copy_from_slice(&p.row(r.y + y)[r.x..r.x + r.w]);
     });
     out
+}
+
+/// Mix, orient, place and tone one sensor-space rectangle of a separation.
+/// The rectangle is clamped to the separation. This is the picture before
+/// the size step.
+pub(crate) fn develop_window(
+    sep: &Separation,
+    rect: DetailRect,
+    orientation: u16,
+    weights: &Weights,
+    place: f64,
+    tone: &Tone,
+) -> Option<SharpenLoupe> {
+    let (sw, sh) = (sep.lum.width, sep.lum.height);
+    if rect.w == 0 || rect.h == 0 || rect.x >= sw || rect.y >= sh {
+        return None;
+    }
+    let rect = DetailRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w.min(sw - rect.x).max(1),
+        h: rect.h.min(sh - rect.y).max(1),
+    };
+    let small = Separation {
+        lum: crop(&sep.lum, rect),
+        c1: crop(&sep.c1, rect),
+        c2: crop(&sep.c2, rect),
+        mask_max: Plane::zeros(1, 1),
+        rounds: sep.rounds,
+        phase: sep.phase,
+        computed: sep.computed,
+    };
+    let mut mixed = orient(&mix(&small, weights), orientation);
+    tone::render(&mut mixed, place, &tone.compile());
+    let gray = mixed.data.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
+    Some(SharpenLoupe { gray, width: mixed.width, height: mixed.height })
 }
 
 /// Render `rect` of the negative at full resolution: crop the separation in

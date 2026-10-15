@@ -8,6 +8,7 @@
 
 mod app;
 mod browser;
+mod compare;
 mod convert;
 mod edit;
 mod histogram;

@@ -3,6 +3,7 @@
 //! them to the workers.
 
 use crate::browser::{self, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::compare::{self, Compare, CompareKey, CompareRequest};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{Converter, DetailRect, DevelopParams, Histogram, Session, ViewParams};
@@ -12,6 +13,7 @@ use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
 use egui_file_dialog::FileDialog;
+use mimizan_core::decode::SensorKind;
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
@@ -203,6 +205,23 @@ pub struct App {
     loupe_px: usize,
     loupe_tex: Option<TextureHandle>,
     loupe_size: [usize; 2],
+    /// The five-up window is open.
+    compare_open: bool,
+    /// Screen pixels per picture pixel in that window. 1 is 1:1.
+    compare_zoom: f32,
+    compare: Compare,
+    compare_sent: u64,
+    /// Generation of the set on screen. The panels swap together.
+    compare_done: u64,
+    compare_key: Option<CompareKey>,
+    compare_tex: [Option<TextureHandle>; 5],
+    compare_failed: [bool; 5],
+    /// Tiles of the request in flight. Shown one by one only until the first full set.
+    compare_incoming: [Option<TextureHandle>; 5],
+    compare_got: [bool; 5],
+    compare_have_set: bool,
+    /// Picture and zoom the compare window paints. It runs on its own pass.
+    compare_pane: Arc<compare::ComparePane>,
 
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
@@ -325,6 +344,18 @@ impl App {
             loupe_px: 0,
             loupe_tex: None,
             loupe_size: [0, 0],
+            compare_open: false,
+            compare_zoom: 1.0,
+            compare: Compare::spawn(cc.egui_ctx.clone()),
+            compare_sent: 0,
+            compare_done: 0,
+            compare_key: None,
+            compare_tex: [None, None, None, None, None],
+            compare_failed: [false; 5],
+            compare_incoming: [None, None, None, None, None],
+            compare_got: [false; 5],
+            compare_have_set: false,
+            compare_pane: Arc::new(compare::ComparePane::default()),
             zoom_to_1to1: false,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
@@ -623,6 +654,16 @@ impl App {
         (w as u32, h as u32)
     }
 
+    /// The recipe the print box uses. While the easel is up the box is the
+    /// whole negative, which is what the view shows.
+    fn loupe_recipe(&self) -> Recipe {
+        let mut recipe = self.print_recipe();
+        if self.crop_open {
+            recipe.crop = None;
+        }
+        recipe
+    }
+
     /// The recipe with its window turned into the current upright picture.
     fn print_recipe(&self) -> Recipe {
         let mut recipe = self.edit.recipe.clone();
@@ -640,6 +681,16 @@ impl App {
             Some(c) => (c.w as usize, c.h as usize),
             None => (w, h),
         }
+    }
+
+    /// The print box's layout: the whole negative while the easel is up.
+    fn loupe_layout(&self) -> Option<mimizan_core::print::Layout> {
+        let (w, h) = self.export_size();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let params = mimizan_core::print::PrintParams { recipe: self.loupe_recipe(), ..Default::default() };
+        Some(mimizan_core::print::layout(w, h, 1, &params))
     }
 
     /// Output size of the print TIFF (after size step and border).
@@ -675,8 +726,9 @@ impl App {
         self.crop_open = true;
         self.crop_drag = None;
         self.sharpen_aim = false;
-        self.sharpen_at = None;
+        self.sharpen_at = Some([0.5, 0.5]);
         self.loupe_key = None;
+        self.loupe_tex = None;
     }
 
     fn reinscribe(&mut self) {
@@ -698,8 +750,9 @@ impl App {
         self.close_crop();
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
-        self.sharpen_at = None;
+        self.sharpen_at = Some([0.5, 0.5]);
         self.loupe_key = None;
+        self.loupe_tex = None;
         self.sharpen_aim = false;
         if self.edit.recipe.size.is_some() {
             self.apply_picture(PictureSide::Width);
@@ -885,11 +938,22 @@ impl App {
                     self.session = Some(s);
                     if fresh {
                         self.sharpen_aim = false;
-                        self.sharpen_at = None;
+                        self.sharpen_at = Some([0.5, 0.5]);
                         self.loupe_key = None;
                         self.loupe_tex = None;
                         self.loupe_size = [0, 0];
+                        self.compare_key = None;
+                        self.compare_tex = [None, None, None, None, None];
+                        self.compare_failed = [false; 5];
+                        self.compare_incoming = [None, None, None, None, None];
+                        self.compare_got = [false; 5];
+                        self.compare_have_set = false;
+                        self.compare_zoom = 1.0;
                         self.reset(true);
+                        if !matches!(self.session.as_ref().map(|s| s.frame.kind), Some(SensorKind::Bayer(_)))
+                        {
+                            self.compare_open = false;
+                        }
                         // A recipe saved next to the file comes back with it.
                         if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
                             self.load_recipe(&p);
@@ -943,6 +1007,9 @@ impl App {
                     self.log("print box failed");
                 }
             }
+        }
+        for r in self.compare.poll() {
+            self.accept_compare_tile(ctx, r);
         }
         for r in self.thumbs.poll() {
             let Some(f) = &mut self.folder else { continue };
@@ -1340,7 +1407,7 @@ impl App {
         let n = &s.negative;
         let info = &n.info;
         // Value cells never widen the panel: long text is elided (the full
-        // text is the tooltip), so the title bar and the body stay one width.
+        // text is the tooltip), so the header and the body stay one width.
         fn val(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>) -> egui::Response {
             ui.add(egui::Label::new(text).truncate())
         }
@@ -1835,7 +1902,6 @@ impl App {
     /// The 1:1 box is the print pixels, for judging the size step.
     fn print_section(&mut self, ui: &mut egui::Ui) {
         self.clear_desktop_sharpen();
-        ui.heading("Print");
         let mut mode = self.size_mode;
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut mode, SizeMode::Native, "native")
@@ -1975,15 +2041,29 @@ impl App {
         let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
         let side = (ui.available_width() * ppp).round() as usize;
         self.loupe_px = side.clamp(64, 960);
-        let scale = self.print_layout().map(|l| l.enlargement);
+        let scale = self.loupe_layout().map(|l| l.enlargement);
         ui.horizontal(|ui| {
-            let aim = ui
-                .selectable_label(self.sharpen_aim, "✛")
-                .on_hover_text(
-                    "Click the picture. The box is that spot, one pixel per screen pixel, as the TIFF. Drag to move.",
-                );
+            let aim = ui.selectable_label(self.sharpen_aim, "✛").on_hover_text(
+                "Click the picture to move the box. It is that spot, one pixel per screen pixel, as the TIFF.",
+            );
             if aim.clicked() {
                 self.sharpen_aim = !self.sharpen_aim;
+            }
+            let bayer = self.is_bayer();
+            let compare = ui
+                .add_enabled(bayer, egui::Button::new("compare").selected(self.compare_open))
+                .on_hover_text(if bayer {
+                    "The same spot from Mimizan and each demosaicer."
+                } else if self.session.is_some() {
+                    "This file has no colour mosaic."
+                } else {
+                    "Open a RAW file first."
+                });
+            if compare.clicked() {
+                self.compare_open = !self.compare_open;
+                if !self.compare_open {
+                    self.close_compare();
+                }
             }
             if let Some(scale) = scale {
                 let text = if scale > 1.0 { format!("{scale:.2}×") } else { "no enlargement".into() };
@@ -1991,8 +2071,8 @@ impl App {
             }
         });
         let mut drag = None;
-        if self.sharpen_at.is_none() {
-            ui.label(RichText::new("Click ✛, then a point in the picture.").weak());
+        if self.session.is_none() {
+            ui.label(RichText::new("Open a RAW file.").weak());
         } else if let Some(tex) = &self.loupe_tex {
             let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
             let [w, h] = self.loupe_size;
@@ -2028,7 +2108,7 @@ impl App {
     /// Move the loupe centre by a drag. `delta` is in points; the box is one
     /// print pixel per screen pixel, and the picture follows the pointer.
     fn nudge_loupe(&mut self, delta: Vec2, ppp: f32) {
-        let Some(l) = self.print_layout() else { return };
+        let Some(l) = self.loupe_layout() else { return };
         let Some(at) = self.sharpen_at.as_mut() else { return };
         let iw = (l.image_w.saturating_sub(1) as f64).max(1.0);
         let ih = (l.image_h.saturating_sub(1) as f64).max(1.0);
@@ -2042,7 +2122,7 @@ impl App {
         let key = (
             Arc::as_ptr(&session) as usize,
             self.weights(),
-            self.edit.recipe.clone(),
+            self.loupe_recipe(),
             self.export_orientation(),
             [nx, ny],
             self.loupe_px,
@@ -2055,12 +2135,195 @@ impl App {
         self.loupe.request(LoupeRequest {
             session,
             weights: self.weights(),
-            recipe: self.print_recipe(),
+            recipe: self.loupe_recipe(),
             orientation: self.export_orientation(),
             nx,
             ny,
             view: self.loupe_px,
             generation: self.loupe_sent,
+        });
+    }
+
+    /// A picture is open, so the print box has a point. A new file and Apply
+    /// put that point in the middle; this only fills a gap.
+    fn ensure_loupe_point(&mut self) {
+        if self.session.is_some() && self.sharpen_at.is_none() {
+            self.sharpen_at = Some([0.5, 0.5]);
+        }
+    }
+
+    fn is_bayer(&self) -> bool {
+        matches!(self.session.as_ref().map(|s| s.frame.kind), Some(SensorKind::Bayer(_)))
+    }
+
+    fn close_compare(&mut self) {
+        self.compare.clear();
+        self.compare_key = None;
+        self.compare_tex = [None, None, None, None, None];
+        self.compare_failed = [false; 5];
+        self.compare_incoming = [None, None, None, None, None];
+        self.compare_got = [false; 5];
+        self.compare_have_set = false;
+    }
+
+    fn accept_compare_tile(&mut self, ctx: &egui::Context, r: crate::compare::TileResult) {
+        if r.generation != self.compare_sent || r.index >= 5 {
+            return;
+        }
+        let tex =
+            (r.image.width > 0 && r.image.height > 0 && r.image.gray.len() == r.image.width * r.image.height)
+                .then(|| {
+                    let pixels: Vec<Color32> = r.image.gray.into_iter().map(Color32::from_gray).collect();
+                    let image = ColorImage::new([r.image.width, r.image.height], pixels);
+                    ctx.load_texture(format!("compare-{}", r.index), image, TextureOptions::NEAREST)
+                });
+        self.compare_got[r.index] = true;
+        self.compare_incoming[r.index] = tex;
+        // The first set fills in as each tile arrives. Later sets swap together,
+        // so the five panels never show two different spots.
+        if !self.compare_have_set {
+            self.compare_tex[r.index] = self.compare_incoming[r.index].clone();
+            self.compare_failed[r.index] = self.compare_tex[r.index].is_none();
+        }
+        if self.compare_got.iter().all(|g| *g) {
+            for i in 0..5 {
+                self.compare_tex[i] = self.compare_incoming[i].take();
+                self.compare_failed[i] = self.compare_tex[i].is_none();
+            }
+            self.compare_got = [false; 5];
+            self.compare_have_set = true;
+            self.compare_done = r.generation;
+        }
+    }
+
+    /// Copy a drag, a zoom or a close from the compare window onto this one.
+    fn apply_compare_input(&mut self) {
+        let mut g = compare::lock(&self.compare_pane);
+        if g.close {
+            g.close = false;
+            g.from_child = false;
+            drop(g);
+            self.compare_open = false;
+            self.close_compare();
+            return;
+        }
+        if g.from_child {
+            self.sharpen_at = Some(g.at);
+            self.compare_zoom = g.zoom;
+            g.from_child = false;
+        }
+    }
+
+    fn publish_compare(&mut self) {
+        let mut g = compare::lock(&self.compare_pane);
+        if !g.from_child {
+            g.zoom = self.compare_zoom;
+            if let Some(at) = self.sharpen_at {
+                g.at = at;
+            }
+        }
+        g.tex = self.compare_tex.clone();
+        g.failed = self.compare_failed;
+        g.updating = self.compare_have_set && self.compare_sent != self.compare_done;
+        g.active = Converter::ALL.iter().position(|c| *c == self.converter).unwrap_or(0);
+        let (w, h) = if self.crop_open { self.export_size() } else { self.picture_size() };
+        g.pic = [w, h];
+    }
+
+    fn show_compare(&mut self, ctx: &egui::Context) {
+        self.publish_compare();
+        let mut open = true;
+        let mut hide = false;
+        let pane = Arc::clone(&self.compare_pane);
+        // Same window as the darkroom. A second system window shares the
+        // graphics context; moving it clears the main window and repaints it.
+        // Dragging is only the heading: a drag inside a crop pans the picture.
+        let mut window = egui::Window::new("Compare")
+            .id(compare_window_id())
+            .open(&mut open)
+            .title_bar(false)
+            .drag_area(egui::WindowDrag::Off)
+            .resizable(true)
+            .collapsible(false)
+            .default_size([1080.0, 760.0])
+            .default_pos([72.0, 48.0])
+            .min_size([640.0, 420.0])
+            .frame(glass_frame());
+        if let Some(pos) = compare_drag_pos(ctx) {
+            window = window.current_pos(pos);
+        }
+        window.show(ctx, |ui| {
+            hide = panel_heading(ui, "Compare", Some(compare_drag_id()));
+            compare::compare_window(ui, &pane);
+        });
+        if hide {
+            open = false;
+        }
+        if !open {
+            self.compare_open = false;
+            self.close_compare();
+            return;
+        }
+        self.apply_compare_input();
+        let raw = compare::lock(&self.compare_pane).view;
+        let view = self.settled_view(ctx, raw);
+        if view != [0, 0] {
+            self.request_compare(view);
+        }
+    }
+
+    /// While the border is being dragged, ignore changes smaller than 24
+    /// picture pixels. The exact size is requested when the pointer is released.
+    fn settled_view(&self, ctx: &egui::Context, raw: [usize; 2]) -> [usize; 2] {
+        let Some(prev) = self.compare_key.as_ref().map(|k| k.view) else {
+            return raw;
+        };
+        if prev == [0, 0] || !ctx.input(|i| i.pointer.any_down()) {
+            return raw;
+        }
+        let close = |a: usize, b: usize| a.abs_diff(b) < 24;
+        if close(prev[0], raw[0]) && close(prev[1], raw[1]) {
+            prev
+        } else {
+            raw
+        }
+    }
+
+    fn request_compare(&mut self, view: [usize; 2]) {
+        let Some(session) = self.session.clone() else { return };
+        let Some(at) = self.sharpen_at else { return };
+        if !self.is_bayer() {
+            return;
+        }
+        let recipe = self.loupe_recipe();
+        let key = CompareKey {
+            frame: Arc::as_ptr(&session.frame) as usize,
+            weights: self.weights(),
+            place_bits: recipe.place.to_bits(),
+            tone: recipe.curve.clone(),
+            orientation: self.export_orientation(),
+            crop: recipe.crop,
+            at: [at[0].to_bits(), at[1].to_bits()],
+            view,
+        };
+        if self.compare_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.compare_key = Some(key);
+        self.compare_sent = self.compare_sent.wrapping_add(1);
+        self.compare_incoming = [None, None, None, None, None];
+        self.compare_got = [false; 5];
+        let generation = self.compare_sent;
+        self.compare.request(CompareRequest {
+            session,
+            weights: self.weights(),
+            place: recipe.place,
+            tone: recipe.curve,
+            orientation: self.export_orientation(),
+            crop: recipe.crop,
+            at,
+            view,
+            generation,
         });
     }
 
@@ -2824,6 +3087,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.ensure_loupe_point();
         self.handle_dialog(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -2865,6 +3129,9 @@ impl eframe::App for App {
         self.request_preview_if_needed();
         self.flush_converter_redevelop();
         self.strip_keys(&ctx);
+        if self.compare_open {
+            self.show_compare(&ctx);
+        }
     }
 }
 
@@ -2885,6 +3152,69 @@ const PANEL_W: f32 = 318.0;
 const SLIDER_STOPS: f64 = 2.0;
 /// Gap between the stage edge and a panel.
 const PANEL_GAP: f32 = 12.0;
+
+/// One line where the window title bar was: the name, and × to hide the dock.
+fn dock_title(ui: &mut egui::Ui, title: &str) -> bool {
+    panel_heading(ui, title, None)
+}
+
+fn compare_window_id() -> egui::Id {
+    egui::Id::new("Compare")
+}
+
+fn compare_drag_id() -> egui::Id {
+    egui::Id::new("compare-header")
+}
+
+/// Where the compare window should sit this frame, if its heading was dragged.
+/// Applied before the window opens: moving the area from inside it is overwritten
+/// when the area closes.
+fn compare_drag_pos(ctx: &egui::Context) -> Option<egui::Pos2> {
+    let resp = ctx.read_response(compare_drag_id())?;
+    if !resp.dragged() {
+        return None;
+    }
+    let delta = resp.drag_delta();
+    if delta == egui::Vec2::ZERO {
+        return None;
+    }
+    let state = egui::AreaState::load(ctx, compare_window_id())?;
+    Some(state.left_top_pos() + delta)
+}
+
+/// Name and ×. `drag` makes the line the handle that moves the window.
+fn panel_heading(ui: &mut egui::Ui, title: &str, drag: Option<egui::Id>) -> bool {
+    let mut hide = false;
+    let mut button_left = f32::MAX;
+    let row = ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let button = ui.small_button("×").on_hover_text("Hide this panel");
+            button_left = button.rect.left();
+            if button.clicked() {
+                hide = true;
+            }
+        });
+    });
+    if let Some(id) = drag {
+        let drag_rect = row.response.rect.with_max_x(button_left);
+        let handle = ui.interact(drag_rect, id, egui::Sense::drag()).on_hover_text("Drag moves this window.");
+        if handle.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if handle.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+    }
+    ui.separator();
+    hide
+}
+
+/// The body of a side dock, under the title line. The window no longer
+/// scrolls as a whole, so the title stays put.
+fn dock_scroll(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let height = ui.available_height();
+    egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| add(ui));
+}
 
 /// The dark translucent glass the panels are made of. Plain alpha, no
 /// blur: it has to look the same on every GPU driver and in software.
@@ -2926,11 +3256,15 @@ impl App {
     /// The three docked windows: the negative left, the print right (both
     /// at the stage's full height), the enlarger at the bottom between them.
     /// Nothing is movable; × closes, the toolbar or Tab brings one back.
+    /// The name sits on one line. The egui title bar is a heading plus its
+    /// own margin, which these fixed docks do not need.
     fn dock_windows(&mut self, ctx: &egui::Context, docks: &Docks) {
         let mut open = self.panels;
+        let mut hide = [false; 3];
         if let Some(r) = docks.left {
             egui::Window::new("Negative")
                 .frame(glass_frame())
+                .title_bar(false)
                 .open(&mut open[0])
                 .fixed_pos(r.min)
                 .movable(false)
@@ -2942,12 +3276,15 @@ impl App {
                 .min_height(r.height())
                 .max_height(r.height())
                 .resizable([false, true])
-                .vscroll(true)
-                .show(ctx, |ui| self.analysis_panel(ui));
+                .show(ctx, |ui| {
+                    hide[0] = dock_title(ui, "Negative");
+                    dock_scroll(ui, |ui| self.analysis_panel(ui));
+                });
         }
         if let Some(r) = docks.right {
             egui::Window::new("Print")
                 .frame(glass_frame())
+                .title_bar(false)
                 .open(&mut open[1])
                 .fixed_pos(r.min)
                 .movable(false)
@@ -2959,14 +3296,17 @@ impl App {
                 .min_height(r.height())
                 .max_height(r.height())
                 .resizable([false, true])
-                .vscroll(true)
-                .show(ctx, |ui| self.print_panel(ui));
+                .show(ctx, |ui| {
+                    hide[1] = dock_title(ui, "Print");
+                    dock_scroll(ui, |ui| self.print_panel(ui));
+                });
         }
         if let Some(r) = docks.bottom {
             // Height follows the content; the stage is laid out with the
             // measured value of the last frame.
             let shown = egui::Window::new("Enlarger")
                 .frame(glass_frame())
+                .title_bar(false)
                 .open(&mut open[2])
                 .fixed_pos(r.min)
                 .movable(false)
@@ -2975,13 +3315,21 @@ impl App {
                 .min_width(r.width())
                 .max_width(r.width())
                 .resizable(false)
-                .show(ctx, |ui| self.enlarger_panel(ui));
+                .show(ctx, |ui| {
+                    hide[2] = dock_title(ui, "Enlarger");
+                    self.enlarger_panel(ui);
+                });
             if let Some(s) = shown {
                 let h = s.response.rect.height();
                 if self.enlarger_h.is_none_or(|old| (old - h).abs() > 0.5) {
                     self.enlarger_h = Some(h);
                     ctx.request_repaint();
                 }
+            }
+        }
+        for (i, hide) in hide.into_iter().enumerate() {
+            if hide {
+                open[i] = false;
             }
         }
         if open != self.panels {
