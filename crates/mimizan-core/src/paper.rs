@@ -17,13 +17,14 @@
 //!   paper the exposure `log₁₀ E = log₁₀2 · (t − γ_n · log₂ L)`, `t` the
 //!   exposure time in stops. A stop of time is therefore worth `1/γ_n` scene
 //!   stops: the negative has compressed the scene.
-//! * Each pass exposes one emulsion component, whose fraction of the
-//!   developable silver is a normal CDF in log exposure (a log-normal spread
-//!   of grain sensitivity), `a = Φ((log₁₀E − μ)/σ)`. The width `σ` comes
-//!   from the ISO range of that grade ([`ISO_R_SOFT`], [`ISO_R_HARD`]: the
-//!   log exposure range between 0.04 above base and 90 % of Dmax), the
-//!   position `μ` from speed matching: each pass alone at `t = 0` puts the
-//!   grey card at the ISO speed point, [`SPEED_DENSITY`] above base.
+//! * Each pass exposes one emulsion component. The hard pass (filter 5) is a
+//!   normal CDF in log exposure, `b = Φ((log₁₀E − μ)/σ)`, its width `σ` from
+//!   the ISO range [`ISO_R_HARD`]. The soft pass (filter 00) is the measured
+//!   grade-00 curve of Ilford Multigrade RC Deluxe: the logit fitted to the
+//!   separated stroke of the datasheet, and below that stroke a toe laid so
+//!   the ISO range is [`ISO_R_SOFT`] (0.04 above base to 90 % of Dmax). Both
+//!   are speed-matched: each pass alone at `t = 0` puts the grey card at the
+//!   ISO speed point, [`SPEED_DENSITY`] above base.
 //! * The two passes share the silver: `D/Dmax = 1 − (1 − a)(1 − b)`. The
 //!   soft pass, with its long toe, is what the highlights see first; the
 //!   hard pass, steep, is what fills the shadows. That is the darkroom's
@@ -42,10 +43,10 @@ use std::sync::LazyLock;
 
 /// Maximum reflection density of the paper above its base (glossy RC).
 pub const DMAX: f64 = 2.0;
-/// ISO range of the soft component alone (grade 00) and of the hard one
-/// (grade 5), as `100 · Δlog₁₀E`.
-pub const ISO_R_SOFT: f64 = 180.0;
-pub const ISO_R_HARD: f64 = 60.0;
+/// ISO range of the soft component (grade 00 of Ilford Multigrade RC Deluxe)
+/// and of the hard one (grade 5), as `100 · Δlog₁₀E`.
+pub const ISO_R_SOFT: f64 = 160.0;
+pub const ISO_R_HARD: f64 = 50.0;
 /// Straight-line gamma of the negative at normal development.
 pub const NEGATIVE_GAMMA: f64 = 0.6;
 /// ISO speed point of the paper, density above base: the grey card lands
@@ -87,17 +88,84 @@ fn probit(p: f64) -> f64 {
     0.5 * (lo + hi)
 }
 
-/// One emulsion component: a normal CDF in log₁₀ exposure.
+/// Logit of the measured grade-00 stroke, `z(h) = a + bh + ch² + dh³`.
+/// `h` counts half-stops of relative log exposure from 2.0 on that chart.
+const SOFT_A: f64 = -0.05416490427546971;
+const SOFT_B: f64 = 1.1447781589403825;
+const SOFT_C: f64 = 0.04294224462390111;
+const SOFT_D: f64 = 0.1770836763782222;
+/// The separated stroke. Left of this the grades share one line on the chart,
+/// so the toe is not a measurement.
+const SOFT_H1: f64 = -0.8533834586466166;
+const SOFT_H2: f64 = 2.048872180451122;
+
+fn soft_cubic_z(h: f64) -> f64 {
+    SOFT_A + SOFT_B * h + SOFT_C * h * h + SOFT_D * h * h * h
+}
+
+fn soft_cubic_dz(h: f64) -> f64 {
+    SOFT_B + 2.0 * SOFT_C * h + 3.0 * SOFT_D * h * h
+}
+
+fn soft_cubic_f(h: f64) -> f64 {
+    let z = soft_cubic_z(h).clamp(-40.0, 40.0);
+    1.0 / (1.0 + (-z).exp())
+}
+
+/// `h` of the speed point and the quadratic coefficient of the toe, solved
+/// so the silver fraction is [`SPEED_DENSITY`]/[`DMAX`] at `h_speed` and the
+/// log exposure from fraction [`R_LOW`] to [`R_HIGH`] is [`ISO_R_SOFT`]/100.
+fn soft_anchors() -> (f64, f64) {
+    let h_at = |target: f64| {
+        let (mut lo, mut hi) = (SOFT_H1, SOFT_H2);
+        for _ in 0..80 {
+            let mid = 0.5 * (lo + hi);
+            if soft_cubic_f(mid) < target {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+    let h_speed = h_at(SPEED_DENSITY / DMAX);
+    let h_low = h_at(R_HIGH) - 2.0 * (ISO_R_SOFT / 100.0);
+    let u = h_low - SOFT_H1;
+    let z_low = (R_LOW / (1.0 - R_LOW)).ln();
+    let toe = (z_low - soft_cubic_z(SOFT_H1) - soft_cubic_dz(SOFT_H1) * u) / (u * u);
+    (h_speed, toe)
+}
+
+/// One emulsion component.
 #[derive(Clone, Copy, Debug)]
-struct Component {
-    mu: f64,
-    sigma: f64,
+enum Component {
+    /// Grade 5: a normal CDF in log₁₀ exposure. `mu` is its median.
+    Normal { mu: f64, sigma: f64 },
+    /// Grade 00: the measured curve. `mu` is the log₁₀ exposure of the speed
+    /// point, `h_speed` that point's chart coordinate, `toe` the quadratic
+    /// coefficient below the separated stroke.
+    Soft { mu: f64, h_speed: f64, toe: f64 },
 }
 
 impl Component {
     #[inline]
     fn fraction(&self, log_e: f64) -> f64 {
-        phi((log_e - self.mu) / self.sigma)
+        match *self {
+            Component::Normal { mu, sigma } => phi((log_e - mu) / sigma),
+            Component::Soft { mu, h_speed, toe } => {
+                let h = h_speed + 2.0 * (log_e - mu);
+                let z = if h < SOFT_H1 {
+                    let u = h - SOFT_H1;
+                    soft_cubic_z(SOFT_H1) + soft_cubic_dz(SOFT_H1) * u + toe * u * u
+                } else if h > SOFT_H2 {
+                    soft_cubic_z(SOFT_H2) + soft_cubic_dz(SOFT_H2) * (h - SOFT_H2)
+                } else {
+                    soft_cubic_z(h)
+                };
+                let z = z.clamp(-40.0, 40.0);
+                1.0 / (1.0 + (-z).exp())
+            }
+        }
     }
 }
 
@@ -127,8 +195,9 @@ impl Paper {
         // Speed matching: at t = 0 the grey card alone reaches the speed point.
         let speed = SPEED_DENSITY / DMAX;
         let mu = |s: f64| log_exposure(GREY, 0.0) - probit(speed) * s;
-        let soft = Component { mu: mu(sigma(ISO_R_SOFT)), sigma: sigma(ISO_R_SOFT) };
-        let hard = Component { mu: mu(sigma(ISO_R_HARD)), sigma: sigma(ISO_R_HARD) };
+        let (h_speed, toe) = soft_anchors();
+        let soft = Component::Soft { mu: log_exposure(GREY, 0.0), h_speed, toe };
+        let hard = Component::Normal { mu: mu(sigma(ISO_R_HARD)), sigma: sigma(ISO_R_HARD) };
         let mut p = Self { soft, hard, base_soft: 0.0, base_hard: 0.0, black: 10f64.powf(-DMAX) };
         // Base exposure: the hard time that puts the grey card at its density
         // for a given soft time, and the soft time that then puts the clip at
@@ -318,10 +387,26 @@ impl PaperCurve {
         self.iso_range() / 100.0 / LOG10_2 / NEGATIVE_GAMMA
     }
 
-    /// The single filter grade this split equals, 00 (−1) … 5, from the ISO
-    /// range by the usual 20 R per grade (grade 2 = 120).
+    /// The single filter grade this split equals, 00 (−1) … 5, read from the
+    /// ISO range against the published ranges of Ilford Multigrade RC Deluxe:
+    /// 160, 130, 110, 90, 70, 60, 50.
     pub fn grade(&self) -> f64 {
-        ((160.0 - self.iso_range()) / 20.0).clamp(-1.0, 5.0)
+        const R: [f64; 7] = [160.0, 130.0, 110.0, 90.0, 70.0, 60.0, 50.0];
+        let r = self.iso_range();
+        if r >= R[0] {
+            return -1.0;
+        }
+        if r <= R[6] {
+            return 5.0;
+        }
+        for i in 0..6 {
+            let (hi, lo) = (R[i], R[i + 1]);
+            if r <= hi && r >= lo {
+                let t = (hi - r) / (hi - lo);
+                return (i as f64 - 1.0) + t;
+            }
+        }
+        5.0
     }
 }
 
@@ -367,10 +452,18 @@ mod tests {
         assert!((hard_only.iso_range() - ISO_R_HARD).abs() < 0.01);
         assert_eq!(grade_label(soft_only.grade()), "00");
         assert_eq!(grade_label(hard_only.grade()), "5");
-        // The base split is a middle grade over five to six scene stops.
+        // The separated stroke of grade 00, silver fraction against log
+        // exposure relative to the speed point. These are the fitted curve.
+        let Component::Soft { mu, h_speed, toe } = p.soft else { panic!("soft") };
+        let f = |x: f64| Component::Soft { mu, h_speed, toe }.fraction(mu + x);
+        for (x, want) in [(0.0, 0.300000), (0.2, 0.411751), (0.4, 0.525649), (0.8, 0.768536), (1.2, 0.952068)]
+        {
+            assert!((f(x) - want).abs() < 1e-5, "x {x}: {} != {want}", f(x));
+        }
+        // The base split lands near grade 2, a little over five scene stops.
         let g = c.grade();
-        assert!((2.0..=3.5).contains(&g), "grade {g}");
-        assert!((5.0..=6.5).contains(&c.scene_range_stops()), "{}", c.scene_range_stops());
+        assert!((1.7..=2.0).contains(&g), "grade {g}");
+        assert!((5.0..=5.4).contains(&c.scene_range_stops()), "{}", c.scene_range_stops());
     }
 
     /// Monotone and bounded for any pair of times in range; a stop of time

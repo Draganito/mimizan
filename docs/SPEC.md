@@ -641,13 +641,15 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
     `L` (Graukarte 0,18, Clip 1) belichtet das Papier mit
     `log₁₀E = log₁₀2 · (t − γ_n · log₂L)`; ein Stop Zeit ist `1/γ_n`
     Szenenstops wert.
-  - Zwei Emulsionskomponenten, je eine Normalverteilungsfunktion in
-    log-Belichtung (log-normal verteilte Kornempfindlichkeit),
-    `a = Φ((log₁₀E − μ)/σ)`. `σ` aus dem ISO-Belichtungsumfang der
-    Gradation (ISO R 180 für 00, 60 für 5; R = 100·Δlog₁₀E zwischen
-    0,04 über Grund und 90 % Dmax), `μ` aus der Empfindlichkeitsangleichung:
-    jede Belichtung allein bringt bei `t = 0` die Graukarte auf den
-    ISO-Empfindlichkeitspunkt 0,6 über Grund.
+  - Zwei Emulsionskomponenten. Die harte (Filter 5) ist eine
+    Normalverteilungsfunktion in log-Belichtung,
+    `b = Φ((log₁₀E − μ)/σ)`, `σ` aus ISO R 50 (Gradation 5;
+    R = 100·Δlog₁₀E zwischen 0,04 über Grund und 90 % Dmax). Die weiche
+    (Filter 00) ist die gemessene Kennlinie von Ilford Multigrade RC
+    Deluxe, Gradation 00: der an den getrennten Strich angepasste Logit,
+    darunter ein Fuß, der den Umfang auf ISO R 160 legt. `μ` aus der
+    Empfindlichkeitsangleichung: jede Belichtung allein bringt bei `t = 0`
+    die Graukarte auf den ISO-Empfindlichkeitspunkt 0,6 über Grund.
   - Gemeinsames Silber: `D/Dmax = 1 − (1 − a)(1 − b)`, Dmax = 2,0 über
     Grund. Die weiche Komponente mit dem langen Fuß ist, was die Lichter
     zuerst sehen; die harte, steile, füllt die Schatten.
@@ -657,15 +659,16 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
   - `t = 0` beider Belichtungen ist die **Grundbelichtung**: das Paar, das
     die Graukarte auf D 0,67 (18 % Reflexion) und den Clip auf D 0,10
     (Zone VIII, strukturiertes Weiß) legt, einmal aus den Konstanten
-    gelöst (Bisektion, deterministisch). Sie entspricht etwa Gradation 3
-    über 5,6 Szenenstops; Zonen 0 und I liegen auf dem Papierschwarz.
+    gelöst (Bisektion, deterministisch). Sie entspricht etwa Gradation 2
+    über 5,2 Szenenstops; Zonen 0 und I liegen auf dem Papierschwarz.
     Mehr weiches Licht graut die Lichter und lässt die Schatten in Ruhe,
     weniger hartes Licht öffnet die Schatten und lässt die Lichter stehen
     (Abnahmetest: +1 Stop weich bewegt Zone VII vier Mal so weit wie Zone
     III; −1 Stop hart bewegt Zone III zehn Mal so weit wie Zone VII).
     Mehr hartes Licht ist eine härtere Gradation (ISO R der Summenkurve
     kleiner), mehr weiches eine weichere; die GUI nennt die äquivalente
-    Einzelgradation (R → Grad: 2 = 120, 20 R je Grad) und den
+    Einzelgradation (veröffentlichte Umfänge 160, 130, 110, 90, 70, 60, 50
+    für 00, 0, 1, 2, 3, 4, 5) und den
     Szenenumfang.
   **[Abweichung zu Whitepaper §3–4]**: Das Whitepaper beschreibt eine
   Zonenkurve mit Knoten je Zone, die einzeln gezogen werden. Eine solche

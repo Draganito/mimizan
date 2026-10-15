@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.7
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.8
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
 those of `docs/SPEC.md`; where this text and the code disagree, the code
 and its tests are right and this text has a bug.
@@ -604,10 +604,11 @@ paper border → [deconvolution →] USM → file. Resizing is separable in
 f64 with the kernel stretched by the scale factor when shrinking; the
 kernel is a parameter (B-spline default, Lanczos-3, Mitchell, Catmull-Rom). The tone is a *paper*, not a curve: a
 variable-contrast paper exposed in two passes (split grade), modelled as
-two emulsion components whose silver fractions are normal CDFs in
-log exposure, $a = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from
-the ISO range of the grade (R 180 for the soft pass, 60 for the hard one)
-and $\mu$ from speed matching at the ISO speed point, sharing the silver,
+two emulsion components. The hard pass is a normal CDF in log exposure,
+$b = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from ISO R 50 (grade 5).
+The soft pass is the measured grade-00 curve of Ilford Multigrade RC Deluxe:
+the logit of the separated stroke, with the toe set so the range is R 160.
+$\mu$ of each pass comes from speed matching at the ISO speed point. They share the silver,
 $D/D_{\max} = 1 - (1-a)(1-b)$, behind a straight-line negative of
 $\gamma_n = 0.6$, so $\log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L)$
 for a scene value $L$ and an exposure time of $t$ stops. The print value

@@ -791,6 +791,18 @@ preview would be enlarged, the full-resolution tile is drawn over the
 fit preview. The crosshair is drawn after that tile and after the crop
 shade, so it stays visible and can still be dragged.
 
+### The paper is the measured Ilford curve (0.10.8)
+
+The soft pass is the grade-00 curve measured from the Ilford Multigrade RC
+Deluxe datasheet: the logit fitted to the separated stroke, and below that
+stroke a toe that makes the ISO range 160. The hard pass stays a normal CDF
+and is ISO R 50, grade 5. At that range the normal curve sits within 0.02
+density of the measured grade 5. Both passes are still speed-matched at
+density 0.6 above base, and Dmax is still 2.0. The grade named in the
+enlarger is read from the published ranges 160, 130, 110, 90, 70, 60, 50.
+The base exposure lands near grade 2, about 5.2 scene stops between the
+first tone and near-black. A recipe still stores the two times.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156

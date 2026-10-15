@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.7-1_amd64.deb
+sudo apt install ./mimizan_0.10.8-1_amd64.deb
 mimizan --version
 ```
 
@@ -352,8 +352,9 @@ recipe holds, in the order the pipeline applies them: the **placing**
 (`--place`, stops; `L ← L·2^place`, the darkroom's exposure), the **paper** (`--paper
 SOFT,HARD`: the print is what a multigrade paper
 gives after a soft exposure (filter 00) and a hard one (filter 5) through
-a gamma-0.6 negative of the scene, each pass a normal CDF in log exposure
-with the width of its ISO range and the two sharing the silver, `D/Dmax =
+a gamma-0.6 negative of the scene. The soft pass is the measured grade-00
+curve of Ilford Multigrade RC Deluxe (ISO R 160) and the hard pass a normal
+CDF of grade 5 (ISO R 50); the two share the silver, `D/Dmax =
 1 − (1−a)(1−b)`; the two exposures in stops of time from the base print are
 the tone parameters, so a kink, a local steepening or a zone squeezed
 to nothing cannot be expressed — more soft light greys the highlights,
