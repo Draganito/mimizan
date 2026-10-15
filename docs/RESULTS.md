@@ -803,6 +803,13 @@ enlarger is read from the published ranges 160, 130, 110, 90, 70, 60, 50.
 The base exposure lands near grade 2, about 5.2 scene stops between the
 first tone and near-black. A recipe still stores the two times.
 
+![Mimizan paper, 0.10.7 dashed and 0.10.8 solid](paper-vorher-nachher.png)
+
+The soft curve is the measured grade 00. The hard curve is grade 5. The
+base exposure stays on the grey card and on white, and is a little more
+open between them. Left, each layer alone, zero at density 0.6. Right, both
+passes at the base exposure, in scene stops from the grey card.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156
