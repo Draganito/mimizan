@@ -283,6 +283,8 @@ files, docs), `mimizan-<version>-x86_64-linux.tar.gz`, and
 unzip and start `mimizan-gui.exe`; `cameras` and `look` stay beside the two
 programs. An unsigned download asks SmartScreen for confirmation.
 
+![Mimizan Lab on 64-bit Windows](docs/windows.png)
+
 ```bash
 sudo apt install ./mimizan_0.10.11-1_amd64.deb
 mimizan --version
