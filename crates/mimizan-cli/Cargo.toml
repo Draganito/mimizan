@@ -48,6 +48,7 @@ assets = [
     ["../../look/*.json", "usr/share/mimizan/look/", "644"],
     ["../../dist/mimizan-gui.desktop", "usr/share/applications/", "644"],
     ["../../README.md", "usr/share/doc/mimizan/", "644"],
+    ["../../DETAILED.md", "usr/share/doc/mimizan/", "644"],
     ["../../LICENSE", "usr/share/doc/mimizan/LICENSE.txt", "644"],
     ["../../third_party/librtprocess/LICENSE.txt", "usr/share/doc/mimizan/LICENSE-librtprocess.txt", "644"],
     ["../../docs/SPEC.md", "usr/share/doc/mimizan/docs/", "644"],
