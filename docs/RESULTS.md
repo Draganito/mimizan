@@ -810,6 +810,16 @@ base exposure stays on the grey card and on white, and is a little more
 open between them. Left, each layer alone, zero at density 0.6. Right, both
 passes at the base exposure, in scene stops from the grey card.
 
+### The crop ratio can stand the other way (0.10.9)
+
+*Turn*, beside the paper format, swaps the ratio. A 4×5 frame on a
+landscape negative stands portrait, and a portrait frame lies down. The
+long side still follows the picture until then. The new window is the
+largest one of that ratio, centered; the corners, the line and the inside
+move it as before. *Apply* or Enter still writes that one window. Opening
+Crop on a window that already stands across the picture selects the ratio
+and *Turn* together. 1:1 has nothing to turn.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156

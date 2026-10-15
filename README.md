@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.8-1_amd64.deb
+sudo apt install ./mimizan_0.10.9-1_amd64.deb
 mimizan --version
 ```
 
@@ -444,7 +444,9 @@ zone and its pixels light up in the preview. The print is the
 negative, one placing and two exposures, as a straight print is. *fit*,
 *1:1* and the mask sit in the toolbar. *Crop*, next to them, frames the
 negative to a darkroom ratio (4×5, 5×7, 8×10, 11×14, 16×20, 20×24, or
-1:1). The corners scale the frame, the line and the inside move it, and
+1:1). The long side follows the picture until *Turn* swaps it, so the
+frame can stand portrait on a landscape negative. The corners scale the
+frame, the line and the inside move it, and
 the dimmed area outside pans the view. *Apply*, or Enter, makes that
 window the picture: whole pixels and no resample, and the histograms,
 the centimetres, the 1:1 box and the export use only it.

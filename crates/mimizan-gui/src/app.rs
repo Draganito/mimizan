@@ -40,7 +40,8 @@ enum PictureSide {
     Height,
 }
 
-/// US darkroom paper, as a ratio. The long side follows the picture.
+/// US darkroom paper, as a ratio. The long side follows the picture until
+/// the ratio is turned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaperFormat {
     R4x5,
@@ -96,14 +97,34 @@ impl PaperFormat {
         }
     }
 
-    fn nearest(img_w: u32, img_h: u32, cw: u32, ch: u32) -> Self {
+    /// `turned` swaps the two sides, so a landscape frame can stand portrait.
+    fn frame(self, img_w: u32, img_h: u32, turned: bool) -> (u32, u32) {
+        let (a, b) = self.oriented(img_w, img_h);
+        if turned && a != b {
+            (b, a)
+        } else {
+            (a, b)
+        }
+    }
+
+    /// The format closest to a window, and whether that window is turned
+    /// against the picture's long side.
+    fn match_window(img_w: u32, img_h: u32, cw: u32, ch: u32) -> (Self, bool) {
         Self::ALL
             .into_iter()
-            .min_by_key(|f| {
+            .map(|f| {
                 let (a, b) = f.oriented(img_w, img_h);
-                (i64::from(cw) * i64::from(b) - i64::from(ch) * i64::from(a)).abs()
+                let along = (i64::from(cw) * i64::from(b) - i64::from(ch) * i64::from(a)).abs();
+                let across = (i64::from(cw) * i64::from(a) - i64::from(ch) * i64::from(b)).abs();
+                if a != b && across < along {
+                    (f, true, across)
+                } else {
+                    (f, false, along)
+                }
             })
-            .unwrap_or(Self::R8x10)
+            .min_by_key(|(_, _, err)| *err)
+            .map(|(f, turned, _)| (f, turned))
+            .unwrap_or((Self::R8x10, false))
     }
 }
 
@@ -267,6 +288,8 @@ pub struct App {
     /// The orange easel is up. The draft is not the picture until Apply.
     crop_open: bool,
     crop_format: PaperFormat,
+    /// The paper ratio stands across the picture's long side.
+    crop_turned: bool,
     /// Draft window, in file-upright pixels (before the user's turns).
     crop_draft: CropRect,
     crop_drag: Option<CropDrag>,
@@ -386,6 +409,7 @@ impl App {
             pan: Vec2::ZERO,
             crop_open: false,
             crop_format: PaperFormat::R8x10,
+            crop_turned: false,
             crop_draft: CropRect { x: 0, y: 0, w: 1, h: 1 },
             crop_drag: None,
             dialog: FileDialog::new(),
@@ -717,10 +741,12 @@ impl App {
         }
         if let Some(c) = self.edit.recipe.crop {
             let c = c.sanitized(fw, fh);
-            self.crop_format = PaperFormat::nearest(fw, fh, c.w, c.h);
+            let (format, turned) = PaperFormat::match_window(fw, fh, c.w, c.h);
+            self.crop_format = format;
+            self.crop_turned = turned;
             self.crop_draft = c;
         } else {
-            let (a, b) = self.crop_format.oriented(fw, fh);
+            let (a, b) = self.crop_format.frame(fw, fh, self.crop_turned);
             self.crop_draft = CropRect::inscribed(fw, fh, a, b);
         }
         self.crop_open = true;
@@ -736,7 +762,7 @@ impl App {
         if fw == 0 || fh == 0 {
             return;
         }
-        let (a, b) = self.crop_format.oriented(fw, fh);
+        let (a, b) = self.crop_format.frame(fw, fh, self.crop_turned);
         self.crop_draft = CropRect::inscribed(fw, fh, a, b);
         self.crop_drag = None;
     }
@@ -806,7 +832,7 @@ impl App {
             }
         }
         if let Some(drag) = self.crop_drag {
-            let (aw, ah) = self.crop_format.oriented(uw, uh);
+            let (aw, ah) = self.crop_format.frame(uw, uh, self.crop_turned);
             let dx = (px - drag.start_x).round() as i32;
             let dy = (py - drag.start_y).round() as i32;
             self.store_turned(moved_crop(drag.origin, drag.hit, dx, dy, uw, uh, (aw, ah)));
@@ -1292,6 +1318,17 @@ impl App {
                     },
                 );
             });
+            if ui
+                .add_enabled(
+                    has && self.crop_open && self.crop_format != PaperFormat::Square,
+                    egui::Button::new("Turn").selected(self.crop_turned),
+                )
+                .on_hover_text("Turn the ratio between landscape and portrait.")
+                .clicked()
+            {
+                self.crop_turned = !self.crop_turned;
+                self.reinscribe();
+            }
             if ui
                 .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
                 .on_hover_text(
@@ -3398,7 +3435,7 @@ impl App {
 
 #[cfg(test)]
 mod crop_drag_tests {
-    use super::{hit_crop, moved_crop, CropHit};
+    use super::{hit_crop, moved_crop, CropHit, PaperFormat};
     use mimizan_core::recipe::{CropCorner, CropRect};
 
     #[test]
@@ -3440,5 +3477,22 @@ mod crop_drag_tests {
         assert_eq!(next.y, origin.y);
         assert_eq!(next.w, origin.w - 20);
         assert_eq!(next.h, origin.h - 16);
+    }
+
+    #[test]
+    fn turning_the_ratio_stands_it_the_other_way() {
+        assert_eq!(PaperFormat::R4x5.frame(100, 80, false), (5, 4));
+        assert_eq!(PaperFormat::R4x5.frame(100, 80, true), (4, 5));
+        assert_eq!(PaperFormat::R4x5.frame(80, 100, false), (4, 5));
+        assert_eq!(PaperFormat::R4x5.frame(80, 100, true), (5, 4));
+        assert_eq!(PaperFormat::Square.frame(100, 80, true), (1, 1));
+    }
+
+    #[test]
+    fn a_portrait_window_on_a_landscape_picture_remembers_the_turn() {
+        let (format, turned) = PaperFormat::match_window(100, 80, 40, 50);
+        assert_eq!((format, turned), (PaperFormat::R4x5, true));
+        let (format, turned) = PaperFormat::match_window(100, 80, 50, 40);
+        assert_eq!((format, turned), (PaperFormat::R4x5, false));
     }
 }
