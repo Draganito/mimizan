@@ -14,9 +14,13 @@ fn main() {
     println!("cargo:rerun-if-changed={}", root.display());
     println!("cargo:rerun-if-changed=src/wrap.cpp");
 
+    // MSVC's OpenMP rejects the vendored `simd` and `reduction(min/max)`
+    // pragmas unless a different runtime is selected. The demosaicers still
+    // run; the parallel loops fall back to one thread. Linux keeps OpenMP.
+    let openmp = if cfg!(target_env = "msvc") { "OFF" } else { "ON" };
     let dst = cmake::Config::new(&root)
         .define("BUILD_SHARED_LIBS", "OFF")
-        .define("OPTION_OMP", "ON")
+        .define("OPTION_OMP", openmp)
         .profile("Release")
         .build();
 
@@ -32,11 +36,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", libdir.display());
     println!("cargo:rustc-link-lib=static=rtprocess");
-    if cfg!(target_env = "msvc") {
-        // CMake links OpenMP as a private dependency of the static library,
-        // so the final link has to name the MSVC OpenMP runtime itself.
-        println!("cargo:rustc-link-lib=dylib=vcomp");
-    } else {
+    if cfg!(not(target_env = "msvc")) {
         println!("cargo:rustc-link-lib=gomp");
         println!("cargo:rustc-link-lib=stdc++");
     }
