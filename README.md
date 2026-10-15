@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.6-1_amd64.deb
+sudo apt install ./mimizan_0.10.7-1_amd64.deb
 mimizan --version
 ```
 
@@ -416,9 +416,10 @@ long side is judged as it will print. The border is drawn, not rendered —
 the picture under it is still the one before the size step. With a file
 open, a 1:1 box of the centre is always there, as wide as the panel,
 resized exactly as the TIFF and with no sharpening, so the size step can
-be judged before the export. ✛ and a click move that spot. Dragging
-inside the box moves it too, and the crosshair on the picture follows.
-*Compare*, next to ✛, opens the same spot for Mimizan and for AMaZE, RCD,
+be judged before the export. Drag the crosshair on the picture to move
+that spot. It stays drawn on top once the view switches to the
+full-resolution pixels. Dragging inside the box moves it too.
+*Compare* opens the same spot for Mimizan and for AMaZE, RCD,
 DCB and LMMSE, native pixels with no size step, so the enlargement cannot
 hide the difference. Pan and zoom move every panel together; a double
 click returns to 1:1. It does not change the recipe or the converter.

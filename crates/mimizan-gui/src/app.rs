@@ -191,10 +191,10 @@ pub struct App {
     // Export section
     size_mode: SizeMode,
     paper_cm: [f64; 2],
-    /// Crosshair armed: the next click in the picture sets the loupe.
-    sharpen_aim: bool,
     /// Where the loupe looks, as a fraction of the upright picture.
     sharpen_at: Option<[f64; 2]>,
+    /// The pointer went down on the crosshair, so this gesture moves the spot.
+    cross_drag: bool,
     loupe: Loupe,
     loupe_sent: u64,
     loupe_shown: u64,
@@ -335,8 +335,8 @@ impl App {
             hover_zone: None,
             size_mode: SizeMode::Native,
             paper_cm: [30.0, 40.0],
-            sharpen_aim: false,
             sharpen_at: None,
+            cross_drag: false,
             loupe: Loupe::spawn(cc.egui_ctx.clone()),
             loupe_sent: 0,
             loupe_shown: 0,
@@ -725,7 +725,7 @@ impl App {
         }
         self.crop_open = true;
         self.crop_drag = None;
-        self.sharpen_aim = false;
+        self.cross_drag = false;
         self.sharpen_at = Some([0.5, 0.5]);
         self.loupe_key = None;
         self.loupe_tex = None;
@@ -753,7 +753,7 @@ impl App {
         self.sharpen_at = Some([0.5, 0.5]);
         self.loupe_key = None;
         self.loupe_tex = None;
-        self.sharpen_aim = false;
+        self.cross_drag = false;
         if self.edit.recipe.size.is_some() {
             self.apply_picture(PictureSide::Width);
         }
@@ -937,7 +937,7 @@ impl App {
                     ));
                     self.session = Some(s);
                     if fresh {
-                        self.sharpen_aim = false;
+                        self.cross_drag = false;
                         self.sharpen_at = Some([0.5, 0.5]);
                         self.loupe_key = None;
                         self.loupe_tex = None;
@@ -2043,12 +2043,6 @@ impl App {
         self.loupe_px = side.clamp(64, 960);
         let scale = self.loupe_layout().map(|l| l.enlargement);
         ui.horizontal(|ui| {
-            let aim = ui.selectable_label(self.sharpen_aim, "✛").on_hover_text(
-                "Click the picture to move the box. It is that spot, one pixel per screen pixel, as the TIFF.",
-            );
-            if aim.clicked() {
-                self.sharpen_aim = !self.sharpen_aim;
-            }
             let bayer = self.is_bayer();
             let compare = ui
                 .add_enabled(bayer, egui::Button::new("compare").selected(self.compare_open))
@@ -2355,9 +2349,6 @@ impl App {
     fn preview_panel(&mut self, ui: &mut egui::Ui) {
         let avail = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(avail, Sense::click_and_drag());
-        if self.sharpen_aim {
-            response.clone().on_hover_cursor(CursorIcon::Crosshair);
-        }
         let painter = ui.painter_at(avail);
         painter.rect_filled(avail, 0.0, Color32::from_gray(28));
         let Some(tex) = self.texture.as_ref().map(|t| t.id()) else {
@@ -2422,8 +2413,26 @@ impl App {
             self.pan *= zoom_1to1 / self.zoom;
             self.zoom = zoom_1to1;
         }
-        if response.double_clicked() && !self.sharpen_aim {
-            // Toggle between fit and 1:1 about the pointer.
+        let place = |zoom: f32, pan: Vec2| {
+            let scale = fit * zoom;
+            let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
+            let border_pts = border_tex * scale;
+            let max_pan = ((size + Vec2::splat(2.0 * border_pts) - avail.size()) * 0.5).max(Vec2::ZERO);
+            let pan = pan.clamp(-max_pan, max_pan);
+            (Rect::from_center_size(avail.center() + pan, size), border_pts, max_pan, pan)
+        };
+        let (rect_now, _, _, _) = place(self.zoom, self.pan);
+        let on_cross = |rect: Rect, p: Pos2| {
+            self.sharpen_at.is_some_and(|[nx, ny]| {
+                let c =
+                    Pos2::new(rect.left() + nx as f32 * rect.width(), rect.top() + ny as f32 * rect.height());
+                c.distance(p) <= CROSS_GRAB
+            })
+        };
+        // A double click on the crosshair leaves the zoom alone. One beside
+        // it still toggles fit and 1:1.
+        let pressed_on_cross = ui.input(|i| i.pointer.press_origin()).is_some_and(|p| on_cross(rect_now, p));
+        if response.double_clicked() && !pressed_on_cross {
             let old = self.zoom;
             self.zoom = if (self.zoom - 1.0).abs() < 1e-3 { zoom_1to1 } else { 1.0 };
             if let Some(ptr) = response.interact_pointer_pos() {
@@ -2435,51 +2444,43 @@ impl App {
                 self.pan = Vec2::ZERO;
             }
         }
-        let scale = fit * self.zoom;
-        let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
-        let border_pts = border_tex * scale;
-        // Keep the sheet covering the viewport when zoomed, centred otherwise.
-        let max_pan = ((size + Vec2::splat(2.0 * border_pts) - avail.size()) * 0.5).max(Vec2::ZERO);
-        self.pan = self.pan.clamp(-max_pan, max_pan);
-        let mut rect = Rect::from_center_size(avail.center() + self.pan, size);
-        if self.crop_open {
-            self.crop_interact(ui, &response, rect);
+        let (mut rect, border_pts, max_pan, pan) = place(self.zoom, self.pan);
+        self.pan = pan;
+        if !response.is_pointer_button_down_on() {
+            self.cross_drag = false;
+        } else if ui.input(|i| i.pointer.primary_pressed()) {
+            self.cross_drag = pressed_on_cross;
+            if self.cross_drag {
+                self.crop_drag = None;
+            }
         }
-        if response.dragged() && self.crop_drag.is_none() {
-            self.pan = (self.pan + response.drag_delta()).clamp(-max_pan, max_pan);
-            rect = Rect::from_center_size(avail.center() + self.pan, size);
+        if self.cross_drag {
+            // The spot follows the pointer. The 1:1 box and Compare read it.
+            if let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) {
+                if rect.width() > 1.0 && rect.height() > 1.0 {
+                    self.sharpen_at = Some([
+                        ((ptr.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64,
+                        ((ptr.y - rect.top()) / rect.height()).clamp(0.0, 1.0) as f64,
+                    ]);
+                }
+            }
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else {
+            if self.crop_open {
+                self.crop_interact(ui, &response, rect);
+            }
+            if response.dragged() && self.crop_drag.is_none() {
+                self.pan = (self.pan + response.drag_delta()).clamp(-max_pan, max_pan);
+                (rect, _, _, _) = place(self.zoom, self.pan);
+            }
         }
         if border_pts > 0.0 {
             painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
         }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-        if self.sharpen_aim && !self.crop_open && response.clicked() {
-            if let Some(ptr) = response.interact_pointer_pos() {
-                if rect.contains(ptr) && rect.width() > 0.0 && rect.height() > 0.0 {
-                    self.sharpen_at = Some([
-                        ((ptr.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64,
-                        ((ptr.y - rect.top()) / rect.height()).clamp(0.0, 1.0) as f64,
-                    ]);
-                    self.sharpen_aim = false;
-                    self.loupe_key = None;
-                }
-            }
-        }
-        if let Some([nx, ny]) = self.sharpen_at {
-            let p = Pos2::new(rect.left() + nx as f32 * rect.width(), rect.top() + ny as f32 * rect.height());
-            let mark = Color32::from_rgb(255, 210, 60);
-            let arm = 7.0;
-            painter.line_segment(
-                [Pos2::new(p.x - arm, p.y), Pos2::new(p.x + arm, p.y)],
-                egui::Stroke::new(1.0, mark),
-            );
-            painter.line_segment(
-                [Pos2::new(p.x, p.y - arm), Pos2::new(p.x, p.y + arm)],
-                egui::Stroke::new(1.0, mark),
-            );
-        }
 
         // Magnification in screen pixels per negative pixel.
+        let size = rect.size();
         let mag = size.x * ppp / uw.max(1) as f32;
         // Once the fit preview would be upscaled, show the real pixels of the
         // visible window instead (rendered by the worker, never sharpened).
@@ -2511,6 +2512,28 @@ impl App {
 
         if self.crop_open {
             self.paint_crop(&painter, rect);
+        }
+        // After the sharp tile and the crop shade, or the cross disappears
+        // under them once the preview would be upscaled.
+        if let Some([nx, ny]) = self.sharpen_at {
+            let p = Pos2::new(rect.left() + nx as f32 * rect.width(), rect.top() + ny as f32 * rect.height());
+            let mark = Color32::from_rgb(255, 210, 60);
+            let arm = 7.0;
+            painter.line_segment(
+                [Pos2::new(p.x - arm, p.y), Pos2::new(p.x + arm, p.y)],
+                egui::Stroke::new(1.0, mark),
+            );
+            painter.line_segment(
+                [Pos2::new(p.x, p.y - arm), Pos2::new(p.x, p.y + arm)],
+                egui::Stroke::new(1.0, mark),
+            );
+            let near = response.hover_pos().is_some_and(|h| h.distance(p) <= CROSS_GRAB);
+            if self.cross_drag {
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else if near && self.crop_drag.is_none() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
+                response.clone().on_hover_text("Drag moves the 1:1 box and Compare.");
+            }
         }
 
         if self.session.is_some() {
@@ -3152,6 +3175,8 @@ const PANEL_W: f32 = 318.0;
 const SLIDER_STOPS: f64 = 2.0;
 /// Gap between the stage edge and a panel.
 const PANEL_GAP: f32 = 12.0;
+/// Grab radius of the crosshair, points. Covers its arms.
+const CROSS_GRAB: f32 = 14.0;
 
 /// One line where the window title bar was: the name, and × to hide the dock.
 fn dock_title(ui: &mut egui::Ui, title: &str) -> bool {

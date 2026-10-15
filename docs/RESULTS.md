@@ -773,14 +773,23 @@ writes one history step. `mimizan print` reads the same field.
 
 ### The same spot, five ways (0.10.6)
 
-With a file open the 1:1 box is always there, centred until ✛ or a drag
-moves it. *Compare* shows that spot for Mimizan and for AMaZE, RCD, DCB
-and LMMSE: mix, place and tone, native pixels, no size step, so the
-enlargement kernel is not in the comparison. The panels pan and zoom
-together; a double click is 1:1. The window does not write the recipe
-and does not change the converter in the menu. A monochrome file has no
-comparison. The three docks and Compare use one heading line (the name
-and ×) instead of a window title bar.
+With a file open the 1:1 box is always there, centred until the crosshair
+or a drag in the box moves it. *Compare* shows that spot for Mimizan and
+for AMaZE, RCD, DCB and LMMSE: mix, place and tone, native pixels, no
+size step, so the enlargement kernel is not in the comparison. The
+panels pan and zoom together; a double click is 1:1. The window does not
+write the recipe and does not change the converter in the menu. A
+monochrome file has no comparison. The three docks and Compare use one
+heading line (the name and ×) instead of a window title bar.
+
+### The crosshair stays put (0.10.7)
+
+Dragging the crosshair on the picture moves the spot. A drag beside it
+still pans the view, and with the crop open it still moves the frame. A
+double click beside the crosshair still toggles fit and 1:1. Once the
+preview would be enlarged, the full-resolution tile is drawn over the
+fit preview. The crosshair is drawn after that tile and after the crop
+shade, so it stays visible and can still be dragged.
 
 ## Real samples
 
