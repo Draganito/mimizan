@@ -20,8 +20,21 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 #include "opthelper.h"
 #include "boxblur.h"
+
+#ifdef _MSC_VER
+// MSVC has no GCC variable-length arrays. This stands in for `T buf[rows][cols]`.
+template<class T>
+struct MsvcVla2D {
+    std::vector<T> store;
+    int cols;
+    MsvcVla2D(int rows, int cols_)
+        : store(static_cast<size_t>(rows) * static_cast<size_t>(cols_)), cols(cols_) {}
+    T* operator[](int row) { return store.data() + static_cast<size_t>(row) * static_cast<size_t>(cols); }
+};
+#endif
 
 enum eGaussType {GAUSS_STANDARD, GAUSS_MULT, GAUSS_DIV};
 
@@ -213,7 +226,11 @@ template<class T> void gauss3x3div (T** RESTRICT src, T** RESTRICT dst, T** REST
 // use separated filter if the support window is small and src == dst
 template<class T> void gaussHorizontal3 (T** src, T** dst, int W, int H, const float c0, const float c1)
 {
+#ifdef _MSC_VER
+    std::vector<T> temp(static_cast<size_t>(W));
+#else
     T temp[W] ALIGNED16;
+#endif
 #ifdef _OPENMP
     #pragma omp for
 #endif
@@ -224,7 +241,7 @@ template<class T> void gaussHorizontal3 (T** src, T** dst, int W, int H, const f
         }
 
         dst[i][0] = src[i][0];
-        memcpy (dst[i] + 1, temp + 1, (W - 2)*sizeof(T));
+        memcpy (dst[i] + 1, &temp[1], (W - 2)*sizeof(T));
 
         dst[i][W - 1] = src[i][W - 1];
     }
@@ -293,7 +310,11 @@ template<class T> void gaussVertical3 (T** src, T** dst, int W, int H, const flo
 #else
 template<class T> void gaussVertical3 (T** src, T** dst, int W, int H, const float c0, const float c1)
 {
+#ifdef _MSC_VER
+    std::vector<T> temp(static_cast<size_t>(H));
+#else
     T temp[H] ALIGNED16;
+#endif
 #ifdef _OPENMP
     #pragma omp for
 #endif
@@ -440,7 +461,11 @@ template<class T> void gaussHorizontal (T** src, T** dst, const int W, const int
             M[i][j] /= (1.0 + b1 - b2 + b3) * (1.0 + b2 + (b1 - b3) * b3);
         }
 
+#ifdef _MSC_VER
+    std::vector<double> temp2(static_cast<size_t>(W));
+#else
     double temp2[W] ALIGNED16;
+#endif
 
 #ifdef _OPENMP
     #pragma omp for
@@ -917,7 +942,11 @@ template<class T> void gaussVertical (T** src, T** dst, const int W, const int H
 
     // process 'numcols' columns for better usage of L1 cpu cache (especially faster for large values of H)
     static const int numcols = 8;
+#ifdef _MSC_VER
+    MsvcVla2D<double> temp2(H, numcols);
+#else
     double temp2[H][numcols] ALIGNED16;
+#endif
     double temp2Hm1[numcols], temp2H[numcols], temp2Hp1[numcols];
 #ifdef _OPENMP
     #pragma omp for nowait
@@ -996,7 +1025,11 @@ template<class T> void gaussVerticaldiv (T** src, T** dst, T** divBuffer, const 
 
     // process 'numcols' columns for better usage of L1 cpu cache (especially faster for large values of H)
     static const int numcols = 8;
+#ifdef _MSC_VER
+    MsvcVla2D<double> temp2(H, numcols);
+#else
     double temp2[H][numcols] ALIGNED16;
+#endif
     double temp2Hm1[numcols], temp2H[numcols], temp2Hp1[numcols];
 #ifdef _OPENMP
     #pragma omp for nowait
@@ -1074,7 +1107,11 @@ template<class T> void gaussVerticalmult (T** src, T** dst, const int W, const i
 
     // process 'numcols' columns for better usage of L1 cpu cache (especially faster for large values of H)
     static const int numcols = 8;
+#ifdef _MSC_VER
+    MsvcVla2D<double> temp2(H, numcols);
+#else
     double temp2[H][numcols] ALIGNED16;
+#endif
     double temp2Hm1[numcols], temp2H[numcols], temp2Hp1[numcols];
 #ifdef _OPENMP
     #pragma omp for nowait
