@@ -790,7 +790,7 @@ nonlinear step can only lose.
 - Liu, Yang, Chen, "Frequency Enhancement for Image Demosaicking",
   arXiv:2503.15800 (as a bound only; no network in this method).
 - D. Bojovic, `docs/whitepaper_v1.pdf` (the original idea), `docs/SPEC.md`
-  (normative constants, German), `docs/RESULTS.md` (all measurements).
+  (normative constants), `docs/RESULTS.md` (all measurements).
 
 ---
 

@@ -43,7 +43,7 @@ way these files were shot, the aim is met. The numbers are under
 Documents: [`docs/PAPER.md`](docs/PAPER.md) (the method as a paper: signal
 model, every formula and constant of the core, evaluation; English),
 [`docs/SPEC.md`](docs/SPEC.md) (the contract: every formula and
-default, German), [`docs/RESULTS.md`](docs/RESULTS.md) (measurements per
+default), [`docs/RESULTS.md`](docs/RESULTS.md) (measurements per
 phase), [`docs/KODAK.md`](docs/KODAK.md), [`docs/KODAK_2X.md`](docs/KODAK_2X.md),
 [`docs/KODAK_LENS.md`](docs/KODAK_LENS.md), [`docs/KODAK_ZF.md`](docs/KODAK_ZF.md)
 and [`docs/KODAK_ZF_SOFT.md`](docs/KODAK_ZF_SOFT.md) (benchmark against
@@ -593,7 +593,7 @@ errors in CI), `cargo test --release` (unit, property and determinism tests),
 ## Status and limits
 
 - Phases 0–7 of the plan are implemented; deviations from the whitepaper are
-  marked **[Abweichung]** in the SPEC with their reason.
+  marked **[Deviation]** in the SPEC with their reason.
 - Reconstruction quality: see "Where it stands". The numbers there are the
   current state, not a target.
 - Reference look and the Z f mix weights are measured; the noise model

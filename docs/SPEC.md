@@ -1,765 +1,758 @@
-# Mimizan Lab SPEC — Zahlen, die der Code braucht
+# Mimizan Lab SPEC — the numbers the code needs
 
-Stand: Oktober 2026. Gilt zusammen mit `whitepaper_v1.pdf`. Wo dieses Dokument
-vom Whitepaper abweicht, gilt dieses Dokument; jede Abweichung ist als
-**[Abweichung]** markiert und begründet. Nichts hier ist "TBD". Jeder Default
-hat einen Wert und eine Einheit.
+As of October 2026. Read with `whitepaper_v1.pdf`. Where this document
+departs from the whitepaper, this document governs; every departure is
+marked **[Deviation]** and given its reason. Nothing here is "TBD". Every
+default has a value and a unit.
 
-Konventionen: `x` ist die Spalte (0 = links), `y` die Zeile (0 = oben).
-`sx = (−1)^x`, `sy = (−1)^y`. Frequenzen in Perioden pro Pixel (c/px),
-Nyquist = 0,5. Alle Bildwerte sind `f64`, normiert so dass Weißpegel = 1,0
-und Schwarzpegel = 0,0.
+Conventions: `x` is the column (0 = left), `y` the row (0 = top).
+`sx = (−1)^x`, `sy = (−1)^y`. Frequencies in cycles per pixel (c/px),
+Nyquist = 0.5. All image values are `f64`, normalised so that white level = 1.0
+and black level = 0.0.
 
 ---
 
-## 1. Geltungsbereich
+## 1. Scope
 
-Eingang: Bayer-RAW mit 2×2-Muster (RGGB, BGGR, GRBG, GBRG), ganzzahlig
-(≤ 16 Bit) oder Float, sowie monochrome DNGs (Photometric `LinearRaw` ohne
-CFA). Ausgeschlossen (Fehler, kein Fallback): X-Trans (6×6), Quad-Bayer in
-voller Auflösung (4×4), Foveon, Nikon High-Efficiency-NEF (HE/HE*), Dateien
-ohne auswertbare CFA-Angabe. Sättigungsmaske, Rauschmodell, Trennung und
-Mischung gelten pro Datei; Kameradatei (`cameras/*.json`) ist optional.
+Input: Bayer RAW with a 2×2 pattern (RGGB, BGGR, GRBG, GBRG), integer
+(≤ 16 bit) or float, and monochrome DNGs (photometric `LinearRaw` without
+a CFA). Excluded (an error, no fallback): X-Trans (6×6), Quad-Bayer at
+full resolution (4×4), Foveon, Nikon high-efficiency NEF (HE/HE*), files
+with no usable CFA statement. The saturation mask, the noise model, the
+separation and the mix apply per file; a camera file (`cameras/*.json`) is
+optional.
 
-## 2. Einlesen
+## 2. Ingest
 
-Dekoder: `rawler` 0.8 hinter dem Trait `RawDecoder`. Gelesen wird das rohe
-CFA-Array (`RawImage.data`), nie ein demosaictes Bild.
+Decoder: `rawler` 0.8 behind the `RawDecoder` trait. What is read is the raw
+CFA array (`RawImage.data`), never a demosaiced image.
 
-| Größe | Quelle | Regel |
+| Quantity | Source | Rule |
 |---|---|---|
-| Schwarzpegel | `blacklevel.levels`: ein Wert für alle Photosites oder ein 2×2-Tile (CFA-Reihenfolge); andere Kachelgrößen sind ein Fehler | pro Photosite abziehen |
-| Weißpegel | `whitelevel.0`; ein Wert oder vier (RGBE-Reihenfolge nach Farbe) | pro Photosite teilen |
-| CFA-Phase | `photometric = Cfa(cfg)`, `cfg.cfa.name` ∈ {RGGB, BGGR, GRBG, GBRG}, relativ zur vollen Sensorfläche (vor Crop) | Pflicht; Kameradatei darf nur bestätigen, nicht überschreiben |
-| Crop | `crop_area` (Herstellerempfehlung); falls `None`: `active_area`; falls `None`: ganzes Bild | Crop-Ursprung muss gerade sein, sonst um 1 nach innen verschieben, damit die Phase erhalten bleibt |
-| Monochrom | `photometric = LinearRaw` oder `BlackIsZero` mit `cpp = 1` | keine Trennung; `L = m` |
+| Black level | `blacklevel.levels`: one value for every photosite, or a 2×2 tile (CFA order); any other tile size is an error | subtract per photosite |
+| White level | `whitelevel.0`; one value or four (RGBE order by colour) | divide per photosite |
+| CFA phase | `photometric = Cfa(cfg)`, `cfg.cfa.name` ∈ {RGGB, BGGR, GRBG, GBRG}, relative to the full sensor (before the crop) | required; a camera file may only confirm it, not override it |
+| Crop | `crop_area` (the manufacturer's recommendation); if `None`: `active_area`; if `None`: the whole image | the crop origin must be even, otherwise shift it inward by 1 so the phase is kept |
+| Monochrome | `photometric = LinearRaw` or `BlackIsZero` with `cpp = 1` | no separation; `L = m` |
 
-Normierung: `m = (raw − black) / (white − black)`. Werte unter 0 bleiben
-negativ (Rauschen darf nicht geklippt werden), Werte über 1 bleiben über 1
-bis zur Sättigungsregel.
+Normalisation: `m = (raw − black) / (white − black)`. Values below 0 stay
+negative (noise must not be clipped), values above 1 stay above 1 until
+the saturation rule.
 
-**Sättigung.** Photosite gesättigt, wenn `raw ≥ white·(1 − sat_margin)` mit
-`sat_margin = 0,02` (**[Abweichung]**: das Whitepaper sagt "8 Stufen", ohne
-Einheit; bei 14 Bit wären 8 DN zu knapp, Sensoren werden Prozent vor dem
-Weißpegel nichtlinear). Die Sättigungsmaske wird um 2 px dilatiert (die
-gleichphasigen Nachbarn teilen den Schätzfehler). Gesättigte Photosites
-bleiben mit ihrem geklippten Wert im Bild; sie werden in der Statistik
-(Fits, Messungen) ausgeschlossen und in der Masken-Sidecar als 255 markiert.
+**Saturation.** A photosite is saturated when `raw ≥ white·(1 − sat_margin)`
+with `sat_margin = 0.02` (**[Deviation]**: the whitepaper says "8 steps",
+with no unit; at 14 bit, 8 DN would be too tight, and sensors go nonlinear
+a percentage short of the white level). The saturation mask is dilated by
+2 px (the same-phase neighbours share the estimation error). Saturated
+photosites stay in the image at their clipped value; they are excluded from
+statistics (fits, measurements) and marked 255 in the mask sidecar.
 
-**Defekte.** Für jede Photosite `v` die acht gleichphasigen Nachbarn
-(Abstand 2 in x und/oder y), Median `med`, Minimum `lo`, Maximum `hi`.
-Wenn `max(v − hi, lo − v) > max(8·σ(med), hi − lo)` (σ aus Abschnitt 3),
-ersetze `v := med`. Die Nachbarspanne `hi − lo` ist ein modellfreier
-Rauschmaßstab (≈ 3σ bei acht Nachbarn), damit die Regel auch bei ISO-Werten
-oberhalb der Rauschdefaults hält. **[Abweichung]**: Das Whitepaper vergleicht nur gegen den
-Median; an jeder scharfen Kante liegt ein Pixel mehr als 8σ vom
-Nachbar-Median entfernt (gemessen: 8 % aller Photosites der Z f-Probe).
-Ein Defekt liegt außerhalb des Nachbar-Wertebereichs, eine Kante nicht. Gesättigte Photosites und ihre
-Nachbarn sind von der Defektregel ausgenommen. Die Defektkarte wird gezählt
-und geloggt (Anzahl, Anteil, Zeilenhäufungen als PDAF-Hinweis).
-Die Reparatur ersetzt gemessene Werte; in der GUI ist sie deshalb per Default
-aus (Development → *repair defects*), die CLI hält sie an (`--no-defects`
-schaltet ab).
+**Defects.** For each photosite `v`, the eight same-phase neighbours
+(distance 2 in x and/or y), median `med`, minimum `lo`, maximum `hi`.
+If `max(v − hi, lo − v) > max(8·σ(med), hi − lo)` (σ from section 3),
+replace `v := med`. The neighbour span `hi − lo` is a model-free noise
+scale (≈ 3σ for eight neighbours), so the rule still holds at ISO values
+above the noise defaults. **[Deviation]**: the whitepaper compares against
+the median only; on every sharp edge a pixel lies more than 8σ from the
+neighbour median (measured: 8 % of all photosites in the Z f sample).
+A defect lies outside the neighbours' value range, an edge does not.
+Saturated photosites and their neighbours are exempt from the defect rule.
+The defect map is counted and logged (count, fraction, row clusters as a
+PDAF hint). The repair replaces measured values; in the GUI it is therefore
+off by default (Development → *repair defects*), and the CLI keeps it on
+(`--no-defects` turns it off).
 
-**Kanalabgleich.** Nach Normierung und Defektregel wird jede Photosite mit
-dem Multiplikator ihres Kanals `k_R, k_G = 1, k_B` multipliziert
-(`--wb`): Default `as-shot` aus der Datei (`wb_coeffs`, auf G normiert),
-Fallback und Option `gray` (Grauwelt: `k_c = mean_G / mean_c` über
-ungesättigte Photosites), `none`, oder drei Zahlen. **[Abweichung,
-gemessen]**: Das Whitepaper trennt auf Rohpegeln. Dann ist ein neutrales
-Motiv in den Rohkanälen nicht neutral, die Chrominanz ist proportional zur
-Luminanz (`C1, C2 ∝ L`) und das *gesamte* Luminanzspektrum sitzt als Kopie
-auf den Trägern. Die Maske muss dann überall "Chrominanz" sagen; die
-adaptive Stufe wird wirkungslos. Mit Abgleich sind die Träger neutraler
-Motive leer, und die Maske kann Luminanz stehen lassen (Siemensstern:
-MTF10 0,405 → 0,451 = Wahrheit, RESULTS.md). Alle folgenden Abschnitte
-rechnen auf abgeglichenen Kanälen; die Gewichte in Abschnitt 6 beziehen
-sich auf abgeglichene Kanäle (ein neutraler Grauwert gibt für jedes
-Gewichtstripel denselben Ausgang, wie Filterfaktor-kompensierte
-Schwarzweißfilter).
+**Channel balance.** After normalisation and the defect rule, each photosite
+is multiplied by its channel's factor `k_R, k_G = 1, k_B` (`--wb`): default
+`as-shot` from the file (`wb_coeffs`, normalised to G), with fallback and
+option `gray` (gray-world: `k_c = mean_G / mean_c` over unsaturated
+photosites), `none`, or three numbers. **[Deviation, measured]**: the
+whitepaper separates on raw levels. A neutral subject is then not neutral
+in the raw channels, the chrominance is proportional to the luminance
+(`C1, C2 ∝ L`), and the *entire* luminance spectrum sits as a copy on the
+carriers. The mask then has to call everything "chrominance"; the adaptive
+stage does nothing. With the balance, the carriers of a neutral subject
+are empty, and the mask can leave luminance alone (Siemens star:
+MTF10 0.405 → 0.451 = truth, RESULTS.md). Every section below works on
+balanced channels; the weights in section 6 refer to balanced channels (a
+neutral grey gives the same output for every weight triple, as
+filter-factor-compensated black-and-white filters do).
 
-## 3. Rauschmodell
+## 3. Noise model
 
-Standardabweichung in normierten Einheiten:
+Standard deviation in normalised units:
 
     σ(s) = noise_a · sqrt(max(s, 0)) + noise_b
 
-**[Abweichung]**: Das Whitepaper nennt `noise_a = 0,005`, `noise_b = 10⁻⁵`
-ohne Modellform. Als Varianzform wäre `a = 0,005` ISO-50 000-Niveau (SNR ≈ 6
-bei Mittelgrau) und die Maske bliebe überall bei 0,5. Als
-Standardabweichungsform passt `a = 0,005` zu einer 24-MP-Kamera bei
-Basis-ISO (gemessen ≈ 28 DN bei 14 Bit, Modell ≈ 34 DN).
+**[Deviation]**: the whitepaper names `noise_a = 0.005`, `noise_b = 10⁻⁵`
+with no model form. As a variance, `a = 0.005` would be ISO-50 000 territory
+(SNR ≈ 6 at mid-grey) and the mask would stay at 0.5 everywhere. As a
+standard deviation, `a = 0.005` fits a 24 MP camera at base ISO (measured
+≈ 28 DN at 14 bit, model ≈ 34 DN).
 
-Defaults bis ein Dunkelbild vorliegt: `noise_a = 0,005`, `noise_b = 2·10⁻⁴`
-(≈ 3 DN bei 14 Bit; das Whitepaper-`10⁻⁵` wäre 0,16 DN und damit unterhalb
-jedes realen Ausleserauschens).
+Defaults until a dark frame exists: `noise_a = 0.005`, `noise_b = 2·10⁻⁴`
+(≈ 3 DN at 14 bit; the whitepaper's `10⁻⁵` would be 0.16 DN, below any
+real read noise).
 
-Das Modell gilt für Rohpegel. Nach dem Kanalabgleich hat eine Photosite der
-Farbe c mit abgeglichenem Pegel `s` die Varianz `k_c²·σ²(s / k_c)`. Die
-mittlere Varianz eines Blocks ist das Bayer-gewichtete Mittel
-`¼·Var_R + ½·Var_G + ¼·Var_B` mit den *kanalweisen* Blockmitteln (ein
-gemeinsames Blockmittel unterschätzt rote Blöcke um bis zu 15 %, gemessen).
+The model applies to raw levels. After the channel balance, a photosite of
+colour c at balanced level `s` has variance `k_c²·σ²(s / k_c)`. The mean
+variance of a block is the Bayer-weighted mean
+`¼·Var_R + ½·Var_G + ¼·Var_B` of the *per-channel* block means (one shared
+block mean underestimates red blocks by up to 15 %, measured).
 
-## 4. Zerlegung
+## 4. Decomposition
 
-Mit `L = (R + 2G + B)/4`, `C1 = (−R + 2G − B)/4`, `C2 = (R − B)/4`
-(Vorzeichen wie im Whitepaper) gilt für jede 2×2-Phase
+With `L = (R + 2G + B)/4`, `C1 = (−R + 2G − B)/4`, `C2 = (R − B)/4`
+(signs as in the whitepaper), every 2×2 phase satisfies
 
     m(x, y) = L + ε·sx·sy·C1 + C2·(a·sx + b·sy)
 
-| Phase (Farbe bei (0,0),(1,0),(0,1),(1,1)) | ε | a | b |
+| Phase (colour at (0,0),(1,0),(0,1),(1,1)) | ε | a | b |
 |---|---|---|---|
 | RGGB | −1 | +1 | +1 |
 | BGGR | −1 | −1 | −1 |
 | GRBG | +1 | −1 | +1 |
 | GBRG | +1 | +1 | −1 |
 
-Herleitung: `p_R = (1 + r_x·sx)(1 + r_y·sy)/4` mit `r_x, r_y = ±1` nach der
-Lage von R, analog B mit umgekehrten Vorzeichen; `p_G = 1 − p_R − p_B`.
-Die Whitepaper-Formel `C2·[(−1)^x − (−1)^y]` ist der Fall GBRG.
+Derivation: `p_R = (1 + r_x·sx)(1 + r_y·sy)/4` with `r_x, r_y = ±1`
+according to where R sits, and B likewise with the signs reversed;
+`p_G = 1 − p_R − p_B`. The whitepaper formula `C2·[(−1)^x − (−1)^y]` is
+the GBRG case.
 
-Umkehrung (wird für die Mischung gebraucht):
+Inverse (needed for the mix):
 
     G = L + C1
     R = L − C1 + 2·C2
     B = L − C1 − 2·C2
 
-Träger: C1 bei (0,5; 0,5); C2 bei (0,5; 0) und (0; 0,5). Chrominanz ist
-physikalisch auf |f| ≤ 0,25 c/px um ihren Träger begrenzt.
+Carriers: C1 at (0.5, 0.5); C2 at (0.5, 0) and (0, 0.5). Chrominance is
+physically limited to |f| ≤ 0.25 c/px around its carrier.
 
-## 5. Trennung
+## 5. Separation
 
-### 5.1 Demodulation und Tiefpass (feste Stufe)
+### 5.1 Demodulation and low-pass (fixed stage)
 
     z1  = ε·sx·sy·m          Ĉ1  = LP(z1)
     z2a = a·sx·m             Ĉ2a = LP(z2a)
     z2b = b·sy·m             Ĉ2b = LP(z2b)
 
-`LP` ist ein separabler Tiefpass (erst Zeilen, dann Spalten) mit identischem
-1-D-Kern, Kaiser-gefensterter Sinc:
+`LP` is a separable low-pass (rows first, then columns) with the same
+1-D kernel, a Kaiser-windowed sinc:
 
-| Parameter | Default | Bedeutung |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `chroma_cutoff` | 0,15 c/px | −6-dB-Grenze |
-| `chroma_transition` | 0,05 c/px | Übergangsbreite (Durchlass bis 0,125, Sperre ab 0,175) |
-| `chroma_attenuation` | 60 dB | Sperrdämpfung → Kaiser β = 0,1102·(A − 8,7) = 5,65 |
-| Taps | aus den dreien berechnet, ungerade | N = ceil((A − 8)/(2,285·2π·Δf)) → 73 |
+| `chroma_cutoff` | 0.15 c/px | −6 dB point |
+| `chroma_transition` | 0.05 c/px | transition width (passband to 0.125, stopband from 0.175) |
+| `chroma_attenuation` | 60 dB | stopband attenuation → Kaiser β = 0.1102·(A − 8.7) = 5.65 |
+| Taps | computed from the three, odd | N = ceil((A − 8)/(2.285·2π·Δf)) → 73 |
 
-Rand: Spiegelung ohne Wiederholung des Randpixels ("reflect-101").
-Der Kern wird so korrigiert (Konstante plus alternierende Konstante), dass
-die Summe exakt 1 und die Antwort bei 0,5 c/px exakt 0 ist: ein flaches
-Farbfeld trennt dann ohne jedes 2-px-Residuum (die Träger liegen bei
-Nyquist). Das Durchlassband ist quadratisch
-(|fx| < fc und |fy| < fc), nicht kreisförmig; die Ecken des Quadrats liegen
-bei 0,21 c/px und damit noch innerhalb der physikalischen Chroma-Grenze.
+Edge: reflection without repeating the edge pixel ("reflect-101").
+The kernel is corrected (a constant plus an alternating constant) so that
+the sum is exactly 1 and the response at 0.5 c/px is exactly 0: a flat
+colour field then separates with no 2 px residue at all (the carriers sit
+at Nyquist). The passband is square
+(|fx| < fc and |fy| < fc), not circular; the corners of the square lie
+at 0.21 c/px and so still inside the physical chroma limit.
 
-**[Abweichung]**: Das Whitepaper sagt "volle FFT". Die Träger liegen fest,
-also ist die Trennung eine Faltung mit festem Kern; im Ortsbereich ist sie
-schneller, speicherärmer (keine komplexen 45-MP-Arrays in f64) und
-deterministisch. Ergebnis ist identisch bis auf Rundung.
+**[Deviation]**: the whitepaper says "full FFT". The carriers are fixed,
+so the separation is a convolution with a fixed kernel; in the spatial
+domain it is faster, leaner in memory (no complex 45 MP arrays in f64) and
+deterministic. The result is identical up to rounding.
 
-### 5.2 Blockmaske (`--mask adaptive`, nicht mehr Default, siehe 5.5)
+### 5.2 Block mask (`--mask adaptive`, no longer the default, see 5.5)
 
-Blöcke 64×64, Schritt 32 (50 % Überlapp), 2-D-Hann-Fenster, 2-D-FFT in
-f64, Blockmittel vor dem Fenster abgezogen. Pro Block und Träger
-k ∈ {C1, C2a, C2b} aus dem Blockspektrum von `m` (Supremumsnorm, passend
-zum quadratischen Durchlassband):
+Blocks of 64×64, stride 32 (50 % overlap), 2-D Hann window, 2-D FFT in
+f64, block mean subtracted before the window. Per block and carrier
+k ∈ {C1, C2a, C2b}, from the block spectrum of `m` (supremum norm, matching
+the square passband):
 
-    Kern   |f − f_k|_∞ < 0,05           immer Chrominanz (Farbton des Blocks, Farbkanten)
-    Band   0,05 ≤ |f − f_k|_∞ < 0,15    strittig: P_C(k) = Σ |M(f)|²
-    Ring   0,15 ≤ |f − f_k|_∞ < 0,35    Luminanz-Nachweis: P_L(k) = Σ |M(f)|²
+    Core   |f − f_k|_∞ < 0.05           always chrominance (the block's hue, colour edges)
+    Band   0.05 ≤ |f − f_k|_∞ < 0.15    disputed: P_C(k) = Σ |M(f)|²
+    Ring   0.15 ≤ |f − f_k|_∞ < 0.35    luminance evidence: P_L(k) = Σ |M(f)|²
 
-Erwartete Rauschenergie pro Bin `N_bin = Var_Block·Σ w²` (Abschnitt 3,
-kanalweise Blockmittel). Mit `n_C, n_L` Bins je Region:
+Expected noise energy per bin `N_bin = Var_Block·Σ w²` (section 3,
+per-channel block means). With `n_C, n_L` bins in each region:
 
     E_L = max(P_L − n_L·N_bin − 3·N_bin·sqrt(16·n_L), 0)
     E_C = max(P_C − n_C·N_bin − 3·N_bin·sqrt(8·n_C), 0)
-    M_k = 0                                        falls E_L = 0  (kein Luminanz-Nachweis)
-    M_k = 1                                        falls E_C = 0  (im Band nur Rauschen)
-    M_k = min( min(1, 0,3·E_L / E_C)²,
-               sqrt(n_C·N_bin / (E_C − 0,3·E_L)) )  sonst
+    M_k = 0                                        if E_L = 0  (no luminance evidence)
+    M_k = 1                                        if E_C = 0  (only noise in the band)
+    M_k = min( min(1, 0.3·E_L / E_C)²,
+               sqrt(n_C·N_bin / (E_C − 0.3·E_L)) )  otherwise
 
-`M_k` ∈ [0, 1]: 1 heißt "Bandinhalt ist Luminanz, stehen lassen", 0 heißt
-"Bandinhalt ist Chrominanz, entfernen". Blöcke mit mehr als 25 %
-gesättigten Photosites bekommen `M_k = 0` für alle k.
+`M_k` ∈ [0, 1]: 1 means "the band content is luminance, leave it", 0 means
+"the band content is chrominance, remove it". Blocks with more than 25 %
+saturated photosites get `M_k = 0` for every k.
 
-**[Abweichung, gemessen]** gegenüber `M = E_L/(E_L + E_C)`, 0,5 unter 2σ:
+**[Deviation, measured]** from `M = E_L/(E_L + E_C)`, 0.5 below 2σ:
 
-- *Kern immer entfernen.* Der Farbton eines Blocks und der Übergang an
-  Farbkanten liegen unter 0,05 c/px um den Träger; dort gibt es keine
-  Luminanz zu retten. Ohne diese Regel ließ jeder Block mit M > 0 den
-  Farbton als 2-px-Gitter stehen.
-- *Faktoren 16 und 8.* Die Summen über Bins eines Hann-gefensterten
-  Bayer-Rauschspektrums streuen nicht wie unabhängige χ²-Bins
-  (`sqrt(2·n)`), sondern 2,9× (Ring) bzw. 2× (Band) stärker: Fensterkorrelation,
-  konjugierte Symmetrie und die 2×2-Untergitter (jedes Farbspektrum
-  wiederholt sich mit Periode 0,5). Gemessen auf reinem Rauschen (Test
-  `noise_sum_fluctuation_matches_constants`). Mit `sqrt(2·n)` sprach die
-  Maske in flachen Feldern ständig an.
-- *Leck-Verhältnis 0,3.* Luminanz mit 1/f²-Spektrum (Kanten) legt nur
-  ∫₀,₃₅^0,5 f⁻² / ∫₀,₁₅^0,35 f⁻² ≈ 0,225 der Ringenergie ins Band; 0,3
-  lässt Texturen etwas Spielraum. Was im Band darüber hinausgeht, ist
-  Chrominanz.
-- *Quadrat.* Zweifelsfälle (Farbkante mit Helligkeitskante) fallen auf den
-  festen Schätzer zurück; eine Farbkante mit 16 % stehengelassener
-  Bandchrominanz wäre ein sichtbares Gitter.
-- *Deckel.* Das stehengelassene Residuum der nicht durch den Ring
-  erklärbaren Bandenergie bleibt unter dem Rauschboden des Bandes:
+- *Always remove the core.* A block's hue and the transition at colour
+  edges lie under 0.05 c/px around the carrier; there is no luminance
+  there to save. Without this rule every block with M > 0 left the hue
+  standing as a 2 px grid.
+- *Factors 16 and 8.* Sums over the bins of a Hann-windowed Bayer noise
+  spectrum do not scatter like independent χ² bins (`sqrt(2·n)`), but
+  2.9× (ring) and 2× (band) more strongly: window correlation, conjugate
+  symmetry and the 2×2 sublattices (each colour spectrum repeats with
+  period 0.5). Measured on pure noise (test
+  `noise_sum_fluctuation_matches_constants`). With `sqrt(2·n)` the mask
+  kept firing in flat fields.
+- *Leak ratio 0.3.* Luminance with a 1/f² spectrum (edges) puts only
+  ∫₀.₃₅^0.5 f⁻² / ∫₀.₁₅^0.35 f⁻² ≈ 0.225 of the ring energy into the band;
+  0.3 leaves textures a little room. Whatever exceeds that in the band is
+  chrominance.
+- *Square.* Doubtful cases (a colour edge with a luminance edge) fall back
+  to the fixed estimator; a colour edge with 16 % of its band chrominance
+  left standing would be a visible grid.
+- *Cap.* The residue left standing from band energy the ring does not
+  explain stays under the noise floor of the band:
   `M²·(E_C − leak) ≤ n_C·N_bin`.
-- *Statt 0,5: 0.* Ohne Nachweis gilt der feste Schätzer (M = 0). 0,5 würde
-  an jeder Farbkante die halbe Bandchrominanz stehen lassen.
-- *Erosion.* Vor der Interpolation wird das Blockgitter mit einem
-  3×3-Minimum erodiert: ein Block, der "Chrominanz" sagt, gewinnt gegen
-  seine Nachbarn, damit die bilineare Interpolation kein M > 0 in die 32 px
-  neben einer Farbkante trägt (gemessen: Farbfeldtafel, Trägerenergie 96×
-  Rauschen → 0,8× nach Erosion).
+- *0 instead of 0.5.* With no evidence the fixed estimator applies (M = 0).
+  0.5 would leave half the band chrominance standing on every colour edge.
+- *Erosion.* Before interpolation the block grid is eroded with a 3×3
+  minimum: a block that says "chrominance" wins against its neighbours, so
+  bilinear interpolation carries no M > 0 into the 32 px beside a colour
+  edge (measured: colour-patch chart, carrier energy 96× noise → 0.8×
+  after erosion).
 
-Blockwerte sitzen auf den Blockmitten und werden bilinear auf Pixel
-interpoliert; außerhalb der äußersten Blockmitten wird geklemmt. Die
-Blockanalyse ist reine Analyse (das Fenster wird einmal angewendet, Hann mit
-50 % Überlapp ist COLA); es gibt keine Block-Synthese und damit keine
-Blockrand-Artefakte. Bilder unter 64 px in einer Richtung laufen mit dem
-festen Schätzer.
+Block values sit on the block centres and are interpolated bilinearly onto
+pixels; outside the outermost block centres they are clamped. The block
+analysis is analysis only (the window is applied once; Hann at 50 % overlap
+is COLA); there is no block synthesis and therefore no block-edge artefact.
+Images under 64 px in either direction run with the fixed estimator.
 
-Zwei C2-Kopien (Dubois): `ρ_a = 1 − M_2a`, `ρ_b = 1 − M_2b`,
+Two C2 copies (Dubois): `ρ_a = 1 − M_2a`, `ρ_b = 1 − M_2b`,
 
-    Ĉ2' = (ρ_a·Ĉ2a' + ρ_b·Ĉ2b') / (ρ_a + ρ_b)      falls ρ_a + ρ_b > 10⁻⁹
-        = (Ĉ2a' + Ĉ2b') / 2                        sonst (beide voll maskiert)
+    Ĉ2' = (ρ_a·Ĉ2a' + ρ_b·Ĉ2b') / (ρ_a + ρ_b)      if ρ_a + ρ_b > 10⁻⁹
+        = (Ĉ2a' + Ĉ2b') / 2                        otherwise (both fully masked)
     g2 = max(ρ_a, ρ_b)
     g1 = 1 − M_1
 
-Die Kombination gilt für die bereits nach 5.3 zerlegten Schätzungen `Ĉ'`.
-**[Abweichung, gemessen]**: Eine frühere Fassung mit `+10⁻⁶` im Nenner
-ließ bei `M_2a = M_2b = 1` den Kern beider Kopien verschwinden
-(`0/10⁻⁶ = 0`), d. h. in texturierten Flächen mit Farbstich blieb der
-Chroma-Gleichanteil als 2-px-Gitter in `L̂` (sichtbar im Z-f-Testbild auf
-dem Stich auf getöntem Papier). Mit dem Mittelwert bleibt der Kern immer
-Chroma, wie 5.3 fordert.
+The combination applies to the estimates `Ĉ'` already decomposed by 5.3.
+**[Deviation, measured]**: an earlier form with `+10⁻⁶` in the denominator
+made the core of both copies vanish at `M_2a = M_2b = 1`
+(`0/10⁻⁶ = 0`), so in textured areas with a colour cast the chroma DC
+stayed in `L̂` as a 2 px grid (visible in the Z f test picture, on the
+cast on tinted paper). With the mean, the core is always chroma, as 5.3
+requires.
 
-### 5.3 Luminanz
+### 5.3 Luminance
 
-Jede Chrominanzschätzung wird in Kern und Band zerlegt. Der Kern ist der
-Tiefpass von `Ĉ` auf 0,05 c/px (Kaiser-Sinc wie 5.1, Übergang 0,05 c/px,
-gerechnet auf halber Auflösung, da `Ĉ` unter 0,175 c/px bandbegrenzt ist,
-und bilinear zurück):
+Each chrominance estimate is split into core and band. The core is the
+low-pass of `Ĉ` at 0.05 c/px (Kaiser sinc as in 5.1, transition 0.05 c/px,
+computed at half resolution, since `Ĉ` is band-limited below 0.175 c/px,
+and bilinearly back):
 
-    Ĉ_k' = g_k·Ĉ_k + (1 − g_k)·Kern(Ĉ_k)
+    Ĉ_k' = g_k·Ĉ_k + (1 − g_k)·Core(Ĉ_k)
     L̂ = m − ε·sx·sy·Ĉ1' − (a·sx + b·sy)·Ĉ2'
 
-(Die Form `g·Ĉ + (1−g)·Kern` ist bei `g = 1` und `g = 0` exakt, so dass
-der adaptive Pfad auf Flächen ohne Maske bitgleich zum festen Schätzer
-ist.)
+(The form `g·Ĉ + (1−g)·Core` is exact at `g = 1` and `g = 0`, so the
+adaptive path is bit-identical to the fixed estimator on areas the mask
+leaves alone.)
 
-Ohne adaptive Stufe (`--mask off`) gilt `g1 = g2 = 1`, also `Ĉ' = Ĉ`, und
+Without the adaptive stage (`--mask off`), `g1 = g2 = 1`, so `Ĉ' = Ĉ`, and
 `Ĉ2 = (Ĉ2a + Ĉ2b)/2`.
 
-### 5.4 Konsistenzschleife
+### 5.4 Consistency loop
 
-**[Abweichung]**: Das Whitepaper nennt POCS. Eine Projektion auf die
-Messwerte würde das Mosaik in `L̂` zurückschreiben, was das Whitepaper selbst
-verbietet. Was bleibt, ist die Kreuzterm-Bereinigung zwischen den Trägern
-(Gauss-Seidel): Vor der Demodulation von Träger k werden die aktuell
-geschätzten Beiträge der anderen Träger abgezogen.
+**[Deviation]**: the whitepaper names POCS. A projection onto the
+measurements would write the mosaic back into `L̂`, which the whitepaper
+itself forbids. What remains is the cross-term cleanup between the
+carriers (Gauss–Seidel): before demodulating carrier k, the current
+estimates of the other carriers' contributions are subtracted.
 
-    Runde n:
-      für k in (C1, C2a, C2b):
-        m_k = m − Σ_{j≠k} g_j·carrier_j·Ĉ_j        (mit den aktuellsten Ĉ_j)
+    Round n:
+      for k in (C1, C2a, C2b):
+        m_k = m − Σ_{j≠k} g_j·carrier_j·Ĉ_j        (with the latest Ĉ_j)
         Ĉ_k = LP(carrier_k · m_k)
-      L̂_n nach 5.3
-    Abbruch, wenn
+      L̂_n by 5.3
+    Stop when
       ‖L̂_n − L̂_{n−1}‖₂ / ‖L̂_{n−1}‖₂ < 10⁻⁴
-      oder n = consistency_rounds_max
+      or n = consistency_rounds_max
 
-Default `consistency_rounds_max = 1` (**[gemessen]**: auf der Messbank
-änderte keine weitere Runde eine Kennzahl jenseits der vierten Stelle,
-während sich die Laufzeit verdoppelte; `--rounds` bleibt als Option). Die
-Maske wird in der Schleife nicht neu berechnet.
+Default `consistency_rounds_max = 1` (**[measured]**: on the bench no
+further round changed a figure past the fourth digit, while the run time
+doubled; `--rounds` stays as an option). The mask is not recomputed inside
+the loop.
 
-### 5.5 Pixeladaptive Trennung (`--mask dubois`, Default)
+### 5.5 Pixel-adaptive separation (`--mask dubois`, the default)
 
-**[Abweichung, gemessen]** gegenüber 5.1–5.3 (Kodak-Messbank, RESULTS.md
-letzter Abschnitt): Die feste Stufe mittelt die beiden C2-Kopien, obwohl
-Luminanz immer nur in eine von ihnen leckt (vertikale Linienmuster in die
-Kopie bei (0,5, 0), horizontale in die bei (0, 0,5)); die Blockmaske kann
-ein Linienmuster innerhalb des Bandes nicht von Chrominanz unterscheiden
-(gleiches Band/Ring-Verhältnis) und reduziert sich nach der Erosion fast
-überall auf das Mittel; und das quadratische Band verschenkt entlang des
-Trägers Chroma-Bandbreite, wo der einzige Nachbar die andere
-Chroma-Komponente ist. Ersatz nach Dubois (2005), auf C1 erweitert:
+**[Deviation, measured]** from 5.1–5.3 (Kodak bench, RESULTS.md, last
+section): the fixed stage averages the two C2 copies, although luminance
+leaks into only one of them at a time (vertical line patterns into the
+copy at (0.5, 0), horizontal into the one at (0, 0.5)); the block mask
+cannot tell a line pattern inside the band from chrominance (the same
+band/ring ratio) and, after the erosion, collapses almost everywhere to
+the mean; and the square band gives away chroma bandwidth along the
+carrier, where the only neighbour is the other chroma component.
+Replacement after Dubois (2005), extended to C1:
 
-Zwei Hypothesen mit separablen Kaiser-Sinc-Tiefpässen (Kerne wie 5.1,
-`LP_n` schmal, `LP_w` breit; Zeilen × Spalten):
+Two hypotheses with separable Kaiser-sinc low-passes (kernels as in 5.1,
+`LP_n` narrow, `LP_w` wide; rows × columns):
 
-    H (horizontale Struktur, Spektrum entlang v; Kopie a sauber):
+    H (horizontal structure, spectrum along v; copy a clean):
       Ĉ2a = LP_n,x LP_w,y (a·sx·m)       Ĉ1_H = LP_n,x LP_w,y (ε·sx·sy·m)
-    V (vertikale Struktur, Spektrum entlang u; Kopie b sauber):
+    V (vertical structure, spectrum along u; copy b clean):
       Ĉ2b = LP_w,x LP_n,y (b·sy·m)       Ĉ1_V = LP_w,x LP_n,y (ε·sx·sy·m)
 
-Lokale Energien und Gewicht pro Pixel:
+Local energies and a weight per pixel:
 
     e_a = G_σ * Ĉ2a²      e_b = G_σ * Ĉ2b²
-    w_H = e_b / (e_a + e_b)        (0,5 falls e_a + e_b ≤ 10⁻¹⁸)
+    w_H = e_b / (e_a + e_b)        (0.5 if e_a + e_b ≤ 10⁻¹⁸)
     Ĉ2 = w_H·Ĉ2a + (1 − w_H)·Ĉ2b
     Ĉ1 = w_H·Ĉ1_H + (1 − w_H)·Ĉ1_V
     L̂ = m − ε·sx·sy·Ĉ1 − (a·sx + b·sy)·Ĉ2
 
-Die Kopie mit der kleineren lokalen Energie ist die vertrauenswürdige: die
-Chrominanz steht in beiden, der Überschuss ist Luminanz. Dasselbe Gewicht
-wählt die Richtung des C1-Bandes.
+The copy with the smaller local energy is the one to trust: the
+chrominance is in both, the excess is luminance. The same weight chooses
+the direction of the C1 band.
 
-**Kohärenzring** (seit 0.3.0, **[gemessen]**, RESULTS „Coherence ring“):
-Das längliche Band bezahlt überall mit Chroma-Bandbreite, auch wo keine
-Luminanz nahe dem Träger liegt. Wo der Ring zwischen dem schmalen
-quadratischen Band (`c2_narrow`) und einem breiteren quadratischen Band
-(`ring_wide`) in beiden Kopien denselben Inhalt trägt, ist er Chrominanz
-(Luminanz leckt nur in eine Kopie) und das Band darf auf die quadratische
-breite Form geöffnet werden. Mit `LP_r` dem quadratischen Tiefpass bei
-`ring_wide`, vor der Gewichtung der Kopien:
+**Coherence ring** (since 0.3.0, **[measured]**, RESULTS "Coherence ring"):
+the elongated band pays with chroma bandwidth everywhere, including where
+no luminance lies near the carrier. Where the ring between the narrow
+square band (`c2_narrow`) and a wider square band (`ring_wide`) carries
+the same content in both copies, it is chrominance (luminance leaks into
+only one copy) and the band may be opened to the wide square form. With
+`LP_r` the square low-pass at `ring_wide`, before the copies are weighted:
 
-    rA = LP_r,x LP_r,y (a·sx·m) − LP_n,x LP_n,y (a·sx·m)       (Kopie a, quadratisch breit minus schmal)
+    rA = LP_r,x LP_r,y (a·sx·m) − LP_n,x LP_n,y (a·sx·m)       (copy a, square wide minus narrow)
     rB = LP_r,x LP_r,y (b·sy·m) − LP_n,x LP_n,y (b·sy·m)
-    κ  = clamp( G_σ*(rA·rB) / sqrt( G_σ*rA² · G_σ*rB² ), 0, 1 )^ring_power     (0 falls Nenner ≤ 10⁻¹⁸)
-    Ĉ2a := Ĉ2a + κ·(LP_r,x LP_r,y (a·sx·m) − Ĉ2a)       ebenso Ĉ2b; danach die Mischung mit w_H
-    Ĉ1  := Ĉ1  + κ·(LP_r,x LP_r,y (ε·sx·sy·m) − Ĉ1)     falls ring_c1, nach der Richtungsmischung
+    κ  = clamp( G_σ*(rA·rB) / sqrt( G_σ*rA² · G_σ*rB² ), 0, 1 )^ring_power     (0 if the denominator ≤ 10⁻¹⁸)
+    Ĉ2a := Ĉ2a + κ·(LP_r,x LP_r,y (a·sx·m) − Ĉ2a)       likewise Ĉ2b; then the mix with w_H
+    Ĉ1  := Ĉ1  + κ·(LP_r,x LP_r,y (ε·sx·sy·m) − Ĉ1)     if ring_c1, after the directional mix
 
-κ ist die normierte Kreuzkorrelation der beiden Ringe im Fenster G_σ:
-1 bei identischem Inhalt, 0 bei unkorreliertem, negative Korrelation wird
-zu 0. `ring_wide` = 0 schaltet den Schritt ab (Ergebnis von 0.2.0).
+κ is the normalised cross-correlation of the two rings inside the window
+G_σ: 1 for identical content, 0 for uncorrelated, and a negative
+correlation becomes 0. `ring_wide` = 0 turns the step off (the 0.2.0
+result).
 
-| Parameter | Default | Bedeutung |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `c1_narrow` | 0,15 c/px | C1 quer zur Strukturrichtung |
-| `c1_wide` | 0,30 c/px | C1 entlang der Strukturrichtung |
-| `c2_narrow` | 0,15 c/px | C2 quer zum Träger (zur Luminanz hin) |
-| `c2_wide` | 0,30 c/px | C2 entlang des Trägers |
-| `transition` | 0,15 c/px | Übergangsbreite |
-| `attenuation_db` | 40 dB | Sperrdämpfung |
-| `energy_sigma` | 3 px | σ des Gauß-Fensters der lokalen Energie und der Kohärenz |
-| `ring_wide` | 0,25 c/px | quadratisches breites Band des Kohärenzrings; 0 = aus |
-| `ring_power` | 2 | Exponent auf κ |
-| `ring_c1` | wahr | auch C1 mit κ öffnen |
+| `c1_narrow` | 0.15 c/px | C1 across the structure direction |
+| `c1_wide` | 0.30 c/px | C1 along the structure direction |
+| `c2_narrow` | 0.15 c/px | C2 across the carrier (towards the luminance) |
+| `c2_wide` | 0.30 c/px | C2 along the carrier |
+| `transition` | 0.15 c/px | transition width |
+| `attenuation_db` | 40 dB | stopband attenuation |
+| `energy_sigma` | 3 px | σ of the Gaussian window of the local energy and the coherence |
+| `ring_wide` | 0.25 c/px | wide square band of the coherence ring; 0 = off |
+| `ring_power` | 2 | exponent on κ |
+| `ring_c1` | true | open C1 with κ as well |
 
-Grenze des breiten Bandes: Unter V wollen C1 (0,5, 0,5) und Ĉ2b (0, 0,5)
-beide entlang derselben Linie v = 0,5 breit sein und treffen sich bei
-u = 0,25; mit Übergang 0,15 überlappen sie ab 0,35 (gemessener Einbruch
-bei 0,40). Dieselbe Grenze gilt für `ring_wide`: 0,30 verliert in jeder
-Bedingung, 0,20 liegt noch im Übergangsband des schmalen Filters und misst
-nichts. Flaches Farbfeld: exakt (Test `flat_colour_is_exact`); neutrales
-vertikales Linienmuster bei 0,42 c/px: unter 10 % des Fehlers der festen
-Stufe (Test `neutral_vertical_lines_survive`). Die Maske nach 5.2 wird in
-diesem Modus nicht berechnet; `mask_max` ist konstant 0,8 wie bei
-`--mask off` (Abschnitt 7), 5.3 (Kern/Band-Zerlegung) und 5.4 entfallen.
+Limit of the wide band: under V, C1 (0.5, 0.5) and Ĉ2b (0, 0.5) both want
+to be wide along the same line v = 0.5 and they meet at u = 0.25; with a
+transition of 0.15 they overlap from 0.35 (the measured drop is at 0.40).
+The same limit applies to `ring_wide`: 0.30 loses in every condition, 0.20
+still lies in the transition band of the narrow filter and measures
+nothing. Flat colour field: exact (test `flat_colour_is_exact`); neutral
+vertical line pattern at 0.42 c/px: under 10 % of the fixed stage's error
+(test `neutral_vertical_lines_survive`). The mask of 5.2 is not computed
+in this mode; `mask_max` is the constant 0.8, as with `--mask off`
+(section 7). 5.3 (core/band split) and 5.4 do not apply.
 
-Laufzeit Trennung 2,17 s auf 24,4 MP (ohne Kohärenzring 1,12 s, fest
-0,75 s, Blockmaske 1,16 s), gesamt 3,3 s — **[Abweichung]** vom Budget in
-Abschnitt 12. Speicher: Spitze zehn volle f64-Ebenen einschließlich Mosaik
-(2,0 GB gemessen; sieben ohne Kohärenzring): die Energie- und
-Kohärenz-Tiefpässe laufen in den Puffern ihrer Operanden mit einer
-Scratch-Ebene für den Zeilenpass, die Zeilenpässe des Mosaiks teilen eine
-Ebene.
+Separation run time 2.17 s on 24.4 MP (without the coherence ring 1.12 s,
+fixed 0.75 s, block mask 1.16 s), 3.3 s in all — **[Deviation]** from the
+budget in section 12. Memory: a peak of ten full f64 planes including the
+mosaic (2.0 GB measured; seven without the coherence ring): the energy and
+coherence low-passes run in the buffers of their operands, with one scratch
+plane for the row pass, and the mosaic's row passes share one plane.
 
-### 5.6 Nichtlineare Rekonstruktion (`--reconstruct`)
+### 5.6 Nonlinear reconstruction (`--reconstruct`)
 
-**[Erweiterung, gemessen]** (RESULTS „Reconstruct“). Bibliothek und Kommando
-lassen den Schritt aus, bis `--reconstruct` gesetzt ist. Die GUI startet mit
-der Checkbox an (Development → *reconstruct the last octave*); Ausschalten
-und *Apply* stellt den linearen Weg wieder her. Alles bis hier ist
-linear: jedes Ausgabepixel ist eine Summe gemessener Werte mit Gewichten,
-die nicht vom Bildinhalt an dieser Stelle abhängen (5.5 wählt zwischen zwei
-solchen Summen, erfindet aber keine). Die Grenze dieses Weges ist die
-letzte Oktave: wo Luminanz nahe den Trägern liegt, kann kein Filter sie
-von Chrominanz trennen. Demosaicer lösen das mit einer Annahme — die
-Farbdifferenzen `G − R`, `G − B` sind lokal glatt — und einer
-Richtungsentscheidung pro Pixel. Dieser Schritt tut dasselbe, nur dort, wo
-die lineare Schätzung noch Energie nahe den Trägern trägt, und schreibt
-pro Pixel in die Sidecar, wie viel davon berechnet statt gemessen ist.
+**[Extension, measured]** (RESULTS "Reconstruct"). The library and the
+command leave the step out until `--reconstruct` is set. The GUI starts
+with the checkbox on (Development → *reconstruct the last octave*); turning
+it off and *Apply* restores the linear path. Everything up to here is
+linear: every output pixel is a sum of measured values with weights that
+do not depend on the picture at that place (5.5 chooses between two such
+sums, and invents none). The limit of that path is the last octave: where
+luminance lies near the carriers, no filter can separate it from
+chrominance. Demosaicers solve this with an assumption — the colour
+differences `G − R`, `G − B` are locally smooth — and a direction decision
+per pixel. This step does the same, only where the linear estimate still
+carries energy near the carriers, and writes into the sidecar, per pixel,
+how much of it was computed rather than measured.
 
-Schätzer (Zhang & Wu 2005, aus dem Papier geschrieben), im Arbeitsbereich
-`m^(1/γ)` mit `γ = 2,2`:
+Estimator (Zhang & Wu 2005, written from the paper), in the working space
+`m^(1/γ)` with `γ = 2.2`:
 
-    Richtungsschätzung des fehlenden Kanals entlang x (ebenso y), an jedem Pixel:
-      X̂(x) = (0,5 + A)·(X(x−1) + X(x+1)) − A·(X(x−3) + X(x+3)) + LAP·(2·O(x) − O(x−2) − O(x+2))
-      A = 0,0625, LAP = 0,125 (Hamilton–Adams ist A = 0, LAP = 0,25); O der eigene Kanal
-    Farbdifferenzsignale  d_h = G − X entlang der Zeile,  d_v entlang der Spalte
-    LMMSE je Linie: s = d * [4 9 15 23 26 23 15 9 4]/128 (Prior),
-      im Fenster ±4:  v_s = Var(s),  v_n = Mean((d − s)²)
-      d̂ = s + v_s/(v_s + v_n)·(d − s),   Fehler e = v_s·v_n/(v_s + v_n)
-    Fusion an den R/B-Stellen:  w_h = 1/(e_h + 10⁻¹² + μ·d̂_h²),  w_v analog, μ = 0,01
+    Direction estimate of the missing channel along x (likewise y), at every pixel:
+      X̂(x) = (0.5 + A)·(X(x−1) + X(x+1)) − A·(X(x−3) + X(x+3)) + LAP·(2·O(x) − O(x−2) − O(x+2))
+      A = 0.0625, LAP = 0.125 (Hamilton–Adams is A = 0, LAP = 0.25); O is the pixel's own channel
+    Colour-difference signals  d_h = G − X along the row,  d_v along the column
+    LMMSE per line: s = d * [4 9 15 23 26 23 15 9 4]/128 (prior),
+      in the window ±4:  v_s = Var(s),  v_n = Mean((d − s)²)
+      d̂ = s + v_s/(v_s + v_n)·(d − s),   error e = v_s·v_n/(v_s + v_n)
+    Fusion at the R/B sites:  w_h = 1/(e_h + 10⁻¹² + μ·d̂_h²),  w_v likewise, μ = 0.01
       Ĝ = X + (w_h·d̂_h + w_v·d̂_v)/(w_h + w_v)
-    R − G und B − G: an der Gegenstelle Mittel der vier Diagonalen, an G-Stellen
-      Mittel der zwei Nachbarn, die den Kanal tragen
-    Rücktransformation ^γ, dann L = (R + 2G + B)/4, C1 = (2G − R − B)/4, C2 = (R − B)/4
+    R − G and B − G: at the opposite site the mean of the four diagonals, at G sites
+      the mean of the two neighbours that carry the channel
+    Transform back by ^γ, then L = (R + 2G + B)/4, C1 = (2G − R − B)/4, C2 = (R − B)/4
 
-μ ist der Zünglein-Term: wo beide Richtungen in sich konsistent sind
-(neutrales Nyquist-Muster, Fehler beidseits null), gewinnt die mit weniger
-Chrominanz (Test `neutral_nyquist_lines_are_exact`); flaches Farbfeld
-exakt (`flat_colour_is_exact`). Der Arbeitsbereich `γ = 2,2` ist **der**
-Unterschied zur Literatur, die 8-Bit-sRGB-Bilder direkt demosaict: in
-linearem Licht sind Farbdifferenzen über eine Kante nicht konstant,
-komprimiert fast (1×-Teilmenge: 36,6 → 42,2 dB, real binned 37,5 → 38,5).
+μ is the tie-breaker: where both directions are self-consistent (a neutral
+Nyquist pattern, error zero on both sides), the one with less chrominance
+wins (test `neutral_nyquist_lines_are_exact`); a flat colour field is exact
+(`flat_colour_is_exact`). The working space `γ = 2.2` is *the* difference
+from the literature, which demosaics 8-bit sRGB pictures directly: in
+linear light, colour differences are not constant across an edge, and
+compressed they nearly are (1× subset: 36.6 → 42.2 dB, real binned
+37.5 → 38.5).
 
-Detektor (`Residue`): die lineare Luminanz L̂ aus 5.5 wird mit den drei
-Trägern demoduliert und mit `G_σ` (σ = 2 px) tiefpassgefiltert; die Summe
-der Amplitudenquadrate gegen die Rauschvarianz im selben Band:
+Detector (`Residue`): the linear luminance L̂ from 5.5 is demodulated with
+the three carriers and low-pass filtered with `G_σ` (σ = 2 px); the sum of
+the squared amplitudes against the noise variance in the same band:
 
     r = Σ_c ( G_σ * (c·L̂) )²  /  ( σ²(L̂) · ‖G_σ‖⁴ )
     β = clamp( (r − lo)/(hi − lo), 0, 1 ),   lo = 20, hi = 80
-    L̂ := L̂ + β·(L_n − L̂),  Ĉ1, Ĉ2 ebenso;  mask_max := 0,8 + 0,19·β
+    L̂ := L̂ + β·(L_n − L̂),  Ĉ1, Ĉ2 likewise;  mask_max := 0.8 + 0.19·β
 
-Wo die lineare Trennung sauber war, liegt nahe den Trägern nur Rauschen
-(r ≈ 1) und β = 0: das Pixel bleibt gemessen. Sidecar (§7): 204 = gemessen,
-252 = ganz berechnet, dazwischen linear; 255 bleibt Sättigung, die
-Schärfungsschwelle 0,8 bleibt erfüllt.
+Where the linear separation was clean, only noise lies near the carriers
+(r ≈ 1) and β = 0: the pixel stays measured. Sidecar (§7): 204 = measured,
+252 = fully computed, linear in between; 255 stays saturation, and the
+sharpening threshold 0.8 stays satisfied.
 
-| Parameter | Default | Bedeutung |
+| Parameter | Default | Meaning |
 |---|---|---|
-| `detector` | `Residue` | `All` setzt β = 1 überall (Messzwecke) |
-| `lo`, `hi` | 20, 80 | Rampe von β in Einheiten Energie/Rauschvarianz |
-| `sigma` | 2 px | Fenster des Detektors |
-| `mu` | 0,01 | Chroma-Zünglein der Richtungsfusion |
-| `gamma` | 2,2 | Arbeitsbereich des Schätzers; 1,0 = linear |
+| `detector` | `Residue` | `All` sets β = 1 everywhere (for measurement) |
+| `lo`, `hi` | 20, 80 | ramp of β in units of energy over noise variance |
+| `sigma` | 2 px | window of the detector |
+| `mu` | 0.01 | chroma tie-breaker of the directional fusion |
+| `gamma` | 2.2 | working space of the estimator; 1.0 = linear |
 
-Verworfen, gemessen: Detektor auf der Differenz der beiden
-Luminanzschätzungen (schlechter in jeder Bedingung), auf dem lokalen
-Gradienten (nutzlos), als skalenfreier Anteil Trägerband/AC-Energie
-(unterscheidet nicht zwischen Signal und Rauschen im Trägerband; −3 dB bei
-1×); 2-D-Fehlerstatistik über die Nachbarlinien (−0,2 dB); Glättung der
-Farbdifferenzen als Verfeinerungsschritt (−0,7 bis −1,3 dB); längere
-Richtungsfilter per 1-D-Demodulation (gleich bis −0,2 dB mit LMMSE,
-katastrophal ohne). Die Bedingung „band-limitiert mit echtem Rauschen"
-(`--raw --scale 2`) ist der Grund für den Detektor: dort ist der
-nichtlineare Schätzer allein 6 dB schlechter als 5.5 (die glatte Prior
-nimmt bandbegrenztem Chroma seinen Inhalt), mit Detektor gleich
-(48,56 gegen 48,57).
+Rejected, measured: a detector on the difference of the two luminance
+estimates (worse in every condition), on the local gradient (useless), as
+a scale-free share of carrier-band over AC energy (does not distinguish
+signal from noise in the carrier band; −3 dB at 1×); a 2-D error statistic
+over the neighbouring lines (−0.2 dB); smoothing the colour differences as
+a refinement pass (−0.7 to −1.3 dB); longer directional filters by 1-D
+demodulation (equal to −0.2 dB with the LMMSE, catastrophic without). The
+condition "band-limited with real noise" (`--raw --scale 2`) is why the
+detector exists: there the nonlinear estimator alone is 6 dB worse than
+5.5 (the smooth prior takes the content of band-limited chroma for its
+own), and with the detector it is unchanged (48.56 against 48.57).
 
-Laufzeit: +2,2 s auf 24,4 MP (Trennung 4,5 s statt 2,3 s), Spitze vier
-zusätzliche Ebenen. Das Negativ-JSON (§7) trägt `reconstruct` (wahr/falsch)
-und `computed` (mittleres β).
+Run time: +2.2 s on 24.4 MP (separation 4.5 s instead of 2.3 s), a peak of
+four more planes. The negative JSON (§7) carries `reconstruct`
+(true/false) and `computed` (mean β).
 
-## 6. Mischung
+## 6. Mixing
 
-Drei Gewichte `w_R, w_G, w_B ≥ 0`, Summe 1, auf *abgeglichene* Kanäle
-(Abschnitt 2). Default 0,25 / 0,50 / 0,25.
+Three weights `w_R, w_G, w_B ≥ 0`, summing to 1, on *balanced* channels
+(section 2). Default 0.25 / 0.50 / 0.25.
 
     out = L̂ + (w_G − w_R − w_B)·Ĉ1' + 2·(w_R − w_B)·Ĉ2'
 
-(`Ĉ'` aus 5.3; die Gewichte g sind darin bereits enthalten.) Eine
-Matrix-Variante (Y-Zeile von `cam_to_xyz`) gab es; sie ist der gefitteten
-Kameradatei (§10) gewichen.
+(`Ĉ'` from 5.3; the weights g are already inside it.) A matrix variant
+(the Y row of `cam_to_xyz`) existed; it gave way to the fitted camera file
+(§10).
 
-**Gewichtsraum [Ergänzung, gemessen].** Die Formel verbraucht Gewichte auf
-abgeglichenen Kanälen (`balanced`). Eine Monochromkamera hat aber eine
-feste Spektralantwort und kennt keinen Abgleich; ihre Nachbildung ist ein
-festes Tripel auf den *rohen* Kanälen (`raw`). Beide Räume hängen exakt
-zusammen:
+**Weight space [addition, measured].** The formula consumes weights on
+balanced channels (`balanced`). A monochrome camera, though, has a fixed
+spectral response and knows no balance; its emulation is a fixed triple on
+the *raw* channels (`raw`). The two spaces are related exactly:
 
-    w_bal,c ∝ w_raw,c / k_c        w_raw,c ∝ w_bal,c · k_c      (jeweils auf Summe 1 normiert)
+    w_bal,c ∝ w_raw,c / k_c        w_raw,c ∝ w_bal,c · k_c      (each normalised to sum 1)
 
-Die Kameradatei speichert gefittete Gewichte im Rohraum
-(`weights_space = "raw"`); die Entwicklung rechnet sie pro Bild mit den
-Multiplikatoren `k_c` des Abgleichs in den abgeglichenen Raum um und
-mischt dann wie oben. Das Negativ trägt beide Formen in der Beschreibung
-(`weights`, `weights_raw`). Begründung (RESULTS.md): dieselbe Szene unter
-Tageslicht und Kunstlicht — die Z-f-Gewichte im abgeglichenen Raum springen
-von (0,171/0,489/0,340) auf (0,297/0,550/0,153), weil die
-As-shot-Multiplikatoren (R 2,02→1,26, B 1,11→2,05) in sie hineingefaltet
-sind; im Rohraum bleiben sie bei (0,284/0,404/0,312) gegen
-(0,302/0,444/0,254). Ohne Angabe gilt `balanced` (ältere Dateien,
-Default-Tripel, CLI-Override `--weights`).
+The camera file stores fitted weights in raw space
+(`weights_space = "raw"`); the development converts them per picture into
+balanced space with the balance multipliers `k_c`, then mixes as above.
+The negative carries both forms in its description (`weights`,
+`weights_raw`). Reason (RESULTS.md): the same scene in daylight and in
+tungsten — the Z f weights in balanced space jump from
+(0.171/0.489/0.340) to (0.297/0.550/0.153), because the as-shot
+multipliers (R 2.02→1.26, B 1.11→2.05) are folded into them; in raw space
+they stay at (0.284/0.404/0.312) against (0.302/0.444/0.254). With no
+statement, `balanced` applies (older files, the default triple, the CLI
+override `--weights`).
 
-**[Abweichung/Präzisierung]**: Das Whitepaper sagt "C bleibt aussen" und
-fordert gleichzeitig drei Gewichte. Beides zugleich geht nur für
-0,25/0,50/0,25 (dann ist `out = L̂` exakt). Jedes andere Gewicht braucht die
-tiefpassgefilterte Chrominanz, siehe Umkehrung in Abschnitt 4. Die
-Chrominanz-Korrektur ist bandbegrenzt (≤ 0,15 c/px), die Kantenauflösung
-bleibt die von `L̂`.
+**[Deviation/clarification]**: the whitepaper says "C stays outside" and
+at the same time asks for three weights. Both at once work only for
+0.25/0.50/0.25 (then `out = L̂` exactly). Every other weight needs the
+low-pass chrominance; see the inverse in section 4. The chrominance
+correction is band-limited (≤ 0.15 c/px), and the edge resolution stays
+that of `L̂`.
 
-**Kontrastfilter [Ergänzung].** Ein Farbfilter vor einem Monochromsensor
-ist eine spektrale Gewichtung vor der Summe, also genau das, was die
-Mischung tut. Ein Filter mit Kanaltransmissionen `T_R, T_G, T_B` auf den
-abgeglichenen Kanälen macht aus den Basisgewichten
+**Contrast filters [addition].** A colour filter in front of a monochrome
+sensor is a spectral weighting before the sum, which is exactly what the
+mix does. A filter with channel transmissions `T_R, T_G, T_B` on the
+balanced channels turns the base weights into
 
     w'_c = w_c · T_c / Σ_j w_j · T_j
 
-Der Filterfaktor (Lichtverlust) fällt durch die Normierung weg; digital
-kostet er keine Belichtung. Basis sind die Gewichte der Kameradatei (ohne
-Datei: nativ). Die Pipeline ändert sich nicht, ein Filter ist nur ein
-anderes Tripel; `filter` steht in der Negativbeschreibung. Tabelle
-(`ColorFilter`), Transmissionen als *Näherungen* typischer Filterkurven
-über typische Kanalbänder, nicht gemessen:
+The filter factor (the light lost) drops out through the normalisation;
+digitally it costs no exposure. The base is the camera file's weights
+(with no file: native). The pipeline does not change; a filter is only
+another triple, and `filter` is recorded in the negative's description.
+Table (`ColorFilter`), transmissions as *approximations* of typical filter
+curves over typical channel bands, not measured:
 
 | Filter | Wratten | T_R | T_G | T_B |
 |---|---|---|---|---|
-| yellow-8 | 8 (K2) | 1,00 | 0,90 | 0,10 |
-| yellow-green-11 | 11 | 0,55 | 1,00 | 0,25 |
-| orange-16 | 16 | 1,00 | 0,50 | 0,02 |
-| red-25 | 25 | 1,00 | 0,08 | 0,00 |
-| green-58 | 58 | 0,10 | 1,00 | 0,10 |
-| blue-47 | 47 | 0,03 | 0,25 | 1,00 |
+| yellow-8 | 8 (K2) | 1.00 | 0.90 | 0.10 |
+| yellow-green-11 | 11 | 0.55 | 1.00 | 0.25 |
+| orange-16 | 16 | 1.00 | 0.50 | 0.02 |
+| red-25 | 25 | 1.00 | 0.08 | 0.00 |
+| green-58 | 58 | 0.10 | 1.00 | 0.10 |
+| blue-47 | 47 | 0.03 | 0.25 | 1.00 |
 
-Qualität (RESULTS.md, Z f): Auflösung und Pixelrauschen bleiben bei jeder
-Gewichtung die von `L̂`; der Filter fügt nur bandbegrenztes Chromarauschen
-(≤ 0,15 c/px) hinzu, beim Rotfilter 19–21 % σ auf glatten Flächen bei
-unverändertem Pixel-zu-Pixel-Rauschen. Eine gemessene Variante würde wie
-die Monochromgewichte gefittet: Referenzkamera plus physischer Filter plus
-Farbtafel (`calibrate weights`).
+Quality (RESULTS.md, Z f): resolution and pixel noise stay those of `L̂`
+for every weighting; the filter adds only band-limited chroma noise
+(≤ 0.15 c/px), 19–21 % σ on smooth areas for the red filter, with
+pixel-to-pixel noise unchanged. A measured variant would be fitted the way
+the monochrome weights are: reference camera plus the physical filter plus
+a colour chart (`calibrate weights`).
 
-## 7. Negativ-Datei
+## 7. Negative file
 
-16-Bit-TIFF, ein Kanal, `PhotometricInterpretation = BlackIsZero`,
-`value = round(clamp(out, 0, 1)·65535)`. Eingebettetes ICC-Profil: Grau,
-D50-Weißpunkt, `kTRC` = Gamma 1,0 (lineares Grau). `ImageDescription` enthält
-JSON mit Kamera, Phase, Abgleich (`wb`), Gewichten in beiden Räumen
-(`weights` abgeglichen, `weights_raw` roh, §6), Maskenmodus, Rundenzahl,
-Rauschparametern, Programmversion. Orientierung aus dem RAW wird als TIFF-`Orientation`
-übernommen, die Pixel werden nicht gedreht. Quelle ist das Raw-IFD; meldet
-es nichts Gedrehtes, gilt die EXIF-`Orientation` (die Z f schreibt sie nur
-dort). Die Aufnahmezeit (`DateTimeOriginal`) steht als `captured` bei der
-Belichtung.
+16-bit TIFF, one channel, `PhotometricInterpretation = BlackIsZero`,
+`value = round(clamp(out, 0, 1)·65535)`. Embedded ICC profile: grey,
+D50 white point, `kTRC` = gamma 1.0 (linear grey). `ImageDescription`
+holds JSON with the camera, the phase, the balance (`wb`), the weights in
+both spaces (`weights` balanced, `weights_raw` raw, §6), the mask mode,
+the round count, the noise parameters and the program version. The
+orientation from the RAW is copied as the TIFF `Orientation`; the pixels
+are not rotated. The source is the raw IFD; if it reports nothing rotated,
+the EXIF `Orientation` applies (the Z f writes it only there). The capture
+time (`DateTimeOriginal`) is stored as `captured` with the exposure.
 
-Sidecar `<name>.mask.tif`: 8-Bit, `round(255·max(M_1, M_2a, M_2b))`,
-gesättigte Photosites (dilatiert) überschreiben mit 255. Wird vom Druck für
-die Schärfungsschwelle (§9) gelesen. Ohne Blockmaske (`--mask off`, der
-Default `--mask dubois`) und bei Monochromsensoren trägt die Sidecar
-überall 204 (= Schwelle 0,8, „Schärfung erlaubt": die Träger sind durch den
-60-dB-Tiefpass in jedem Block unterdrückt, RESULTS Phase 3) und 255 an
-gesättigten Photosites. Mit `--reconstruct` (5.6) trägt sie
-`round(255·(0,8 + 0,19·β))`: 204 = gemessen, 252 = ganz berechnet; das JSON
-trägt `reconstruct: true` und `computed` (mittleres β).
+Sidecar `<name>.mask.tif`: 8-bit, `round(255·max(M_1, M_2a, M_2b))`,
+saturated photosites (dilated) overwritten with 255. The print reads it
+for the sharpening threshold (§9). Without a block mask (`--mask off`, and
+the default `--mask dubois`) and for monochrome sensors, the sidecar
+carries 204 everywhere (= threshold 0.8, "sharpening allowed": the
+carriers are suppressed by the 60 dB low-pass in every block, RESULTS
+phase 3) and 255 at saturated photosites. With `--reconstruct` (5.6) it
+carries `round(255·(0.8 + 0.19·β))`: 204 = measured, 252 = fully
+computed; the JSON carries `reconstruct: true` and `computed` (mean β).
 
-## 8. Messgrößen
+## 8. Measurements
 
-- **Trägerenergie** eines Bildes: Energie des 2-D-Spektrums (blockweise wie
-  5.2, über alle Blöcke gemittelt) in `|f − f_k|_∞ < 0,15` für die drei
-  Träger, relativ zur erwarteten Rauschenergie derselben Bins.
-  Bestehensgrenze auf Farbflächen: ≤ 1,5.
-- **Graukeil-Linearität**: Patch-Mittel gegen relative Belichtung, Fit in
-  log-log; Bestehen bei Steigung 1,00 ± 0,02 und maximalem relativem
-  Residuum ≤ 2 %. **[Abweichung]**: R² ≥ 0,98 bestehen auch Gamma 1,2 und
-  Toes; es ist kein Linearitätstest.
-- **MTF am Siemensstern**: Kontrast gegen Ortsfrequenz getrennt für
-  achsparallel (±10° um 0°/90°) und diagonal (±10° um 45°/135°); MTF50 und
-  MTF10 in c/px; Aliasing-Ring = Kontrastanstieg jenseits des ersten
-  Minimums.
-- **RMSE gegen Wahrheit** (nur synthetisch): `L_true = (R + 2G + B)/4` der
-  erzeugten Szene, RMSE und 99-Perzentil des Fehlers, ohne 40-px-Rand.
+- **Carrier energy** of a picture: energy of the 2-D spectrum (blockwise
+  as in 5.2, averaged over all blocks) in `|f − f_k|_∞ < 0.15` for the
+  three carriers, relative to the expected noise energy of the same bins.
+  Pass limit on colour patches: ≤ 1.5.
+- **Grey-wedge linearity**: patch means against relative exposure, a
+  log-log fit; pass at slope 1.00 ± 0.02 and a maximum relative residue
+  ≤ 2 %. **[Deviation]**: R² ≥ 0.98 is also passed by gamma 1.2 and by
+  toes; it is not a linearity test.
+- **MTF on a Siemens star**: contrast against spatial frequency, separate
+  for axis-parallel (±10° about 0°/90°) and diagonal (±10° about
+  45°/135°); MTF50 and MTF10 in c/px; aliasing ring = a rise in contrast
+  beyond the first minimum.
+- **RMSE against truth** (synthetic only): `L_true = (R + 2G + B)/4` of
+  the generated scene, RMSE and the 99th percentile of the error, with a
+  40 px border excluded.
 
-Kein Prozentwert ohne eine dieser Messungen.
+No percentage without one of these measurements.
 
-## 9. Ausgang (Druck)
+## 9. Output (print)
 
-Reihenfolge: Mischung → Orientierung → Fenster (`crop`, ganze Pixel;
-fehlt das Feld, das ganze Negativ) → Größe → Platzierung und Tonwert
-(Papier oder Look) in einem Schritt → Rand → [Entfaltung →] USM → Datei.
-Ein Durchgang in f64, eine Quantisierung am Ende.
+Order: mix → orientation → window (`crop`, whole pixels; if the field is
+absent, the whole negative) → size → placing and tone (paper or look) in
+one step → border → [deconvolution →] USM → file.
+One pass in f64, one quantisation at the end.
 
-- **Rezept [Ergänzung, Zonensystem-Whitepaper §5 und Anhang A]**: Der
-  Druck ist ein Parametersatz, keine Folge von Bearbeitungen. `Recipe`
-  (`recipe.rs`, `schema: 1`) hält `place`, `curve` (der Tonwert: das
-  Papier mit seinen zwei Belichtungen
-  `{"paper":"multigrade","soft":s,"hard":h}` oder eine Look-Datei inline;
-  `tone.rs`, in JSON ohne Tag unterscheidbar am Feld `paper` bzw.
+- **Recipe [addition, zone-system whitepaper §5 and Appendix A]**: the
+  print is a parameter set, not a sequence of edits. `Recipe`
+  (`recipe.rs`, `schema: 1`) holds `place`, `curve` (the tone: the paper
+  with its two exposures
+  `{"paper":"multigrade","soft":s,"hard":h}`, or a look file inline;
+  `tone.rs`, distinguishable in untagged JSON by the field `paper` or
   `points`), `resample`, `size`, `dpi`, `border_mm`, `crop`
-  (Fenster `x,y,w,h` in ganzen Pixeln, aufrecht nach der Datei-Orientierung
-  und vor den Vierteldrehungen; fehlt es, das ganze Negativ),
-  `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Weggelassen werden
-  `place` (0), `size` (nativ), `border_mm` (0) und `crop` (ganzes Negativ); `schema`, `resample` und
-  `sharpen` stehen immer in der Datei. Das leere Rezept
-  `{"schema":1,"curve":<neutral>,"dpi":300}` ergibt bit-identisch den Lauf
-  ohne alle diese Schritte (Abnahmetest `recipe_acceptance.rs`); die GUI
-  beginnt mit dem Papier in Grundbelichtung. Das
-  Rezept steht als JSON in der `ImageDescription` des Druck-TIFFs und in
-  `--write-recipe`; `--recipe` liest es, Flags auf der Kommandozeile
-  überschreiben einzelne Felder. Die GUI-Historie ist eine Liste solcher
-  Zustände (plus Gewichte und Drehung), nie von Pixeln. Nichts im Rezept
-  liest das Bild: keine inhaltsabhängige Maske, kein Tone-Equalizer (§1,
-  §10 des Whitepapers).
-- **Orientierung**: Das Negativ trägt die RAW-Orientierung nur als Tag
-  (§7). Der Druck dreht zuerst Pixel und Sidecar-Maske aufrecht
-  (Orientierung 1–8), danach steht im Druck-TIFF `Orientation = 1`.
-- **Größe**: Ziel `--size <B>x<H><cm|mm|in>` plus `--dpi`; Zielpixel =
-  Zoll·DPI, Bild wird eingepasst (Seitenverhältnis bleibt). Die Angabe
-  ist das Papier, nicht die Bildlage: Ein Querformat auf „30x40cm“ wird
-  in 40×30 cm eingepasst. Mit `--border-mm` wird der Rand vorher vom
-  Papier abgezogen (Zielbox = Papier − 2·Rand), das Bild in den Rest
-  eingepasst. Kern `--resample` (Rezeptfeld `resample`), separabel in f64:
-  `b-spline` (Default, B = 1, C = 0), `lanczos3` (der Kern der
-  Benchmark-Zahlen), `mitchell` (Mitchell–Netravali B = C = ⅓) und
-  `catmull-rom` (B = 0, C = ½). Beim Verkleinern wird der Kern mit dem
-  Skalenfaktor gestreckt (das ist der Tiefpass vorher), Ränder gefaltet
-  (Gewichte außerhalb werden auf den Randpixel gelegt, Summe exakt 1).
-  Niemals über Zielpixel hinaus skalieren. Die GUI zeigt nicht diese
-  Kiste, sondern das Bild: die beiden Zentimeter sind gekoppelt, eine Seite
-  setzt die andere über das Seitenverhältnis des Bildes (das Fenster,
-  wenn ein `crop` gesetzt ist, sonst das aufrechte Negativ; eine
-  Skala, `round` auf der mitlaufenden Seite), und der Rand wird außen
-  addiert. Das Rezept speichert weiterhin die Kiste, also Bild plus Rand,
-  damit `layout` genau diese Bildpixel zurückgibt (`box_for_picture_width`,
-  `box_for_picture_height`). Die Kommandozeile `--size` bleibt die Kiste;
-  der Rand wird dort wie bisher vorher abgezogen. Die Maske wird mit Lanczos-3
-  mitskaliert (sie ist ein Gewichtsfeld). Ohne `--size` bleibt die
-  Pixelzahl des Negativs. Ein `crop` im Rezept (x, y, w, h, aufrecht nach
-  der Datei-Orientierung, vor den Vierteldrehungen) ersetzt diese Fläche
-  durch das Fenster: ganze Pixel, keine neue Abtastung. `dpi` steht trotzdem in der Datei; die GUI
-  zeigt die Bogengröße, Bild plus Rand, in cm. Eine Pixelgröße (`<N>px`, lange Kante) gab es
-  bis 0.9.0 für den Bildschirm; sie ist mit der Bildschirmausgabe
-  gestrichen (unten).
-  **[Abweichung zu Anhang A.2]**: Der dort empfohlene „Cubic B = 0,
-  C = 1“ ist kein Catmull-Rom (das ist C = ½) und überschwingt an einer
-  Kante stärker als Lanczos-3 (RESULTS.md, Tabelle der Kernüberschwinger);
-  allein der B-Spline ist überschwingfrei und dafür sichtbar weich. Der
-  Kern ist deshalb ein Parameter des Rezepts, kein Ersatz des Defaults.
-- **Platzierung [Ergänzung, Whitepaper Gl. 1]** (`--place <stops>`,
-  Rezeptfeld `place`, |place| ≤ 5): `L ← L · 2^place` auf der linearen
-  Luminanz nach der Größe, vor dem Tonwert. `place = 0` lässt jeden Wert
-  unangetastet (kein Rechenschritt). Auf Papier ist eine Platzierung um
-  `p` Szenenstops dasselbe wie `−γ_n·p` Stops Zeit auf beiden
-  Belichtungen (Abnahmetest, ±1 LSB); die GUI bewegt dafür die beiden
-  Belichtungen und lässt `place` bei 0.
-- **Abwedeln und Nachbelichten [Abweichung zu Anhang A, entfernt in
-  0.9.0]**: Es gibt keine lokale Belichtung. Anhang A sieht Formen mit
-  einem EV vor; 0.7.0 und 0.8.0 hatten sie (Scheibe, Gerade, zuletzt mit
-  Filterwahl). Sie sind ersatzlos gestrichen: Der Druck ist das Negativ,
-  eine Platzierung und zwei Belichtungen — ein gerader Abzug. Ein Pixel
-  wird nirgends anders behandelt als sein Nachbar mit demselben
-  Szenenwert, womit Vorschau, 1:1-Fenster, Histogramm und Export dieselbe
-  Funktion `L ↦ Ton(L·2^place)` sind (`tone::render`). Rezepte älterer
-  Fassungen mit `dodge_burn` werden gelesen; das Feld wird verworfen.
-- **Papier [Ergänzung, Whitepaper §3–4, anstelle der Zonenkurve]**
-  (`--paper SOFT,HARD`, GUI „Enlarger“, dort die einzige
-  Tonwertsteuerung; `paper.rs`): Es gibt keine Kurve, die gezogen wird.
-  Der Tonwert eines Szenenwerts ist, was ein Multigrade-Papier nach einer
-  **weichen** Belichtung (Filter 00) und einer **harten** (Filter 5)
-  durch ein Negativ dieser Szene zeigt — Splitgrade. Die einzigen zwei
-  Zahlen des Tonwerts sind die beiden Belichtungen in Stops Zeit
-  (f-Stop-Timing), |t| ≤ 3; alles, was die Dunkelkammer mit einer
-  Tonwertskala kann (verschieben, strecken, stauchen, Fuß und Schulter),
-  folgt daraus, und alles, was sie nicht kann (ein Knick, eine lokale
-  Versteilerung, eine auf nichts gestauchte Zone), ist hier nicht
-  ausdrückbar. Modell in log₁₀-Belichtung auf dem Papier:
-  - Negativ als Gerade mit `γ_n = 0,6` (Normalentwicklung): Szenenwert
-    `L` (Graukarte 0,18, Clip 1) belichtet das Papier mit
-    `log₁₀E = log₁₀2 · (t − γ_n · log₂L)`; ein Stop Zeit ist `1/γ_n`
-    Szenenstops wert.
-  - Zwei Emulsionskomponenten. Die harte (Filter 5) ist eine
-    Normalverteilungsfunktion in log-Belichtung,
-    `b = Φ((log₁₀E − μ)/σ)`, `σ` aus ISO R 50 (Gradation 5;
-    R = 100·Δlog₁₀E zwischen 0,04 über Grund und 90 % Dmax). Die weiche
-    (Filter 00) ist die gemessene Kennlinie von Ilford Multigrade RC
-    Deluxe, Gradation 00: der an den getrennten Strich angepasste Logit,
-    darunter ein Fuß, der den Umfang auf ISO R 160 legt. `μ` aus der
-    Empfindlichkeitsangleichung: jede Belichtung allein bringt bei `t = 0`
-    die Graukarte auf den ISO-Empfindlichkeitspunkt 0,6 über Grund.
-  - Gemeinsames Silber: `D/Dmax = 1 − (1 − a)(1 − b)`, Dmax = 2,0 über
-    Grund. Die weiche Komponente mit dem langen Fuß ist, was die Lichter
-    zuerst sehen; die harte, steile, füllt die Schatten.
-  - Reflexion `10^−D` relativ zum Papiergrund, Dmax auf das Schwarz der
-    Ausgabe (Schwarzpunktkompensation), Kodierung `^(1/2,2)`.
-    Unbelichtetes Papier ist 1, ein klares Negativ (L = 0) ist 0.
-  - `t = 0` beider Belichtungen ist die **Grundbelichtung**: das Paar, das
-    die Graukarte auf D 0,67 (18 % Reflexion) und den Clip auf D 0,10
-    (Zone VIII, strukturiertes Weiß) legt, einmal aus den Konstanten
-    gelöst (Bisektion, deterministisch). Sie entspricht etwa Gradation 2
-    über 5,2 Szenenstops; Zonen 0 und I liegen auf dem Papierschwarz.
-    Mehr weiches Licht graut die Lichter und lässt die Schatten in Ruhe,
-    weniger hartes Licht öffnet die Schatten und lässt die Lichter stehen
-    (Abnahmetest: +1 Stop weich bewegt Zone VII vier Mal so weit wie Zone
-    III; −1 Stop hart bewegt Zone III zehn Mal so weit wie Zone VII).
-    Mehr hartes Licht ist eine härtere Gradation (ISO R der Summenkurve
-    kleiner), mehr weiches eine weichere; die GUI nennt die äquivalente
-    Einzelgradation (veröffentlichte Umfänge 160, 130, 110, 90, 70, 60, 50
-    für 00, 0, 1, 2, 3, 4, 5) und den
-    Szenenumfang.
-  **[Abweichung zu Whitepaper §3–4]**: Das Whitepaper beschreibt eine
-  Zonenkurve mit Knoten je Zone, die einzeln gezogen werden. Eine solche
-  Kurve ist ein Kurveneditor mit anderem Gesicht: jede Grenze einzeln
-  setzbar heißt Knicke, lokale Steilstellen und Zonen auf null Breite —
-  Ergebnisse, die kein Papier liefert und die ein Bild digital bearbeitet
-  aussehen lassen. Die Leiste der GUI zeigt deshalb nur noch, wo die
-  Zonen auf dem Papier liegen (Achse = Tonwert, Breite = Anteil am
-  Papier); ein Zug an ihr bewegt beide Belichtungen gemeinsam, so dass der
-  Ton unter dem Zeiger dem Zeiger folgt (`PaperCurve::shift_for`,
-  Bisektion). Vorschau und Export werten das Papier je Pixel in f64 aus
-  (dieselbe Kette, `tone::render`); die 16-Bit-LUT dient nur den
-  Histogrammen. Nicht modelliert und bewusst weggelassen: der
-  Fuß des Films (das Negativ ist eine Gerade) und eine Entwicklung N±k
-  (ein zweiter Kontrastparameter neben dem Splitgrade wäre doppelt).
-- **Look** (`--look <datei>`, Mess-Pipeline und ältere Rezepte):
-  `look/*.json` mit monotonen Stützstellen in [0,1]², PCHIP
-  (Fritsch–Carlson, monoton). `encoding = gamma22` (Default): Eingang
-  und Ausgang kodiert, d. h. `u = clamp(L,0,1)^(1/2,2)`, `v = PCHIP(u)`;
-  `encoding = none`: Stützstellen auf der linearen Achse. Preset
-  `neutral`: reine Gamma-2,2-Kodierung. Preset `reference`: durch
-  `calibrate wedge` aus dem Graukeil der Referenz-Monochromkamera (lineares
-  DNG gegen ihr eigenes Kamera-JPEG) gefittet, RESULTS.md. Identität
-  (keine Kurve wird gerechnet) ist erkannt, wenn erster Punkt (0,0),
-  letzter (1,1) und alle `x = y`. Die GUI legt ein Rezept mit dem
-  neutralen Look auf das Papier in Grundbelichtung; jeden anderen Look
-  lässt sie als Look und bietet im Enlarger den Wechsel aufs Papier an.
-  Druck-TIFF bekommt ein Grau-ICC mit Gamma 2,2.
-- **Rand [Ergänzung, Anhang B.3]** (`--border-mm`, Rezeptfeld
-  `border_mm`): nach dem Tonwert wird das Bild in ein Papierfeld der Breite
-  `round(border_mm / 25,4 · DPI)` Pixel je Seite gelegt, gefüllt mit
-  Papierweiß = unbelichtetes Papier (1,0) bzw. beim Look dessen Wert bei
-  linear 1 (bei `neutral` 1,0); die Maske wird
-  mit 0 aufgefüllt, damit keine Schärfung in den Rand läuft. Die GUI
-  zeigt den Rand in der Vorschau: eingepasst wird der Bogen (Bild plus
-  Rand), der Rand ist in Papierweiß gemalt, nicht gerechnet (ein flacher
-  Wert), in der Proportion `border_px / image_w` des Drucks.
-- **Skalierungskompensation** (`--usm-amount`, `--deconv <N>`, Rezeptfeld
-  `sharpen`): Ausgleich der Unschärfe, die der Kern beim Vergrößern
-  hinzufügt. Beim Vergrößern ist `s` das Verhältnis der langen Seiten,
-  Bildpixel / Negativpixel. Für `s > 1` hat der Skalierer eine Unschärfe
-  `σ = k · s` in Druckpixeln. `k` ist je Kern an der 10–90-%-Rampe einer
-  Kante gemessen (Lanczos-3 0,281, Catmull–Rom 0,275, Mitchell 0,330,
-  B-Spline 0,515). USM und Richardson–Lucy benutzen dieses σ. Bei nativer
-  Größe und beim Verkleinern ist σ = 0, der Schritt ist dann bitgleich
-  zum ungeschärften Druck.
-  USM: `out = x + amount·(x − Gauß(σ))`, `amount` ∈ [0; 1,5], Default aus
-  der Kameradatei, sonst 0. Nur dort, wo die Sidecar-Maske ≥ 0,8 (204/255)
-  **und < 1,0** ist: 255 markiert gesättigte Photosites. Ohne Sidecar mit
-  Warnung überall. Gauß-Kern, Länge 2·⌈3σ⌉+1, Rand reflect-101, auf dem
-  kodierten Wert nach der Kurve.
-  Entfaltung (`--deconv <N>`, N ∈ [1; 10], aus ohne Flag; die Mobile-App
-  startet mit 3). Die Desktop-GUI setzt `sharpen` auf aus: die 1:1-Box,
-  der Export und ein dort gespeichertes Rezept enthalten den Schritt
-  nicht. Kommandozeile und Mobile-App setzen ihn weiter.
-  Richardson–Lucy mit derselben Gauß-PSF,
+  (window `x,y,w,h` in whole pixels, upright after the file orientation
+  and before the quarter-turns; if absent, the whole negative),
+  `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Omitted when absent are
+  `place` (0), `size` (native), `border_mm` (0) and `crop` (the whole
+  negative); `schema`, `resample` and `sharpen` are always in the file.
+  The empty recipe `{"schema":1,"curve":<neutral>,"dpi":300}` is
+  bit-identical to the run with none of these steps (acceptance test
+  `recipe_acceptance.rs`); the GUI starts on the paper at its base
+  exposure. The recipe is stored as JSON in the print TIFF's
+  `ImageDescription` and by `--write-recipe`; `--recipe` reads it, and
+  flags on the command line override single fields. The GUI history is a
+  list of such states (plus weights and rotation), never of pixels.
+  Nothing in the recipe reads the picture: no content-dependent mask, no
+  tone equaliser (§1, §10 of the whitepaper).
+- **Orientation**: the negative carries the RAW orientation only as a tag
+  (§7). The print first turns the pixels and the sidecar mask upright
+  (orientation 1–8); the print TIFF then has `Orientation = 1`.
+- **Size**: target `--size <W>x<H><cm|mm|in>` plus `--dpi`; target pixels
+  = inches·DPI, and the picture is fitted (the aspect ratio stays). The
+  statement is the paper, not the picture's orientation: a landscape
+  picture on "30x40cm" is fitted into 40×30 cm. With `--border-mm` the
+  border is taken off the paper first (target box = paper − 2·border),
+  and the picture is fitted into what remains. Kernel `--resample`
+  (recipe field `resample`), separable in f64: `b-spline` (default,
+  B = 1, C = 0), `lanczos3` (the kernel of the benchmark numbers),
+  `mitchell` (Mitchell–Netravali B = C = ⅓) and `catmull-rom` (B = 0,
+  C = ½). When reducing, the kernel is stretched by the scale factor
+  (that is the low-pass beforehand), and edges are folded (weights
+  outside are laid on the edge pixel, sum exactly 1). Never scale past
+  the target pixels. The GUI shows the picture, not this box: the two
+  centimetre fields are coupled, one side sets the other through the
+  picture's aspect ratio (the window, when a `crop` is set, otherwise the
+  upright negative; one scale, `round` on the side that follows), and the
+  border is added outside. The recipe still stores the box, picture plus
+  border, so that `layout` returns exactly those picture pixels
+  (`box_for_picture_width`, `box_for_picture_height`). The command-line
+  `--size` stays the box; the border is still taken off it first. The
+  mask is scaled along with Lanczos-3 (it is a weight field). Without
+  `--size` the negative's pixel count stays. A `crop` in the recipe
+  (x, y, w, h, upright after the file orientation, before the
+  quarter-turns) replaces that area with the window: whole pixels, no new
+  sampling. `dpi` is in the file anyway; the GUI shows the sheet size,
+  picture plus border, in cm. A pixel size (`<N>px`, the long edge)
+  existed until 0.9.0 for the screen; it was removed with the screen
+  output (below).
+  **[Deviation from Appendix A.2]**: the "Cubic B = 0, C = 1" recommended
+  there is not Catmull–Rom (that is C = ½) and overshoots an edge more
+  than Lanczos-3 (RESULTS.md, table of kernel overshoot); the B-spline
+  alone is free of overshoot and visibly soft for it. The kernel is
+  therefore a parameter of the recipe, not a replacement of the default.
+- **Placing [addition, whitepaper eq. 1]** (`--place <stops>`, recipe
+  field `place`, |place| ≤ 5): `L ← L · 2^place` on the linear luminance
+  after the size step, before the tone. `place = 0` leaves every value
+  untouched (no arithmetic step). On paper, a placing of `p` scene stops
+  is the same as `−γ_n·p` stops of time on both exposures (acceptance
+  test, ±1 LSB); the GUI moves the two exposures for that and leaves
+  `place` at 0.
+- **Dodging and burning [Deviation from Appendix A, removed in 0.9.0]**:
+  there is no local exposure. Appendix A provides shapes with one EV;
+  0.7.0 and 0.8.0 had them (a disc, a line, and last a choice of filter).
+  They were removed with no replacement: the print is the negative, one
+  placing and two exposures — a straight print. A pixel is nowhere
+  treated differently from its neighbour with the same scene value, so
+  the preview, the 1:1 window, the histogram and the export are the same
+  function `L ↦ Tone(L·2^place)` (`tone::render`). Recipes from older
+  versions that contain `dodge_burn` are read; the field is discarded.
+- **Paper [addition, whitepaper §3–4, in place of the zone curve]**
+  (`--paper SOFT,HARD`, GUI "Enlarger", the only tone control there;
+  `paper.rs`): there is no curve to drag. The tone of a scene value is
+  what a multigrade paper shows after a **soft** exposure (filter 00) and
+  a **hard** one (filter 5) through a negative of that scene —
+  split-grade. The only two numbers of the tone are the two exposures in
+  stops of time (f-stop timing), |t| ≤ 3; everything a darkroom can do
+  with a tone scale (shift, stretch, compress, toe and shoulder) follows
+  from that, and everything it cannot (a kink, a local steepening, a zone
+  squeezed to nothing) cannot be expressed here. Model in log₁₀ exposure
+  on the paper:
+  - The negative is a straight line with `γ_n = 0.6` (normal
+    development): a scene value `L` (grey card 0.18, clip 1) exposes the
+    paper with `log₁₀E = log₁₀2 · (t − γ_n · log₂L)`; one stop of time is
+    worth `1/γ_n` scene stops.
+  - Two emulsion components. The hard one (filter 5) is a normal CDF in
+    log exposure, `b = Φ((log₁₀E − μ)/σ)`, `σ` from ISO R 50 (grade 5;
+    R = 100·Δlog₁₀E between 0.04 above base and 90 % of Dmax). The soft
+    one (filter 00) is the measured characteristic of Ilford Multigrade
+    RC Deluxe, grade 00: the logit fitted to the separated curve, and
+    below it a toe that sets the range to ISO R 160. `μ` from the speed
+    match: each exposure alone, at `t = 0`, puts the grey card on the ISO
+    speed point, 0.6 above base.
+  - Shared silver: `D/Dmax = 1 − (1 − a)(1 − b)`, Dmax = 2.0 above base.
+    The soft component, with the long toe, is what the highlights see
+    first; the hard, steep one fills the shadows.
+  - Reflectance `10^−D` relative to the paper base, Dmax onto the black
+    of the output (black-point compensation), encoding `^(1/2.2)`.
+    Unexposed paper is 1, a clear negative (L = 0) is 0.
+  - `t = 0` on both exposures is the **base exposure**: the pair that
+    puts the grey card at D 0.67 (18 % reflectance) and the clip at
+    D 0.10 (Zone VIII, a textured white), solved once from the constants
+    (bisection, deterministic). It is about grade 2 over 5.2 scene stops;
+    zones 0 and I lie on the paper's black. More soft light greys the
+    highlights and leaves the shadows; less hard light opens the shadows
+    and leaves the highlights (acceptance test: +1 stop soft moves Zone
+    VII four times as far as Zone III; −1 stop hard moves Zone III ten
+    times as far as Zone VII). More hard light is a harder grade (the
+    ISO R of the combined curve gets smaller), more soft light a softer
+    one; the GUI names the equivalent single grade (published ranges
+    160, 130, 110, 90, 70, 60, 50 for 00, 0, 1, 2, 3, 4, 5) and the scene
+    range.
+  **[Deviation from whitepaper §3–4]**: the whitepaper describes a zone
+  curve with a knot per zone, each dragged on its own. Such a curve is a
+  curve editor with another face: setting each boundary on its own means
+  kinks, local steep places and zones of zero width — results no paper
+  delivers, and that make a picture look digitally edited. The GUI bar
+  therefore only shows where the zones lie on the paper (axis = tone,
+  width = share of the paper); a drag on it moves both exposures together
+  so that the tone under the pointer follows the pointer
+  (`PaperCurve::shift_for`, bisection). Preview and export evaluate the
+  paper per pixel in f64 (the same chain, `tone::render`); the 16-bit LUT
+  serves the histograms only. Not modelled, and left out on purpose: the
+  film's toe (the negative is a straight line) and a development N±k (a
+  second contrast parameter beside the split-grade would be double).
+- **Look** (`--look <file>`, the measurement pipeline and older recipes):
+  `look/*.json` with monotone knots in [0,1]², PCHIP (Fritsch–Carlson,
+  monotone). `encoding = gamma22` (default): input and output encoded,
+  that is `u = clamp(L,0,1)^(1/2.2)`, `v = PCHIP(u)`; `encoding = none`:
+  knots on the linear axis. Preset `neutral`: pure gamma-2.2 encoding.
+  Preset `reference`: fitted by `calibrate wedge` from the grey wedge of
+  the reference monochrome camera (linear DNG against its own camera
+  JPEG), RESULTS.md. Identity (no curve is computed) is recognised when
+  the first point is (0,0), the last is (1,1) and every `x = y`. The GUI
+  puts a recipe whose curve is the neutral look onto the paper at its
+  base exposure; it leaves any other look as a look and offers the switch
+  to paper in the Enlarger. The print TIFF gets a grey ICC with gamma 2.2.
+- **Border [addition, Appendix B.3]** (`--border-mm`, recipe field
+  `border_mm`): after the tone, the picture is placed in a paper field
+  `round(border_mm / 25.4 · DPI)` pixels wide on each side, filled with
+  paper white = unexposed paper (1.0), or, for a look, that look's value
+  at linear 1 (1.0 for `neutral`); the mask is filled with 0 so no
+  sharpening runs into the border. The GUI shows the border in the
+  preview: what is fitted is the sheet (picture plus border), the border
+  is painted in paper white, not rendered (a flat value), in the print's
+  proportion `border_px / image_w`.
+- **Scale compensation** (`--usm-amount`, `--deconv <N>`, recipe field
+  `sharpen`): compensation of the blur the kernel adds when enlarging.
+  When enlarging, `s` is the ratio of the long sides, picture pixels /
+  negative pixels. For `s > 1` the resampler has a blur `σ = k · s` in
+  print pixels. `k` is measured per kernel on the 10–90 % ramp of an edge
+  (Lanczos-3 0.281, Catmull–Rom 0.275, Mitchell 0.330, B-spline 0.515).
+  USM and Richardson–Lucy use this σ. At native size and when reducing,
+  σ = 0, and the step is then bit-identical to the unsharpened print.
+  USM: `out = x + amount·(x − Gaussian(σ))`, `amount` ∈ [0, 1.5], default
+  from the camera file, otherwise 0. Only where the sidecar mask is
+  ≥ 0.8 (204/255) **and < 1.0**: 255 marks saturated photosites. With no
+  sidecar, everywhere, with a warning. Gaussian kernel, length
+  2·⌈3σ⌉+1, edge reflect-101, on the encoded value after the curve.
+  Deconvolution (`--deconv <N>`, N ∈ [1, 10], off without the flag; the
+  mobile app starts at 3). The desktop GUI sets `sharpen` to off: the
+  1:1 box, the export and a recipe saved there do not contain the step.
+  The command line and the mobile app still set it. Richardson–Lucy with
+  the same Gaussian PSF,
 
       e_{k+1} = e_k · G ⊛ ( b / (G ⊛ e_k) ),   e_0 = max(b, 0)
 
-  auf **jedem** Pixel — die Maske greift hier nicht. Die PSF ist die
-  gemessene Rampe des Skalierers, keine gemessene Optik. Mehr als wenige
-  Durchgänge fängt an zu ringeln. Eine USM derselben Breite kann danach
-  folgen. Die Dateibeschreibung nennt `resample_sigma_px` und, solange
-  > 0, `deconvolution_iterations`. Sie nennt außerdem `usm_radius_px` =
-  `usm_k · d_mm · DPI` mit `usm_k = 1,15·10⁻⁵` (eine Bogenminute;
-  400 mm, 300 DPI → 1,4 px). Diese Zahl wird nur mitgeschrieben,
-  `--usm-k` und `--distance-mm` ändern sie. Angewendet wird sie nicht.
-- **Bildschirmausgabe [Abweichung, entfernt in 0.10.0]**: Bis 0.9.0 gab
-  es `--screen <amount>` (eine 9-Tap-FIR als Wiener-Inverse der bekannten
-  Übertragung Verkleinerungskern × Pixelapertur, Verstärkung auf 2
-  begrenzt), `--size <N>px`, `-o *.jpg`, `--proof` und in der GUI eine
-  zweite Exportdatei `<name>_2048px.jpg`. Alles gestrichen. Grund: Die
-  Kompensation setzt ein Bildpixel = ein Gerätepixel voraus, was kein
-  HiDPI-Bildschirm und kein Browser einhält; die „bekannten Verluste“ sind
-  beim Bildschirm des Betrachters gerade nicht bekannt, beim Druck schon
-  (Resampler, Format, Abstand). Und ein Rezept ergab zwei verschiedene
-  Bilder. Der Druck ist eine Datei, das TIFF. Das Herleitungsprotokoll
-  der Kompensation steht in RESULTS.md (Phase 4). Die Mobile-App schreibt
-  weiter ein JPEG in voller Größe (ihr Album), ohne Kompensation.
-- **Datei**: 16-Bit-TIFF mit Kurve und Gamma-2,2-Grau-ICC (bei
-  `encoding = none` lineares ICC), `XResolution/YResolution` = DPI,
-  `ImageDescription` = JSON mit Quelle, dem vollständigen Rezept, Größe
-  und Rand in Pixeln, USM-Parametern und der Beschreibung des Negativs.
-  Die CLI schreibt nur TIFF (`-o *.jpg` wird abgelehnt); `print::write`
-  kann ein 8-Bit-Grau-JPEG (Qualität 100, ein Kanal, dasselbe Grau-ICC)
-  schreiben, das nutzt die Mobile-App.
+  on **every** pixel — the mask does not apply here. The PSF is the
+  measured ramp of the resampler, not a measured lens. More than a few
+  passes starts to ring. A USM of the same width may follow. The file
+  description names `resample_sigma_px` and, while it is > 0,
+  `deconvolution_iterations`. It also names `usm_radius_px` =
+  `usm_k · d_mm · DPI` with `usm_k = 1.15·10⁻⁵` (one arcminute; 400 mm,
+  300 DPI → 1.4 px). That number is only recorded; `--usm-k` and
+  `--distance-mm` change it. It is not applied.
+- **Screen output [Deviation, removed in 0.10.0]**: until 0.9.0 there was
+  `--screen <amount>` (a 9-tap FIR as the Wiener inverse of the known
+  transfer of reduction kernel × pixel aperture, gain limited to 2),
+  `--size <N>px`, `-o *.jpg`, `--proof`, and in the GUI a second export
+  file `<name>_2048px.jpg`. All removed. Reason: the compensation assumes
+  one image pixel = one device pixel, which no HiDPI display and no
+  browser keeps; the "known losses" are precisely not known on the
+  viewer's screen, and they are known for the print (resampler, format,
+  distance). And one recipe produced two different pictures. The print is
+  one file, the TIFF. The derivation of the compensation is in RESULTS.md
+  (phase 4). The mobile app still writes a full-size JPEG (its album),
+  without compensation.
+- **File**: 16-bit TIFF with the curve and a gamma-2.2 grey ICC (a linear
+  ICC when `encoding = none`), `XResolution/YResolution` = DPI,
+  `ImageDescription` = JSON with the source, the complete recipe, size
+  and border in pixels, the USM parameters and the negative's
+  description. The CLI writes TIFF only (`-o *.jpg` is refused);
+  `print::write` can write an 8-bit grey JPEG (quality 100, one channel,
+  the same grey ICC), which the mobile app uses.
 
-## 10. Eichdateien
+## 10. Calibration files
 
-`cameras/<clean_make>_<clean_model>.json` (Kleinbuchstaben, Leerzeichen →
-`_`):
+`cameras/<clean_make>_<clean_model>.json` (lowercase, spaces → `_`):
 
 ```json
 {
@@ -774,43 +767,42 @@ Ein Durchgang in f64, eine Quantisierung am Ende.
 }
 ```
 
-Regeln: `bayer_phase` muss zur Datei passen, sonst Fehler. `weights_rgb`
-nichtnegativ, Summe 1 ± 10⁻⁶. `weights_space` ist `balanced` (Default,
-Tripel wird direkt gemischt) oder `raw` (Tripel auf Sensorkanälen,
-Umrechnung pro Bild nach §6; so schreibt `calibrate weights`). Fehlt die
-Datei: Defaults wie oben. Schwarz-
-und Weißpegel kommen immer aus der RAW-Datei, nie aus der Kameradatei.
-Optionale Felder, von `calibrate` geschrieben: `weights_fitted_against`
-(Referenzdatei des Gewichte-Fits) und `star` (`mtf50_axis`, `mtf50_diag`,
-`mtf10_axis`, `mtf10_diag` in c/px, `ring`, `source`).
+Rules: `bayer_phase` must match the file, otherwise an error.
+`weights_rgb` non-negative, sum 1 ± 10⁻⁶. `weights_space` is `balanced`
+(default, the triple is mixed directly) or `raw` (triple on the sensor
+channels, converted per picture by §6; that is how `calibrate weights`
+writes). If the file is missing: the defaults above. Black level and
+white level always come from the RAW file, never from the camera file.
+Optional fields, written by `calibrate`: `weights_fitted_against` (the
+reference file of the weight fit) and `star` (`mtf50_axis`,
+`mtf50_diag`, `mtf10_axis`, `mtf10_diag` in c/px, `ring`, `source`).
 
-### Eichverfahren (`mimizan calibrate`)
+### Calibration procedure (`mimizan calibrate`)
 
-- **`wedge`**: Graukeil als Negativ (linear) und als Referenz-JPEG der
-  Zielkamera. Pro Feld (Rechtecke oder Raster `x,y,w,h,cols,rows` mit
-  Einzug) Mittelwert im Negativ `n_i` und in der Referenz `r_i` (8-Bit
-  dekodiert, /255). Stützstellen `(n_i^(1/2,2), r_i)` bei `gamma22`,
-  sortiert, Felder mit `|Δx| < 10⁻³` gemittelt, Monotonie durch
-  gewichtete isotone Regression (Pool-Adjacent-Violators) erzwungen,
-  Anker (0,0) und (1,1) ergänzt. Felder mit > 1 % gesättigten Photosites
-  (Sidecar = 255) werden verworfen. Bestehen: ≤ 3/255 auf den Feldern;
-  der synthetische Selbsttest misst zusätzlich zwischen den Stufen
-  (Hold-out) und die Linearität nach §8.
-- **`weights`**: Farbtafel als RAW und als Referenz (JPEG der Zielkamera,
-  sRGB-dekodiert zu linear, oder Werteliste). Pro Feld balancierte Mittel
-  `(R_i, G_i, B_i)` ohne gesättigte Photosites. Modell
-  `s · (w_R R_i + w_G G_i + w_B B_i) ≈ ref_i`, `s` frei (Belichtung),
-  `w ≥ 0`, `Σw = 1`. Suche erschöpfend auf dem Simplex (Schritt 0,01,
-  verfeinert 0,001) — deterministisch, keine lokalen Minima. Bestehen:
-  RMSE ≤ 5 % der mittleren Referenzhelligkeit (§11). Der Fit läuft im
-  abgeglichenen Raum des Aufnahmebalance (`--wb`); `--write` rechnet das
-  Ergebnis mit den Multiplikatoren dieser Aufnahme in den Rohraum um und
-  trägt es als `weights_space = "raw"` in die Kameradatei ein
-  (`fitted.weights = true`). Mit `--wb none` ist der Fit bereits im
-  Rohraum.
-- **`star`**: MTF nach §8 auf einem Negativ, mit `--write` in `star` der
-  Kameradatei; optional `--usm-amount` setzen. Mittelpunkt und Radien
-  werden angegeben, nicht gesucht.
+- **`wedge`**: a grey wedge as a negative (linear) and as the reference
+  JPEG of the target camera. Per patch (rectangles, or a grid
+  `x,y,w,h,cols,rows` with an inset) the mean in the negative `n_i` and
+  in the reference `r_i` (8-bit decoded, /255). Knots
+  `(n_i^(1/2.2), r_i)` at `gamma22`, sorted, patches with `|Δx| < 10⁻³`
+  averaged, monotonicity forced by weighted isotonic regression
+  (pool-adjacent-violators), anchors (0,0) and (1,1) added. Patches with
+  > 1 % saturated photosites (sidecar = 255) are discarded. Pass: ≤ 3/255
+  on the patches; the synthetic self-test additionally measures between
+  the steps (hold-out) and the linearity of §8.
+- **`weights`**: a colour chart as RAW and as a reference (JPEG of the
+  target camera, sRGB-decoded to linear, or a list of values). Per patch,
+  balanced means `(R_i, G_i, B_i)` with no saturated photosites. Model
+  `s · (w_R R_i + w_G G_i + w_B B_i) ≈ ref_i`, `s` free (the exposure),
+  `w ≥ 0`, `Σw = 1`. Search exhaustive on the simplex (step 0.01, refined
+  to 0.001) — deterministic, no local minima. Pass: RMSE ≤ 5 % of the
+  mean reference brightness (§11). The fit runs in the balanced space of
+  the capture balance (`--wb`); `--write` converts the result into raw
+  space with that capture's multipliers and writes it into the camera
+  file as `weights_space = "raw"` (`fitted.weights = true`). With
+  `--wb none` the fit is already in raw space.
+- **`star`**: MTF by §8 on a negative, written into the camera file's
+  `star` with `--write`; optionally set `--usm-amount`. Centre and radii
+  are given, not searched for.
 
 `look/<name>.json`:
 
@@ -818,62 +810,62 @@ Optionale Felder, von `calibrate` geschrieben: `weights_fitted_against`
 { "schema": 1, "name": "neutral", "points": [[0.0, 0.0], [1.0, 1.0]], "encoding": "gamma22", "fitted_against": null }
 ```
 
-`encoding = gamma22` heißt: Eingang linear → `x^(1/2,2)` → dann die
-Stützstellen. `encoding = none` heißt: Stützstellen direkt auf linear.
+`encoding = gamma22` means: linear input → `x^(1/2.2)` → then the knots.
+`encoding = none` means: knots directly on linear.
 
-## 11. Abnahme
+## 11. Acceptance
 
-| Prüfung | Bestehen | Scheitern |
+| Test | Pass | Fail |
 |---|---|---|
-| Negativ, Graukeil | log-log-Steigung 1,00 ± 0,02; Residuum ≤ 2 % | Kurve, Gamma oder WB im Negativ |
-| Rückmosaik | Trägerenergie von `L̂` auf Grauflächen ≤ 1,0× Rauschen | sichtbares 2-px-Gitter |
-| Farbfläche | Trägerenergie ≤ 1,5× lokales Rauschen | sichtbares 2-px-Gitter |
-| Look, Graukeil | ≤ 3/255 gegen das JPEG der Referenz-Monochromkamera | an anderem JPEG gefittet |
-| Gewichte | Patch-RMSE ≤ 5 % der linearen Helligkeit der Referenz-Monochromkamera | Matrix vor der Trennung |
-| Stern | MTF50 achsparallel und 45° gemessen, kein Ring | Prozent ohne Messung |
-| Zwei Kameras, Grau | dieselbe Kurve, ≤ 3/255 nach Mittelgrau-Anker | Look pro Gehäuse |
-| Synthetisch | RMSE gegen `L_true` auf neutralen Szenen ≤ 1,5·σ; MTF50 achsparallel ≥ 0,35 c/px | — |
+| Negative, grey wedge | log-log slope 1.00 ± 0.02; residue ≤ 2 % | a curve, a gamma or a WB in the negative |
+| Re-mosaic | carrier energy of `L̂` on grey patches ≤ 1.0× noise | a visible 2 px grid |
+| Colour patch | carrier energy ≤ 1.5× local noise | a visible 2 px grid |
+| Look, grey wedge | ≤ 3/255 against the JPEG of the reference monochrome camera | fitted to some other JPEG |
+| Weights | patch RMSE ≤ 5 % of the linear brightness of the reference monochrome camera | a matrix before the separation |
+| Star | MTF50 axis-parallel and at 45° measured, no ring | a percentage without a measurement |
+| Two cameras, grey | the same curve, ≤ 3/255 after a mid-grey anchor | a look per body |
+| Synthetic | RMSE against `L_true` on neutral scenes ≤ 1.5·σ; MTF50 axis-parallel ≥ 0.35 c/px | — |
 
-## 12. Performance-Budget
+## 12. Performance budget
 
-Referenz: AMD Ryzen 7 5700U, 16 Threads, f64 überall. 24 MP Negativ
-(Einlesen bis TIFF) ≤ 3 s, 45 MP ≤ 6 s. Speicher ≤ 6 Vollebenen f64
-(45 MP: ≤ 2,2 GB). Parallelreduktionen in fester Chunk-Reihenfolge
-(deterministisch bitgenau zwischen Läufen).
+Reference: AMD Ryzen 7 5700U, 16 threads, f64 throughout. A 24 MP negative
+(ingest through TIFF) ≤ 3 s, 45 MP ≤ 6 s. Memory ≤ 6 full f64 planes
+(45 MP: ≤ 2.2 GB). Parallel reductions in a fixed chunk order
+(deterministic, bit-exact between runs).
 
-**[Abweichung, gemessen]** seit 0.3.0: Der Default-Pfad (5.5 mit
-Kohärenzring) braucht 3,3 s und zehn Vollebenen auf 24 MP (2,0 GB; 45 MP
-hochgerechnet ≈ 6 s, 3,7 GB). Das Budget gilt weiter für `--mask off` und
-`--mask adaptive` (2,2 s, sechs Ebenen). Der Mehraufwand ist der Preis
-für +1,5 bis +3,8 dB in den bandbegrenzten Bedingungen (RESULTS „Coherence
-ring“); er wird akzeptiert, bis eine Ebene gespart ist, ohne das Ergebnis
-bitgenau zu ändern.
+**[Deviation, measured]** since 0.3.0: the default path (5.5 with the
+coherence ring) takes 3.3 s and ten full planes on 24 MP (2.0 GB; 45 MP
+extrapolated ≈ 6 s, 3.7 GB). The budget still holds for `--mask off` and
+`--mask adaptive` (2.2 s, six planes). The extra cost is the price of
++1.5 to +3.8 dB in the band-limited conditions (RESULTS "Coherence
+ring"); it is accepted until a plane is saved without changing the result
+bit for bit.
 
-Umsetzung (**[gemessen]**, RESULTS „Phase 5“):
+Implementation (**[measured]**, RESULTS "Phase 5"):
 
-- Faltung: Jeder Ausgabewert summiert seine Taps in fester Reihenfolge
-  `t = 0..n`; gerechnet werden 16 Ausgabewerte gleichzeitig in Registern
-  (Lanes), die Spaltenfaltung in Bändern von 32 Zeilen × 512 Spalten
-  (Quellzeilen bleiben im L2). Die Träger (±1) werden beim Füllen der
-  Zeile bzw. als Zeilenvorzeichen in der Spaltenfaltung angebracht: zwei
-  Zeilen- und drei Spaltenpässe für die drei Chrominanzschätzungen statt
-  drei Modulationen und sechs Pässe — bitgleich zur Referenz
-  (`lowpass_reference`, Test `fused_demodulation_matches_reference`).
-- Speicher: Maskenwerte bleiben Blockraster und werden beim Mischen pro
-  Pixel bilinear abgetastet; Kern-Zerlegung und Dubois-Kombination laufen
-  in den Puffern der Schätzungen; die Mischung überschreibt `L̂`. Spitze
-  im adaptiven Pfad: Mosaik, drei Schätzungen, `L̂`, Maskenebene = 6
-  Vollebenen. Allokator mimalloc (glibc gibt 200-MB-Blöcke sofort an den
-  Kernel zurück, jede neue Ebene zahlte ihre Seitenfehler neu).
-- Determinismus: Parallelsummen (Grauwelt, Schleifenabbruch) werden pro
-  Zeile gebildet und in Zeilenreihenfolge addiert; Test
-  `separation_is_deterministic_across_thread_counts` (16 gegen 3 Threads,
-  bitgleich).
-- Defektprüfung: der Median der acht Nachbarn wird nur für Pixel außerhalb
-  der Nachbarspanne gebildet (identisches Ergebnis, kein Sortieren pro
-  Pixel).
+- Convolution: every output value sums its taps in the fixed order
+  `t = 0..n`; 16 output values are computed at once in registers (lanes),
+  and the column convolution runs in bands of 32 rows × 512 columns
+  (source rows stay in L2). The carriers (±1) are applied while filling
+  the row, or as a row sign in the column convolution: two row passes and
+  three column passes for the three chrominance estimates, instead of
+  three modulations and six passes — bit-identical to the reference
+  (`lowpass_reference`, test `fused_demodulation_matches_reference`).
+- Memory: mask values stay on the block grid and are sampled bilinearly
+  per pixel at mix time; the core split and the Dubois combination run in
+  the estimates' buffers; the mix overwrites `L̂`. Peak on the adaptive
+  path: mosaic, three estimates, `L̂`, mask plane = 6 full planes.
+  Allocator mimalloc (glibc returns 200 MB blocks to the kernel at once,
+  and every new plane paid its page faults again).
+- Determinism: parallel sums (gray-world, loop exit) are formed per row
+  and added in row order; test
+  `separation_is_deterministic_across_thread_counts` (16 against 3
+  threads, bit-identical).
+- Defect check: the median of the eight neighbours is formed only for
+  pixels outside the neighbour span (identical result, no sort per
+  pixel).
 
-## 13. Quellen
+## 13. References
 
 Alleysson, Süsstrunk, Hérault: Color demosaicing by estimating luminance and
 opponent chromatic signals in the Fourier domain, CIC 2002; Linear
@@ -881,4 +873,4 @@ demosaicing inspired by the human visual system, IEEE TIP 2005.
 Dubois: Frequency-domain methods for demosaicking of Bayer-sampled color
 images, IEEE SPL 2005.
 Liu, Yang, Chen: Frequency Enhancement for Image Demosaicking,
-arXiv:2503.15800 (nur als Grenze, kein Netz in dieser App).
+arXiv:2503.15800 (as a bound only; no network in this app).
