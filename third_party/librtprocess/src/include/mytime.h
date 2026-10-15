@@ -20,7 +20,12 @@
 #define _MYTIME_
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#undef min
+#undef max
 #elif defined __APPLE__
 #include <sys/time.h>
 #else
