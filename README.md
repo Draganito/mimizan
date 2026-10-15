@@ -279,7 +279,7 @@ Prebuilt packages are on the
 files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
 
 ```bash
-sudo apt install ./mimizan_0.10.9-1_amd64.deb
+sudo apt install ./mimizan_0.10.10-1_amd64.deb
 mimizan --version
 ```
 
@@ -460,7 +460,11 @@ this recipe in one pass against the negative and writes one file:
 description, size and border as set, with no sharpening — the print). *Recipe*
 saves the parameter set as `<name>.recipe.json` next to the RAW (it comes
 back when the file is opened again) or anywhere else, and loads one; the
-same JSON drives `mimizan print --recipe`. The preview is the picture before
+same JSON drives `mimizan print --recipe`. Opening another negative, or
+closing the window, asks before a recipe that differs from that file is
+left behind: *Save* writes it next to the RAW, *Don't save* leaves the
+file as it is, *Cancel* stays. *Reset* puts the controls back and does
+not write the file. The preview is the picture before
 the size step — mix, placing and the paper exactly as the TIFF gets
 them — and once you zoom past the fit-to-window preview (scroll,
 `1:1`, or a double click) the visible window is rendered from the

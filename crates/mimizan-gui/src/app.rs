@@ -134,6 +134,26 @@ enum CropHit {
     Corner(CropCorner),
 }
 
+/// Why the recipe question is on screen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Leave {
+    Open(PathBuf),
+    Quit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+/// A negative is open and its recipe is no longer the one it was opened
+/// with, or the one Reset put back.
+fn recipe_needs_saving(has_negative: bool, current: &Recipe, saved: &Recipe) -> bool {
+    has_negative && current != saved
+}
+
 #[derive(Clone, Copy)]
 struct CropDrag {
     hit: CropHit,
@@ -297,6 +317,12 @@ pub struct App {
     dialog: FileDialog,
     dialog_purpose: DialogPurpose,
     cameras_dir: PathBuf,
+    /// Recipe as opened, as reset, or as last saved next to the RAW.
+    recipe_baseline: Recipe,
+    /// A file change or a close is waiting on the save question.
+    pending_leave: Option<Leave>,
+    /// The close question was answered; the window may go.
+    close_allowed: bool,
 
     /// `MIMIZAN_SCREENSHOT=<png>`: capture the window once the first preview
     /// is on screen, then quit. Used for unattended checks and the README.
@@ -415,6 +441,9 @@ impl App {
             dialog: FileDialog::new(),
             dialog_purpose: DialogPurpose::Export,
             cameras_dir,
+            recipe_baseline: Recipe::on_paper(),
+            pending_leave: None,
+            close_allowed: false,
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
         };
@@ -881,6 +910,17 @@ impl App {
     fn open(&mut self, path: PathBuf) {
         // Absolute like the strip's entries, so the tile lights up.
         let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if self.session.as_ref().is_some_and(|s| s.path == path) {
+            return;
+        }
+        if self.should_ask_to_save() {
+            self.pending_leave = Some(Leave::Open(path));
+            return;
+        }
+        self.start_open(path);
+    }
+
+    fn start_open(&mut self, path: PathBuf) {
         self.busy = Some(format!("opening {}", path.display()));
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             if self.folder.as_ref().is_none_or(|f| f.path != parent) {
@@ -904,6 +944,11 @@ impl App {
             self.history = History::new(e.clone());
         }
         self.set_edit(e);
+        if !fresh {
+            // The working recipe is the default again. The file next to the
+            // RAW stays until a later save.
+            self.recipe_baseline = self.edit.recipe.clone();
+        }
         self.tex_rotation = 0;
         self.keep_scale = None;
         self.show_mask = false;
@@ -938,8 +983,93 @@ impl App {
 
     fn save_recipe(&mut self, path: &Path) {
         match self.edit.recipe.validate().and_then(|_| self.edit.recipe.save(path)) {
-            Ok(()) => self.log(format!("saved recipe {}", path.display())),
+            Ok(()) => {
+                self.log(format!("saved recipe {}", path.display()));
+                if self.recipe_sidecar().as_deref() == Some(path) {
+                    self.recipe_baseline = self.edit.recipe.clone();
+                }
+            }
             Err(e) => self.log(format!("recipe not saved: {e}")),
+        }
+    }
+
+    fn should_ask_to_save(&self) -> bool {
+        self.screenshot_to.is_none()
+            && recipe_needs_saving(self.session.is_some(), &self.edit.recipe, &self.recipe_baseline)
+    }
+
+    /// The window was asked to close. A changed recipe stays until the
+    /// question is answered. An unattended screenshot is never asked.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        let requested = ctx.input(|i| i.viewport().close_requested());
+        if !requested || self.close_allowed || self.screenshot_to.is_some() {
+            return;
+        }
+        if self.should_ask_to_save() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_leave = Some(Leave::Quit);
+        }
+    }
+
+    fn follow_leave(&mut self, ctx: &egui::Context, leave: Leave) {
+        match leave {
+            Leave::Open(path) => self.start_open(path),
+            Leave::Quit => {
+                self.close_allowed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn answer_save(&mut self, ctx: &egui::Context, leave: Leave, choice: SaveChoice) {
+        match choice {
+            SaveChoice::Cancel => self.pending_leave = None,
+            SaveChoice::Discard => {
+                self.pending_leave = None;
+                self.follow_leave(ctx, leave);
+            }
+            SaveChoice::Save => {
+                let Some(path) = self.recipe_sidecar() else {
+                    self.log("recipe not saved: no negative open");
+                    return;
+                };
+                self.save_recipe(&path);
+                if self.edit.recipe == self.recipe_baseline {
+                    self.pending_leave = None;
+                    self.follow_leave(ctx, leave);
+                }
+            }
+        }
+    }
+
+    fn save_prompt(&mut self, ctx: &egui::Context) {
+        let Some(leave) = self.pending_leave.clone() else { return };
+        let when = match &leave {
+            Leave::Quit => "before closing",
+            Leave::Open(_) => "before opening another negative",
+        };
+        let mut choice = None;
+        egui::Modal::new(egui::Id::new("save_recipe")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.label(format!("Save the recipe next to the RAW {when}?"));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Save").clicked() {
+                    choice = Some(SaveChoice::Save);
+                }
+                if ui.button("Don't save").clicked() {
+                    choice = Some(SaveChoice::Discard);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(SaveChoice::Cancel);
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                choice = Some(SaveChoice::Cancel);
+            }
+        });
+        if let Some(choice) = choice {
+            self.answer_save(ctx, leave, choice);
         }
     }
 
@@ -1000,6 +1130,7 @@ impl App {
                             // A paper border in the unattended capture.
                             self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
                         }
+                        self.recipe_baseline = self.edit.recipe.clone();
                     }
                     self.busy = None;
                     self.last_view = None;
@@ -1362,7 +1493,13 @@ impl App {
             {
                 self.redo();
             }
-            if ui.button("Reset").on_hover_text("Controls back to defaults; the negative stays").clicked() {
+            if ui
+                .button("Reset")
+                .on_hover_text(
+                    "Controls back to defaults; the negative stays. The recipe file next to the RAW is left as it is.",
+                )
+                .clicked()
+            {
                 self.reset(false);
             }
             ui.separator();
@@ -2719,7 +2856,7 @@ impl App {
     /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
     /// keyboard is not in a text field.
     fn strip_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        if self.pending_leave.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         let (b, left, right) = ctx.input(|i| {
@@ -3143,6 +3280,7 @@ impl eframe::App for App {
     /// window is hidden or covered, so an export finishes and logs regardless.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events(ctx);
+        self.guard_close(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3192,6 +3330,7 @@ impl eframe::App for App {
         if self.compare_open {
             self.show_compare(&ctx);
         }
+        self.save_prompt(&ctx);
     }
 }
 
@@ -3403,7 +3542,7 @@ impl App {
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
     /// every panel. Enter keeps the crop. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        if self.pending_leave.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -3435,8 +3574,8 @@ impl App {
 
 #[cfg(test)]
 mod crop_drag_tests {
-    use super::{hit_crop, moved_crop, CropHit, PaperFormat};
-    use mimizan_core::recipe::{CropCorner, CropRect};
+    use super::{hit_crop, moved_crop, recipe_needs_saving, CropHit, PaperFormat};
+    use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
 
     #[test]
     fn grabbing_does_not_jump() {
@@ -3494,5 +3633,16 @@ mod crop_drag_tests {
         assert_eq!((format, turned), (PaperFormat::R4x5, true));
         let (format, turned) = PaperFormat::match_window(100, 80, 50, 40);
         assert_eq!((format, turned), (PaperFormat::R4x5, false));
+    }
+
+    #[test]
+    fn a_recipe_is_saved_only_when_it_differs_from_the_one_opened() {
+        let opened = Recipe::on_paper();
+        assert!(!recipe_needs_saving(false, &opened, &opened));
+        assert!(!recipe_needs_saving(true, &opened, &opened));
+        let mut changed = opened.clone();
+        changed.place = 0.25;
+        assert!(recipe_needs_saving(true, &changed, &opened));
+        assert!(!recipe_needs_saving(true, &changed, &changed));
     }
 }

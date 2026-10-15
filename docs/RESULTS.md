@@ -820,6 +820,17 @@ move it as before. *Apply* or Enter still writes that one window. Opening
 Crop on a window that already stands across the picture selects the ratio
 and *Turn* together. 1:1 has nothing to turn.
 
+### A changed recipe is asked for (0.10.10)
+
+A recipe saved as `<name>.recipe.json` next to the RAW still opens with
+the file. Opening another negative, or closing the window, asks when the
+working recipe differs from the one the file was opened with: *Save*
+writes it next to the RAW, *Don't save* leaves that file untouched,
+*Cancel* stays on the negative. An unchanged recipe is not asked about.
+*Reset* returns the controls to the base print and does not write the
+file; a recipe made after that is asked about again. *Save next to the
+RAW* in the menu still writes the same file and clears the question.
+
 ## Real samples
 
 `mimizan negative testdata/NikonZF.nef` (adaptive, as-shot balance R 2.0156
