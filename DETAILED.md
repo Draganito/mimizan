@@ -278,15 +278,19 @@ no lens corrections.
 Prebuilt packages are on the
 [releases page](https://github.com/Draganito/mimizan/releases):
 `mimizan_<version>-1_amd64.deb` (Debian/Ubuntu, both binaries, camera and look
-files, docs) and `mimizan-<version>-x86_64-linux.tar.gz`.
+files, docs), `mimizan-<version>-x86_64-linux.tar.gz`, and
+`mimizan-<version>-x86_64-windows.zip` (64-bit Intel and AMD). On Windows,
+unzip and start `mimizan-gui.exe`; `cameras` and `look` stay beside the two
+programs. An unsigned download asks SmartScreen for confirmation.
 
 ```bash
-sudo apt install ./mimizan_0.10.10-1_amd64.deb
+sudo apt install ./mimizan_0.10.11-1_amd64.deb
 mimizan --version
 ```
 
 From source (a recent stable Rust, a C++ compiler for the vendored
-demosaicers, and a working OpenGL for the GUI):
+demosaicers, CMake, and a working OpenGL for the GUI; on Windows that
+compiler is MSVC):
 
 ```bash
 git clone https://github.com/Draganito/mimizan

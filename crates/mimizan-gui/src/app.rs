@@ -2,7 +2,7 @@
 //! (right). Nothing here changes pixels; it only chooses parameters and hands
 //! them to the workers.
 
-use crate::browser::{self, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::compare::{self, Compare, CompareKey, CompareRequest};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
@@ -2801,7 +2801,7 @@ fn crop_cursor(hit: CropHit, dragging: bool) -> CursorIcon {
 /// Where the strip starts when nothing is remembered: the pictures folder
 /// if there is one, else home.
 fn start_folder() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let home = home_dir()?;
     ["Pictures", "Bilder", "Images", "Photos"]
         .iter()
         .map(|d| home.join(d))

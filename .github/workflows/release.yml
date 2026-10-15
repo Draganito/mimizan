@@ -18,10 +18,40 @@ jobs:
         run: cargo install cargo-deb --locked
       - name: Build artefacts
         run: dist/make_release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            dist/mimizan_*.deb
+            dist/mimizan-*-x86_64-linux.tar.gz
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build artefacts
+        shell: pwsh
+        run: pwsh -ExecutionPolicy Bypass -File ./dist/make_release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/mimizan-*-x86_64-windows.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
       - name: Upload to the release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/mimizan_*.deb
-            dist/mimizan-*-x86_64-linux.tar.gz
+          files: release-assets/*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc') }}

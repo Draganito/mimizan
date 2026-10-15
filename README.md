@@ -30,13 +30,17 @@ The print is a sheet of Ilford Multigrade. The soft pass is the measured grade-0
 
 ## Get it
 
-The desktop build for Debian and Ubuntu is on the [releases page](https://github.com/Draganito/mimizan/releases):
+Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/releases).
+
+Debian and Ubuntu:
 
 ```bash
-sudo apt install ./mimizan_0.10.10-1_amd64.deb
+sudo apt install ./mimizan_0.10.11-1_amd64.deb
 ```
 
-That installs the darkroom window, `mimizan-gui`, and the `mimizan` command. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
+That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
+
+Windows, 64-bit Intel and AMD: unzip `mimizan-0.10.11-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
 
 The same paper is on the phone: [Mimizan Lab for Android](https://github.com/Draganito/mimizan-lab-mobile).
 
