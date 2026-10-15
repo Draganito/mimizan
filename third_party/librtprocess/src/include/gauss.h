@@ -1177,7 +1177,8 @@ template<class T> void gaussianBlurImpl(T** src, T** dst, const int W, const int
         double mIdeal = (12 * sigma * sigma - n * wl * wl - 4 * n * wl - 3 * n) / (-4 * wl - 4);
         int m = round(mIdeal);
 
-        int sizes[n];
+        // n is clamped to 3..6 above. A variable-length array is a GCC extension.
+        int sizes[6];
 
         for(int i = 0; i < n; i++) {
             sizes[i] = ((i < m ? wl : wu) - 1) / 2;
