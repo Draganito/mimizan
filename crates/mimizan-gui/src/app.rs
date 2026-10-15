@@ -353,6 +353,9 @@ fn resource_dir(name: &str) -> PathBuf {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
+        // The panels are always dark. Pin the preference as well, so the native
+        // title bar follows. A light Windows caption would otherwise stay light.
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let cameras_dir = resource_dir("cameras");
         let persisted = Persisted::load();
