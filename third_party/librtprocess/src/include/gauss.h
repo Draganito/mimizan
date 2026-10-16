@@ -24,8 +24,15 @@
 #include "opthelper.h"
 #include "boxblur.h"
 
-#ifdef _MSC_VER
-// MSVC has no GCC variable-length arrays. This stands in for `T buf[rows][cols]`.
+// ISO C++ has no variable-length arrays. MSVC never had them. Apple Clang is
+// invoked with extensions off, so it rejects them too. GCC on Linux still
+// accepts the extension.
+#if defined(_MSC_VER) || defined(__APPLE__)
+#define RT_NO_VLA 1
+#endif
+
+#ifdef RT_NO_VLA
+// Stands in for `T buf[rows][cols]`.
 template<class T>
 struct MsvcVla2D {
     std::vector<T> store;
@@ -226,7 +233,7 @@ template<class T> void gauss3x3div (T** RESTRICT src, T** RESTRICT dst, T** REST
 // use separated filter if the support window is small and src == dst
 template<class T> void gaussHorizontal3 (T** src, T** dst, int W, int H, const float c0, const float c1)
 {
-#ifdef _MSC_VER
+#ifdef RT_NO_VLA
     std::vector<T> temp(static_cast<size_t>(W));
 #else
     T temp[W] ALIGNED16;
@@ -310,7 +317,7 @@ template<class T> void gaussVertical3 (T** src, T** dst, int W, int H, const flo
 #else
 template<class T> void gaussVertical3 (T** src, T** dst, int W, int H, const float c0, const float c1)
 {
-#ifdef _MSC_VER
+#ifdef RT_NO_VLA
     std::vector<T> temp(static_cast<size_t>(H));
 #else
     T temp[H] ALIGNED16;
@@ -461,7 +468,7 @@ template<class T> void gaussHorizontal (T** src, T** dst, const int W, const int
             M[i][j] /= (1.0 + b1 - b2 + b3) * (1.0 + b2 + (b1 - b3) * b3);
         }
 
-#ifdef _MSC_VER
+#ifdef RT_NO_VLA
     std::vector<double> temp2(static_cast<size_t>(W));
 #else
     double temp2[W] ALIGNED16;
@@ -942,7 +949,7 @@ template<class T> void gaussVertical (T** src, T** dst, const int W, const int H
 
     // process 'numcols' columns for better usage of L1 cpu cache (especially faster for large values of H)
     static const int numcols = 8;
-#ifdef _MSC_VER
+#ifdef RT_NO_VLA
     MsvcVla2D<double> temp2(H, numcols);
 #else
     double temp2[H][numcols] ALIGNED16;
@@ -1025,7 +1032,7 @@ template<class T> void gaussVerticaldiv (T** src, T** dst, T** divBuffer, const 
 
     // process 'numcols' columns for better usage of L1 cpu cache (especially faster for large values of H)
     static const int numcols = 8;
-#ifdef _MSC_VER
+#ifdef RT_NO_VLA
     MsvcVla2D<double> temp2(H, numcols);
 #else
     double temp2[H][numcols] ALIGNED16;
@@ -1107,7 +1114,7 @@ template<class T> void gaussVerticalmult (T** src, T** dst, const int W, const i
 
     // process 'numcols' columns for better usage of L1 cpu cache (especially faster for large values of H)
     static const int numcols = 8;
-#ifdef _MSC_VER
+#ifdef RT_NO_VLA
     MsvcVla2D<double> temp2(H, numcols);
 #else
     double temp2[H][numcols] ALIGNED16;

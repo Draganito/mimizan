@@ -41,8 +41,24 @@ jobs:
           path: dist/mimizan-*-x86_64-windows.zip
           if-no-files-found: error
 
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apple silicon
+        run: test "$(uname -m)" = arm64
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build artefacts
+        run: bash dist/make_release_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: dist/mimizan-*-aarch64-macos.zip
+          if-no-files-found: error
+
   publish:
-    needs: [linux, windows]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

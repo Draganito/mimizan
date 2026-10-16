@@ -27,12 +27,13 @@ image.workspace = true
 
 # GNOME Wayland draws no server-side frame: let winit draw the Adwaita-style
 # client-side decorations itself, with the window title centred in the bar.
-# Those features stay off the Windows build; Glow is the shared renderer.
-[target.'cfg(not(windows))'.dependencies]
+# macOS and Windows keep the native frame. Glow is the shared renderer, and
+# on macOS that is the system OpenGL framework, not a library to install.
+[target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 
 [lints.clippy]

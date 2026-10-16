@@ -280,9 +280,12 @@ Prebuilt packages are on the
 [releases page](https://github.com/Draganito/mimizan/releases):
 `mimizan_<version>-1_amd64.deb` (Debian/Ubuntu, both binaries, camera and look
 files, docs), `mimizan-<version>-x86_64-linux.tar.gz`, and
-`mimizan-<version>-x86_64-windows.zip` (64-bit Intel and AMD). On Windows,
-unzip and start `mimizan-gui.exe`; `cameras` and `look` stay beside the two
-programs. An unsigned download asks SmartScreen for confirmation.
+`mimizan-<version>-x86_64-windows.zip` (64-bit Intel and AMD), and
+`mimizan-<version>-aarch64-macos.zip` (Apple silicon). On Windows, unzip and
+start `mimizan-gui.exe`; `cameras` and `look` stay beside the two programs.
+An unsigned download asks SmartScreen for confirmation. On a Mac with an M
+processor, unzip and start `mimizan-gui`. The programs link only the
+frameworks that ship with macOS, so nothing from Homebrew is required.
 
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
@@ -293,7 +296,7 @@ mimizan --version
 
 From source (a recent stable Rust, a C++ compiler for the vendored
 demosaicers, CMake, and a working OpenGL for the GUI; on Windows that
-compiler is MSVC):
+compiler is MSVC, on a Mac it is the Clang that comes with Xcode):
 
 ```bash
 git clone https://github.com/Draganito/mimizan

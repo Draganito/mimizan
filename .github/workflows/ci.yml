@@ -40,3 +40,27 @@ jobs:
         run: cargo test --release --workspace
       - name: Synthetic bench (smoke)
         run: cargo run --release -p mimizan-cli -- measure synth --size 512
+
+  macos:
+    # Hosted macOS runners are Apple silicon. The job refuses an Intel machine.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apple silicon
+        run: |
+          uname -m
+          test "$(uname -m)" = arm64
+          cmake --version
+          clang++ --version
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --release --workspace
+      - name: Synthetic bench (smoke)
+        run: cargo run --release -p mimizan-cli -- measure synth --size 512
+      - name: No libraries beyond macOS
+        run: bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui

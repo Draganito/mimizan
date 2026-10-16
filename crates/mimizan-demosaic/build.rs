@@ -3,9 +3,10 @@
 //! librtprocess is GPL-3.0-or-later. This crate links it. The rest of
 //! Mimizan Lab is under the same license.
 //!
-//! MSVC has no `<x86intrin.h>` and does not define `__SSE2__`. The vendored
-//! sources then take their scalar paths. The default Mimizan negative does
-//! not demosaic; AMaZE, RCD, DCB and LMMSE still run, without the SSE kernels.
+//! MSVC has no `<x86intrin.h>` and does not define `__SSE2__`. Apple silicon
+//! is the same: no SSE, and no libgomp on the system. The vendored sources
+//! then take their scalar paths. The default Mimizan negative does not
+//! demosaic; AMaZE, RCD, DCB and LMMSE still run, without the SSE kernels.
 
 use std::path::{Path, PathBuf};
 
@@ -15,9 +16,11 @@ fn main() {
     println!("cargo:rerun-if-changed=src/wrap.cpp");
 
     // MSVC's OpenMP rejects the vendored `simd` and `reduction(min/max)`
-    // pragmas unless a different runtime is selected. The demosaicers still
+    // pragmas unless a different runtime is selected. Apple Clang has no
+    // OpenMP unless a separate libomp is installed, and that would be a
+    // dependency the finished program must not have. The demosaicers still
     // run; the parallel loops fall back to one thread. Linux keeps OpenMP.
-    let openmp = if cfg!(target_env = "msvc") { "OFF" } else { "ON" };
+    let openmp = if cfg!(target_env = "msvc") || cfg!(target_os = "macos") { "OFF" } else { "ON" };
     let dst = cmake::Config::new(&root)
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("OPTION_OMP", openmp)
@@ -36,7 +39,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", libdir.display());
     println!("cargo:rustc-link-lib=static=rtprocess");
-    if cfg!(not(target_env = "msvc")) {
+    if cfg!(target_os = "macos") {
+        // libc++, the C++ library that ships with macOS. Not libstdc++.
+        println!("cargo:rustc-link-lib=c++");
+    } else if cfg!(not(target_env = "msvc")) {
         println!("cargo:rustc-link-lib=gomp");
         println!("cargo:rustc-link-lib=stdc++");
     }
