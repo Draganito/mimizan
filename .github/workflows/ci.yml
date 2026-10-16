@@ -62,5 +62,7 @@ jobs:
         run: cargo test --release --workspace
       - name: Synthetic bench (smoke)
         run: cargo run --release -p mimizan-cli -- measure synth --size 512
+      - name: Window
+        run: cargo build --release -p mimizan-gui
       - name: No libraries beyond macOS
         run: bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui
