@@ -35,14 +35,14 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 Debian and Ubuntu:
 
 ```bash
-sudo apt install ./mimizan_0.10.11-1_amd64.deb
+sudo apt install ./mimizan_0.10.12-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: unzip `mimizan-0.10.11-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
+Windows, 64-bit Intel and AMD: unzip `mimizan-0.10.12-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
 
-Apple silicon: unzip `mimizan-<version>-aarch64-macos.zip` and start `mimizan-gui`. Leave `cameras` and `look` beside the two programs. The programs use the frameworks that come with macOS.
+Apple silicon: unzip `mimizan-0.10.12-aarch64-macos.zip` and start `mimizan-gui`. Leave `cameras` and `look` beside the two programs. The programs use the frameworks that come with macOS.
 
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 

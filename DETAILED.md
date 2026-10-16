@@ -290,7 +290,7 @@ frameworks that ship with macOS, so nothing from Homebrew is required.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.10.11-1_amd64.deb
+sudo apt install ./mimizan_0.10.12-1_amd64.deb
 mimizan --version
 ```
 
