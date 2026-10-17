@@ -6,7 +6,9 @@ use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbSta
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{DetailRect, DevelopParams, Histogram, Session, ViewParams};
-use crate::worker::{Event, Heavy, Job, Loupe, LoupeRequest, Preview, PreviewRequest};
+use crate::worker::{
+    Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, Preview, PreviewRequest, PreviewResult,
+};
 use crate::zone_bar::zone_bar;
 use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
@@ -186,6 +188,24 @@ enum DialogPurpose {
     LoadRecipe,
 }
 
+/// What the main picture and the print box both render: the exposure,
+/// the weights, the turn and the crop. The box's place in the picture
+/// is not part of it, so a drag of the crosshair updates the box alone.
+#[derive(Clone, PartialEq)]
+struct SharedPicture {
+    session: usize,
+    weights: Weights,
+    tone: Tone,
+    place: f64,
+    rotation: u8,
+    crop: Option<CropRect>,
+}
+
+/// The print box has a newer exposure than the picture on screen.
+fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
+    tile_has_picture && !tile_matches_shown
+}
+
 pub struct App {
     heavy: Heavy,
     preview: Preview,
@@ -242,8 +262,20 @@ pub struct App {
     loupe_key: Option<(usize, Weights, Recipe, u16, [f64; 2], usize)>,
     /// Box side asked for this frame, in print pixels (one screen pixel each).
     loupe_px: usize,
+    /// The print window was on screen this frame, so its box is part of the pair.
+    loupe_open: bool,
     loupe_tex: Option<TextureHandle>,
     loupe_size: [usize; 2],
+    /// Exposure last sent to the preview and to the print box, and the one
+    /// on screen. The box keeps its pixels until the main picture shows
+    /// that exposure. A drag of the crosshair does not change it.
+    preview_picture: Option<SharedPicture>,
+    loupe_picture: Option<SharedPicture>,
+    shown_picture: Option<SharedPicture>,
+    /// Preview generation that carries the new main picture.
+    picture_gen: u64,
+    /// A finished print box kept back until the main picture shows its exposure.
+    held_loupe: Option<LoupeResult>,
 
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
@@ -272,6 +304,8 @@ pub struct App {
     /// Window the view currently wants (None when the fit preview suffices).
     wanted_detail: Option<DetailRect>,
     last_detail_request: Option<DetailRect>,
+    /// Fitted-print recipe last sent for the 100% window. `None` is the negative.
+    last_inspect: Option<Recipe>,
     generation: u64,
     shown_generation: u64,
     last_view: Option<ViewParams>,
@@ -371,8 +405,14 @@ impl App {
             loupe_shown: 0,
             loupe_key: None,
             loupe_px: 0,
+            loupe_open: false,
             loupe_tex: None,
             loupe_size: [0, 0],
+            preview_picture: None,
+            loupe_picture: None,
+            shown_picture: None,
+            picture_gen: 0,
+            held_loupe: None,
             zoom_to_1to1: false,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
@@ -389,6 +429,7 @@ impl App {
             detail_rect: None,
             wanted_detail: None,
             last_detail_request: None,
+            last_inspect: None,
             generation: 0,
             shown_generation: 0,
             last_view: None,
@@ -719,6 +760,37 @@ impl App {
         let params = mimizan_core::print::PrintParams { recipe: self.print_recipe(), ..Default::default() };
         // Already upright: orientation 1.
         Some(mimizan_core::print::layout(w, h, 1, &params))
+    }
+
+    /// Pixel size the 100% view addresses. A centimetre size addresses the
+    /// fitted print; otherwise the negative (the crop, when one is committed).
+    fn inspect_size(&self) -> (usize, usize) {
+        if self.crop_open {
+            return self.export_size();
+        }
+        if !self.show_mask {
+            if let Some(lay) = self.print_layout() {
+                return (lay.image_w, lay.image_h);
+            }
+        }
+        self.picture_size()
+    }
+
+    /// The print recipe when 100% is a window of the fitted picture.
+    /// `None` keeps 100% on the negative's own pixels.
+    fn inspect_recipe(&self) -> Option<Recipe> {
+        if self.session.is_none() || self.crop_open || self.show_mask {
+            return None;
+        }
+        let recipe = self.print_recipe();
+        recipe.size?;
+        let (nw, nh) = self.picture_size();
+        let lay = self.print_layout()?;
+        if lay.image_w == nw && lay.image_h == nh {
+            None
+        } else {
+            Some(recipe)
+        }
     }
 
     fn close_crop(&mut self) {
@@ -1098,22 +1170,7 @@ impl App {
         }
         if let Some(r) = self.loupe.poll() {
             if r.generation == self.loupe_sent {
-                self.loupe_shown = r.generation;
-                if r.image.width > 0
-                    && r.image.height > 0
-                    && r.image.gray.len() == r.image.width * r.image.height
-                {
-                    let w = r.image.width;
-                    let h = r.image.height;
-                    let pixels: Vec<Color32> = r.image.gray.iter().copied().map(Color32::from_gray).collect();
-                    let image = ColorImage::new([w, h], pixels);
-                    self.loupe_tex = Some(ctx.load_texture("sharpen-loupe", image, TextureOptions::NEAREST));
-                    self.loupe_size = [w, h];
-                } else {
-                    // Same controls are not sent again. The previous box stays
-                    // up; the next change of size, dpi or kernel asks once more.
-                    self.log("print box failed");
-                }
+                self.accept_loupe(ctx, r);
             }
         }
         for r in self.thumbs.poll() {
@@ -1142,44 +1199,7 @@ impl App {
                 continue;
             }
             self.shown_generation = r.generation;
-            self.preview_ms = r.ms;
-            if let Some(im) = r.image {
-                // A turned picture keeps its magnification and its centre:
-                // turn the pan with it, and let the panel re-derive the zoom
-                // (which is relative to "fit") from the absolute scale.
-                let turns = (4 + im.rotation - self.tex_rotation) % 4;
-                for _ in 0..turns {
-                    self.pan = Vec2::new(-self.pan.y, self.pan.x);
-                }
-                if turns % 2 == 1 {
-                    if let Some(f) = self.last_fit {
-                        self.keep_scale = Some(f * self.zoom);
-                    }
-                }
-                self.tex_rotation = im.rotation;
-                let img = ColorImage::from_gray([im.width, im.height], &im.gray);
-                let opts = TextureOptions::LINEAR;
-                match &mut self.texture {
-                    Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
-                    _ => self.texture = Some(ctx.load_texture("preview", img, opts)),
-                }
-                self.tex_size = [im.width, im.height];
-                self.hist_view = im.hist_view;
-                self.hist_negative = im.hist_negative;
-            }
-            if let Some(d) = r.detail {
-                let img = ColorImage::from_gray([d.rect.w, d.rect.h], &d.gray);
-                // Shown at >= 1 screen pixel per image pixel: no filtering, the
-                // pixels are the point.
-                let opts = TextureOptions::NEAREST;
-                match &mut self.detail_texture {
-                    Some(t) if self.detail_rect.is_some_and(|r| (r.w, r.h) == (d.rect.w, d.rect.h)) => {
-                        t.set(img, opts)
-                    }
-                    _ => self.detail_texture = Some(ctx.load_texture("detail", img, opts)),
-                }
-                self.detail_rect = Some(d.rect);
-            }
+            self.accept_preview(ctx, r);
         }
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
@@ -1242,27 +1262,146 @@ impl App {
         }
     }
 
+    /// The exposure both pictures are made from. The crosshair is absent,
+    /// so moving the box does not change this.
+    fn shared_picture(&self) -> Option<SharedPicture> {
+        let session = self.session.as_ref()?;
+        let r = &self.edit.recipe;
+        Some(SharedPicture {
+            session: Arc::as_ptr(session) as usize,
+            weights: self.weights(),
+            tone: r.curve.clone(),
+            place: r.place,
+            rotation: self.edit.rotation,
+            crop: if self.crop_open { None } else { r.crop },
+        })
+    }
+
+    fn accept_preview(&mut self, ctx: &egui::Context, r: PreviewResult) {
+        // A newer exposure is already on its way. This result belongs to the previous one.
+        if self.picture_gen > 0 && r.generation < self.picture_gen {
+            return;
+        }
+        let shows_picture = r.image.is_some();
+        self.apply_preview(ctx, r);
+        if shows_picture {
+            self.shown_picture = self.preview_picture.clone();
+            self.flush_loupe(ctx);
+        }
+    }
+
+    fn accept_loupe(&mut self, ctx: &egui::Context, r: LoupeResult) {
+        let matches = self.loupe_picture == self.shown_picture;
+        if tile_must_wait(self.loupe_picture.is_some(), matches) {
+            self.held_loupe = Some(r);
+        } else {
+            self.apply_loupe(ctx, r);
+        }
+    }
+
+    /// The box finished before the main picture. Show it once that picture is up.
+    fn flush_loupe(&mut self, ctx: &egui::Context) {
+        let Some(r) = self.held_loupe.take() else { return };
+        if r.generation != self.loupe_sent {
+            return;
+        }
+        if self.loupe_picture == self.shown_picture {
+            self.apply_loupe(ctx, r);
+        } else {
+            self.held_loupe = Some(r);
+        }
+    }
+
+    fn apply_preview(&mut self, ctx: &egui::Context, r: PreviewResult) {
+        self.preview_ms = r.ms;
+        if let Some(im) = r.image {
+            // A turned picture keeps its magnification and its centre:
+            // turn the pan with it, and let the panel re-derive the zoom
+            // (which is relative to "fit") from the absolute scale.
+            let turns = (4 + im.rotation - self.tex_rotation) % 4;
+            for _ in 0..turns {
+                self.pan = Vec2::new(-self.pan.y, self.pan.x);
+            }
+            if turns % 2 == 1 {
+                if let Some(f) = self.last_fit {
+                    self.keep_scale = Some(f * self.zoom);
+                }
+            }
+            self.tex_rotation = im.rotation;
+            let img = ColorImage::from_gray([im.width, im.height], &im.gray);
+            let opts = TextureOptions::LINEAR;
+            match &mut self.texture {
+                Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
+                _ => self.texture = Some(ctx.load_texture("preview", img, opts)),
+            }
+            self.tex_size = [im.width, im.height];
+            self.hist_view = im.hist_view;
+            self.hist_negative = im.hist_negative;
+        }
+        if let Some(d) = r.detail {
+            let img = ColorImage::from_gray([d.rect.w, d.rect.h], &d.gray);
+            // Shown at >= 1 screen pixel per image pixel: no filtering, the
+            // pixels are the point.
+            let opts = TextureOptions::NEAREST;
+            match &mut self.detail_texture {
+                Some(t) if self.detail_rect.is_some_and(|r| (r.w, r.h) == (d.rect.w, d.rect.h)) => {
+                    t.set(img, opts)
+                }
+                _ => self.detail_texture = Some(ctx.load_texture("detail", img, opts)),
+            }
+            self.detail_rect = Some(d.rect);
+        }
+    }
+
+    fn apply_loupe(&mut self, ctx: &egui::Context, r: LoupeResult) {
+        self.loupe_shown = r.generation;
+        if r.image.width > 0 && r.image.height > 0 && r.image.gray.len() == r.image.width * r.image.height {
+            let w = r.image.width;
+            let h = r.image.height;
+            let pixels: Vec<Color32> = r.image.gray.iter().copied().map(Color32::from_gray).collect();
+            let image = ColorImage::new([w, h], pixels);
+            self.loupe_tex = Some(ctx.load_texture("sharpen-loupe", image, TextureOptions::NEAREST));
+            self.loupe_size = [w, h];
+        } else {
+            // Same controls are not sent again. The previous box stays
+            // up; the next change of size, dpi or kernel asks once more.
+            self.log("print box failed");
+        }
+    }
+
     fn request_preview_if_needed(&mut self) {
         let Some(s) = &self.session else { return };
         let view = self.view_params();
         let view_changed = self.last_view.as_ref() != Some(&view);
         let detail_changed = self.wanted_detail != self.last_detail_request;
-        if !view_changed && !detail_changed {
+        let inspect = self.inspect_recipe();
+        let inspect_changed = self.last_inspect != inspect;
+        let need = view_changed || detail_changed || (inspect_changed && self.wanted_detail.is_some());
+        if !need {
             return;
         }
-        if view_changed {
+        if view_changed || inspect_changed {
             // Everything shown so far belongs to the old view.
             self.detail_rect = None;
         }
         self.generation += 1;
+        if view_changed {
+            let picture = self.shared_picture();
+            if picture != self.preview_picture {
+                self.picture_gen = self.generation;
+                self.preview_picture = picture;
+            }
+        }
         self.preview.request(PreviewRequest {
             session: Arc::clone(s),
             view: view.clone(),
             detail: self.wanted_detail,
+            inspect: inspect.clone(),
             generation: self.generation,
         });
         self.last_view = Some(view);
         self.last_detail_request = self.wanted_detail;
+        self.last_inspect = inspect;
     }
 
     fn start_dialog(&mut self, purpose: DialogPurpose, default_name: Option<String>) {
@@ -2146,6 +2285,7 @@ impl App {
     /// The 1:1 box, as wide as this panel. Print pixels after the size
     /// step, the same ones the TIFF gets, with no sharpening.
     fn sharpen_loupe(&mut self, ui: &mut egui::Ui) {
+        self.loupe_open = true;
         let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
         let side = (ui.available_width() * ppp).round() as usize;
         self.loupe_px = side.clamp(64, 960);
@@ -2186,7 +2326,6 @@ impl App {
             // The picture follows the hand. One screen pixel is one print pixel.
             self.nudge_loupe(delta, ppp);
         }
-        self.request_loupe();
     }
 
     /// Move the loupe centre by a drag. `delta` is in points; the box is one
@@ -2215,6 +2354,7 @@ impl App {
             return;
         }
         self.loupe_key = Some(key);
+        self.loupe_picture = self.shared_picture();
         self.loupe_sent = self.loupe_sent.wrapping_add(1);
         self.loupe.request(LoupeRequest {
             session,
@@ -2320,9 +2460,11 @@ impl App {
                 }
             }
         }
-        let (uw, uh) = if self.crop_open { self.export_size() } else { self.picture_size() };
+        let (uw, uh) = self.inspect_size();
         let ppp = ui.pixels_per_point();
-        // Zoom at which one negative pixel is one screen pixel.
+        // Zoom at which one picture pixel is one screen pixel. Without a
+        // centimetre size that pixel is a negative pixel; with one, it is a
+        // pixel of the fitted print.
         let zoom_1to1 = (uw as f32 / (tw as f32 * fit * ppp)).clamp(1.0, MAX_ZOOM);
         if std::mem::take(&mut self.zoom_to_1to1) {
             // About the viewport centre.
@@ -2412,14 +2554,20 @@ impl App {
         }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
-        // Magnification in screen pixels per negative pixel.
+        // Magnification in screen pixels per picture pixel (negative, or the
+        // fitted print when a centimetre size is set).
         let size = rect.size();
         let mag = size.x * ppp / uw.max(1) as f32;
-        // Once the fit preview would be upscaled, show the real pixels of the
-        // visible window instead (rendered by the worker, never sharpened).
+        // The fit copy stays while its texels are smaller than the screen.
+        // Past that, the visible window is the file. A fitted print waits
+        // until one of its pixels covers a screen pixel: building it earlier
+        // would resample the whole sheet on every exposure.
         let pts_per_px = size.x / uw.max(1) as f32;
         let texel_px = size.x * ppp / tw as f32;
-        self.wanted_detail = if texel_px > 1.0 && uw > 0 && uh > 0 {
+        let inspecting = self.inspect_recipe().is_some();
+        // 0.999 absorbs the rounding of the 1:1 zoom, which lands on 1.
+        let show_file = if inspecting { mag >= 0.999 } else { texel_px > 1.0 };
+        self.wanted_detail = if show_file && uw > 0 && uh > 0 {
             let vis = avail.intersect(rect);
             let x0 = ((vis.left() - rect.left()) / pts_per_px).floor().max(0.0) as usize;
             let y0 = ((vis.top() - rect.top()) / pts_per_px).floor().max(0.0) as usize;
@@ -2471,7 +2619,11 @@ impl App {
 
         if self.session.is_some() {
             let txt = if self.detail_rect.is_some() {
-                format!("{:.0} % · full-resolution negative pixels, before scale", 100.0 * mag)
+                if inspecting {
+                    format!("{:.0} % · print pixels", 100.0 * mag)
+                } else {
+                    format!("{:.0} % · the file's pixels", 100.0 * mag)
+                }
             } else {
                 format!("{:.0} % of full size", 100.0 * mag)
             };
@@ -3044,6 +3196,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.loupe_open = false;
         self.ensure_loupe_point();
         self.handle_dialog(&ctx);
 
@@ -3092,6 +3245,11 @@ impl eframe::App for App {
         self.clear_desktop_sharpen();
         self.commit_history(&ctx);
         self.request_preview_if_needed();
+        // After every slider. The print window is drawn before the enlarger,
+        // so a request from inside it would still carry the previous exposure.
+        if self.loupe_open {
+            self.request_loupe();
+        }
         self.strip_keys(&ctx);
         self.save_prompt(&ctx);
     }
@@ -3372,7 +3530,7 @@ impl App {
 
 #[cfg(test)]
 mod crop_drag_tests {
-    use super::{hit_crop, moved_crop, recipe_needs_saving, CropHit, PaperFormat};
+    use super::{hit_crop, moved_crop, recipe_needs_saving, tile_must_wait, CropHit, PaperFormat};
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
 
     #[test]
@@ -3442,6 +3600,13 @@ mod crop_drag_tests {
         changed.place = 0.25;
         assert!(recipe_needs_saving(true, &changed, &opened));
         assert!(!recipe_needs_saving(true, &changed, &changed));
+    }
+
+    #[test]
+    fn the_tile_waits_until_the_picture_shows_its_exposure() {
+        assert!(tile_must_wait(true, false));
+        assert!(!tile_must_wait(true, true));
+        assert!(!tile_must_wait(false, false));
     }
 }
 

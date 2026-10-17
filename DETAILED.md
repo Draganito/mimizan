@@ -295,7 +295,7 @@ right-click and Open.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.6-1_amd64.deb
+sudo apt install ./mimizan_0.11.7-1_amd64.deb
 mimizan --version
 ```
 
@@ -478,12 +478,16 @@ same JSON drives `mimizan print --recipe`. Opening another negative, or
 closing the window, asks before a recipe that differs from that file is
 left behind: *Save* writes it next to the RAW, *Don't save* leaves the
 file as it is, *Cancel* stays. *Reset* puts the controls back and does
-not write the file. The preview is the picture before
-the size step — mix, placing and the paper exactly as the TIFF gets
-them — and once you zoom past the fit-to-window preview (scroll,
-`1:1`, or a double click) the visible window is rendered from the
-full-resolution separation, pixel for pixel, so the
-negative can be judged, carrier residue included. The *Development* fold
+not write the file. The preview is a downscaled copy of the picture before the size step.
+A drag of the exposures looks up one table of 65536 steps, the same
+table the histogram uses, so the paper is not solved again for every
+pixel. Once that copy would be enlarged (scroll, `1:1`, or a double
+click) the visible window is the file's pixels: one screen pixel is one
+negative pixel after the paper, and the neighbour stays the neighbour.
+When a centimetre size is set, that window starts at 100%, and one
+screen pixel is one pixel of the fitted print, the same kernel the TIFF
+uses. The screen holds the 8-bit face of the 16-bit code; the TIFF keeps
+16. Carrier residue is in the negative pixels. The *Development* fold
 is the Dubois separation (`mask: Dubois`); the fixed
 estimator and the block mask are there, and reconstruction starts on.
 *Apply* recomputes with them. Three histograms (256 bins,

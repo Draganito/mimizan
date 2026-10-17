@@ -4,8 +4,9 @@
 //! same way, the pixels the TIFF gets.
 
 use crate::session::{
-    preview_planes, render_detail, render_preview, render_sharpen_loupe, DetailImage, DetailRect,
-    DevelopParams, HistCache, PreviewImage, RawHistogram, Session, SharpenLoupe, ViewParams,
+    preview_planes, render_detail, render_preview, render_print_detail, render_sharpen_loupe, DetailImage,
+    DetailRect, DevelopParams, HistCache, PreviewImage, RawHistogram, Session, SharpenLoupe, ToneHold,
+    ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -191,7 +192,11 @@ pub struct PreviewRequest {
     pub session: Arc<Session>,
     pub view: ViewParams,
     /// Full-resolution window the zoomed view needs, if any.
+    /// Without `inspect` the coordinates are negative pixels. With it, they
+    /// are pixels of the fitted print.
     pub detail: Option<DetailRect>,
+    /// Set when a centimetre size makes 100% a window of the fitted print.
+    pub inspect: Option<Recipe>,
     pub generation: u64,
 }
 
@@ -220,7 +225,9 @@ impl Preview {
                 // the 1:1 window and a slider only the whole image.
                 let mut last: Option<(*const Session, ViewParams)> = None;
                 let mut last_detail: Option<DetailRect> = None;
+                let mut last_inspect: Option<Recipe> = None;
                 let mut hists = HistCache::default();
+                let mut tones = ToneHold::default();
                 while let Ok(mut req) = reqs.recv() {
                     // Coalesce: only the newest request matters.
                     while let Ok(newer) = reqs.try_recv() {
@@ -229,15 +236,27 @@ impl Preview {
                     let t = Instant::now();
                     let key = (Arc::as_ptr(&req.session), req.view.clone());
                     let view_changed = last.as_ref() != Some(&key);
-                    let image = view_changed.then(|| render_preview(&req.session, &req.view, &mut hists));
-                    let detail = match req.detail {
-                        Some(r) if view_changed || last_detail != Some(r) => {
-                            render_detail(&req.session, &req.view, r)
+                    let table = tones.get(&req.view.tone);
+                    let image =
+                        view_changed.then(|| render_preview(&req.session, &req.view, &mut hists, table));
+                    let detail_due = req.detail.is_some()
+                        && (view_changed || last_detail != req.detail || last_inspect != req.inspect);
+                    let detail = if detail_due {
+                        let r = req.detail.unwrap();
+                        if let Some(recipe) = &req.inspect {
+                            render_print_detail(&req.session, &req.view, recipe, r, table)
+                        } else if req.view.show_mask || req.view.place != 0.0 {
+                            render_detail(&req.session, &req.view, r, table, None)
+                        } else {
+                            let codes = hists.codes_for(&req.session, &req.view.weights);
+                            render_detail(&req.session, &req.view, r, table, Some(codes))
                         }
-                        _ => None,
+                    } else {
+                        None
                     };
                     last = Some(key);
                     last_detail = req.detail;
+                    last_inspect = req.inspect;
                     if image.is_none() && detail.is_none() {
                         continue;
                     }

@@ -10,14 +10,16 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
-use mimizan_core::print::{loupe_source_rect, orient, rotated, sharpen_window, window_plane, PrintParams};
+use mimizan_core::print::{
+    layout, loupe_source_rect, orient, rotated, sharpen_window, source_window, window_plane, PrintParams,
+};
 use mimizan_core::recipe::{CropRect, Recipe};
-use mimizan_core::resize::{fit_dims, resize, PlaneWindow};
+use mimizan_core::resize::{fit_dims, resize, resize_rect, source_coverage, PixelRect, PlaneWindow};
 use mimizan_core::separate::{MaskMode, Separation};
-use mimizan_core::tone::{self, Tone, ToneMap};
+use mimizan_core::tone::{Tone, ToneMap};
 use rayon::prelude::*;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Longest preview edge in pixels (the texture the GUI shows).
 pub const PREVIEW_MAX: usize = 1800;
@@ -306,12 +308,19 @@ fn crop(p: &Plane, r: DetailRect) -> Plane {
     out
 }
 
-/// Render `rect` of the negative at full resolution: crop the separation in
-/// the sensor frame, mix, orient the small crop, then place and tone (or
-/// the mask).
-/// The rectangle is clamped to the image; the returned `rect` is the one
-/// actually rendered.
-pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<DetailImage> {
+/// Render `rect` of the negative at full resolution.
+///
+/// The mask is the sidecar. Otherwise the pixels are the 8-bit face of the
+/// file: with `codes` and no placing, a lookup in the cached mix; else the
+/// visible window is mixed and looked up in `table`. The rectangle is
+/// clamped to the image; the returned `rect` is the one actually rendered.
+pub fn render_detail(
+    s: &Session,
+    v: &ViewParams,
+    rect: DetailRect,
+    table: &ToneTable,
+    codes: Option<&[u16]>,
+) -> Option<DetailImage> {
     let sep = s.separation();
     let (sw, sh) = (sep.lum.width, sep.lum.height);
     let orientation = rotated(s.negative.orientation, v.rotation);
@@ -342,9 +351,8 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
         w: rect.w.min(uw - rect.x).max(1),
         h: rect.h.min(uh - rect.y).max(1),
     };
-    let src = source_rect(orientation, sw, sh, rect);
-    let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let upright = if v.show_mask {
+    let gray = if v.show_mask {
+        let src = source_rect(orientation, sw, sh, rect);
         let n = &s.negative;
         let mut m = Plane::zeros(src.w, src.h);
         m.data.par_chunks_mut(src.w).enumerate().for_each(|(y, row)| {
@@ -353,32 +361,87 @@ pub fn render_detail(s: &Session, v: &ViewParams, rect: DetailRect) -> Option<De
                 *o = f64::from(n.mask8[base + x]) / 255.0;
             }
         });
-        orient(&m, orientation)
+        let upright = orient(&m, orientation);
+        debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
+        upright.data.par_iter().map(|&x| (x.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+    } else if v.place == 0.0 {
+        if let Some(codes) = codes.filter(|c| c.len() == sw * sh) {
+            display_codes(codes, sw, sh, orientation, rect, table)
+        } else {
+            let src = source_rect(orientation, sw, sh, rect);
+            display_bytes(&mixed_upright(sep, &v.weights, src, orientation), 0.0, table)
+        }
     } else {
-        let small = Separation {
-            lum: crop(&sep.lum, src),
-            c1: crop(&sep.c1, src),
-            c2: crop(&sep.c2, src),
-            mask_max: Plane::zeros(1, 1),
-            rounds: sep.rounds,
-            phase: sep.phase,
-            computed: sep.computed,
-        };
-        let mut mixed = orient(&mix(&small, &v.weights), orientation);
-        tone::render(&mut mixed, v.place, &v.tone.compile());
-        mixed
+        let src = source_rect(orientation, sw, sh, rect);
+        display_bytes(&mixed_upright(sep, &v.weights, src, orientation), v.place, table)
     };
-    debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
-    let gray: Vec<u8> = upright.data.par_iter().map(|&x| to_u8(x)).collect();
     Some(DetailImage {
         rect: DetailRect {
             x: rect.x.saturating_sub(origin.0),
             y: rect.y.saturating_sub(origin.1),
-            w: upright.width,
-            h: upright.height,
+            w: rect.w,
+            h: rect.h,
         },
         gray,
     })
+}
+
+fn mixed_upright(sep: &Separation, weights: &Weights, src: DetailRect, orientation: u16) -> Plane {
+    let small = Separation {
+        lum: crop(&sep.lum, src),
+        c1: crop(&sep.c1, src),
+        c2: crop(&sep.c2, src),
+        mask_max: Plane::zeros(1, 1),
+        rounds: sep.rounds,
+        phase: sep.phase,
+        computed: sep.computed,
+    };
+    orient(&mix(&small, weights), orientation)
+}
+
+/// The visible window of a fitted print: the recipe's kernel on the negative,
+/// then the same table as the file's 16-bit codes. Borders stay outside the
+/// picture. Desktop sharpening is off, so the tile is not sharpened.
+pub fn render_print_detail(
+    s: &Session,
+    v: &ViewParams,
+    recipe: &Recipe,
+    rect: DetailRect,
+    table: &ToneTable,
+) -> Option<DetailImage> {
+    if v.show_mask {
+        return render_detail(s, v, rect, table, None);
+    }
+    let sep = s.separation();
+    let (sensor_w, sensor_h) = (sep.lum.width, sep.lum.height);
+    let orientation = rotated(s.negative.orientation, v.rotation);
+    let (full_w, full_h) =
+        if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
+    let params = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
+    let lay = layout(full_w, full_h, 1, &params);
+    if lay.image_w == 0 || lay.image_h == 0 || rect.x >= lay.image_w || rect.y >= lay.image_h {
+        return None;
+    }
+    let rect = DetailRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w.min(lay.image_w - rect.x).max(1),
+        h: rect.h.min(lay.image_h - rect.y).max(1),
+    };
+    let (ox, oy, sw, sh) = source_window(full_w, full_h, recipe.crop);
+    let pix = PixelRect { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+    let (x0, y0, x1, y1) = source_coverage(sw, sh, lay.image_w, lay.image_h, recipe.resample, pix);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let upright = DetailRect { x: x0 + ox, y: y0 + oy, w: x1 - x0, h: y1 - y0 };
+    let sensor = source_rect(orientation, sensor_w, sensor_h, upright);
+    let mixed = mixed_upright(sep, &v.weights, sensor, orientation);
+    debug_assert_eq!((mixed.width, mixed.height), (upright.w, upright.h));
+    let window = PlaneWindow { plane: &mixed, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
+    let picture = resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix);
+    let gray = display_bytes(&picture, v.place, table);
+    Some(DetailImage { rect, gray })
 }
 
 pub struct SharpenLoupe {
@@ -477,6 +540,155 @@ fn q16(x: f64) -> usize {
     (x.clamp(0.0, 1.0) * 65535.0).round() as usize
 }
 
+/// One table of the paper: index `q16(placed linear)`, then the print.
+///
+/// The screen and the histogram share it. Building it is 65536 evaluations;
+/// a slider then looks up, it does not solve the paper again per pixel.
+/// `view` is the histogram bin `(eval * 255).round()`. `show` is the 8-bit
+/// face of the 16-bit code the TIFF stores, `q16(eval)`. Quantising the
+/// linear value first is the histogram's contract; the file evaluates the
+/// float and then quantises, so a code can differ by the last bit.
+pub(crate) struct ToneTable {
+    view: Vec<u8>,
+    show: Vec<u8>,
+    /// 1 = code 0 (paper black), 2 = code 65535 (paper white).
+    clip: Vec<u8>,
+}
+
+impl ToneTable {
+    fn build(tone: &ToneMap) -> Self {
+        let built: Vec<(u8, u8, u8)> = (0..65536u32)
+            .into_par_iter()
+            .map(|i| {
+                let t = tone.eval(f64::from(i) / 65535.0);
+                let code = q16(t);
+                let view = (t.clamp(0.0, 1.0) * 255.0).round() as u8;
+                let show = ((code as f64 / 65535.0) * 255.0).round() as u8;
+                let clip = if code == 0 {
+                    1
+                } else if code == 65535 {
+                    2
+                } else {
+                    0
+                };
+                (view, show, clip)
+            })
+            .collect();
+        let mut view = Vec::with_capacity(built.len());
+        let mut show = Vec::with_capacity(built.len());
+        let mut clip = Vec::with_capacity(built.len());
+        for (v, s, c) in built {
+            view.push(v);
+            show.push(s);
+            clip.push(c);
+        }
+        Self { view, show, clip }
+    }
+}
+
+/// The paper for `tone`, kept while the exposures stay put. A pan reuses it.
+#[derive(Default)]
+pub struct ToneHold {
+    held: Option<(Tone, ToneTable)>,
+}
+
+impl ToneHold {
+    pub fn get(&mut self, tone: &Tone) -> &ToneTable {
+        let fresh = !matches!(&self.held, Some((t, _)) if t == tone);
+        if fresh {
+            self.held = Some((tone.clone(), ToneTable::build(&tone.compile())));
+        }
+        &self.held.as_ref().unwrap().1
+    }
+}
+
+/// Gamma-2.2 bins of a 16-bit linear code. The negative histogram's axis;
+/// it does not depend on the paper, so it is built once.
+fn neg_lut() -> &'static [u8; 65536] {
+    static LUT: OnceLock<[u8; 65536]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut lut = [0u8; 65536];
+        for (i, bin) in lut.iter_mut().enumerate() {
+            *bin = ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8;
+        }
+        lut
+    })
+}
+
+/// `q16` of the full-resolution mix, sensor order. Rebuilt when the weights
+/// change, then every exposure is a lookup.
+fn mix_codes(sep: &Separation, w: &Weights) -> Vec<u16> {
+    let width = sep.lum.width;
+    let mut out = vec![0u16; width * sep.lum.height];
+    if w.is_native() {
+        out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+            for (o, &v) in row.iter_mut().zip(sep.lum.row(y)) {
+                *o = q16(v) as u16;
+            }
+        });
+        return out;
+    }
+    let k1 = w.g - w.r - w.b;
+    let k2 = 2.0 * (w.r - w.b);
+    out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+        let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
+        for x in 0..width {
+            row[x] = q16(l[x] + k1 * c1[x] + k2 * c2[x]) as u16;
+        }
+    });
+    out
+}
+
+/// 8-bit face of the print. `place == 0` quantises `v`; a placing quantises
+/// `v · 2^place`, which is what the histogram counts.
+fn display_bytes(plane: &Plane, place: f64, table: &ToneTable) -> Vec<u8> {
+    let global = 2f64.powf(place);
+    plane
+        .data
+        .par_iter()
+        .map(|&v| {
+            let q = if place == 0.0 { q16(v) } else { q16(v * global) };
+            table.show[q]
+        })
+        .collect()
+}
+
+/// Sensor pixel under upright `(ox, oy)`. The same map `orient` uses.
+fn sensor_xy(orientation: u16, w: usize, h: usize, ox: usize, oy: usize) -> (usize, usize) {
+    match orientation {
+        2 => (w - 1 - ox, oy),
+        3 => (w - 1 - ox, h - 1 - oy),
+        4 => (ox, h - 1 - oy),
+        5 => (oy, ox),
+        6 => (oy, h - 1 - ox),
+        7 => (w - 1 - oy, h - 1 - ox),
+        8 => (w - 1 - oy, ox),
+        _ => (ox, oy),
+    }
+}
+
+/// The visible window from cached mix codes, place 0. One lookup per pixel.
+fn display_codes(
+    codes: &[u16],
+    sw: usize,
+    sh: usize,
+    orientation: u16,
+    rect: DetailRect,
+    table: &ToneTable,
+) -> Vec<u8> {
+    debug_assert_eq!(codes.len(), sw.saturating_mul(sh));
+    let mut out = vec![0u8; rect.w * rect.h];
+    out.par_chunks_mut(rect.w).enumerate().for_each(|(y, row)| {
+        let oy = rect.y + y;
+        for (x, o) in row.iter_mut().enumerate() {
+            let (sx, sy) = sensor_xy(orientation, sw, sh, rect.x + x, oy);
+            debug_assert!(sx < sw && sy < sh);
+            *o = table.show[codes[sy * sw + sx] as usize];
+        }
+    });
+    out
+}
+
 /// Partial histogram counts of one row (or their sum).
 struct Counts {
     neg: [u32; 256],
@@ -538,13 +750,10 @@ impl Histogram {
         place: f64,
         window: Option<(usize, usize, usize, usize)>,
     ) -> (Self, Self) {
-        // 16-bit input -> 8-bit bin, for both encodings.
-        let lut_neg: Vec<u8> =
-            (0..65536).map(|i| ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
-        let lut_view: Vec<u8> =
-            (0..65536).map(|i| (tone.eval(i as f64 / 65535.0) * 255.0).round() as u8).collect();
-        let view_clips: Vec<bool> =
-            (0..65536).map(|i| matches!(q16(tone.eval(i as f64 / 65535.0)), 0 | 65535)).collect();
+        // 16-bit input -> 8-bit bin, for both encodings. One evaluation per
+        // code: the clip flag is that same value at 0 or 65535.
+        let table = ToneTable::build(tone);
+        let lut_neg = neg_lut();
         let k1 = w.g - w.r - w.b;
         let k2 = 2.0 * (w.r - w.b);
         let width = sep.lum.width;
@@ -571,14 +780,67 @@ impl Histogram {
                     c.neg_low += (q == 0) as usize;
                     c.neg_high += (q == 65535) as usize;
                     let qv = q16(m * global);
-                    let (bin, clips) = (lut_view[qv], view_clips[qv]);
+                    let bin = table.view[qv];
                     c.view[bin as usize] += 1;
-                    if clips {
-                        if bin == 0 {
-                            c.view_low += 1;
-                        } else {
-                            c.view_high += 1;
-                        }
+                    match table.clip[qv] {
+                        1 => c.view_low += 1,
+                        2 => c.view_high += 1,
+                        _ => {}
+                    }
+                }
+                c
+            })
+            .collect();
+        let mut all = Counts::default();
+        for c in parts {
+            all.add(&c);
+        }
+        let total = (x1 - x0) * (y1 - y0);
+        (
+            Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
+            Self::from_bins(all.view, total, all.view_low, all.view_high),
+        )
+    }
+
+    /// The same counts as [`of_separation`] from cached `q16(mix)` codes.
+    /// `place == 0` is exact: the view index is the code. A placing
+    /// dequantises the code before scaling, which can move a bin at the
+    /// boundary, so the worker keeps the float walk when `place != 0`.
+    fn of_codes(
+        codes: &[u16],
+        width: usize,
+        table: &ToneTable,
+        place: f64,
+        window: Option<(usize, usize, usize, usize)>,
+    ) -> (Self, Self) {
+        let height = codes.len().checked_div(width).unwrap_or(0);
+        let (x0, y0, x1, y1) = match window {
+            Some((x, y, w, h)) => {
+                let x0 = x.min(width);
+                let y0 = y.min(height);
+                (x0, y0, (x + w).min(width).max(x0), (y + h).min(height).max(y0))
+            }
+            None => (0, 0, width, height),
+        };
+        let lut_neg = neg_lut();
+        let global = 2f64.powf(place);
+        let parts: Vec<Counts> = (y0..y1)
+            .into_par_iter()
+            .map(|y| {
+                let row = &codes[y * width + x0..y * width + x1];
+                let mut c = Counts::default();
+                for &code in row {
+                    let q = code as usize;
+                    c.neg[lut_neg[q] as usize] += 1;
+                    c.neg_low += (q == 0) as usize;
+                    c.neg_high += (q == 65535) as usize;
+                    let qv = if place == 0.0 { q } else { q16((q as f64 / 65535.0) * global) };
+                    let bin = table.view[qv];
+                    c.view[bin as usize] += 1;
+                    match table.clip[qv] {
+                        1 => c.view_low += 1,
+                        2 => c.view_high += 1,
+                        _ => {}
                     }
                 }
                 c
@@ -659,37 +921,90 @@ pub struct PreviewImage {
     pub hist_negative: Histogram,
 }
 
-/// Full-resolution histograms kept between renders: they depend on the
-/// weights, the tone and the placing, not on the mask view.
+/// Full-resolution histograms, and the mix codes they are counted from.
+/// The codes depend on the session and the weights. The bins also depend
+/// on the tone, the placing and the crop. A drag of the exposures rebins
+/// the codes; it does not mix the negative again.
 pub struct HistCache {
-    key: Option<(*const Session, HistKey)>,
+    session: Option<*const Session>,
+    weights: Option<Weights>,
+    codes: Vec<u16>,
+    width: usize,
+    hist_key: Option<HistKey>,
     hists: (Histogram, Histogram),
 }
 
 impl Default for HistCache {
     fn default() -> Self {
-        Self { key: None, hists: (Histogram::empty(), Histogram::empty()) }
+        Self {
+            session: None,
+            weights: None,
+            codes: Vec::new(),
+            width: 0,
+            hist_key: None,
+            hists: (Histogram::empty(), Histogram::empty()),
+        }
     }
 }
 
+fn hist_window(s: &Session, v: &ViewParams) -> Option<(usize, usize, usize, usize)> {
+    v.crop.map(|c| {
+        let (fw, fh) = s.upright_size();
+        let c = c.sanitized(fw as u32, fh as u32);
+        let (sw, sh) = (s.separation().lum.width, s.separation().lum.height);
+        let r = source_rect(
+            s.negative.orientation,
+            sw,
+            sh,
+            DetailRect { x: c.x as usize, y: c.y as usize, w: c.w as usize, h: c.h as usize },
+        );
+        (r.x, r.y, r.w, r.h)
+    })
+}
+
 impl HistCache {
-    fn get(&mut self, s: &Session, v: &ViewParams, tone: &ToneMap) -> (Histogram, Histogram) {
-        let key = (s as *const Session, v.hist_key());
-        if self.key.as_ref() != Some(&key) {
-            let window = v.crop.map(|c| {
-                let (fw, fh) = s.upright_size();
-                let c = c.sanitized(fw as u32, fh as u32);
-                let (sw, sh) = (s.separation().lum.width, s.separation().lum.height);
-                let r = source_rect(
-                    s.negative.orientation,
-                    sw,
-                    sh,
-                    DetailRect { x: c.x as usize, y: c.y as usize, w: c.w as usize, h: c.h as usize },
-                );
-                (r.x, r.y, r.w, r.h)
-            });
-            self.hists = Histogram::of_separation(s.separation(), &v.weights, tone, v.place, window);
-            self.key = Some(key);
+    fn ensure(&mut self, s: &Session, w: &Weights) {
+        let ptr = s as *const Session;
+        if self.session == Some(ptr) && self.weights.as_ref() == Some(w) {
+            return;
+        }
+        let sep = s.separation();
+        self.width = sep.lum.width;
+        self.codes = mix_codes(sep, w);
+        self.session = Some(ptr);
+        self.weights = Some(*w);
+        self.hist_key = None;
+    }
+
+    /// Cached mix codes for this session and these weights. Sensor order.
+    pub fn codes_for(&mut self, s: &Session, w: &Weights) -> &[u16] {
+        self.ensure(s, w);
+        &self.codes
+    }
+
+    fn histograms(
+        &mut self,
+        s: &Session,
+        v: &ViewParams,
+        tone: &ToneMap,
+        table: &ToneTable,
+    ) -> (Histogram, Histogram) {
+        let ptr = s as *const Session;
+        let key = v.hist_key();
+        if self.session != Some(ptr) || self.hist_key.as_ref() != Some(&key) {
+            let window = hist_window(s, v);
+            // Place 0 reads the cached codes. A placing keeps the float
+            // walk: `q16(m · 2^place)` is not `q16` of the dequantised code,
+            // and the histogram tests lock the float.
+            let hists = if v.place == 0.0 {
+                self.ensure(s, &v.weights);
+                Histogram::of_codes(&self.codes, self.width, table, 0.0, window)
+            } else {
+                self.session = Some(ptr);
+                Histogram::of_separation(s.separation(), &v.weights, tone, v.place, window)
+            };
+            self.hists = hists;
+            self.hist_key = Some(key);
         }
         self.hists.clone()
     }
@@ -704,9 +1019,9 @@ fn scale_crop(c: CropRect, scale: f64, dst_w: usize, dst_h: usize) -> CropRect {
     CropRect { x, y, w, h }.sanitized(dst_w as u32, dst_h as u32)
 }
 
-/// 8-bit grey preview of the whole negative: mix, place and tone (or the
-/// mask), in the picture's final orientation.
-pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> PreviewImage {
+/// 8-bit grey preview of the whole negative: the downscaled mix, then the
+/// tone table (or the mask), in the picture's final orientation.
+pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table: &ToneTable) -> PreviewImage {
     let pp = &s.preview;
     let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     if v.show_mask {
@@ -729,7 +1044,7 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
     }
     let tone_map = v.tone.compile();
     // Histograms from the full-resolution separation, not the preview copy.
-    let (hist_negative, hist_view) = cache.get(s, v, &tone_map);
+    let (hist_negative, hist_view) = cache.histograms(s, v, &tone_map, table);
     let mut mixed = orient(&mix(&pp.sep, &v.weights), rotated(1, v.rotation));
     if let Some(c) = v.crop {
         let (fw, fh) = s.upright_size();
@@ -737,9 +1052,8 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
         let scaled = scale_crop(turned, s.preview.scale, mixed.width, mixed.height);
         mixed = window_plane(&mixed, scaled);
     }
-    tone::render(&mut mixed, v.place, &tone_map);
+    let gray = display_bytes(&mixed, v.place, table);
     let plane = mixed;
-    let gray: Vec<u8> = plane.data.par_iter().map(|&x| to_u8(x)).collect();
     PreviewImage {
         width: plane.width,
         height: plane.height,
@@ -773,6 +1087,36 @@ mod tests {
             assert_eq!((got.width, got.height), (r.w, r.h), "orientation {o}");
             assert_eq!(got.data, expected, "orientation {o}");
         }
+    }
+
+    /// A window of the cached codes is the oriented mix, including a turn.
+    #[test]
+    fn code_window_matches_the_oriented_mix() {
+        let (w, h) = (13usize, 9usize);
+        let mut lum = Plane::zeros(w, h);
+        let mut c1 = Plane::zeros(w, h);
+        for (i, (l, a)) in lum.data.iter_mut().zip(c1.data.iter_mut()).enumerate() {
+            *l = i as f64 / (w * h - 1) as f64;
+            *a = 0.01 * ((i % 5) as f64 - 2.0);
+        }
+        let sep = Separation {
+            lum,
+            c1,
+            c2: Plane::zeros(w, h),
+            mask_max: Plane::zeros(1, 1),
+            rounds: 1,
+            phase: mimizan_core::cfa::BayerPhase::RGGB,
+            computed: 0.0,
+        };
+        let wts = Weights { r: 0.2, g: 0.6, b: 0.2 };
+        let o = 6u16;
+        let upright = orient(&mix(&sep, &wts), o);
+        let rect = DetailRect { x: 1, y: 2, w: 4, h: 3 };
+        let table = ToneTable::build(&Tone::paper().compile());
+        let expected = display_bytes(&crop(&upright, rect), 0.0, &table);
+        let codes = mix_codes(&sep, &wts);
+        let got = display_codes(&codes, w, h, o, rect, &table);
+        assert_eq!(got, expected);
     }
 
     /// The desktop program starts with the last octave reconstructed. The
@@ -875,13 +1219,45 @@ mod histogram_tests {
         {
             let (_, view) = Histogram::of_separation(&sep, &wts, &tone, place, None);
             let mut pic = mix(&sep, &wts);
-            tone::place(&mut pic, place);
+            mimizan_core::tone::place(&mut pic, place);
             let mut ev = [0u32; 256];
             for &l in &pic.data {
                 let lin = q16(l) as f64 / 65535.0;
                 ev[(tone.eval(lin) * 255.0).round() as usize] += 1;
             }
             assert_eq!(view.bins, ev);
+        }
+    }
+
+    /// Place 0 counts the cached codes. The bins are the float walk's bins.
+    #[test]
+    fn of_codes_matches_of_separation_without_placing() {
+        let sep = sweep(40, 24);
+        let wts = Weights { r: 0.2, g: 0.5, b: 0.3 };
+        let tone = Tone::paper().compile();
+        let (n1, v1) = Histogram::of_separation(&sep, &wts, &tone, 0.0, None);
+        let codes = mix_codes(&sep, &wts);
+        let table = ToneTable::build(&tone);
+        let (n2, v2) = Histogram::of_codes(&codes, sep.lum.width, &table, 0.0, None);
+        assert_eq!(n1, n2);
+        assert_eq!(v1, v2);
+    }
+
+    /// The byte on screen is the 8-bit face of the 16-bit print code.
+    #[test]
+    fn display_byte_is_the_files_code() {
+        let n = 16usize;
+        let mut plane = Plane::zeros(8, 2);
+        for (i, v) in plane.data.iter_mut().enumerate() {
+            *v = -0.05 + 1.1 * i as f64 / (n - 1) as f64;
+        }
+        let tone = Tone::paper().compile();
+        let table = ToneTable::build(&tone);
+        let got = display_bytes(&plane, 0.0, &table);
+        for (byte, &v) in got.iter().zip(&plane.data) {
+            let code = q16(tone.eval(q16(v) as f64 / 65535.0));
+            let expect = ((code as f64 / 65535.0) * 255.0).round() as u8;
+            assert_eq!(*byte, expect);
         }
     }
 }

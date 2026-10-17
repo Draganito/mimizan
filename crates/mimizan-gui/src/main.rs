@@ -22,7 +22,11 @@ mod zone_bar;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Name in the title bar, with the version this binary was built from.
-const WINDOW_TITLE: &str = concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"));
+const WINDOW_TITLE: &str = if cfg!(debug_assertions) {
+    concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"), " debug")
+} else {
+    concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"))
+};
 
 /// The letter M. The same drawing is the window icon, the Linux theme icon
 /// and the Apple icon.
