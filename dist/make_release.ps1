@@ -2,7 +2,8 @@
 #
 # Result (always under dist/, not committed):
 #   dist/mimizan-<version>-x86_64-windows.zip
-#     mimizan.exe, mimizan-gui.exe, cameras/, look/, docs
+#     mimizan.exe, mimizan-gui.exe, cameras/, look/, README, manual, license
+# The programs carry the Visual C++ runtime. mimizan-gui.exe opens no console.
 #
 # Usage:  dist/make_release.ps1 [-SkipBuild]
 
@@ -34,6 +35,8 @@ foreach ($binary in @($Cli, $Gui)) {
     }
     Write-Host "==> binary: $binary"
 }
+& "$PSScriptRoot\check_windows_exe.ps1" -Path $Cli -Kind console
+& "$PSScriptRoot\check_windows_exe.ps1" -Path $Gui -Kind gui
 
 $versionLine = (& $Cli --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -47,15 +50,12 @@ if ($LASTEXITCODE -ne 0) { throw "ERROR: measure synth failed" }
 $Name = "mimizan-$Version-x86_64-windows"
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("mimizan-" + [guid]::NewGuid().ToString("n"))
 $Root = Join-Path $Stage $Name
-New-Item -ItemType Directory -Path (Join-Path $Root "docs") -Force | Out-Null
+New-Item -ItemType Directory -Path $Root -Force | Out-Null
 Copy-Item -LiteralPath $Cli, $Gui -Destination $Root
 Copy-Item -LiteralPath (Join-Path $ProjectDir "cameras") -Destination $Root -Recurse
 Copy-Item -LiteralPath (Join-Path $ProjectDir "look") -Destination $Root -Recurse
 foreach ($doc in @("README.md", "DETAILED.md", "LICENSE")) {
     Copy-Item -LiteralPath (Join-Path $ProjectDir $doc) -Destination $Root
-}
-foreach ($doc in @("SPEC.md", "RESULTS.md", "gui.png")) {
-    Copy-Item -LiteralPath (Join-Path $ProjectDir "docs\$doc") -Destination (Join-Path $Root "docs")
 }
 
 $Dist = Join-Path $ProjectDir "dist"

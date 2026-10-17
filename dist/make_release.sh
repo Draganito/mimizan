@@ -3,7 +3,7 @@
 #
 # Result (always under dist/, not committed):
 #   dist/mimizan_<version>_amd64.deb                 both binaries, cameras/, look/,
-#                                                     desktop file, docs
+#                                                     desktop file, README, manual, license
 #   dist/mimizan-<version>-x86_64-linux.tar.gz       the same as a plain tarball
 #
 # Usage:  dist/make_release.sh [--skip-build]
@@ -37,11 +37,10 @@ echo "==> version $VERSION"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 NAME="mimizan-$VERSION-x86_64-linux"
-mkdir -p "$STAGE/$NAME/docs"
+mkdir -p "$STAGE/$NAME"
 cp "$CLI" "$GUI" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
-cp "$PROJECT_DIR/docs/SPEC.md" "$PROJECT_DIR/docs/RESULTS.md" "$PROJECT_DIR/docs/gui.png" "$STAGE/$NAME/docs/"
 cp "$PROJECT_DIR/dist/mimizan-gui.desktop" "$STAGE/$NAME/"
 TARBALL="$PROJECT_DIR/dist/$NAME.tar.gz"
 rm -f "$PROJECT_DIR"/dist/mimizan-*-x86_64-linux.tar.gz
@@ -62,12 +61,13 @@ if command -v cargo-deb >/dev/null; then
         ./usr/share/applications/mimizan-gui.desktop \
         ./usr/share/doc/mimizan/README.md \
         ./usr/share/doc/mimizan/DETAILED.md \
-        ./usr/share/doc/mimizan/LICENSE.txt \
-        ./usr/share/doc/mimizan/docs/SPEC.md \
-        ./usr/share/doc/mimizan/docs/RESULTS.md
+        ./usr/share/doc/mimizan/LICENSE.txt
     do
         grep -q " $f\$" <<<"$LISTING" || { echo "ERROR: $f missing in deb"; exit 1; }
     done
+    if grep -qE 'docs/SPEC.md|docs/RESULTS.md|docs/gui.png' <<<"$LISTING"; then
+        echo "ERROR: the lab record leaked into the deb"; exit 1
+    fi
     if grep -qE '\.git/|/target/|testdata/|\.nef|\.dng' <<<"$LISTING"; then
         echo "ERROR: source tree or RAW samples leaked into deb"; exit 1
     fi

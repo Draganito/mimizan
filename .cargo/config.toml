@@ -1,0 +1,5 @@
+# The Windows programs carry the Visual C++ runtime inside them. A machine
+# without the redistributable can start them. The C build of mimalloc sees
+# `crt-static` and passes `/MT`, so that library does not keep the DLL.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

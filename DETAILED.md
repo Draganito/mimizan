@@ -279,18 +279,23 @@ no lens corrections.
 Prebuilt packages are on the
 [releases page](https://github.com/Draganito/mimizan/releases):
 `mimizan_<version>-1_amd64.deb` (Debian/Ubuntu, both binaries, camera and look
-files, docs), `mimizan-<version>-x86_64-linux.tar.gz`, and
+files, the introduction, this manual and the license), `mimizan-<version>-x86_64-linux.tar.gz`, and
 `mimizan-<version>-x86_64-windows.zip` (64-bit Intel and AMD), and
 `mimizan-<version>-aarch64-macos.zip` (Apple silicon). On Windows, unzip and
 start `mimizan-gui.exe`; `cameras` and `look` stay beside the two programs.
-An unsigned download asks SmartScreen for confirmation. On a Mac with an M
-processor, unzip and start `mimizan-gui`. The programs link only the
-frameworks that ship with macOS, so nothing from Homebrew is required.
+The programs carry the Visual C++ runtime, and a double click opens the
+darkroom window without a terminal. An unsigned download asks SmartScreen
+for confirmation. On a Mac with an M processor, unzip and open
+`Mimizan Lab.app`. The command line is
+`Mimizan Lab.app/Contents/MacOS/mimizan`, and `cameras` and `look` sit in
+that same folder. The programs link only the frameworks that ship with
+macOS, so nothing from Homebrew is required. The first launch is a
+right-click and Open.
 
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.0-1_amd64.deb
+sudo apt install ./mimizan_0.11.1-1_amd64.deb
 mimizan --version
 ```
 

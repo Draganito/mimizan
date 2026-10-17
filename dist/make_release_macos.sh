@@ -3,9 +3,11 @@
 #
 # Result (always under dist/, not committed):
 #   dist/mimizan-<version>-aarch64-macos.zip
-#     mimizan, mimizan-gui, cameras/, look/, docs
+#     Mimizan Lab.app  (double click starts mimizan-gui; no Terminal)
+#     README.md, DETAILED.md, LICENSE
 #
 # The two programs link only the frameworks that ship with macOS.
+# cameras/ and look/ sit beside them inside Contents/MacOS.
 #
 # Usage:  dist/make_release_macos.sh [--skip-build]
 
@@ -41,11 +43,9 @@ echo "==> version $VERSION"
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 NAME="mimizan-$VERSION-aarch64-macos"
-mkdir -p "$STAGE/$NAME/docs"
-cp "$CLI" "$GUI" "$STAGE/$NAME/"
-cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
+mkdir -p "$STAGE/$NAME"
+"$PROJECT_DIR/dist/assemble_macos_app.sh" "$CLI" "$GUI" "$STAGE/$NAME/Mimizan Lab.app" "$VERSION"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
-cp "$PROJECT_DIR/docs/SPEC.md" "$PROJECT_DIR/docs/RESULTS.md" "$PROJECT_DIR/docs/gui.png" "$STAGE/$NAME/docs/"
 
 DIST="$PROJECT_DIR/dist"
 mkdir -p "$DIST"

@@ -40,6 +40,12 @@ jobs:
         run: cargo test --release --workspace
       - name: Synthetic bench (smoke)
         run: cargo run --release -p mimizan-cli -- measure synth --size 512
+      - name: No redistributable, and no console on the window
+        shell: pwsh
+        run: |
+          cargo build --release -p mimizan-cli -p mimizan-gui
+          pwsh -File dist/check_windows_exe.ps1 -Path target/release/mimizan.exe -Kind console
+          pwsh -File dist/check_windows_exe.ps1 -Path target/release/mimizan-gui.exe -Kind gui
 
   macos:
     # Hosted macOS runners are Apple silicon. The job refuses an Intel machine.
@@ -64,3 +70,12 @@ jobs:
         run: cargo build --release -p mimizan-gui
       - name: No libraries beyond macOS
         run: bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui
+      - name: App bundle starts the window
+        run: |
+          version=$(target/release/mimizan --version | awk '{print $2}')
+          bash dist/assemble_macos_app.sh target/release/mimizan target/release/mimizan-gui "$RUNNER_TEMP/Mimizan Lab.app" "$version"
+          exec=$(plutil -extract CFBundleExecutable raw "$RUNNER_TEMP/Mimizan Lab.app/Contents/Info.plist")
+          test "$exec" = "mimizan-gui"
+          bash dist/check_macos_links.sh \
+            "$RUNNER_TEMP/Mimizan Lab.app/Contents/MacOS/mimizan" \
+            "$RUNNER_TEMP/Mimizan Lab.app/Contents/MacOS/mimizan-gui"

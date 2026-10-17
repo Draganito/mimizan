@@ -1,7 +1,11 @@
 //! Mimizan Lab desktop: open a RAW, judge the luminance estimate interactively,
 //! export the negative or a print. The program is GPL-3.0-or-later. The
 //! separation lives in `mimizan-core`.
+//!
+//! On Windows this is a windowed program: a double click does not open a
+//! console. The command-line program stays a console program.
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 mod app;
