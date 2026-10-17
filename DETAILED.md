@@ -295,7 +295,7 @@ right-click and Open.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.5-1_amd64.deb
+sudo apt install ./mimizan_0.11.6-1_amd64.deb
 mimizan --version
 ```
 
@@ -452,8 +452,9 @@ leaves the shadows; less hard light opens the shadows and leaves the
 highlights; a drag on the bar moves both so that the tone under the
 pointer follows the pointer — one more or less second under the
 enlarger. The line under the sliders names the single grade this pair
-equals and the scene stops the paper holds; *base* goes back. Hover a
-zone and its pixels light up in the preview. The print is the
+equals and the scene stops the paper holds. *base* stays in the row:
+grey while the pair is the base exposure, orange when a click returns
+there. The print is the
 negative, one placing and two exposures, as a straight print is. *fit*,
 *1:1* and the mask sit in the toolbar. *Crop*, next to them, frames the
 negative to a darkroom ratio (4×5, 5×7, 8×10, 11×14, 16×20, 20×24, or

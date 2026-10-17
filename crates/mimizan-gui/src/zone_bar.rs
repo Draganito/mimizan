@@ -24,9 +24,8 @@ fn grey(v: f64) -> Color32 {
     Color32::from_gray((v.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-/// Draws the bar for `split` and lets a drag move both exposures. Returns
-/// the zone (0 … VII) under the pointer, for tinting the preview.
-pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) -> Option<u8> {
+/// Draws the bar for `split` and lets a drag move both exposures.
+pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H + BELOW_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals().clone();
@@ -187,6 +186,4 @@ pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) -> Option<u8> {
             100.0 * (edges[k + 1] - edges[k]),
         ));
     }
-
-    hover_zone
 }

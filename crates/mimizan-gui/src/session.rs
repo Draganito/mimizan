@@ -15,7 +15,6 @@ use mimizan_core::recipe::{CropRect, Recipe};
 use mimizan_core::resize::{fit_dims, resize, PlaneWindow};
 use mimizan_core::separate::{MaskMode, Separation};
 use mimizan_core::tone::{self, Tone, ToneMap};
-use mimizan_core::zone;
 use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -246,8 +245,6 @@ pub struct ViewParams {
     /// Window on the file-upright negative. `None` is the whole frame.
     /// The preview turns it with `rotation` before cutting.
     pub crop: Option<CropRect>,
-    /// Scene zone (0 … X) whose pixels the fit preview marks, if any.
-    pub hover_zone: Option<u8>,
 }
 
 /// The parts of a view the full-resolution histograms depend on (the
@@ -658,16 +655,12 @@ pub struct PreviewImage {
     /// Quarter turns this image was rendered with (`ViewParams::rotation`).
     pub rotation: u8,
     pub gray: Vec<u8>,
-    /// 255 where the curve's input lies in `ViewParams::hover_zone`, same
-    /// layout as `gray`; `None` when no zone is hovered.
-    pub zone_mask: Option<Vec<u8>>,
     pub hist_view: Histogram,
     pub hist_negative: Histogram,
 }
 
 /// Full-resolution histograms kept between renders: they depend on the
-/// weights, the tone and the placing, not on the mask view or the
-/// hovered zone.
+/// weights, the tone and the placing, not on the mask view.
 pub struct HistCache {
     key: Option<(*const Session, HistKey)>,
     hists: (Histogram, Histogram),
@@ -730,7 +723,6 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
             height: plane.height,
             rotation: v.rotation,
             gray,
-            zone_mask: None,
             hist_view,
             hist_negative: Histogram::empty(),
         };
@@ -745,24 +737,6 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
         let scaled = scale_crop(turned, s.preview.scale, mixed.width, mixed.height);
         mixed = window_plane(&mixed, scaled);
     }
-    let zone_mask = v.hover_zone.map(|k| {
-        // The scene zone after placing.
-        let (lo, hi) = (k as f64 - 5.5, k as f64 - 4.5);
-        mixed
-            .data
-            .par_iter()
-            .map(|&l| {
-                let st = zone::stops(l * 2f64.powf(v.place));
-                // The outer zones take everything beyond them.
-                let inside = (st >= lo || k == 0) && (st < hi || k as usize == zone::ZONES - 1);
-                if inside {
-                    255
-                } else {
-                    0
-                }
-            })
-            .collect()
-    });
     tone::render(&mut mixed, v.place, &tone_map);
     let plane = mixed;
     let gray: Vec<u8> = plane.data.par_iter().map(|&x| to_u8(x)).collect();
@@ -771,7 +745,6 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
         height: plane.height,
         rotation: v.rotation,
         gray,
-        zone_mask,
         hist_view,
         hist_negative,
     }

@@ -227,9 +227,6 @@ pub struct App {
     /// history. The export renders exactly `edit`.
     edit: Edit,
     history: History,
-    /// Zone under the pointer in the zone bar; tints the preview.
-    hover_zone: Option<u8>,
-
     // Export section
     size_mode: SizeMode,
     paper_cm: [f64; 2],
@@ -365,7 +362,6 @@ impl App {
             log: Vec::new(),
             edit: Edit::new(Weights::default()),
             history: History::new(Edit::new(Weights::default())),
-            hover_zone: None,
             size_mode: SizeMode::Native,
             paper_cm: [30.0, 40.0],
             sharpen_at: None,
@@ -646,7 +642,6 @@ impl App {
             place: r.place,
             show_mask: self.show_mask,
             rotation: self.edit.rotation,
-            hover_zone: self.hover_zone,
             // While the easel is up the whole negative is shown.
             crop: if self.crop_open { None } else { r.crop },
         }
@@ -921,7 +916,6 @@ impl App {
         self.tex_rotation = 0;
         self.keep_scale = None;
         self.show_mask = false;
-        self.hover_zone = None;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.close_crop();
@@ -1163,30 +1157,7 @@ impl App {
                     }
                 }
                 self.tex_rotation = im.rotation;
-                let img = match &im.zone_mask {
-                    // Hovered zone: its pixels in the bar's orange over the grey.
-                    Some(mask) => {
-                        let pixels: Vec<Color32> = im
-                            .gray
-                            .iter()
-                            .zip(mask.iter())
-                            .map(|(&g, &m)| {
-                                if m != 0 {
-                                    let g = g as u16;
-                                    Color32::from_rgb(
-                                        ((g + 2 * 255) / 3) as u8,
-                                        ((g + 2 * 140) / 3) as u8,
-                                        ((g + 2 * 30) / 3) as u8,
-                                    )
-                                } else {
-                                    Color32::from_gray(g)
-                                }
-                            })
-                            .collect();
-                        ColorImage::new([im.width, im.height], pixels)
-                    }
-                    None => ColorImage::from_gray([im.width, im.height], &im.gray),
-                };
+                let img = ColorImage::from_gray([im.width, im.height], &im.gray);
                 let opts = TextureOptions::LINEAR;
                 match &mut self.texture {
                     Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
@@ -1821,8 +1792,6 @@ impl App {
     /// Bottom window, step 2: everything that exposes the print: the mix
     /// (the filter), placing and the two paper exposures (the grade).
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
-        // The zone bar sets this again while the pointer is over it.
-        self.hover_zone = None;
         // The width is the gap this window was given. A larger minimum
         // would push the glass out over the columns.
         let width = ui.available_width();
@@ -1872,11 +1841,10 @@ impl App {
             {
                 self.edit.recipe.curve = Tone::paper();
             }
-            self.hover_zone = None;
             return;
         };
         let mut split = split;
-        self.hover_zone = zone_bar(ui, &mut split, width);
+        zone_bar(ui, &mut split, width);
         ui.add_space(4.0);
         // One rail width for both exposures, taken before either slider is
         // built. The number sits beside the rail; sizing the rail to the whole
@@ -1935,8 +1903,23 @@ impl App {
              stops between the paper's first tone and its near-black, and where Zone V lands.",
         );
         ui.horizontal_wrapped(|ui| {
-            if (split.soft != 0.0 || split.hard != 0.0)
-                && ui.small_button("base").on_hover_text("Back to the base exposure").clicked()
+            // Always here, so the window does not grow and shrink as the
+            // exposures leave the base and come back. Grey while the pair
+            // is the base; orange, and a click, when it is not.
+            let at_base = split.soft == 0.0 && split.hard == 0.0;
+            let label = if at_base {
+                RichText::new("base")
+            } else {
+                RichText::new("base").color(Color32::from_rgb(28, 18, 6))
+            };
+            let mut button = egui::Button::new(label).small();
+            if !at_base {
+                button = button.fill(Color32::from_rgb(255, 170, 60));
+            }
+            if ui
+                .add_enabled(!at_base, button)
+                .on_hover_text(if at_base { "The base exposure" } else { "Back to the base exposure" })
+                .clicked()
             {
                 self.edit.recipe.curve = Tone::paper();
             }
