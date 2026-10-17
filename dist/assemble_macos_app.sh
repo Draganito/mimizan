@@ -5,9 +5,10 @@
 #   Mimizan Lab.app/Contents/MacOS/mimizan       the command line
 #   Mimizan Lab.app/Contents/MacOS/cameras
 #   Mimizan Lab.app/Contents/MacOS/look
+#   Mimizan Lab.app/Contents/Resources/AppIcon.icns
 #
 # The programs look for cameras and look next to themselves. A double click
-# on the bundle does not open Terminal.
+# on the bundle does not open Terminal. The icon is the letter M.
 #
 # Usage: dist/assemble_macos_app.sh <mimizan> <mimizan-gui> <dest.app> <version>
 
@@ -53,6 +54,8 @@ cat > "$DEST/Contents/Info.plist" <<EOF
 	<string>mimizan-gui</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>LSMinimumSystemVersion</key>
@@ -64,8 +67,27 @@ cat > "$DEST/Contents/Info.plist" <<EOF
 EOF
 
 plutil -lint "$DEST/Contents/Info.plist" >/dev/null
+
+# iconutil wants one PNG per size, including the @2x names.
+ICONSET="$(mktemp -d)/AppIcon.iconset"
+mkdir -p "$ICONSET" "$DEST/Contents/Resources"
+cp "$PROJECT_DIR/dist/icons/mimizan-16.png" "$ICONSET/icon_16x16.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-32.png" "$ICONSET/icon_16x16@2x.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-32.png" "$ICONSET/icon_32x32.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-64.png" "$ICONSET/icon_32x32@2x.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-128.png" "$ICONSET/icon_128x128.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-256.png" "$ICONSET/icon_128x128@2x.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-256.png" "$ICONSET/icon_256x256.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-512.png" "$ICONSET/icon_256x256@2x.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-512.png" "$ICONSET/icon_512x512.png"
+cp "$PROJECT_DIR/dist/icons/mimizan-1024.png" "$ICONSET/icon_512x512@2x.png"
+iconutil -c icns "$ICONSET" -o "$DEST/Contents/Resources/AppIcon.icns"
+rm -rf "$(dirname "$ICONSET")"
+
 test -x "$MACOS/mimizan-gui"
 test -x "$MACOS/mimizan"
 test -f "$MACOS/cameras/nikon_z_f.json"
 test -f "$MACOS/look/neutral.json"
+test -s "$DEST/Contents/Resources/AppIcon.icns"
+test "$(plutil -extract CFBundleIconFile raw "$DEST/Contents/Info.plist")" = "AppIcon"
 echo "==> $DEST"

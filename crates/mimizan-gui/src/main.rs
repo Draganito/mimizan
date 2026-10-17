@@ -8,6 +8,8 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 mod app;
 mod browser;
 mod edit;
@@ -18,6 +20,19 @@ mod zone_bar;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Name in the title bar, with the version this binary was built from.
+const WINDOW_TITLE: &str = concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"));
+
+/// The letter M. The same drawing is the window icon, the Linux theme icon
+/// and the Apple icon.
+fn app_icon() -> Arc<egui::IconData> {
+    let image = image::load_from_memory(include_bytes!("../../../dist/icons/mimizan-256.png"))
+        .expect("embedded application icon")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    Arc::new(egui::IconData { rgba: image.into_raw(), width, height })
+}
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -44,7 +59,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
             .with_min_inner_size([820.0, 560.0])
-            .with_title("Mimizan Lab"),
+            .with_title(WINDOW_TITLE)
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native("Mimizan Lab", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))))

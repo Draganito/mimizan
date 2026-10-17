@@ -42,6 +42,8 @@ cp "$CLI" "$GUI" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/dist/mimizan-gui.desktop" "$STAGE/$NAME/"
+mkdir -p "$STAGE/$NAME/icons"
+cp "$PROJECT_DIR"/dist/icons/mimizan-*.png "$STAGE/$NAME/icons/"
 TARBALL="$PROJECT_DIR/dist/$NAME.tar.gz"
 rm -f "$PROJECT_DIR"/dist/mimizan-*-x86_64-linux.tar.gz
 tar -C "$STAGE" -czf "$TARBALL" "$NAME"
@@ -59,6 +61,8 @@ if command -v cargo-deb >/dev/null; then
         ./usr/share/mimizan/cameras/nikon_z_f.json \
         ./usr/share/mimizan/look/neutral.json \
         ./usr/share/applications/mimizan-gui.desktop \
+        ./usr/share/icons/hicolor/256x256/apps/mimizan.png \
+        ./usr/share/icons/hicolor/48x48/apps/mimizan.png \
         ./usr/share/doc/mimizan/README.md \
         ./usr/share/doc/mimizan/DETAILED.md \
         ./usr/share/doc/mimizan/LICENSE.txt

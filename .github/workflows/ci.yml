@@ -76,6 +76,9 @@ jobs:
           bash dist/assemble_macos_app.sh target/release/mimizan target/release/mimizan-gui "$RUNNER_TEMP/Mimizan Lab.app" "$version"
           exec=$(plutil -extract CFBundleExecutable raw "$RUNNER_TEMP/Mimizan Lab.app/Contents/Info.plist")
           test "$exec" = "mimizan-gui"
+          icon=$(plutil -extract CFBundleIconFile raw "$RUNNER_TEMP/Mimizan Lab.app/Contents/Info.plist")
+          test "$icon" = "AppIcon"
+          test -s "$RUNNER_TEMP/Mimizan Lab.app/Contents/Resources/AppIcon.icns"
           bash dist/check_macos_links.sh \
             "$RUNNER_TEMP/Mimizan Lab.app/Contents/MacOS/mimizan" \
             "$RUNNER_TEMP/Mimizan Lab.app/Contents/MacOS/mimizan-gui"

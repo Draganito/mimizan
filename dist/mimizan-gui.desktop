@@ -1,6 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Mimizan Lab
+Icon=mimizan
 Comment=Bayer RAW to linear monochrome negative, no demosaic
 Exec=mimizan-gui %f
 Terminal=false
