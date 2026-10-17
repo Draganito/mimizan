@@ -50,7 +50,6 @@ assets = [
     ["../../README.md", "usr/share/doc/mimizan/", "644"],
     ["../../DETAILED.md", "usr/share/doc/mimizan/", "644"],
     ["../../LICENSE", "usr/share/doc/mimizan/LICENSE.txt", "644"],
-    ["../../third_party/librtprocess/LICENSE.txt", "usr/share/doc/mimizan/LICENSE-librtprocess.txt", "644"],
     ["../../docs/SPEC.md", "usr/share/doc/mimizan/docs/", "644"],
     ["../../docs/RESULTS.md", "usr/share/doc/mimizan/docs/", "644"],
     ["../../docs/gui.png", "usr/share/doc/mimizan/docs/", "644"],

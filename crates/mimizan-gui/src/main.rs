@@ -1,15 +1,11 @@
 //! Mimizan Lab desktop: open a RAW, judge the luminance estimate interactively,
 //! export the negative or a print. The program is GPL-3.0-or-later. The
-//! separation lives in `mimizan-core`. AMaZE, RCD, DCB and LMMSE are an
-//! optional extra path in `mimizan-demosaic` (librtprocess); choosing one
-//! does not run the separation.
+//! separation lives in `mimizan-core`.
 
 #![forbid(unsafe_code)]
 
 mod app;
 mod browser;
-mod compare;
-mod convert;
 mod edit;
 mod histogram;
 mod session;

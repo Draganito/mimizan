@@ -54,7 +54,6 @@ Copy-Item -LiteralPath (Join-Path $ProjectDir "look") -Destination $Root -Recurs
 foreach ($doc in @("README.md", "DETAILED.md", "LICENSE")) {
     Copy-Item -LiteralPath (Join-Path $ProjectDir $doc) -Destination $Root
 }
-Copy-Item -LiteralPath (Join-Path $ProjectDir "third_party\librtprocess\LICENSE.txt") -Destination (Join-Path $Root "LICENSE-librtprocess.txt")
 foreach ($doc in @("SPEC.md", "RESULTS.md", "gui.png")) {
     Copy-Item -LiteralPath (Join-Path $ProjectDir "docs\$doc") -Destination (Join-Path $Root "docs")
 }

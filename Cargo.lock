@@ -554,15 +554,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1876,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-cli"
-version = "0.10.12"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1891,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-core"
-version = "0.10.12"
+version = "0.11.0"
 dependencies = [
  "criterion",
  "image",
@@ -1908,16 +1899,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimizan-demosaic"
-version = "0.10.12"
-dependencies = [
- "cc",
- "cmake",
-]
-
-[[package]]
 name = "mimizan-gui"
-version = "0.10.12"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1926,7 +1909,6 @@ dependencies = [
  "image",
  "mimalloc",
  "mimizan-core",
- "mimizan-demosaic",
  "rayon",
  "serde",
  "serde_json",

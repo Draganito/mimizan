@@ -50,5 +50,5 @@ digital negative" heading with the same paragraph is the alternative.
 ## 3. Tooling table row ("How this was built")
 
 ```
-| `mimizan` | Rust (cargo workspace: core, cli, gui) | rust-analyzer; `cargo test --release`, `cargo bench -p mimizan-core` |
+| `mimizan` | Rust (cargo workspace: core, cli, gui). The demosaic comparison stays on branch `demosaic` and in release 0.10.12 | rust-analyzer; `cargo test --release`, `cargo bench -p mimizan-core` |
 ```

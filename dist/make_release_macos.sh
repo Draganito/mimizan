@@ -45,7 +45,6 @@ mkdir -p "$STAGE/$NAME/docs"
 cp "$CLI" "$GUI" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
-cp "$PROJECT_DIR/third_party/librtprocess/LICENSE.txt" "$STAGE/$NAME/LICENSE-librtprocess.txt"
 cp "$PROJECT_DIR/docs/SPEC.md" "$PROJECT_DIR/docs/RESULTS.md" "$PROJECT_DIR/docs/gui.png" "$STAGE/$NAME/docs/"
 
 DIST="$PROJECT_DIR/dist"

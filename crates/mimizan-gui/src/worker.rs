@@ -138,12 +138,9 @@ fn develop_frame(
     develop: DevelopParams,
     status: &dyn Fn(String),
 ) -> Result<Session> {
-    status(match develop.converter {
-        crate::session::Converter::Mimizan => "separating".into(),
-        other => format!("demosaicing with {}", other.label()),
-    });
+    status("separating".into());
     let params = develop.negative_params(camera_file.clone());
-    let negative: Negative = crate::convert::develop(&frame, &params, decode_ms, develop.converter)?;
+    let negative: Negative = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
     status("building preview".into());
     let t = Instant::now();
     let preview = preview_planes(&negative);

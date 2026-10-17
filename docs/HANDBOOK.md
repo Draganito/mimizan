@@ -105,12 +105,11 @@ path that estimates nothing.
 **Repair defects** stays off. It is not ready. It brings in more
 artifacts than it takes out. Work on it continues.
 
-**The four estimators.** AMaZE, RCD, DCB and LMMSE sit beside Mimizan so
-that someone testing the method does not have to lose the afternoon in
-several programs. I need them as proof. In **Print** they appear again,
-in Compare, next to Lanczos-3. That is where you see what a digital
-artifact is. On the screen the difference is easy to miss. On the large
-print, when someone steps closer, it is there.
+The comparison with AMaZE, RCD, DCB and LMMSE is not in this window.
+It stays in the older line, release 0.10.12 and the branch `demosaic`,
+for anyone who wants to see the difference beside the separation.
+On the screen that difference is easy to miss. On the large print,
+when someone steps closer, it is there.
 
 ## 3. Enlarger
 
@@ -169,9 +168,8 @@ will stand on the sheet.
 
 **B-spline** is the default. It does what a darkroom enlargement does.
 It blows the picture up, plainly, without inventing anything that looks
-artificial. Lanczos-3 is the other kernel. On it, and on the four
-demosaicers in Compare, you see the artifacts Mimizan is not to have.
-Compare itself is native pixels. It does not pass through Lanczos.
+artificial. Lanczos-3 is the other kernel. It rings. That is the
+artifact this enlargement is not to have.
 
 **No sharpening.** I decided against it on purpose. Unsharp masking
 comes from the darkroom, and it was little used. An analog print simply

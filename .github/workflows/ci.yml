@@ -50,8 +50,6 @@ jobs:
         run: |
           uname -m
           test "$(uname -m)" = arm64
-          cmake --version
-          clang++ --version
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

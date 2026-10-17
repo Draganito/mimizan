@@ -82,10 +82,6 @@ pub struct NegativeInfo {
     /// Mean β of that reconstruction: fraction of the picture that was
     /// computed from a direction decision instead of filtered. 0 when off.
     pub computed: f64,
-    /// Set when this negative was mixed from a demosaicer instead of the
-    /// separation. Absent on the Mimizan path, which does not call one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub demosaic: Option<String>,
     pub report: IngestReport,
     pub timing: Timing,
 }
@@ -151,7 +147,6 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         cutoff: p.separate.cutoff,
         reconstruct: p.separate.reconstruct.is_some(),
         computed: 0.0,
-        demosaic: None,
         report: mosaic.report.clone(),
         timing: Timing { decode_ms, ingest_ms, separate_ms: 0, mix_ms: 0 },
     };

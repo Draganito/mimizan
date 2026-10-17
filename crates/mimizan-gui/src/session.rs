@@ -24,8 +24,6 @@ use std::sync::Arc;
 pub const PREVIEW_MAX: usize = 1800;
 
 /// Settings that need a new separation (ingest + separate), not just a re-mix.
-/// `converter` chooses that separation or a demosaicer. `Mimizan` is the
-/// unchanged path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DevelopParams {
     pub wb: WhiteBalance,
@@ -34,34 +32,8 @@ pub struct DevelopParams {
     /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). The
     /// desktop program starts with it on. The library and the command stay
     /// off until `--reconstruct` is passed, because a pixel that passes
-    /// through it is computed, not measured. Ignored unless `converter` is
-    /// [`Converter::Mimizan`].
+    /// through it is computed, not measured.
     pub reconstruct: bool,
-    pub converter: Converter,
-}
-
-/// How the mosaic becomes three channels. `Mimizan` does not demosaic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Converter {
-    Mimizan,
-    Amaze,
-    Rcd,
-    Dcb,
-    Lmmse,
-}
-
-impl Converter {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Mimizan => "Mimizan",
-            Self::Amaze => "AMaZE",
-            Self::Rcd => "RCD",
-            Self::Dcb => "DCB",
-            Self::Lmmse => "LMMSE",
-        }
-    }
-
-    pub const ALL: [Converter; 5] = [Self::Mimizan, Self::Amaze, Self::Rcd, Self::Dcb, Self::Lmmse];
 }
 
 impl Default for DevelopParams {
@@ -69,13 +41,7 @@ impl Default for DevelopParams {
         // Pixel-adaptive Dubois separation is the default (RESULTS.md, Kodak
         // benchmark); the fixed estimator and the block mask stay available
         // under Development.
-        Self {
-            wb: WhiteBalance::AsShot,
-            mask: MaskMode::Dubois,
-            fix_defects: false,
-            reconstruct: true,
-            converter: Converter::Mimizan,
-        }
+        Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois, fix_defects: false, reconstruct: true }
     }
 }
 
@@ -341,42 +307,6 @@ fn crop(p: &Plane, r: DetailRect) -> Plane {
         row.copy_from_slice(&p.row(r.y + y)[r.x..r.x + r.w]);
     });
     out
-}
-
-/// Mix, orient, place and tone one sensor-space rectangle of a separation.
-/// The rectangle is clamped to the separation. This is the picture before
-/// the size step.
-pub(crate) fn develop_window(
-    sep: &Separation,
-    rect: DetailRect,
-    orientation: u16,
-    weights: &Weights,
-    place: f64,
-    tone: &Tone,
-) -> Option<SharpenLoupe> {
-    let (sw, sh) = (sep.lum.width, sep.lum.height);
-    if rect.w == 0 || rect.h == 0 || rect.x >= sw || rect.y >= sh {
-        return None;
-    }
-    let rect = DetailRect {
-        x: rect.x,
-        y: rect.y,
-        w: rect.w.min(sw - rect.x).max(1),
-        h: rect.h.min(sh - rect.y).max(1),
-    };
-    let small = Separation {
-        lum: crop(&sep.lum, rect),
-        c1: crop(&sep.c1, rect),
-        c2: crop(&sep.c2, rect),
-        mask_max: Plane::zeros(1, 1),
-        rounds: sep.rounds,
-        phase: sep.phase,
-        computed: sep.computed,
-    };
-    let mut mixed = orient(&mix(&small, weights), orientation);
-    tone::render(&mut mixed, place, &tone.compile());
-    let gray = mixed.data.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
-    Some(SharpenLoupe { gray, width: mixed.width, height: mixed.height })
 }
 
 /// Render `rect` of the negative at full resolution: crop the separation in

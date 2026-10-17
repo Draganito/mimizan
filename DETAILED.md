@@ -25,9 +25,9 @@ separated straight from the mosaic. On pictures a lens can take, that
 unconventional path lands among the strongest demosaicers, and with
 `--reconstruct` it has the highest mean of the photographic tests.
 
-AMaZE, RCD, DCB and LMMSE are in the desktop app beside it, so anyone can
-switch and see the difference, not only read a table. They are there so
-Mimizan can be compared. The separation stays the default and is unchanged.
+AMaZE, RCD, DCB and LMMSE are not in this line. The comparison stays in
+release 0.10.12 and on the branch `demosaic`. The separation is the path
+this program develops.
 
 The program is a gift to the community: GPL-3.0-or-later, free to use and
 to check.
@@ -260,7 +260,7 @@ the same, so there the estimator, not the detector, is the limit).
 | binary          | purpose |
 |-----------------|---------|
 | `mimizan`      | CLI: `info`, `dump`, `negative`, `print`, `calibrate`, `synth`, `measure`, `bench` |
-| `mimizan-gui`  | Desktop darkroom: walk the folder as a film strip, judge mix, placing and the two split-grade exposures interactively, export the print recipe as a 16-bit TIFF. Converter: Mimizan (default), or AMaZE, RCD, DCB, LMMSE |
+| `mimizan-gui`  | Desktop darkroom: walk the folder as a film strip, judge mix, placing and the two split-grade exposures interactively, export the print recipe as a 16-bit TIFF |
 
 Supported input: Bayer RAWs that [rawler](https://crates.io/crates/rawler)
 decodes (verified: Nikon Z f NEF). Monochrome sensors (DNG without a colour
@@ -294,9 +294,8 @@ sudo apt install ./mimizan_0.10.12-1_amd64.deb
 mimizan --version
 ```
 
-From source (a recent stable Rust, a C++ compiler for the vendored
-demosaicers, CMake, and a working OpenGL for the GUI; on Windows that
-compiler is MSVC, on a Mac it is the Clang that comes with Xcode):
+From source (a recent stable Rust, a C compiler for the small allocator
+mimalloc, and a working OpenGL for the GUI):
 
 ```bash
 git clone https://github.com/Draganito/mimizan
@@ -432,11 +431,6 @@ resized exactly as the TIFF and with no sharpening, so the size step can
 be judged before the export. Drag the crosshair on the picture to move
 that spot. It stays drawn on top once the view switches to the
 full-resolution pixels. Dragging inside the box moves it too.
-*Compare* opens the same spot for Mimizan and for AMaZE, RCD,
-DCB and LMMSE, native pixels with no size step, so the enlargement cannot
-hide the difference. Pan and zoom move every panel together; a double
-click returns to 1:1. It does not change the recipe or the converter.
-A monochrome file has no Compare.
 
 The Enlarger works like a split-grade session, and nothing in it can do
 what a sheet of paper cannot. The zone bar is the paper from its black to
@@ -482,11 +476,9 @@ them — and once you zoom past the fit-to-window preview (scroll,
 `1:1`, or a double click) the visible window is rendered from the
 full-resolution separation, pixel for pixel, so the
 negative can be judged, carrier residue included. The *Development* fold
-defaults to Mimizan with the Dubois separation (`mask: Dubois`); the fixed
+is the Dubois separation (`mask: Dubois`); the fixed
 estimator and the block mask are there, and reconstruction starts on.
-*Apply* recomputes with them. The same
-fold can switch to AMaZE, RCD, DCB or LMMSE; that recomputes the picture
-at once and leaves the Mimizan path untouched. Three histograms (256 bins,
+*Apply* recomputes with them. Three histograms (256 bins,
 linear or log), all from the full-resolution data, never from the preview
 copy: *print* (after placing and the paper: what the TIFF gets),
 *negative* (the linear mix on a gamma-2.2 axis) and *raw* (the four sensor
@@ -586,9 +578,7 @@ README.md              the introduction for photographers
 DETAILED.md            this manual
 crates/mimizan-core   the pipeline: decode, ingest, separate (dubois, mask, reconstruct), mix, paper, tone, recipe, print (resize, usm, deconv), zone, calibrate, synth, kodak, metrics
 crates/mimizan-cli    the `mimizan` binary (clap)
-crates/mimizan-gui    the `mimizan-gui` binary (egui/eframe); links mimizan-demosaic
-crates/mimizan-demosaic  AMaZE, RCD, DCB, LMMSE via librtprocess (GPL-3.0-or-later)
-third_party/librtprocess  vendored RawTherapee demosaic library
+crates/mimizan-gui    the `mimizan-gui` binary (egui/eframe)
 cameras/               per-camera JSON (noise, weights, USM; star MTF optional)
 look/                  look curves (PCHIP points over gamma-2.2 encoded values)
 docs/                  HANDBOOK.md, handbook.pdf, SPEC.md, PAPER.md, RESULTS.md, KODAK*.md + kodak*/ and kodak-field/ (benchmark reports and crops), VISION_ENTRY.md, whitepaper, screenshot
@@ -621,9 +611,7 @@ or any later version. See [LICENSE](LICENSE). The already published release
 0.4.0 stays under the MIT license it was shipped with. This change applies
 from here on.
 
-AMaZE, RCD, DCB and LMMSE come from
-[librtprocess](https://github.com/CarVac/librtprocess) (GPL-3.0-or-later,
-vendored in `third_party/librtprocess`). They sit beside the separation:
-Mimizan remains the default and that path is unchanged. Part of Dragan
-Bojovic's analogue/digital darkroom tool line (LF Concept Camera *miluka*,
-splitgrade controller, kicad-mcp).
+Part of Dragan Bojovic's analogue/digital darkroom tool line (LF Concept
+Camera *miluka*, splitgrade controller, kicad-mcp). The comparison with
+AMaZE, RCD, DCB and LMMSE stays in release 0.10.12 and on the branch
+`demosaic`.
