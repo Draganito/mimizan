@@ -1380,10 +1380,9 @@ impl App {
         if !need {
             return;
         }
-        if view_changed || inspect_changed {
-            // Everything shown so far belongs to the old view.
-            self.detail_rect = None;
-        }
+        // The sharp window stays up until its replacement is applied.
+        // Clearing it here would leave the soft fit copy on screen for the
+        // whole wait, and the picture would flicker on every slider step.
         self.generation += 1;
         if view_changed {
             let picture = self.shared_picture();
