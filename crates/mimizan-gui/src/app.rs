@@ -211,15 +211,6 @@ pub struct App {
     /// Measured height of the enlarger window (docked at the bottom); the
     /// stage above it is laid out with it.
     enlarger_h: Option<f32>,
-    /// A press on the picture or the enlarger is unfinished: the button is
-    /// still down, or the mix menu it opened is still up. The strip stays
-    /// until that action ends, so the picture and the enlarger do not move
-    /// away from the pointer.
-    strip_held: bool,
-    /// The enlarger's mix menu is open this frame. Set while that combo is
-    /// shown; cleared at the start of the frame so a hidden enlarger cannot
-    /// leave it stuck.
-    mix_menu_open: bool,
     /// RAW counts of the strip's subfolders, arriving in the background.
     dir_counts: Option<std::sync::mpsc::Receiver<(u64, PathBuf, usize)>>,
     /// Priority list last sent to the thumbnail worker.
@@ -366,8 +357,6 @@ impl App {
             panels: persisted.panels.unwrap_or([true; 3]),
             waiting: [false; 3],
             enlarger_h: None,
-            strip_held: false,
-            mix_menu_open: false,
             dir_counts: None,
             last_wanted: Vec::new(),
             scroll_to_selected: false,
@@ -1777,8 +1766,7 @@ impl App {
                 selected = format!("{} {}", capitalise(f.colour()), f.wratten().unwrap_or(0));
             }
         }
-        let menu =
-            egui::ComboBox::from_id_salt("mix-combo").selected_text(selected).width(118.0).show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("mix-combo").selected_text(selected).width(118.0).show_ui(ui, |ui| {
             if ui
                 .selectable_label(same(&current, &native), "Native")
                 .on_hover_text("¼ ½ ¼: exactly the Bayer luminance, no chroma mixed in")
@@ -1825,7 +1813,6 @@ impl App {
                 }
             }
         });
-        self.mix_menu_open = egui::ComboBox::is_open(ui.ctx(), menu.response.id);
         if let Some(w) = pick {
             self.set_weights(w);
         }
@@ -2394,6 +2381,7 @@ impl App {
         }
         let (mut rect, white_pts, black_pts, max_pan, pan) = place(self.zoom, self.pan);
         self.pan = pan;
+        let crosshair_released = self.cross_drag && !response.is_pointer_button_down_on();
         if !response.is_pointer_button_down_on() {
             self.cross_drag = false;
         } else if ui.input(|i| i.pointer.primary_pressed()) {
@@ -2421,6 +2409,16 @@ impl App {
                 self.pan = (self.pan + response.drag_delta()).clamp(-max_pan, max_pan);
                 (rect, _, _, _, _) = place(self.zoom, self.pan);
             }
+        }
+        // The strip is the way in. It leaves when a click on the picture is
+        // released, or when a drag of the crosshair is released. The close
+        // is not written down, so the next launch still opens on the strip.
+        let clicked_on_picture =
+            response.clicked() && response.interact_pointer_pos().is_some_and(|p| rect.contains(p));
+        if self.pending_leave.is_none()
+            && strip_closes(self.show_strip, true, clicked_on_picture, crosshair_released)
+        {
+            self.show_strip = false;
         }
         let border_pts = white_pts + black_pts;
         if border_pts > 0.0 {
@@ -2653,47 +2651,6 @@ impl App {
         if right {
             self.open_neighbour(1);
         }
-    }
-
-    /// The strip is the way in. Once the picture is up, the first press,
-    /// drag or scroll on the picture or on Negative, Enlarger or Print
-    /// closes it for this session. It is not written to the config, so the
-    /// next launch still opens on the strip. `B` brings it back.
-    ///
-    /// A press on the picture, the crosshair or the enlarger keeps the strip
-    /// until the button comes up, and the mix menu keeps it until a filter
-    /// is chosen or the menu closes. Closing the strip mid-drag would move
-    /// the picture and drop the enlarger away from the pointer. Negative and
-    /// Print grow downward from a fixed top, so they close the strip at once.
-    fn dismiss_strip_for_work(&mut self, ctx: &egui::Context, docks: &Docks) {
-        if self.pending_leave.is_some() {
-            return;
-        }
-        let (pointer_down, at) = ctx.input(|i| {
-            let at = if i.pointer.any_pressed() || i.pointer.is_decidedly_dragging() {
-                i.pointer.press_origin().or(i.pointer.latest_pos())
-            } else if (i.zoom_delta() - 1.0).abs() > f32::EPSILON || i.smooth_scroll_delta.y.abs() > 0.0 {
-                i.pointer.hover_pos()
-            } else {
-                None
-            };
-            (i.pointer.any_down(), at)
-        });
-        let picture_up = self.session.is_some() && self.texture.is_some();
-        let inside = |r: Rect| at.is_some_and(|p| r.contains(p));
-        let on_picture = docks.stage.width() > 0.0 && docks.stage.height() > 0.0 && inside(docks.stage);
-        let on_enlarger = docks.bottom.is_some_and(inside);
-        let next = step_strip(
-            self.show_strip,
-            self.strip_held,
-            picture_up,
-            pointer_down,
-            on_picture || on_enlarger,
-            self.mix_menu_open,
-            strip_hides_for_work(self.show_strip, picture_up, work_rect(docks), at),
-        );
-        self.show_strip = next.show;
-        self.strip_held = next.held;
     }
 
     fn strip_bar(&mut self, ui: &mut egui::Ui) {
@@ -3104,7 +3061,6 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.mix_menu_open = false;
         self.ensure_loupe_point();
         self.handle_dialog(&ctx);
 
@@ -3148,7 +3104,6 @@ impl eframe::App for App {
             self.panels[1] && docks.right.is_none(),
             self.panels[2] && docks.bottom.is_none(),
         ];
-        self.dismiss_strip_for_work(&ctx, &docks);
 
         self.edit_keys(&ctx);
         self.clear_desktop_sharpen();
@@ -3288,67 +3243,10 @@ fn show_dock(
     (hide, content_h + margin.sum().y)
 }
 
-/// The picture and the three docks. A press here, once a picture is up, closes the strip.
-fn work_rect(docks: &Docks) -> Rect {
-    let mut acc: Option<Rect> = None;
-    let mut add = |r: Rect| {
-        if r.width() > 0.0 && r.height() > 0.0 {
-            acc = Some(match acc {
-                Some(a) => a.union(r),
-                None => r,
-            });
-        }
-    };
-    add(docks.stage);
-    if let Some(r) = docks.left {
-        add(r);
-    }
-    if let Some(r) = docks.right {
-        add(r);
-    }
-    if let Some(r) = docks.bottom {
-        add(r);
-    }
-    acc.unwrap_or(Rect::NOTHING)
-}
-
-/// The strip closes for a gesture on the open picture or on a dock.
-/// A press on the strip, the toolbar or an empty darkroom does not.
-fn strip_hides_for_work(show_strip: bool, picture_up: bool, work: Rect, at: Option<Pos2>) -> bool {
-    show_strip && picture_up && at.is_some_and(|p| work.contains(p))
-}
-
-/// The strip for one frame, and whether an enlarger press is still held.
-struct StripDuringDrag {
-    show: bool,
-    held: bool,
-}
-
-/// A press on the picture or the enlarger holds the strip until the button
-/// comes up. The mix menu holds it until a filter is chosen or the menu
-/// closes. A press on Negative or Print closes it on that frame.
-fn step_strip(
-    show: bool,
-    held: bool,
-    picture_up: bool,
-    pointer_down: bool,
-    hold_press: bool,
-    menu_open: bool,
-    hide_for_work: bool,
-) -> StripDuringDrag {
-    if (held && (pointer_down || menu_open)) || (menu_open && show && picture_up) {
-        return StripDuringDrag { show: true, held: true };
-    }
-    if held {
-        return StripDuringDrag { show: false, held: false };
-    }
-    if show && picture_up && pointer_down && hold_press {
-        return StripDuringDrag { show: true, held: true };
-    }
-    if hide_for_work {
-        return StripDuringDrag { show: false, held: false };
-    }
-    StripDuringDrag { show, held: false }
+/// The strip closes on the release of a click on the picture, or on the
+/// release of a drag that started on the crosshair. It is not written down.
+fn strip_closes(show: bool, picture_up: bool, clicked_on_picture: bool, crosshair_released: bool) -> bool {
+    show && picture_up && (clicked_on_picture || crosshair_released)
 }
 
 /// True when the rectangles share an interior. A shared edge is room, not a stack.
@@ -3567,8 +3465,8 @@ mod crop_drag_tests {
 #[cfg(test)]
 mod dock_tests {
     use super::{
-        docks_cross, exposure_number_fits, exposure_rail_width, place_docks, step_strip,
-        strip_hides_for_work, work_rect, DOCK_MIN_H, ENLARGER_MIN_W, PANEL_GAP, PANEL_W,
+        docks_cross, exposure_number_fits, exposure_rail_width, place_docks, strip_closes, DOCK_MIN_H,
+        ENLARGER_MIN_W, PANEL_GAP, PANEL_W,
     };
     use egui::{Pos2, Rect, Vec2};
 
@@ -3647,20 +3545,12 @@ mod dock_tests {
     }
 
     #[test]
-    fn the_strip_stays_until_work_starts_on_the_picture() {
-        let d = place_docks(area(1200.0, 700.0), [true; 3], 190.0);
-        let work = work_rect(&d);
-        let on_picture = d.stage.center();
-        let on_print = d.right.unwrap().center();
-        let on_strip = Pos2::new(400.0, 800.0);
-        assert!(strip_hides_for_work(true, true, work, Some(on_picture)));
-        assert!(strip_hides_for_work(true, true, work, Some(on_print)));
-        assert!(strip_hides_for_work(true, true, work, Some(d.left.unwrap().center())));
-        assert!(strip_hides_for_work(true, true, work, Some(d.bottom.unwrap().center())));
-        assert!(!strip_hides_for_work(true, true, work, Some(on_strip)));
-        assert!(!strip_hides_for_work(true, false, work, Some(on_picture)));
-        assert!(!strip_hides_for_work(false, true, work, Some(on_picture)));
-        assert!(!strip_hides_for_work(true, true, work, None));
+    fn the_strip_closes_only_for_a_picture_click_or_the_crosshair() {
+        assert!(strip_closes(true, true, true, false));
+        assert!(strip_closes(true, true, false, true));
+        assert!(!strip_closes(true, true, false, false));
+        assert!(!strip_closes(true, false, true, true));
+        assert!(!strip_closes(false, true, true, true));
     }
 
     #[test]
@@ -3671,39 +3561,5 @@ mod dock_tests {
         assert!(exposure_number_fits(400.0, 100.0, 8.0));
         assert_eq!(exposure_rail_width(40.0, 100.0, 8.0), 24.0);
         assert!(!exposure_number_fits(40.0, 100.0, 8.0));
-    }
-
-    #[test]
-    fn an_enlarger_drag_holds_the_strip_until_the_button_comes_up() {
-        let pressed = step_strip(true, false, true, true, true, false, true);
-        assert!(pressed.show && pressed.held);
-        let dragging = step_strip(pressed.show, pressed.held, true, true, true, false, true);
-        assert!(dragging.show && dragging.held);
-        let released = step_strip(dragging.show, dragging.held, true, false, false, false, false);
-        assert!(!released.show && !released.held);
-    }
-
-    #[test]
-    fn the_mix_menu_holds_the_strip_until_it_closes() {
-        let opened = step_strip(true, false, true, false, true, true, true);
-        assert!(opened.show && opened.held);
-        let choosing = step_strip(opened.show, opened.held, true, true, false, true, true);
-        assert!(choosing.show && choosing.held);
-        let closed = step_strip(choosing.show, choosing.held, true, false, false, false, false);
-        assert!(!closed.show && !closed.held);
-    }
-
-    #[test]
-    fn a_press_on_the_picture_holds_the_strip_until_the_button_comes_up() {
-        let pressed = step_strip(true, false, true, true, true, false, true);
-        assert!(pressed.show && pressed.held);
-        let released = step_strip(pressed.show, pressed.held, true, false, false, false, false);
-        assert!(!released.show && !released.held);
-    }
-
-    #[test]
-    fn a_press_on_negative_or_print_closes_the_strip_at_once() {
-        let frame = step_strip(true, false, true, true, false, false, true);
-        assert!(!frame.show && !frame.held);
     }
 }

@@ -295,7 +295,7 @@ right-click and Open.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.4-1_amd64.deb
+sudo apt install ./mimizan_0.11.5-1_amd64.deb
 mimizan --version
 ```
 
@@ -412,7 +412,7 @@ steps: *Negative* on the left, *Enlarger* in the middle at the bottom,
 edge, the Enlarger sits at the bottom between them above the film strip,
 and the picture is fitted into the free area in between, never hidden
 behind a window; close a window from the × on its heading or the toolbar and the
-picture takes the space (`Tab` hides all three). The strip stays up when a file is opened. The first press, drag or scroll on the picture or in one of the three windows closes it for this session; B or the Strip button brings it back, and the arrow keys still change the file. They are plain egui on
+picture takes the space (`Tab` hides all three). The strip stays up when a file is opened. It closes for this session when a click on the picture is released, or when a drag of the crosshair is released; B or the Strip button brings it back, and the arrow keys still change the file. They are plain egui on
 glow — alpha and a shadow, no blur — so the app looks the same on a machine
 without a GPU driver. *Negative* is the judging step: the file's exposure
 from EXIF, the histograms and the *Development* fold. *Enlarger* is the

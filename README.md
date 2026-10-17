@@ -12,7 +12,7 @@ The name is the beach at Mimizan, where the idea came up watching the surf: sepa
 
 ## A session
 
-The folder lies along the bottom as a strip of negatives. Once you start on an open picture, the strip closes; B brings it back, and the arrow keys still change the file. The picture in the middle is the print. A white border is added around it, and a black edge can sit inside that white, never wider than it, so the sheet is judged as it will go on the wall.
+The folder lies along the bottom as a strip of negatives. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. The picture in the middle is the print. A white border is added around it, and a black edge can sit inside that white, never wider than it, so the sheet is judged as it will go on the wall.
 
 *Enlarger* holds the mix and the only tone controls a sheet of paper has. *soft* is filter 00, *hard* is filter 5, both in stops of time from the base print. The zone bar is that paper from its black to its white. More soft light greys the highlights. Less hard light opens the shadows. A drag on the bar is one more or less second under the enlarger. The line under the sliders names the single grade this pair equals, and how many stops of the scene the paper holds.
 
@@ -35,14 +35,14 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 Debian and Ubuntu:
 
 ```bash
-sudo apt install ./mimizan_0.11.4-1_amd64.deb
+sudo apt install ./mimizan_0.11.5-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.4-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
+Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.5-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
 
-Apple silicon: unzip `mimizan-0.11.4-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS.
+Apple silicon: unzip `mimizan-0.11.5-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS.
 
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
