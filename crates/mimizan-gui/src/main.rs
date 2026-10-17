@@ -60,7 +60,10 @@ fn main() -> eframe::Result {
             .with_inner_size(size)
             .with_min_inner_size([820.0, 560.0])
             .with_title(WINDOW_TITLE)
-            .with_icon(app_icon()),
+            .with_icon(app_icon())
+            // Must match dist/mimizan-gui.desktop, or GNOME shows a generic
+            // mark in the dock while the launcher still has the letter M.
+            .with_app_id("mimizan-gui"),
         ..Default::default()
     };
     eframe::run_native("Mimizan Lab", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))))
