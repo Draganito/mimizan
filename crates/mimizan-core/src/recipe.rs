@@ -120,10 +120,15 @@ pub struct Recipe {
     pub size: Option<PrintSize>,
     #[serde(default = "default_dpi")]
     pub dpi: f64,
-    /// Paper border around the fitted picture, mm (converted with `dpi`),
+    /// White paper around the fitted picture, mm (converted with `dpi`),
     /// filled with paper white, the curve's value at linear 1.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub border_mm: f64,
+    /// Black film edge between the picture and the white border, mm.
+    /// Never wider than `border_mm`: a wider value is printed as the white
+    /// width, and zero white turns the edge off. Old recipes omit it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub black_mm: f64,
     #[serde(default)]
     pub sharpen: Sharpen,
     /// Window on the upright negative, whole pixels, before the size step.
@@ -142,6 +147,7 @@ impl Default for Recipe {
             size: None,
             dpi: default_dpi(),
             border_mm: 0.0,
+            black_mm: 0.0,
             sharpen: Sharpen::Off,
             crop: None,
         }
@@ -310,6 +316,9 @@ impl Recipe {
         if !(self.border_mm.is_finite() && self.border_mm >= 0.0) {
             return Err(Error::Invalid("border must be zero or positive".into()));
         }
+        if !(self.black_mm.is_finite() && self.black_mm >= 0.0) {
+            return Err(Error::Invalid("black edge must be zero or positive".into()));
+        }
         if let Some(c) = self.crop {
             if c.w == 0 || c.h == 0 {
                 return Err(Error::Invalid("crop must cover at least one pixel".into()));
@@ -330,13 +339,30 @@ impl Recipe {
         Ok(())
     }
 
-    /// Border in pixels at this recipe's dpi.
-    pub fn border_px(&self) -> usize {
-        if self.border_mm <= 0.0 {
+    /// Millimetres at this recipe's dpi, rounded to whole pixels.
+    fn mm_px(&self, mm: f64) -> usize {
+        if mm <= 0.0 || !mm.is_finite() || !(self.dpi.is_finite() && self.dpi > 0.0) {
             0
         } else {
-            (self.border_mm / 25.4 * self.dpi).round() as usize
+            (mm / 25.4 * self.dpi).round() as usize
         }
+    }
+
+    /// White border in pixels on each side.
+    pub fn border_px(&self) -> usize {
+        self.mm_px(self.border_mm)
+    }
+
+    /// Black edge in pixels on each side. Clamped to the white border, so
+    /// rounding cannot put black outside white, and a zero white border
+    /// turns the edge off.
+    pub fn black_px(&self) -> usize {
+        self.mm_px(self.black_mm.min(self.border_mm)).min(self.border_px())
+    }
+
+    /// Both rings, pixels on each side. The picture sits inside this.
+    pub fn frame_px(&self) -> usize {
+        self.black_px() + self.border_px()
     }
 }
 
@@ -349,8 +375,8 @@ mod tests {
         let r = Recipe::default();
         r.validate().unwrap();
         let json = serde_json::to_string(&r).unwrap();
-        // Zero place, no size, no border are omitted.
-        assert!(!json.contains("place") && !json.contains("border"));
+        // Zero place, no size, no border, no black edge are omitted.
+        assert!(!json.contains("place") && !json.contains("border") && !json.contains("black"));
         assert!(json.contains(r#""resample":"b-spline""#), "{json}");
         assert!(json.contains(r#""sharpen":{"mode":"off"}"#), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
@@ -366,6 +392,7 @@ mod tests {
             size: Some(PrintSize::Physical { width_in: 11.811, height_in: 15.748 }),
             dpi: 360.0,
             border_mm: 20.0,
+            black_mm: 8.0,
             sharpen: Sharpen::Deconv { passes: 5, usm_amount: 0.5 },
             ..Recipe::default()
         };
@@ -375,6 +402,10 @@ mod tests {
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert_eq!(r.border_px(), 283);
+        assert_eq!(r.black_px(), 113);
+        assert_eq!(r.frame_px(), 396);
+        let wider = Recipe { black_mm: 40.0, ..r.clone() };
+        assert_eq!(wider.black_px(), wider.border_px());
         // Older fields missing: defaults fill in.
         let minimal: Recipe =
             serde_json::from_str(r#"{"curve":{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}}"#)
@@ -391,6 +422,8 @@ mod tests {
         let bad = Recipe { sharpen: Sharpen::Deconv { passes: 0, usm_amount: 0.0 }, ..Recipe::default() };
         assert!(bad.validate().is_err());
         let bad = Recipe { border_mm: -1.0, ..Recipe::default() };
+        assert!(bad.validate().is_err());
+        let bad = Recipe { black_mm: -1.0, ..Recipe::default() };
         assert!(bad.validate().is_err());
         let bad = Recipe { schema: 2, ..Recipe::default() };
         assert!(bad.validate().is_err());

@@ -295,7 +295,7 @@ right-click and Open.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.3-1_amd64.deb
+sudo apt install ./mimizan_0.11.4-1_amd64.deb
 mimizan --version
 ```
 
@@ -377,8 +377,7 @@ to nothing cannot be expressed — more soft light greys the highlights,
 less hard light opens the shadows; `--look` takes a look file
 for the measurement pipeline), the **size step** (`--size`, `--dpi`, `--resample b-spline |
 lanczos3 | mitchell | catmull-rom`: B-spline is the default, the only one
-without overshoot; Lanczos-3 stays the benchmark kernel), the **border** (`--border-mm`, unexposed paper, taken from the
-paper size), and the **scale compensation** (USM or deconvolution of the
+without overshoot; Lanczos-3 stays the benchmark kernel), the **border** (`--border-mm`, unexposed paper, and `--black-mm`, a black edge inside it, never wider than the white), and the **scale compensation** (USM or deconvolution of the
 enlargement; the desktop GUI leaves it off, the CLI and the phone
 set it). Nothing in the recipe reads the picture:
 there is no tone equaliser and no content-adaptive mask (SPEC §9).
@@ -413,7 +412,7 @@ steps: *Negative* on the left, *Enlarger* in the middle at the bottom,
 edge, the Enlarger sits at the bottom between them above the film strip,
 and the picture is fitted into the free area in between, never hidden
 behind a window; close a window from the × on its heading or the toolbar and the
-picture takes the space (`Tab` hides all three). They are plain egui on
+picture takes the space (`Tab` hides all three). The strip stays up when a file is opened. The first press, drag or scroll on the picture or in one of the three windows closes it for this session; B or the Strip button brings it back, and the arrow keys still change the file. They are plain egui on
 glow — alpha and a shadow, no blur — so the app looks the same on a machine
 without a GPU driver. *Negative* is the judging step: the file's exposure
 from EXIF, the histograms and the *Development* fold. *Enlarger* is the
@@ -422,15 +421,18 @@ the camera file's calibrated weights, and the filters *Yellow 8* … *Blue
 47* in front of it) or the R and B fields, the zone bar and the two exposures
 *soft* and *hard*. *Print* is the output step
 and nothing else: native pixels (the sheet in centimetres at that dpi, border included), or the picture in centimetres at a dpi,
-the border and the resampling kernel, the output size it
+the white border, the black edge and the resampling kernel, the output size it
 adds up to, and the *Export…* button. The two centimetre fields are the
 picture, and they are one proportion: type the short side and the long
 side follows the picture, and the other way round, a single scale. The
-border is paper white added around those centimetres, and it is part of
-the preview: the sheet (picture plus border, in the print's proportion)
-is what is fitted into the stage, so 20 mm around a picture 40 cm on the
-long side is judged as it will print. The border is drawn, not rendered —
-the picture under it is still the one before the size step. With a file
+white border and the black edge are added around those centimetres. The
+black edge sits between the picture and the white, and it cannot be wider
+than the white; zero white turns it off. The crop window is the picture
+the rings wrap. Both are part of
+the preview: the sheet (picture plus black plus white, in the print's proportion)
+is what is fitted into the stage, so 20 mm of white around a picture 40 cm on the
+long side is judged as it will print. The rings are drawn, not rendered —
+the picture under them is still the one before the size step. With a file
 open, a 1:1 box of the centre is always there, as wide as the panel,
 resized exactly as the TIFF and with no sharpening, so the size step can
 be judged before the export. Drag the crosshair on the picture to move

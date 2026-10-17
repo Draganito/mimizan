@@ -1,6 +1,6 @@
 //! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
-//! one pass. Upright -> crop window -> size -> place -> curve -> border ->
-//! [Richardson–Lucy ->] USM -> one quantisation ->
+//! one pass. Upright -> crop window -> size -> place -> curve -> black edge ->
+//! white border -> [Richardson–Lucy ->] USM -> one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
 //! print decision (viewing model constant, sidecar use).
@@ -111,9 +111,12 @@ pub struct PrintInfo {
     /// The recipe this pass ran (Zonensystem paper, section 11): place,
     /// curve, kernel, size, border, sharpening mode.
     pub recipe: Recipe,
-    /// Border in pixels on each side, when there is one.
+    /// White border in pixels on each side, when there is one.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub border_px: usize,
+    /// Black edge in pixels on each side, inside the white border.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub black_px: usize,
     pub usm_amount: f64,
     /// One arc minute at the viewing distance, in print pixels. Recorded
     /// only: sharpening uses [`Self::resample_sigma_px`].
@@ -276,16 +279,18 @@ pub struct PrintSource<'a> {
     pub description: Option<serde_json::Value>,
 }
 
-/// Where the picture lands: its pixel size, the border around it, the sheet
-/// (picture plus border), and the viewing model's numbers.
+/// Where the picture lands: its pixel size, the two rings around it, the sheet
+/// (picture plus black plus white), and the viewing model's numbers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     /// Picture size after the fit, pixels.
     pub image_w: usize,
     pub image_h: usize,
-    /// Border on each side, pixels.
+    /// White border on each side, pixels.
     pub border_px: usize,
-    /// Output file size: picture plus twice the border.
+    /// Black edge on each side, inside the white, pixels.
+    pub black_px: usize,
+    /// Output file size: picture plus twice the black edge plus twice the white.
     pub out_w: usize,
     pub out_h: usize,
     /// Viewing distance, mm (given, or the sheet diagonal).
@@ -352,24 +357,27 @@ pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
     out
 }
 
-/// Layout for a negative of `w×h` (before orientation). The border is taken
-/// from the paper box before the fit, so picture plus border never exceeds
-/// the size asked for.
+/// Layout for a negative of `w×h` (before orientation). Both rings are taken
+/// from the paper box before the fit, so picture plus black plus white never
+/// exceeds the size asked for. With no size, the rings are added outside the
+/// crop window and the picture pixels stay as they are.
 pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let r = &p.recipe;
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
     // The fit and the enlargement are measured from the crop window.
     let (_, _, w, h) = source_window(w, h, r.crop);
-    let b = r.border_px();
+    let white = r.border_px();
+    let black = r.black_px();
+    let frame = white + black;
     let (image_w, image_h) = match r.size {
         Some(sz) => {
             let (bw, bh) = sz.pixels(r.dpi);
-            // A border wider than the paper leaves one pixel of picture.
-            fit_dims(w, h, bw.saturating_sub(2 * b).max(1), bh.saturating_sub(2 * b).max(1))
+            // A frame wider than the paper leaves one pixel of picture.
+            fit_dims(w, h, bw.saturating_sub(2 * frame).max(1), bh.saturating_sub(2 * frame).max(1))
         }
         None => (w, h),
     };
-    let (out_w, out_h) = (image_w + 2 * b, image_h + 2 * b);
+    let (out_w, out_h) = (image_w + 2 * frame, image_h + 2 * frame);
     let viewing_mm = p.viewing_distance_mm.unwrap_or_else(|| {
         let diag_in = ((out_w as f64 / r.dpi).powi(2) + (out_h as f64 / r.dpi).powi(2)).sqrt();
         diag_in * 25.4
@@ -379,7 +387,8 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     Layout {
         image_w,
         image_h,
-        border_px: b,
+        border_px: white,
+        black_px: black,
         out_w,
         out_h,
         viewing_mm,
@@ -420,7 +429,7 @@ pub fn sharpen_halo(sigma: f64, passes: usize, usm: bool) -> usize {
 /// Where the loupe sits on the sheet, and which picture pixels have to be
 /// resampled so the sharpening around that box sees real neighbours.
 struct LoupeGeom {
-    /// Box origin on the sheet (picture plus border).
+    /// Box origin on the sheet (picture plus black edge plus white border).
     view_x: usize,
     view_y: usize,
     view_w: usize,
@@ -442,7 +451,9 @@ struct LoupeGeom {
 }
 
 fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> LoupeGeom {
-    let (image_w, image_h, border) = (lay.image_w, lay.image_h, lay.border_px);
+    let (image_w, image_h) = (lay.image_w, lay.image_h);
+    // Picture inset: white on the outside, black between that and the picture.
+    let border = lay.border_px + lay.black_px;
     let (sheet_w, sheet_h) = (lay.out_w, lay.out_h);
     let vw = view.min(sheet_w).max(1);
     let vh = view.min(sheet_h).max(1);
@@ -545,6 +556,22 @@ pub fn sharpen_window(
     let tone = p.recipe.curve.compile();
     let white = tone.white();
     let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
+    if lay.black_px > 0 {
+        let x0 = lay.border_px;
+        let y0 = lay.border_px;
+        paint_sheet_rect(
+            &mut tile,
+            g.tile_x,
+            g.tile_y,
+            (
+                x0,
+                y0,
+                x0 + lay.black_px + lay.image_w + lay.black_px,
+                y0 + lay.black_px + lay.image_h + lay.black_px,
+            ),
+            tone.eval(0.0),
+        );
+    }
     let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
     // The plane window is in full-image coordinates. The resize maps the
     // crop, so its coordinate system is the window.
@@ -580,6 +607,28 @@ pub fn sharpen_window(
         out.row_mut(y).copy_from_slice(&tile.row(oy + y)[ox..ox + g.view_w]);
     }
     out
+}
+
+/// Paint `value` into the part of `tile` that overlaps the sheet rectangle
+/// `(x0, y0, x1, y1)`, half-open. `tile_x` and `tile_y` are the tile's origin.
+fn paint_sheet_rect(
+    tile: &mut Plane,
+    tile_x: usize,
+    tile_y: usize,
+    rect: (usize, usize, usize, usize),
+    value: f64,
+) {
+    let (x0, y0, x1, y1) = rect;
+    let left = x0.max(tile_x);
+    let top = y0.max(tile_y);
+    let right = x1.min(tile_x + tile.width);
+    let bottom = y1.min(tile_y + tile.height);
+    if left >= right || top >= bottom {
+        return;
+    }
+    for y in top..bottom {
+        tile.row_mut(y - tile_y)[left - tile_x..right - tile_x].fill(value);
+    }
 }
 
 /// Surround `p` with `b` pixels of `value` on every side. The mask gets 0
@@ -653,11 +702,23 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     info!("tone {}", r.curve.name());
     crate::tone::render(&mut plane, r.place, &tone);
 
+    if lay.black_px > 0 {
+        info!(
+            "black edge {} px ({} mm) at clear film {:.4}",
+            lay.black_px,
+            r.black_mm.min(r.border_mm),
+            tone.eval(0.0)
+        );
+        plane = add_border(&plane, lay.black_px, tone.eval(0.0));
+    }
     if lay.border_px > 0 {
         info!("border {} px ({} mm) in paper white {:.4}", lay.border_px, r.border_mm, tone.white());
         plane = add_border(&plane, lay.border_px, tone.white());
+    }
+    let frame = lay.black_px + lay.border_px;
+    if frame > 0 {
         if let Some(m) = mask.take() {
-            mask = Some(add_border(&m, lay.border_px, 0.0));
+            mask = Some(add_border(&m, frame, 0.0));
         }
     }
 
@@ -690,6 +751,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         orientation_applied: src.orientation,
         recipe: r.clone(),
         border_px: lay.border_px,
+        black_px: lay.black_px,
         usm_amount: r.sharpen.usm_amount(),
         usm_radius_px: lay.usm_radius_px,
         resample_sigma_px: lay.resample_sigma_px,
@@ -961,6 +1023,78 @@ mod tests {
         assert!(out3.plane.at(100, 100) < grey);
     }
 
+    /// Both rings are added around the crop window. A pixel inside the crop
+    /// is the same as a print of that window with no border. A pixel outside
+    /// the crop is not on the sheet. Black sits against the picture; white
+    /// is the outer edge. A black wider than the white is printed as the white.
+    #[test]
+    fn black_edge_wraps_the_crop_and_leaves_its_pixels() {
+        let (w, h) = (8, 6);
+        let mut data = vec![0.5; w * h];
+        data[0] = 0.9;
+        data[2 * w + 3] = 0.25;
+        let plane = Plane::from_vec(w, h, data);
+        let recipe = Recipe {
+            dpi: 254.0,
+            border_mm: 2.0,
+            black_mm: 1.0,
+            crop: Some(crate::recipe::CropRect { x: 2, y: 1, w: 4, h: 3 }),
+            ..Recipe::default()
+        };
+        assert_eq!((recipe.border_px(), recipe.black_px(), recipe.frame_px()), (20, 10, 30));
+        let wider = Recipe { black_mm: 9.0, ..recipe.clone() };
+        assert_eq!(wider.black_px(), wider.border_px());
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "crop".into(), description: None };
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(w, h, 1, &p);
+        assert_eq!((lay.image_w, lay.image_h, lay.black_px, lay.border_px), (4, 3, 10, 20));
+        assert_eq!((lay.out_w, lay.out_h), (64, 63));
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (64, 63));
+        assert_eq!((out.info.border_px, out.info.black_px), (20, 10));
+        assert_eq!(out.plane.at(0, 0), 1.0);
+        assert_eq!(out.plane.at(19, 31), 1.0);
+        assert_eq!(out.plane.at(20, 31), 0.0);
+        assert_eq!(out.plane.at(29, 31), 0.0);
+        let bare = Recipe { border_mm: 0.0, black_mm: 0.0, ..p.recipe.clone() };
+        let bare_out = render_planes(&src, &PrintParams { recipe: bare, ..Default::default() });
+        assert_eq!((bare_out.plane.width, bare_out.plane.height), (4, 3));
+        assert!((out.plane.at(30, 30) - bare_out.plane.at(0, 0)).abs() < 1e-12);
+        assert!((out.plane.at(31, 31) - bare_out.plane.at(1, 1)).abs() < 1e-12);
+        assert!((out.plane.at(33, 32) - bare_out.plane.at(3, 2)).abs() < 1e-12);
+        let outside = 0.9f64.powf(1.0 / 2.2);
+        assert!(out.plane.data.iter().all(|v| (*v - outside).abs() > 1e-6));
+    }
+
+    /// The centimetre picture stays the size that was asked. Black and white
+    /// grow the sheet around it.
+    #[test]
+    fn black_and_white_are_added_around_the_picture() {
+        let dpi = 300.0;
+        let (img_w, img_h) = (5504, 8256);
+        let picture = 2400usize;
+        let white = 15usize;
+        let black = 4usize;
+        let frame = white + black;
+        let (bw, bh) = box_for_picture_width(img_w, img_h, picture, frame);
+        let p = PrintParams {
+            recipe: Recipe {
+                size: Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi }),
+                dpi,
+                border_mm: white as f64 / dpi * 25.4,
+                black_mm: black as f64 / dpi * 25.4,
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(p.recipe.border_px(), white);
+        assert_eq!(p.recipe.black_px(), black);
+        let lay = layout(img_w, img_h, 1, &p);
+        assert_eq!(lay.image_w, picture);
+        assert_eq!((lay.out_w, lay.out_h), (lay.image_w + 2 * frame, lay.image_h + 2 * frame));
+    }
+
     /// Paper, table 4: place = 0 is the run that never had
     /// the step; the same recipe twice is the same picture; paper at its
     /// base exposure is a different picture from the neutral look.
@@ -1055,6 +1189,7 @@ mod tests {
         let mut recipe = Recipe::on_paper();
         recipe.dpi = 100.0;
         recipe.border_mm = 1.0;
+        recipe.black_mm = 0.5;
         recipe.size = Some(PrintSize::Physical { width_in: 0.22, height_in: 0.22 });
         recipe.resample = ResampleKernel::Lanczos3;
         recipe.sharpen = Sharpen::Deconv { passes: 2, usm_amount: 0.6 };
@@ -1130,6 +1265,7 @@ mod tests {
                     recipe.resample = kernel;
                     recipe.sharpen = sharpen;
                     recipe.border_mm = 2.0;
+                    recipe.black_mm = 1.0;
                     recipe.size =
                         Some(PrintSize::Physical { width_in, height_in: width_in * h as f64 / w as f64 });
                     let params = PrintParams { recipe, ..PrintParams::default() };

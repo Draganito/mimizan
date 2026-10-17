@@ -128,6 +128,10 @@ enum Cmd {
         /// Paper border around the picture, mm, filled with paper white
         #[arg(long, value_name = "MM")]
         border_mm: Option<f64>,
+        /// Black edge between the picture and the white border, mm.
+        /// Never wider than the white border; zero white turns it off.
+        #[arg(long, value_name = "MM")]
+        black_mm: Option<f64>,
         #[arg(long)]
         dpi: Option<f64>,
         /// Scale compensation: USM amount of the enlargement blur (0 = off).
@@ -234,6 +238,7 @@ fn main() -> Result<()> {
             size,
             resample,
             border_mm,
+            black_mm,
             dpi,
             usm_amount,
             usm_k,
@@ -252,6 +257,7 @@ fn main() -> Result<()> {
             size,
             resample,
             border_mm,
+            black_mm,
             dpi,
             usm_amount,
             usm_k,

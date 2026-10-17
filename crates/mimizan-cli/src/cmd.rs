@@ -177,6 +177,7 @@ pub struct PrintArgs {
     pub size: Option<String>,
     pub resample: Option<String>,
     pub border_mm: Option<f64>,
+    pub black_mm: Option<f64>,
     pub dpi: Option<f64>,
     pub usm_amount: Option<f64>,
     pub usm_k: f64,
@@ -241,6 +242,12 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     }
     if let Some(b) = a.border_mm {
         r.border_mm = b;
+    }
+    if let Some(b) = a.black_mm {
+        r.black_mm = b;
+    }
+    if r.black_mm > r.border_mm {
+        r.black_mm = r.border_mm;
     }
     if let Some(d) = a.dpi {
         r.dpi = d;

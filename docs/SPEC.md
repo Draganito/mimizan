@@ -558,11 +558,11 @@ One pass in f64, one quantisation at the end.
   with its two exposures
   `{"paper":"multigrade","soft":s,"hard":h}`, or a look file inline;
   `tone.rs`, distinguishable in untagged JSON by the field `paper` or
-  `points`), `resample`, `size`, `dpi`, `border_mm`, `crop`
+  `points`), `resample`, `size`, `dpi`, `border_mm`, `black_mm`, `crop`
   (window `x,y,w,h` in whole pixels, upright after the file orientation
   and before the quarter-turns; if absent, the whole negative),
   `sharpen` (`{"mode":"off"}` | `usm` | `deconv`). Omitted when absent are
-  `place` (0), `size` (native), `border_mm` (0) and `crop` (the whole
+  `place` (0), `size` (native), `border_mm` (0), `black_mm` (0) and `crop` (the whole
   negative); `schema`, `resample` and `sharpen` are always in the file.
   The empty recipe `{"schema":1,"curve":<neutral>,"dpi":300}` is
   bit-identical to the run with none of these steps (acceptance test
@@ -692,15 +692,20 @@ One pass in f64, one quantisation at the end.
   puts a recipe whose curve is the neutral look onto the paper at its
   base exposure; it leaves any other look as a look and offers the switch
   to paper in the Enlarger. The print TIFF gets a grey ICC with gamma 2.2.
-- **Border [addition, Appendix B.3]** (`--border-mm`, recipe field
-  `border_mm`): after the tone, the picture is placed in a paper field
-  `round(border_mm / 25.4 · DPI)` pixels wide on each side, filled with
-  paper white = unexposed paper (1.0), or, for a look, that look's value
-  at linear 1 (1.0 for `neutral`); the mask is filled with 0 so no
-  sharpening runs into the border. The GUI shows the border in the
-  preview: what is fitted is the sheet (picture plus border), the border
-  is painted in paper white, not rendered (a flat value), in the print's
-  proportion `border_px / image_w`.
+- **Border [addition, Appendix B.3]** (`--border-mm`, `--black-mm`,
+  recipe fields `border_mm` and `black_mm`): after the tone, two rings
+  are added around the crop window. Nothing is taken from the picture
+  and nothing is resampled because of the rings. Inside is the picture,
+  then a black edge `round(min(black_mm, border_mm) / 25.4 · DPI)` pixels
+  wide, then a white border `round(border_mm / 25.4 · DPI)` pixels wide.
+  A black wider than the white is printed as the white width. Zero white
+  turns the black edge off. Black is clear film (the curve at linear 0;
+  0 on paper). White is unexposed paper (1.0), or, for a look, that
+  look's value at linear 1 (1.0 for `neutral`). The mask is filled with 0
+  across both rings so no sharpening runs into them. The GUI paints both
+  flat, under the picture, in the print's proportion. What is fitted is
+  the sheet (picture plus black plus white). The centimetre fields stay
+  the picture; both rings grow the sheet around them.
 - **Scale compensation** (`--usm-amount`, `--deconv <N>`, recipe field
   `sharpen`): compensation of the blur the kernel adds when enlarging.
   When enlarging, `s` is the ratio of the long sides, picture pixels /

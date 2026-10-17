@@ -205,9 +205,21 @@ pub struct App {
     strip_height_saved: f32,
     /// Floating panels shown: analysis, enlarger, print.
     panels: [bool; 3],
+    /// Open panels that had no rectangle last frame. The toolbar button
+    /// stays lit; the panel returns when the window has room again.
+    waiting: [bool; 3],
     /// Measured height of the enlarger window (docked at the bottom); the
     /// stage above it is laid out with it.
     enlarger_h: Option<f32>,
+    /// A press on the picture or the enlarger is unfinished: the button is
+    /// still down, or the mix menu it opened is still up. The strip stays
+    /// until that action ends, so the picture and the enlarger do not move
+    /// away from the pointer.
+    strip_held: bool,
+    /// The enlarger's mix menu is open this frame. Set while that combo is
+    /// shown; cleared at the start of the frame so a hidden enlarger cannot
+    /// leave it stuck.
+    mix_menu_open: bool,
     /// RAW counts of the strip's subfolders, arriving in the background.
     dir_counts: Option<std::sync::mpsc::Receiver<(u64, PathBuf, usize)>>,
     /// Priority list last sent to the thumbnail worker.
@@ -352,7 +364,10 @@ impl App {
                 .unwrap_or(STRIP_HEIGHT)
                 .clamp(STRIP_MIN_H, STRIP_MAX_H),
             panels: persisted.panels.unwrap_or([true; 3]),
+            waiting: [false; 3],
             enlarger_h: None,
+            strip_held: false,
+            mix_menu_open: false,
             dir_counts: None,
             last_wanted: Vec::new(),
             scroll_to_selected: false,
@@ -558,7 +573,7 @@ impl App {
     }
 
     /// Write a paper box whose picture is the centimetre field on `side`,
-    /// the other side following at the same scale, the border outside it.
+    /// the other side following at the same scale, black and white outside it.
     /// Then show the centimetres the file actually has.
     fn apply_picture(&mut self, side: PictureSide) {
         let (uw, uh) = self.picture_size();
@@ -566,7 +581,7 @@ impl App {
         if uw == 0 || uh == 0 || dpi <= 0.0 {
             return;
         }
-        let b = self.edit.recipe.border_px();
+        let b = self.edit.recipe.frame_px();
         let (bw, bh) = match side {
             PictureSide::Width => {
                 let px = (self.paper_cm[0] / 2.54 * dpi).round().max(1.0) as usize;
@@ -1328,8 +1343,7 @@ impl App {
             if ui
                 .selectable_label(self.show_strip, "Strip")
                 .on_hover_text(
-                    "Show or hide the film strip (B): the folder's RAW files, the way in. ←/→ open the \
-                     neighbouring file; a file or folder can also be dropped on the window.",
+                    "Show or hide the film strip (B): the folder's RAW files, the way in. It closes when you start on an open picture. ←/→ open the neighbouring file either way.",
                 )
                 .clicked()
             {
@@ -1346,6 +1360,11 @@ impl App {
                 (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
                 (1, "Print", "3 · The print: size, border, export"),
             ] {
+                let hover = if self.waiting[i] {
+                    "No room at this size. It returns when the window is larger. Click to close it."
+                } else {
+                    hover
+                };
                 if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
                     self.panels[i] = !self.panels[i];
                     self.persist();
@@ -1758,7 +1777,8 @@ impl App {
                 selected = format!("{} {}", capitalise(f.colour()), f.wratten().unwrap_or(0));
             }
         }
-        egui::ComboBox::from_id_salt("mix-combo").selected_text(selected).width(118.0).show_ui(ui, |ui| {
+        let menu =
+            egui::ComboBox::from_id_salt("mix-combo").selected_text(selected).width(118.0).show_ui(ui, |ui| {
             if ui
                 .selectable_label(same(&current, &native), "Native")
                 .on_hover_text("¼ ½ ¼: exactly the Bayer luminance, no chroma mixed in")
@@ -1805,6 +1825,7 @@ impl App {
                 }
             }
         });
+        self.mix_menu_open = egui::ComboBox::is_open(ui.ctx(), menu.response.id);
         if let Some(w) = pick {
             self.set_weights(w);
         }
@@ -1815,7 +1836,9 @@ impl App {
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
         // The zone bar sets this again while the pointer is over it.
         self.hover_zone = None;
-        let width = ui.available_width().max(240.0);
+        // The width is the gap this window was given. A larger minimum
+        // would push the glass out over the columns.
+        let width = ui.available_width();
         self.zones_column(ui, width);
     }
 
@@ -1868,58 +1891,63 @@ impl App {
         let mut split = split;
         self.hover_zone = zone_bar(ui, &mut split, width);
         ui.add_space(4.0);
-        let slider_w = (width - 170.0).max(120.0);
-        // One column per part. "soft"/"hard" and "filter 00"/"filter 5" are
-        // different widths; without the grid the second track starts later.
-        ui.spacing_mut().slider_width = slider_w;
-        egui::Grid::new("paper_exposures").num_columns(3).show(ui, |ui| {
-            let exposure = |ui: &mut egui::Ui, label: &str, filter: &str, v: &mut f64, hint: &str| {
-                ui.label(RichText::new(label).weak()).on_hover_text(hint);
-                ui.add(
-                    egui::Slider::new(v, -SLIDER_STOPS..=SLIDER_STOPS)
-                        .fixed_decimals(2)
-                        .step_by(1.0 / 12.0)
-                        .suffix(" stops"),
-                )
-                .on_hover_text(hint);
-                ui.label(RichText::new(filter).weak().small());
-                ui.end_row();
+        // One rail width for both exposures, taken before either slider is
+        // built. The number sits beside the rail; sizing the rail to the whole
+        // row lets that number widen the column, and the slider below then
+        // puts its zero further right. The reservation is the widest reading,
+        // so the rail stays put as the number changes.
+        let row = ui.available_width();
+        let value_w = exposure_value_width(ui);
+        let gap = ui.spacing().item_spacing.x;
+        let rail = exposure_rail_width(row, value_w, gap);
+        let number_beside = exposure_number_fits(row, value_w, gap);
+        let exposure = |ui: &mut egui::Ui, label: &str, filter: &str, v: &mut f64, hint: &str| {
+            let caption = if number_beside {
+                format!("{label} · {filter}")
+            } else {
+                format!("{label} · {filter} · {v:.2} stops")
             };
-            exposure(
-                ui,
-                "soft",
-                "filter 00",
-                &mut split.soft,
-                "The soft exposure, in stops of time from the base print. More soft light greys the \
-                 highlights and hardly touches the shadows: the highlights' exposure.",
-            );
-            exposure(
-                ui,
-                "hard",
-                "filter 5",
-                &mut split.hard,
-                "The hard exposure, in stops of time from the base print. More hard light deepens the \
-                 shadows and the mid tones with them, the highlights stay: the shadows' exposure.",
-            );
-        });
+            ui.label(RichText::new(caption).weak()).on_hover_text(hint);
+            ui.spacing_mut().slider_width = if number_beside { rail } else { row };
+            let mut slider =
+                egui::Slider::new(v, -SLIDER_STOPS..=SLIDER_STOPS).fixed_decimals(2).step_by(1.0 / 12.0);
+            slider = if number_beside { slider.suffix(" stops") } else { slider.show_value(false) };
+            ui.add(slider).on_hover_text(hint);
+        };
+        exposure(
+            ui,
+            "soft",
+            "filter 00",
+            &mut split.soft,
+            "The soft exposure, in stops of time from the base print. More soft light greys the \
+             highlights and hardly touches the shadows: the highlights' exposure.",
+        );
+        exposure(
+            ui,
+            "hard",
+            "filter 5",
+            &mut split.hard,
+            "The hard exposure, in stops of time from the base print. More hard light deepens the \
+             shadows and the mid tones with them, the highlights stay: the shadows' exposure.",
+        );
         if split != *self.edit.recipe.curve.as_paper().unwrap() {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }
         let curve = split.curve();
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "≈ grade {} · {:.1} stops of scene · grey card prints at {:.2}",
-                    paper::grade_label(curve.grade()),
-                    curve.scene_range_stops(),
-                    curve.eval(zone::GRAY_CARD)
-                ))
-                .weak(),
-            )
-            .on_hover_text(
-                "The single filter grade this pair of exposures equals (by its ISO range), the scene \
-                 stops between the paper's first tone and its near-black, and where Zone V lands.",
-            );
+        ui.label(
+            RichText::new(format!(
+                "≈ grade {} · {:.1} stops of scene · grey card prints at {:.2}",
+                paper::grade_label(curve.grade()),
+                curve.scene_range_stops(),
+                curve.eval(zone::GRAY_CARD)
+            ))
+            .weak(),
+        )
+        .on_hover_text(
+            "The single filter grade this pair of exposures equals (by its ISO range), the scene \
+             stops between the paper's first tone and its near-black, and where Zone V lands.",
+        );
+        ui.horizontal_wrapped(|ui| {
             if (split.soft != 0.0 || split.hard != 0.0)
                 && ui.small_button("base").on_hover_text("Back to the base exposure").clicked()
             {
@@ -2011,7 +2039,7 @@ impl App {
                                 .suffix(" cm"),
                         )
                         .on_hover_text(
-                            "Width of the picture. The height follows the negative, one scale for both sides. The border is added around this.",
+                            "Width of the picture. The height follows the negative, one scale for both sides. The black edge and the white border are added around this.",
                         );
                     ui.label("×");
                     let height = ui
@@ -2023,7 +2051,7 @@ impl App {
                                 .suffix(" cm"),
                         )
                         .on_hover_text(
-                            "Height of the picture. The width follows the negative, one scale for both sides. The border is added around this.",
+                            "Height of the picture. The width follows the negative, one scale for both sides. The black edge and the white border are added around this.",
                         );
                     ui.label(RichText::new("at").weak());
                     let dpi = ui.add(
@@ -2058,22 +2086,45 @@ impl App {
             }
         }
         let border_before = self.edit.recipe.border_mm;
-        ui.horizontal(|ui| {
+        let black_before = self.edit.recipe.black_mm;
+        if self.edit.recipe.black_mm > self.edit.recipe.border_mm {
+            self.edit.recipe.black_mm = self.edit.recipe.border_mm.max(0.0);
+        }
+        // One row of border, black and resample is wider than the dock.
+        // The side windows take their width from the content, so that row
+        // pushed Print leftwards over the enlarger. The two millimetres
+        // stay together; the kernel is the next line. Wrapped, so a long
+        // value breaks inside the column instead of widening it.
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("border").weak());
-            let border = ui
-                .add(
-                    egui::DragValue::new(&mut self.edit.recipe.border_mm)
-                        .range(0.0..=100.0)
-                        .speed(0.2)
-                        .suffix(" mm"),
-                )
-                .on_hover_text("Paper white around the picture");
-            if self.size_mode == SizeMode::Paper
-                && border.changed()
-                && (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON
-            {
-                self.apply_picture(PictureSide::Width);
+            ui.add(
+                egui::DragValue::new(&mut self.edit.recipe.border_mm)
+                    .range(0.0..=100.0)
+                    .speed(0.2)
+                    .suffix(" mm"),
+            )
+            .on_hover_text("White paper around the picture, outside the black edge");
+            if self.edit.recipe.black_mm > self.edit.recipe.border_mm {
+                self.edit.recipe.black_mm = self.edit.recipe.border_mm.max(0.0);
             }
+            let white_mm = self.edit.recipe.border_mm.max(0.0);
+            ui.label(RichText::new("black").weak());
+            ui.add(
+                egui::DragValue::new(&mut self.edit.recipe.black_mm)
+                    .range(0.0..=white_mm)
+                    .speed(0.2)
+                    .suffix(" mm"),
+            )
+            .on_hover_text(
+                "Black film edge between the picture and the white border. It cannot be wider than the white border. Zero is off.",
+            );
+        });
+        let border_moved = (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON;
+        let black_moved = (black_before - self.edit.recipe.black_mm).abs() > f64::EPSILON;
+        if self.size_mode == SizeMode::Paper && (border_moved || black_moved) {
+            self.apply_picture(PictureSide::Width);
+        }
+        ui.horizontal(|ui| {
             ui.label(RichText::new("resample").weak());
             let r = &mut self.edit.recipe.resample;
             egui::ComboBox::from_id_salt("resample").selected_text(r.name()).show_ui(ui, |ui| {
@@ -2092,7 +2143,12 @@ impl App {
         self.sharpen_loupe(ui);
         if let Some(l) = self.print_layout() {
             let (uw, uh) = self.picture_size();
-            let txt = if l.border_px > 0 {
+            let txt = if l.black_px > 0 {
+                format!(
+                    "{uw} × {uh} → {} × {} px picture + {} px black + {} px white = {} × {} px",
+                    l.image_w, l.image_h, l.black_px, l.border_px, l.out_w, l.out_h
+                )
+            } else if l.border_px > 0 {
                 format!(
                     "{uw} × {uh} → {} × {} px picture + {} px border = {} × {} px",
                     l.image_w, l.image_h, l.border_px, l.out_w, l.out_h
@@ -2107,7 +2163,11 @@ impl App {
             if dpi > 0.0 {
                 let cm = |px: usize| px as f64 / dpi * 2.54;
                 let sheet = format!("{:.1} × {:.1} cm", cm(l.out_w), cm(l.out_h));
-                let sheet = if l.border_px > 0 { format!("{sheet}, border included") } else { sheet };
+                let sheet = if l.border_px > 0 || l.black_px > 0 {
+                    format!("{sheet}, border included")
+                } else {
+                    sheet
+                };
                 ui.label(RichText::new(sheet).weak());
             }
         }
@@ -2252,22 +2312,23 @@ impl App {
         if tw == 0 || th == 0 {
             return;
         }
-        // The paper border, in texture pixels: the print's border against
-        // its picture (`layout`), so it keeps its proportion at any size and
-        // dpi. A flat value, so it is painted under the picture, not
-        // rendered into it; the mask view is not a print and has none.
-        let (border_tex, white) = if self.show_mask || self.crop_open {
-            (0.0, 0)
+        // The two rings, in texture pixels: the print's black and white
+        // against its picture (`layout`), so they keep their proportion at
+        // any size and dpi. Flat values, painted under the picture, not
+        // rendered into it. The mask view and the open crop are not a sheet.
+        let (black_tex, white_tex, white, black) = if self.show_mask || self.crop_open {
+            (0.0, 0.0, 0, 0)
+        } else if let Some(l) = self.print_layout() {
+            let scale = tw as f32 / l.image_w.max(1) as f32;
+            let tone = self.edit.recipe.curve.compile();
+            let white = (tone.white().clamp(0.0, 1.0) * 255.0).round() as u8;
+            let black = (tone.eval(0.0).clamp(0.0, 1.0) * 255.0).round() as u8;
+            (l.black_px as f32 * scale, l.border_px as f32 * scale, white, black)
         } else {
-            let b = self
-                .print_layout()
-                .filter(|l| l.border_px > 0)
-                .map(|l| l.border_px as f32 * tw as f32 / l.image_w.max(1) as f32)
-                .unwrap_or(0.0);
-            let w = self.edit.recipe.curve.compile().white();
-            (b, (w.clamp(0.0, 1.0) * 255.0).round() as u8)
+            (0.0, 0.0, 0, 0)
         };
-        // The sheet (picture plus border) is what fits the stage.
+        let border_tex = black_tex + white_tex;
+        // The sheet (picture plus both rings) is what fits the stage.
         let fit = (avail.width() / (tw as f32 + 2.0 * border_tex))
             .min(avail.height() / (th as f32 + 2.0 * border_tex));
         self.last_fit = Some(fit);
@@ -2301,12 +2362,14 @@ impl App {
         let place = |zoom: f32, pan: Vec2| {
             let scale = fit * zoom;
             let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
-            let border_pts = border_tex * scale;
+            let white_pts = white_tex * scale;
+            let black_pts = black_tex * scale;
+            let border_pts = white_pts + black_pts;
             let max_pan = ((size + Vec2::splat(2.0 * border_pts) - avail.size()) * 0.5).max(Vec2::ZERO);
             let pan = pan.clamp(-max_pan, max_pan);
-            (Rect::from_center_size(avail.center() + pan, size), border_pts, max_pan, pan)
+            (Rect::from_center_size(avail.center() + pan, size), white_pts, black_pts, max_pan, pan)
         };
-        let (rect_now, _, _, _) = place(self.zoom, self.pan);
+        let (rect_now, _, _, _, _) = place(self.zoom, self.pan);
         let on_cross = |rect: Rect, p: Pos2| {
             self.sharpen_at.is_some_and(|[nx, ny]| {
                 let c =
@@ -2329,7 +2392,7 @@ impl App {
                 self.pan = Vec2::ZERO;
             }
         }
-        let (mut rect, border_pts, max_pan, pan) = place(self.zoom, self.pan);
+        let (mut rect, white_pts, black_pts, max_pan, pan) = place(self.zoom, self.pan);
         self.pan = pan;
         if !response.is_pointer_button_down_on() {
             self.cross_drag = false;
@@ -2356,11 +2419,15 @@ impl App {
             }
             if response.dragged() && self.crop_drag.is_none() {
                 self.pan = (self.pan + response.drag_delta()).clamp(-max_pan, max_pan);
-                (rect, _, _, _) = place(self.zoom, self.pan);
+                (rect, _, _, _, _) = place(self.zoom, self.pan);
             }
         }
+        let border_pts = white_pts + black_pts;
         if border_pts > 0.0 {
             painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
+        }
+        if black_pts > 0.0 {
+            painter.rect_filled(rect.expand(black_pts), 0.0, Color32::from_gray(black));
         }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
@@ -2565,7 +2632,7 @@ fn draw_perforation(painter: &egui::Painter, band: Rect) {
 
 impl App {
     /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
-    /// keyboard is not in a text field.
+    /// keyboard is not in a text field, whether or not the strip is up.
     fn strip_keys(&mut self, ctx: &egui::Context) {
         if self.pending_leave.is_some() || ctx.egui_wants_keyboard_input() {
             return;
@@ -2580,12 +2647,53 @@ impl App {
         if b {
             self.toggle_strip();
         }
-        if self.show_strip && left {
+        if left {
             self.open_neighbour(-1);
         }
-        if self.show_strip && right {
+        if right {
             self.open_neighbour(1);
         }
+    }
+
+    /// The strip is the way in. Once the picture is up, the first press,
+    /// drag or scroll on the picture or on Negative, Enlarger or Print
+    /// closes it for this session. It is not written to the config, so the
+    /// next launch still opens on the strip. `B` brings it back.
+    ///
+    /// A press on the picture, the crosshair or the enlarger keeps the strip
+    /// until the button comes up, and the mix menu keeps it until a filter
+    /// is chosen or the menu closes. Closing the strip mid-drag would move
+    /// the picture and drop the enlarger away from the pointer. Negative and
+    /// Print grow downward from a fixed top, so they close the strip at once.
+    fn dismiss_strip_for_work(&mut self, ctx: &egui::Context, docks: &Docks) {
+        if self.pending_leave.is_some() {
+            return;
+        }
+        let (pointer_down, at) = ctx.input(|i| {
+            let at = if i.pointer.any_pressed() || i.pointer.is_decidedly_dragging() {
+                i.pointer.press_origin().or(i.pointer.latest_pos())
+            } else if (i.zoom_delta() - 1.0).abs() > f32::EPSILON || i.smooth_scroll_delta.y.abs() > 0.0 {
+                i.pointer.hover_pos()
+            } else {
+                None
+            };
+            (i.pointer.any_down(), at)
+        });
+        let picture_up = self.session.is_some() && self.texture.is_some();
+        let inside = |r: Rect| at.is_some_and(|p| r.contains(p));
+        let on_picture = docks.stage.width() > 0.0 && docks.stage.height() > 0.0 && inside(docks.stage);
+        let on_enlarger = docks.bottom.is_some_and(inside);
+        let next = step_strip(
+            self.show_strip,
+            self.strip_held,
+            picture_up,
+            pointer_down,
+            on_picture || on_enlarger,
+            self.mix_menu_open,
+            strip_hides_for_work(self.show_strip, picture_up, work_rect(docks), at),
+        );
+        self.show_strip = next.show;
+        self.strip_held = next.held;
     }
 
     fn strip_bar(&mut self, ui: &mut egui::Ui) {
@@ -2996,6 +3104,7 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.mix_menu_open = false;
         self.ensure_loupe_point();
         self.handle_dialog(&ctx);
 
@@ -3021,16 +3130,25 @@ impl eframe::App for App {
             }
         }
         // What is left is the darkroom: the three docked windows and, in
-        // the room between them, the picture — never under a window.
+        // the room between them, the picture — never under a window. The
+        // ground is opaque, so a resize cannot leave the previous print,
+        // enlarger or picture showing through the glass.
+        let fill = ui.visuals().panel_fill;
         let docks = egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::new().fill(fill))
             .show(ui, |ui| {
                 let docks = self.docks(ui.available_rect_before_wrap());
                 ui.scope_builder(egui::UiBuilder::new().max_rect(docks.stage), |ui| self.preview_panel(ui));
+                self.dock_windows(ui, &docks);
                 docks
             })
             .inner;
-        self.dock_windows(&ctx, &docks);
+        self.waiting = [
+            self.panels[0] && docks.left.is_none(),
+            self.panels[1] && docks.right.is_none(),
+            self.panels[2] && docks.bottom.is_none(),
+        ];
+        self.dismiss_strip_for_work(&ctx, &docks);
 
         self.edit_keys(&ctx);
         self.clear_desktop_sharpen();
@@ -3056,8 +3174,39 @@ const PANEL_W: f32 = 318.0;
 /// allows `paper::STOP_LIMIT`; beyond two stops the print is all black or
 /// all grey).
 const SLIDER_STOPS: f64 = 2.0;
+/// Shortest rail when the gap cannot hold the number beside it.
+const EXPOSURE_RAIL_MIN: f32 = 24.0;
+
+/// Width of the number beside an exposure slider: the widest reading the
+/// range can show, in the button font the slider uses, plus its padding.
+/// A little extra keeps the button stroke inside the row.
+fn exposure_value_width(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let text =
+        ui.painter().layout_no_wrap(format!("-{SLIDER_STOPS:.2} stops"), font, egui::Color32::WHITE).size().x;
+    let padded = text + ui.spacing().button_padding.x * 2.0 + 2.0;
+    padded.max(ui.spacing().interact_size.x)
+}
+
+/// Rail shared by the two exposure sliders. `value` is the number's width,
+/// `gap` the space between rail and number.
+fn exposure_rail_width(row: f32, value: f32, gap: f32) -> f32 {
+    (row - value - gap).max(EXPOSURE_RAIL_MIN)
+}
+
+/// The number fits on the rail's row. Otherwise both sliders use the full
+/// row and the reading moves up into the label, so neither can widen the glass.
+fn exposure_number_fits(row: f32, value: f32, gap: f32) -> bool {
+    let rail = exposure_rail_width(row, value, gap);
+    rail + value + gap <= row + 0.5
+}
+
 /// Gap between the stage edge and a panel.
 const PANEL_GAP: f32 = 12.0;
+/// Shortest outer height that still holds the name and the ×.
+const DOCK_MIN_H: f32 = 48.0;
+/// Narrowest enlarger that still holds its name and the ×.
+const ENLARGER_MIN_W: f32 = 64.0;
 /// Grab radius of the crosshair, points. Covers its arms.
 const CROSS_GRAB: f32 = 14.0;
 
@@ -3090,7 +3239,8 @@ fn dock_scroll(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 }
 
 /// The dark translucent glass the panels are made of. Plain alpha, no
-/// blur: it has to look the same on every GPU driver and in software.
+/// backdrop blur: it has to look the same on every GPU driver and in software.
+/// The shadow stays inside the dock; the clip is set before this is painted.
 fn glass_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(Color32::from_rgba_unmultiplied(14, 14, 16, 222))
@@ -3100,104 +3250,199 @@ fn glass_frame() -> egui::Frame {
         .shadow(egui::Shadow { offset: [0, 6], blur: 26, spread: 0, color: Color32::from_black_alpha(150) })
 }
 
+/// Glass painted on `rect`, contents clipped to it. Drawn in the darkroom,
+/// not as a floating area: an area remembers last frame's size and, while
+/// the window is being resized, paints a faint copy beside the new rectangle.
+/// The clip is the dock, set before the glass, so the shadow cannot leave it.
+/// The returned height is the outer height the contents wanted, frame included.
+fn show_dock(
+    ui: &mut egui::Ui,
+    salt: &str,
+    rect: Rect,
+    title: &str,
+    add: impl FnOnce(&mut egui::Ui),
+) -> (bool, f32) {
+    let frame = glass_frame();
+    let margin = frame.total_margin();
+    let inner = rect - margin;
+    let mut hide = false;
+    let mut content_h = 0.0;
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .id(egui::Id::new(salt))
+            .max_rect(rect)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+        |ui| {
+            ui.set_clip_rect(rect);
+            ui.allocate_rect(rect, Sense::click_and_drag());
+            ui.painter().add(frame.paint(inner));
+            let mut child = ui.new_child(
+                egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            child.set_clip_rect(inner);
+            hide = dock_title(&mut child, title);
+            add(&mut child);
+            content_h = child.min_rect().height();
+        },
+    );
+    (hide, content_h + margin.sum().y)
+}
+
+/// The picture and the three docks. A press here, once a picture is up, closes the strip.
+fn work_rect(docks: &Docks) -> Rect {
+    let mut acc: Option<Rect> = None;
+    let mut add = |r: Rect| {
+        if r.width() > 0.0 && r.height() > 0.0 {
+            acc = Some(match acc {
+                Some(a) => a.union(r),
+                None => r,
+            });
+        }
+    };
+    add(docks.stage);
+    if let Some(r) = docks.left {
+        add(r);
+    }
+    if let Some(r) = docks.right {
+        add(r);
+    }
+    if let Some(r) = docks.bottom {
+        add(r);
+    }
+    acc.unwrap_or(Rect::NOTHING)
+}
+
+/// The strip closes for a gesture on the open picture or on a dock.
+/// A press on the strip, the toolbar or an empty darkroom does not.
+fn strip_hides_for_work(show_strip: bool, picture_up: bool, work: Rect, at: Option<Pos2>) -> bool {
+    show_strip && picture_up && at.is_some_and(|p| work.contains(p))
+}
+
+/// The strip for one frame, and whether an enlarger press is still held.
+struct StripDuringDrag {
+    show: bool,
+    held: bool,
+}
+
+/// A press on the picture or the enlarger holds the strip until the button
+/// comes up. The mix menu holds it until a filter is chosen or the menu
+/// closes. A press on Negative or Print closes it on that frame.
+fn step_strip(
+    show: bool,
+    held: bool,
+    picture_up: bool,
+    pointer_down: bool,
+    hold_press: bool,
+    menu_open: bool,
+    hide_for_work: bool,
+) -> StripDuringDrag {
+    if (held && (pointer_down || menu_open)) || (menu_open && show && picture_up) {
+        return StripDuringDrag { show: true, held: true };
+    }
+    if held {
+        return StripDuringDrag { show: false, held: false };
+    }
+    if show && picture_up && pointer_down && hold_press {
+        return StripDuringDrag { show: true, held: true };
+    }
+    if hide_for_work {
+        return StripDuringDrag { show: false, held: false };
+    }
+    StripDuringDrag { show, held: false }
+}
+
+/// True when the rectangles share an interior. A shared edge is room, not a stack.
+fn docks_cross(a: Rect, b: Rect) -> bool {
+    a.right() > b.left() && b.right() > a.left() && a.bottom() > b.top() && b.bottom() > a.top()
+}
+
+/// The three windows, or none where the rectangle would cross another window
+/// or leave the darkroom. Print keeps the right edge. Negative yields first.
+/// The enlarger exists only in the gap that remains. An omitted window stays
+/// open in `open`: the toolbar brings it back when the room returns.
+fn place_docks(full: Rect, open: [bool; 3], enlarger_h: f32) -> Docks {
+    let gap = PANEL_GAP;
+    let h = full.height() - 2.0 * gap;
+    let columns = h >= DOCK_MIN_H;
+    let left_rect = Rect::from_min_size(full.left_top() + Vec2::splat(gap), Vec2::new(PANEL_W, h));
+    let right_rect =
+        Rect::from_min_size(Pos2::new(full.right() - gap - PANEL_W, full.top() + gap), Vec2::new(PANEL_W, h));
+    let inside = |r: Rect| {
+        r.width() > 0.0
+            && r.height() > 0.0
+            && full.min.x <= r.min.x
+            && full.min.y <= r.min.y
+            && r.max.x <= full.max.x
+            && r.max.y <= full.max.y
+    };
+    let mut show_left = open[0] && columns && inside(left_rect);
+    let show_right = open[1] && columns && inside(right_rect);
+    if show_left && show_right && docks_cross(left_rect, right_rect) {
+        show_left = false;
+    }
+    let left = show_left.then_some(left_rect);
+    let right = show_right.then_some(right_rect);
+    let x0 = left.map(|r| r.right() + gap).unwrap_or(full.left() + gap);
+    let x1 = right.map(|r| r.left() - gap).unwrap_or(full.right() - gap);
+    let bottom = open[2]
+        .then(|| {
+            let bh = enlarger_h.min(h);
+            Rect::from_min_max(Pos2::new(x0, full.bottom() - gap - bh), Pos2::new(x1, full.bottom() - gap))
+        })
+        .filter(|r| {
+            r.width() >= ENLARGER_MIN_W
+                && r.height() >= DOCK_MIN_H
+                && inside(*r)
+                && left.is_none_or(|l| !docks_cross(l, *r))
+                && right.is_none_or(|c| !docks_cross(c, *r))
+        });
+    let stage_bottom = bottom.map(|r| r.top() - gap).unwrap_or(full.bottom());
+    let stage = if x1 > x0 && stage_bottom > full.top() {
+        Rect::from_min_max(Pos2::new(x0, full.top()), Pos2::new(x1, stage_bottom))
+    } else {
+        Rect::from_min_size(full.left_top(), Vec2::ZERO)
+    };
+    Docks { left, right, bottom, stage }
+}
+
 impl App {
     /// Where the three windows stand and what is left for the picture.
     fn docks(&self, full: Rect) -> Docks {
-        let gap = PANEL_GAP;
-        let h = (full.height() - 2.0 * gap).max(120.0);
-        let left = self.panels[0]
-            .then(|| Rect::from_min_size(full.left_top() + Vec2::splat(gap), Vec2::new(PANEL_W, h)));
-        let right = self.panels[1].then(|| {
-            Rect::from_min_size(
-                Pos2::new(full.right() - gap - PANEL_W, full.top() + gap),
-                Vec2::new(PANEL_W, h),
-            )
-        });
-        let x0 = left.map(|r| r.right() + gap).unwrap_or(full.left() + gap);
-        let x1 = right.map(|r| r.left() - gap).unwrap_or(full.right() - gap);
-        let bottom = self.panels[2].then(|| {
-            let bh = self.enlarger_h.unwrap_or(190.0).min(h);
-            Rect::from_min_max(Pos2::new(x0, full.bottom() - gap - bh), Pos2::new(x1, full.bottom() - gap))
-        });
-        let stage = Rect::from_min_max(
-            Pos2::new(x0, full.top()),
-            Pos2::new(x1, bottom.map(|r| r.top() - gap).unwrap_or(full.bottom())),
-        );
-        Docks { left, right, bottom, stage }
+        place_docks(full, self.panels, self.enlarger_h.unwrap_or(190.0))
     }
 
     /// The three docked windows: the negative left, the print right (both
     /// at the stage's full height), the enlarger at the bottom between them.
-    /// Nothing is movable; × closes, the toolbar or Tab brings one back.
-    /// The name sits on one line. The egui title bar is a heading plus its
-    /// own margin, which these fixed docks do not need.
-    fn dock_windows(&mut self, ctx: &egui::Context, docks: &Docks) {
+    /// A window with no rectangle is left closed on screen and open in
+    /// `panels`, so the toolbar can dismiss it or the next wider frame
+    /// brings it back. Nothing is movable; × closes a window that is up.
+    /// The name sits on one line. Each window is drawn in the darkroom and
+    /// clipped to its rectangle, so the contents cannot change its size.
+    fn dock_windows(&mut self, ui: &mut egui::Ui, docks: &Docks) {
         let mut open = self.panels;
         let mut hide = [false; 3];
         if let Some(r) = docks.left {
-            egui::Window::new("Negative")
-                .frame(glass_frame())
-                .title_bar(false)
-                .open(&mut open[0])
-                .fixed_pos(r.min)
-                .movable(false)
-                .collapsible(false)
-                .default_width(PANEL_W)
-                .min_width(PANEL_W)
-                .max_width(PANEL_W)
-                .default_height(r.height())
-                .min_height(r.height())
-                .max_height(r.height())
-                .resizable([false, true])
-                .show(ctx, |ui| {
-                    hide[0] = dock_title(ui, "Negative");
-                    dock_scroll(ui, |ui| self.analysis_panel(ui));
-                });
+            hide[0] = show_dock(ui, "dock-negative", r, "Negative", |ui| {
+                dock_scroll(ui, |ui| self.analysis_panel(ui));
+            })
+            .0;
         }
         if let Some(r) = docks.right {
-            egui::Window::new("Print")
-                .frame(glass_frame())
-                .title_bar(false)
-                .open(&mut open[1])
-                .fixed_pos(r.min)
-                .movable(false)
-                .collapsible(false)
-                .default_width(PANEL_W)
-                .min_width(PANEL_W)
-                .max_width(PANEL_W)
-                .default_height(r.height())
-                .min_height(r.height())
-                .max_height(r.height())
-                .resizable([false, true])
-                .show(ctx, |ui| {
-                    hide[1] = dock_title(ui, "Print");
-                    dock_scroll(ui, |ui| self.print_panel(ui));
-                });
+            hide[1] = show_dock(ui, "dock-print", r, "Print", |ui| {
+                dock_scroll(ui, |ui| self.print_panel(ui));
+            })
+            .0;
         }
         if let Some(r) = docks.bottom {
             // Height follows the content; the stage is laid out with the
-            // measured value of the last frame.
-            let shown = egui::Window::new("Enlarger")
-                .frame(glass_frame())
-                .title_bar(false)
-                .open(&mut open[2])
-                .fixed_pos(r.min)
-                .movable(false)
-                .collapsible(false)
-                .default_width(r.width())
-                .min_width(r.width())
-                .max_width(r.width())
-                .resizable(false)
-                .show(ctx, |ui| {
-                    hide[2] = dock_title(ui, "Enlarger");
-                    self.enlarger_panel(ui);
-                });
-            if let Some(s) = shown {
-                let h = s.response.rect.height();
-                if self.enlarger_h.is_none_or(|old| (old - h).abs() > 0.5) {
-                    self.enlarger_h = Some(h);
-                    ctx.request_repaint();
-                }
+            // measured value of the last frame. The width stays the gap.
+            let (closed, h) = show_dock(ui, "dock-enlarger", r, "Enlarger", |ui| {
+                self.enlarger_panel(ui);
+            });
+            hide[2] = closed;
+            if h >= DOCK_MIN_H && self.enlarger_h.is_none_or(|old| (old - h).abs() > 0.5) {
+                self.enlarger_h = Some(h);
+                ui.ctx().request_repaint();
             }
         }
         for (i, hide) in hide.into_iter().enumerate() {
@@ -3316,5 +3561,149 @@ mod crop_drag_tests {
         changed.place = 0.25;
         assert!(recipe_needs_saving(true, &changed, &opened));
         assert!(!recipe_needs_saving(true, &changed, &changed));
+    }
+}
+
+#[cfg(test)]
+mod dock_tests {
+    use super::{
+        docks_cross, exposure_number_fits, exposure_rail_width, place_docks, step_strip,
+        strip_hides_for_work, work_rect, DOCK_MIN_H, ENLARGER_MIN_W, PANEL_GAP, PANEL_W,
+    };
+    use egui::{Pos2, Rect, Vec2};
+
+    fn area(w: f32, h: f32) -> Rect {
+        Rect::from_min_size(Pos2::ZERO, Vec2::new(w, h))
+    }
+
+    fn apart(dock: Rect, other: Option<Rect>) {
+        if let Some(other) = other {
+            assert!(!docks_cross(dock, other), "{dock:?} crosses {other:?}");
+        }
+    }
+
+    #[test]
+    fn a_wide_window_keeps_all_three_apart() {
+        let full = area(1200.0, 700.0);
+        let d = place_docks(full, [true; 3], 190.0);
+        let left = d.left.unwrap();
+        let right = d.right.unwrap();
+        let bottom = d.bottom.unwrap();
+        assert!((left.left() - PANEL_GAP).abs() < 0.1);
+        assert!((right.right() - (1200.0 - PANEL_GAP)).abs() < 0.1);
+        assert_eq!(left.width(), PANEL_W);
+        assert_eq!(right.width(), PANEL_W);
+        apart(left, Some(right));
+        apart(bottom, Some(left));
+        apart(bottom, Some(right));
+        assert!(bottom.width() >= ENLARGER_MIN_W && bottom.height() >= DOCK_MIN_H);
+        apart(d.stage, Some(left));
+        apart(d.stage, Some(right));
+        apart(d.stage, Some(bottom));
+    }
+
+    #[test]
+    fn a_narrow_window_drops_the_negative_and_keeps_print() {
+        let full = area(500.0, 700.0);
+        let d = place_docks(full, [true; 3], 190.0);
+        assert!(d.left.is_none());
+        let right = d.right.unwrap();
+        assert!((right.right() - (500.0 - PANEL_GAP)).abs() < 0.1);
+        assert!(right.left() >= full.left());
+        if let Some(bottom) = d.bottom {
+            apart(bottom, Some(right));
+            assert!(bottom.right() <= right.left());
+        }
+        apart(d.stage, Some(right));
+    }
+
+    #[test]
+    fn a_window_narrower_than_one_column_shows_no_column() {
+        let d = place_docks(area(200.0, 700.0), [true; 3], 190.0);
+        assert!(d.left.is_none() && d.right.is_none());
+    }
+
+    #[test]
+    fn the_enlarger_yields_when_its_gap_cannot_hold_the_heading() {
+        // Both columns fit (wider than 660). The gap between them is too
+        // small for the enlarger's name and ×.
+        let d = place_docks(area(700.0, 700.0), [true; 3], 190.0);
+        assert!(d.left.is_some() && d.right.is_some());
+        assert!(d.bottom.is_none());
+        apart(d.left.unwrap(), d.right);
+    }
+
+    #[test]
+    fn a_short_window_shows_no_dock() {
+        let d = place_docks(area(1200.0, 40.0), [true; 3], 190.0);
+        assert!(d.left.is_none() && d.right.is_none() && d.bottom.is_none());
+    }
+
+    #[test]
+    fn room_brings_the_negative_back_without_a_new_click() {
+        let open = [true; 3];
+        assert!(place_docks(area(500.0, 700.0), open, 190.0).left.is_none());
+        assert!(place_docks(area(1200.0, 700.0), open, 190.0).left.is_some());
+    }
+
+    #[test]
+    fn the_strip_stays_until_work_starts_on_the_picture() {
+        let d = place_docks(area(1200.0, 700.0), [true; 3], 190.0);
+        let work = work_rect(&d);
+        let on_picture = d.stage.center();
+        let on_print = d.right.unwrap().center();
+        let on_strip = Pos2::new(400.0, 800.0);
+        assert!(strip_hides_for_work(true, true, work, Some(on_picture)));
+        assert!(strip_hides_for_work(true, true, work, Some(on_print)));
+        assert!(strip_hides_for_work(true, true, work, Some(d.left.unwrap().center())));
+        assert!(strip_hides_for_work(true, true, work, Some(d.bottom.unwrap().center())));
+        assert!(!strip_hides_for_work(true, true, work, Some(on_strip)));
+        assert!(!strip_hides_for_work(true, false, work, Some(on_picture)));
+        assert!(!strip_hides_for_work(false, true, work, Some(on_picture)));
+        assert!(!strip_hides_for_work(true, true, work, None));
+    }
+
+    #[test]
+    fn the_two_exposure_rails_share_one_width() {
+        let wide = exposure_rail_width(400.0, 100.0, 8.0);
+        assert!((wide - 292.0).abs() < 0.01);
+        assert_eq!(exposure_rail_width(400.0, 100.0, 8.0), wide);
+        assert!(exposure_number_fits(400.0, 100.0, 8.0));
+        assert_eq!(exposure_rail_width(40.0, 100.0, 8.0), 24.0);
+        assert!(!exposure_number_fits(40.0, 100.0, 8.0));
+    }
+
+    #[test]
+    fn an_enlarger_drag_holds_the_strip_until_the_button_comes_up() {
+        let pressed = step_strip(true, false, true, true, true, false, true);
+        assert!(pressed.show && pressed.held);
+        let dragging = step_strip(pressed.show, pressed.held, true, true, true, false, true);
+        assert!(dragging.show && dragging.held);
+        let released = step_strip(dragging.show, dragging.held, true, false, false, false, false);
+        assert!(!released.show && !released.held);
+    }
+
+    #[test]
+    fn the_mix_menu_holds_the_strip_until_it_closes() {
+        let opened = step_strip(true, false, true, false, true, true, true);
+        assert!(opened.show && opened.held);
+        let choosing = step_strip(opened.show, opened.held, true, true, false, true, true);
+        assert!(choosing.show && choosing.held);
+        let closed = step_strip(choosing.show, choosing.held, true, false, false, false, false);
+        assert!(!closed.show && !closed.held);
+    }
+
+    #[test]
+    fn a_press_on_the_picture_holds_the_strip_until_the_button_comes_up() {
+        let pressed = step_strip(true, false, true, true, true, false, true);
+        assert!(pressed.show && pressed.held);
+        let released = step_strip(pressed.show, pressed.held, true, false, false, false, false);
+        assert!(!released.show && !released.held);
+    }
+
+    #[test]
+    fn a_press_on_negative_or_print_closes_the_strip_at_once() {
+        let frame = step_strip(true, false, true, true, false, false, true);
+        assert!(!frame.show && !frame.held);
     }
 }
