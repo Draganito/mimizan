@@ -16,8 +16,6 @@ use mimizan_core::zone;
 
 /// Height of the bar, points.
 pub const BAR_H: f32 = 44.0;
-/// The label row under the bar.
-const BELOW_H: f32 = 12.0;
 
 /// Print value shown as the print grey.
 fn grey(v: f64) -> Color32 {
@@ -26,7 +24,7 @@ fn grey(v: f64) -> Color32 {
 
 /// Draws the bar for `split` and lets a drag move both exposures.
 pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
-    let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H + BELOW_H), Sense::click_and_drag());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals().clone();
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), BAR_H));
@@ -148,31 +146,6 @@ pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
             egui::StrokeKind::Inside,
         );
     }
-
-    let label_y = bar.bottom() + 2.0;
-    painter.text(
-        pos2(bar.left(), label_y),
-        Align2::LEFT_TOP,
-        "black",
-        FontId::proportional(9.0),
-        visuals.weak_text_color(),
-    );
-    if x_of(clip) < bar.right() - 56.0 {
-        painter.text(
-            pos2(x_of(clip), label_y),
-            Align2::CENTER_TOP,
-            "clip",
-            FontId::proportional(9.0),
-            visuals.weak_text_color(),
-        );
-    }
-    painter.text(
-        pos2(bar.right(), label_y),
-        Align2::RIGHT_TOP,
-        "paper white",
-        FontId::proportional(9.0),
-        visuals.weak_text_color(),
-    );
 
     if let Some(k) = hover_zone {
         let k = k as usize;

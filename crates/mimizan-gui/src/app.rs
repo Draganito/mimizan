@@ -1929,16 +1929,30 @@ impl App {
 
     /// Bottom window, step 2: everything that exposes the print: the mix
     /// (the filter), placing and the two paper exposures (the grade).
+    ///
+    /// The controls keep the width they need. A narrower glass clips them;
+    /// nothing wraps, nothing shrinks, and this window does not scroll.
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
-        // The width is the gap this window was given. A larger minimum
-        // would push the glass out over the columns.
-        let width = ui.available_width();
-        self.zones_column(ui, width);
+        let visible = ui.available_width().max(0.0);
+        let width = visible.max(enlarger_content_width(ui));
+        let origin = ui.cursor().min;
+        // Taller than the glass, so a short window does not squeeze the rows.
+        // The clip stays the glass. The used rectangle is what sizes the dock.
+        let wide = Rect::from_min_size(origin, Vec2::new(width, 420.0));
+        let clip = ui.clip_rect();
+        let mut body = ui.new_child(
+            egui::UiBuilder::new().max_rect(wide).layout(egui::Layout::top_down(egui::Align::Min)),
+        );
+        body.set_clip_rect(clip);
+        self.zones_column(&mut body, width);
+        let used = body.min_rect();
+        drop(body);
+        ui.advance_cursor_after_rect(used);
     }
 
     /// Mix as one row, placing, the bar, the grades and the paper's ends.
     fn zones_column(&mut self, ui: &mut egui::Ui, width: f32) {
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             ui.label(RichText::new("mix").weak());
             self.mix_combo(ui);
             let cur = self.weights();
@@ -1961,16 +1975,38 @@ impl App {
                  R {:.3} G {:.3} B {:.3}",
                 raw.r, raw.g, raw.b
             ));
+            // Stays in this row, so the window does not grow when the exposures
+            // leave the base. Right edge of the glass, not of the unclipped row.
+            if self.edit.recipe.curve.as_paper().is_some() {
+                let at_base =
+                    self.edit.recipe.curve.as_paper().is_some_and(|s| s.soft == 0.0 && s.hard == 0.0);
+                let mut slot = ui.available_rect_before_wrap();
+                let edge = ui.clip_rect().right();
+                if edge > slot.left() {
+                    slot.set_right(edge.min(slot.right()));
+                    ui.scope_builder(
+                        egui::UiBuilder::new()
+                            .max_rect(slot)
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                        |ui| {
+                            self.base_button(ui, at_base);
+                        },
+                    );
+                }
+            }
         });
         ui.add_space(6.0);
         let Some(split) = self.edit.recipe.curve.as_paper().cloned() else {
             // A look from a file or an older recipe: no paper to expose.
-            ui.label(
-                RichText::new(format!(
-                    "This recipe prints through the look \"{}\", not on paper.",
-                    self.edit.recipe.curve.name()
-                ))
-                .weak(),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!(
+                        "This recipe prints through the look \"{}\", not on paper.",
+                        self.edit.recipe.curve.name()
+                    ))
+                    .weak(),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
             if ui
                 .button("Print on paper")
@@ -1989,79 +2025,48 @@ impl App {
         // row lets that number widen the column, and the slider below then
         // puts its zero further right. The reservation is the widest reading,
         // so the rail stays put as the number changes.
-        let row = ui.available_width();
         let value_w = exposure_value_width(ui);
         let gap = ui.spacing().item_spacing.x;
-        let rail = exposure_rail_width(row, value_w, gap);
-        let number_beside = exposure_number_fits(row, value_w, gap);
-        let exposure = |ui: &mut egui::Ui, label: &str, filter: &str, v: &mut f64, hint: &str| {
-            let caption = if number_beside {
-                format!("{label} · {filter}")
-            } else {
-                format!("{label} · {filter} · {v:.2} stops")
-            };
-            ui.label(RichText::new(caption).weak()).on_hover_text(hint);
-            ui.spacing_mut().slider_width = if number_beside { rail } else { row };
-            let mut slider =
-                egui::Slider::new(v, -SLIDER_STOPS..=SLIDER_STOPS).fixed_decimals(2).step_by(1.0 / 12.0);
-            slider = if number_beside { slider.suffix(" stops") } else { slider.show_value(false) };
-            ui.add(slider).on_hover_text(hint);
-        };
-        exposure(
+        let rail = exposure_rail_width(width, value_w, gap);
+        exposure_slider(
             ui,
-            "soft",
-            "filter 00",
+            rail,
+            "00",
             &mut split.soft,
-            "The soft exposure, in stops of time from the base print. More soft light greys the \
-             highlights and hardly touches the shadows: the highlights' exposure.",
+            "Filter 00, the soft exposure, in stops of time from the base print. More soft light \
+             greys the highlights and hardly touches the shadows: the highlights' exposure.",
         );
-        exposure(
+        exposure_slider(
             ui,
-            "hard",
-            "filter 5",
+            rail,
+            "5",
             &mut split.hard,
-            "The hard exposure, in stops of time from the base print. More hard light deepens the \
-             shadows and the mid tones with them, the highlights stay: the shadows' exposure.",
+            "Filter 5, the hard exposure, in stops of time from the base print. More hard light \
+             deepens the shadows and the mid tones with them, the highlights stay: the shadows' \
+             exposure.",
         );
         if split != *self.edit.recipe.curve.as_paper().unwrap() {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }
         let curve = split.curve();
-        ui.label(
-            RichText::new(format!(
-                "≈ grade {} · {:.1} stops of scene · grey card prints at {:.2}",
-                paper::grade_label(curve.grade()),
-                curve.scene_range_stops(),
-                curve.eval(zone::GRAY_CARD)
-            ))
-            .weak(),
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "≈ grade {} · {:.1} stops of scene · grey card prints at {:.2}",
+                    paper::grade_label(curve.grade()),
+                    curve.scene_range_stops(),
+                    curve.eval(zone::GRAY_CARD)
+                ))
+                .weak(),
+            )
+            .wrap_mode(egui::TextWrapMode::Extend),
         )
         .on_hover_text(
             "The single filter grade this pair of exposures equals (by its ISO range), the scene \
              stops between the paper's first tone and its near-black, and where Zone V lands.",
         );
-        ui.horizontal_wrapped(|ui| {
-            // Always here, so the window does not grow and shrink as the
-            // exposures leave the base and come back. Grey while the pair
-            // is the base; orange, and a click, when it is not.
-            let at_base = split.soft == 0.0 && split.hard == 0.0;
-            let label = if at_base {
-                RichText::new("base")
-            } else {
-                RichText::new("base").color(Color32::from_rgb(28, 18, 6))
-            };
-            let mut button = egui::Button::new(label).small();
-            if !at_base {
-                button = button.fill(Color32::from_rgb(255, 170, 60));
-            }
-            if ui
-                .add_enabled(!at_base, button)
-                .on_hover_text(if at_base { "The base exposure" } else { "Back to the base exposure" })
-                .clicked()
-            {
-                self.edit.recipe.curve = Tone::paper();
-            }
-            if self.edit.recipe.place != 0.0 {
+        if self.edit.recipe.place != 0.0 {
+            ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("place {:+.2}", self.edit.recipe.place)).weak().small())
                     .on_hover_text(
                         "A placing from the recipe, in scene stops; the bar moves both exposures instead.",
@@ -2069,8 +2074,28 @@ impl App {
                 if ui.small_button("0").on_hover_text("Drop the placing").clicked() {
                     self.edit.recipe.place = 0.0;
                 }
-            }
-        });
+            });
+        }
+    }
+
+    /// Grey and quiet at the base exposure, orange when a click returns there.
+    fn base_button(&mut self, ui: &mut egui::Ui, at_base: bool) {
+        let label = if at_base {
+            RichText::new("base")
+        } else {
+            RichText::new("base").color(Color32::from_rgb(28, 18, 6))
+        };
+        let mut button = egui::Button::new(label).small();
+        if !at_base {
+            button = button.fill(Color32::from_rgb(255, 170, 60));
+        }
+        if ui
+            .add_enabled(!at_base, button)
+            .on_hover_text(if at_base { "The base exposure" } else { "Back to the base exposure" })
+            .clicked()
+        {
+            self.edit.recipe.curve = Tone::paper();
+        }
     }
 
     /// Right window, step 3: the print and its export.
@@ -3269,8 +3294,37 @@ const PANEL_W: f32 = 318.0;
 /// allows `paper::STOP_LIMIT`; beyond two stops the print is all black or
 /// all grey).
 const SLIDER_STOPS: f64 = 2.0;
-/// Shortest rail when the gap cannot hold the number beside it.
-const EXPOSURE_RAIL_MIN: f32 = 24.0;
+/// Twelfth of a stop, the step of an exposure handle.
+const EXPOSURE_STEP: f64 = 1.0 / 12.0;
+/// Rail the two exposures keep. A wider enlarger may lengthen it.
+/// A narrower one clips the row; the rail does not shrink.
+const EXPOSURE_RAIL: f32 = 168.0;
+
+/// Width the enlarger controls are drawn at. The glass may be narrower
+/// and then clips them. Nothing in the enlarger wraps to fit.
+fn enlarger_content_width(ui: &egui::Ui) -> f32 {
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let paint =
+        |text: &str| ui.painter().layout_no_wrap(text.to_owned(), body.clone(), Color32::WHITE).size().x;
+    let gap = ui.spacing().item_spacing.x;
+    let value = exposure_value_width(ui);
+    let grade = paint("≈ grade 00 · 00.0 stops of scene · grey card prints at 0.00");
+    let slider = EXPOSURE_RAIL + gap + value;
+    let mix = paint("mix")
+        + gap
+        + 118.0
+        + gap
+        + paint("R")
+        + gap
+        + value
+        + gap
+        + paint("B")
+        + gap
+        + value
+        + gap
+        + paint("G 0.000");
+    grade.max(slider).max(mix)
+}
 
 /// Width of the number beside an exposure slider: the widest reading the
 /// range can show, in the button font the slider uses, plus its padding.
@@ -3284,16 +3338,122 @@ fn exposure_value_width(ui: &egui::Ui) -> f32 {
 }
 
 /// Rail shared by the two exposure sliders. `value` is the number's width,
-/// `gap` the space between rail and number.
+/// `gap` the space between rail and number. Below [`EXPOSURE_RAIL`] the
+/// row is clipped instead of the rail being shortened.
 fn exposure_rail_width(row: f32, value: f32, gap: f32) -> f32 {
-    (row - value - gap).max(EXPOSURE_RAIL_MIN)
+    (row - value - gap).max(EXPOSURE_RAIL)
 }
 
-/// The number fits on the rail's row. Otherwise both sliders use the full
-/// row and the reading moves up into the label, so neither can widen the glass.
-fn exposure_number_fits(row: f32, value: f32, gap: f32) -> bool {
-    let rail = exposure_rail_width(row, value, gap);
-    rail + value + gap <= row + 0.5
+/// One exposure. The filter number sits in the handle; the stops sit beside the rail.
+fn exposure_slider(ui: &mut egui::Ui, rail: f32, mark: &str, v: &mut f64, hint: &str) {
+    let row = ui.horizontal(|ui| {
+        let thickness = ui
+            .text_style_height(&egui::TextStyle::Body)
+            .max(ui.spacing().interact_size.y);
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(rail, thickness), Sense::click_and_drag());
+        let handle = exposure_handle_size(ui, thickness);
+        if response.has_focus() {
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter { horizontal_arrows: true, ..Default::default() },
+                );
+            });
+            let step = ui.input(|i| {
+                i.num_presses(egui::Key::ArrowRight) as i32
+                    - i.num_presses(egui::Key::ArrowLeft) as i32
+            });
+            if step != 0 {
+                *v = (*v + f64::from(step) * EXPOSURE_STEP).clamp(-SLIDER_STOPS, SLIDER_STOPS);
+            }
+        }
+        if let Some(pos) = response.interact_pointer_pos() {
+            *v = exposure_stops_from_pointer(rect.left(), rect.width(), handle.x, pos.x);
+        }
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if ui.is_rect_visible(rect) {
+            paint_exposure_slider(ui, rect, handle, *v, mark, &response);
+        }
+        let stepping = ui.input(|i| {
+            i.num_presses(egui::Key::ArrowUp) > 0 || i.num_presses(egui::Key::ArrowDown) > 0
+        });
+        let speed = if stepping {
+            EXPOSURE_STEP
+        } else {
+            (2.0 * SLIDER_STOPS) / f64::from(rail.max(1.0))
+        };
+        ui.add(
+            egui::DragValue::new(v)
+                .range(-SLIDER_STOPS..=SLIDER_STOPS)
+                .speed(speed)
+                .fixed_decimals(2)
+                .suffix(" stops"),
+        );
+    });
+    row.response.on_hover_text(hint);
+}
+
+fn exposure_mark_font() -> egui::FontId {
+    egui::FontId::proportional(12.0)
+}
+
+/// Width for the wider mark, "00", so both handles travel the same distance.
+fn exposure_handle_size(ui: &egui::Ui, row_h: f32) -> Vec2 {
+    let text = ui.painter().layout_no_wrap("00".to_owned(), exposure_mark_font(), Color32::WHITE).size().x;
+    let w = text + 12.0;
+    let h = (row_h - 2.0).clamp(12.0, row_h);
+    Vec2::new(w, h)
+}
+
+fn exposure_handle_left(rail_left: f32, rail_w: f32, handle_w: f32, stops: f64) -> f32 {
+    let t = ((stops + SLIDER_STOPS) / (2.0 * SLIDER_STOPS)).clamp(0.0, 1.0);
+    let travel = (rail_w - handle_w).max(0.0);
+    rail_left + (t as f32) * travel
+}
+
+fn exposure_stops_from_pointer(rail_left: f32, rail_w: f32, handle_w: f32, x: f32) -> f64 {
+    let travel = (rail_w - handle_w).max(1.0);
+    let t = ((x - handle_w * 0.5 - rail_left) / travel).clamp(0.0, 1.0);
+    let raw = -SLIDER_STOPS + (t as f64) * (2.0 * SLIDER_STOPS);
+    ((raw / EXPOSURE_STEP).round() * EXPOSURE_STEP).clamp(-SLIDER_STOPS, SLIDER_STOPS)
+}
+
+fn paint_exposure_slider(
+    ui: &egui::Ui,
+    rect: Rect,
+    handle: Vec2,
+    stops: f64,
+    mark: &str,
+    response: &egui::Response,
+) {
+    let visuals = ui.style().interact(response);
+    let inactive = &ui.visuals().widgets.inactive;
+    let rail_h = ui.spacing().slider_rail_height;
+    let rail = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), rail_h));
+    let painter = ui.painter();
+    painter.rect_filled(rail, inactive.corner_radius, inactive.bg_fill);
+    let left = exposure_handle_left(rect.left(), rect.width(), handle.x, stops);
+    let knob = Rect::from_min_size(Pos2::new(left, rect.center().y - handle.y * 0.5), handle)
+        .expand(visuals.expansion);
+    painter.rect(
+        knob,
+        visuals.corner_radius,
+        visuals.bg_fill,
+        visuals.fg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    painter.text(
+        knob.center(),
+        egui::Align2::CENTER_CENTER,
+        mark,
+        exposure_mark_font(),
+        visuals.fg_stroke.color,
+    );
 }
 
 /// Gap between the stage edge and a panel.
@@ -3612,8 +3772,9 @@ mod crop_drag_tests {
 #[cfg(test)]
 mod dock_tests {
     use super::{
-        docks_cross, exposure_number_fits, exposure_rail_width, place_docks, strip_closes, DOCK_MIN_H,
-        ENLARGER_MIN_W, PANEL_GAP, PANEL_W,
+        docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer,
+        place_docks, strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, EXPOSURE_RAIL, PANEL_GAP, PANEL_W,
+        SLIDER_STOPS,
     };
     use egui::{Pos2, Rect, Vec2};
 
@@ -3705,8 +3866,23 @@ mod dock_tests {
         let wide = exposure_rail_width(400.0, 100.0, 8.0);
         assert!((wide - 292.0).abs() < 0.01);
         assert_eq!(exposure_rail_width(400.0, 100.0, 8.0), wide);
-        assert!(exposure_number_fits(400.0, 100.0, 8.0));
-        assert_eq!(exposure_rail_width(40.0, 100.0, 8.0), 24.0);
-        assert!(!exposure_number_fits(40.0, 100.0, 8.0));
+        assert_eq!(exposure_rail_width(40.0, 100.0, 8.0), EXPOSURE_RAIL);
+        assert_eq!(exposure_rail_width(80.0, 100.0, 8.0), EXPOSURE_RAIL);
+    }
+
+    #[test]
+    fn the_exposure_handle_sits_on_the_stops() {
+        let (left, rail, handle) = (10.0, 200.0, 28.0);
+        assert!((exposure_handle_left(left, rail, handle, -SLIDER_STOPS) - left).abs() < 0.01);
+        let mid = exposure_handle_left(left, rail, handle, 0.0);
+        assert!((mid - (left + (rail - handle) / 2.0)).abs() < 0.01);
+        let end = exposure_handle_left(left, rail, handle, SLIDER_STOPS);
+        assert!((end + handle - (left + rail)).abs() < 0.01);
+        assert!(exposure_stops_from_pointer(left, rail, handle, left + rail / 2.0).abs() < 1e-9);
+        assert!(
+            (exposure_stops_from_pointer(left, rail, handle, left + handle / 2.0) + SLIDER_STOPS)
+                .abs()
+                < 1e-9
+        );
     }
 }
