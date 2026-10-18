@@ -122,6 +122,10 @@ Monochrom, made together against a real monochrome camera. Good, and not
 perfect, because the light changes. **Native** is the sensor without
 that emulation: the plain luminance of the mosaic.
 
+A file from a sensor that has no colour filter is a further case. There
+is no mosaic and nothing to mix. The enlarger says so. What you see is
+the measurement, and the two lights stay.
+
 **The filters.** Yellow, orange, red, green and blue have been in
 black-and-white photography for a century. A filter is a spectral
 weighting before the sum, which is exactly what the mix is. Yellow,

@@ -33,30 +33,22 @@ pub fn raw_histogram_widget(ui: &mut Ui, h: &RawHistogram, size: egui::Vec2, log
     if h.total.iter().all(|&t| t == 0) {
         return;
     }
+    if h.mono {
+        draw_channel(&painter, rect, &h.bins[0], log_scale, Color32::from_rgb(210, 210, 210));
+        painter.text(
+            pos2(rect.left() + 4.0, rect.top() + 3.0),
+            egui::Align2::LEFT_TOP,
+            format!("sensor {:.2} %", 100.0 * h.clipped_frac(0)),
+            egui::FontId::proportional(10.5),
+            Color32::from_rgb(210, 210, 210),
+        );
+        return;
+    }
     let mut seen_green = false;
     for t in 0..4 {
-        let bins = &h.bins[t];
-        let peak = bins[1..255].iter().copied().max().unwrap_or(0).max(1) as f64;
         let colour = channel_colour(h.colors[t], h.colors[t] == Color::G && seen_green);
         seen_green |= h.colors[t] == Color::G;
-        let pts: Vec<egui::Pos2> = bins
-            .iter()
-            .enumerate()
-            .map(|(i, &n)| {
-                let f = if n == 0 {
-                    0.0
-                } else if log_scale {
-                    ((n as f64).ln_1p() / peak.ln_1p()).min(1.0)
-                } else {
-                    (n as f64 / peak).min(1.0)
-                };
-                pos2(
-                    rect.left() + (i as f32 + 0.5) / 256.0 * rect.width(),
-                    rect.bottom() - 1.0 - f as f32 * (rect.height() - 3.0),
-                )
-            })
-            .collect();
-        painter.add(egui::Shape::line(pts, Stroke::new(1.2, colour)));
+        draw_channel(&painter, rect, &h.bins[t], log_scale, colour);
     }
     // Legend with clipping per channel, top-left.
     let font = egui::FontId::proportional(10.5);
@@ -75,6 +67,28 @@ pub fn raw_histogram_widget(ui: &mut Ui, h: &RawHistogram, size: egui::Vec2, log
         painter.text(pos2(rect.left() + 4.0, y), egui::Align2::LEFT_TOP, txt, font.clone(), colour);
         y += 12.0;
     }
+}
+
+fn draw_channel(painter: &egui::Painter, rect: egui::Rect, bins: &[u32], log_scale: bool, colour: Color32) {
+    let peak = bins[1..255].iter().copied().max().unwrap_or(0).max(1) as f64;
+    let pts: Vec<egui::Pos2> = bins
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| {
+            let f = if n == 0 {
+                0.0
+            } else if log_scale {
+                ((n as f64).ln_1p() / peak.ln_1p()).min(1.0)
+            } else {
+                (n as f64 / peak).min(1.0)
+            };
+            pos2(
+                rect.left() + (i as f32 + 0.5) / 256.0 * rect.width(),
+                rect.bottom() - 1.0 - f as f32 * (rect.height() - 3.0),
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, Stroke::new(1.2, colour)));
 }
 
 pub fn histogram_widget(ui: &mut Ui, h: &Histogram, size: egui::Vec2, log_scale: bool) {

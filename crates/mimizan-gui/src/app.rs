@@ -1122,16 +1122,24 @@ impl App {
                 Event::Opened(s) => {
                     let fresh = self.session.as_ref().is_none_or(|old| old.path != s.path);
                     let t = &s.negative.info.timing;
-                    self.log(format!(
-                        "{}: decode {} ms, ingest {} ms, separate {} ms ({} rounds), {}x{}",
-                        s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
-                        t.decode_ms,
-                        t.ingest_ms,
-                        t.separate_ms,
-                        s.negative.info.rounds,
-                        s.negative.plane.width,
-                        s.negative.plane.height
-                    ));
+                    let name =
+                        s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    self.log(if s.is_mono() {
+                        format!(
+                            "{name}: decode {} ms, ingest {} ms, {}x{}",
+                            t.decode_ms, t.ingest_ms, s.negative.plane.width, s.negative.plane.height
+                        )
+                    } else {
+                        format!(
+                            "{name}: decode {} ms, ingest {} ms, separate {} ms ({} rounds), {}x{}",
+                            t.decode_ms,
+                            t.ingest_ms,
+                            t.separate_ms,
+                            s.negative.info.rounds,
+                            s.negative.plane.width,
+                            s.negative.plane.height
+                        )
+                    });
                     self.session = Some(s);
                     if fresh {
                         self.cross_drag = false;
@@ -1604,8 +1612,12 @@ impl App {
             {
                 self.zoom_to_1to1 = true;
             }
-            ui.checkbox(&mut self.show_mask, "mask")
-                .on_hover_text("USM mask: white = chroma treated as texture");
+            let mask_tip = if self.session.as_ref().is_some_and(|s| s.is_mono()) {
+                "White where the sensor clipped"
+            } else {
+                "USM mask: white = chroma treated as texture"
+            };
+            ui.checkbox(&mut self.show_mask, "mask").on_hover_text(mask_tip);
             // Status text takes only what is left and is cut, never painted
             // over the buttons.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1661,7 +1673,7 @@ impl App {
             val(ui, format!("{} x {} @ {} bit", n.plane.width, n.plane.height, info.camera.bits));
             ui.end_row();
             ui.label("pattern");
-            val(ui, info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "mono".into()));
+            val(ui, info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "monochrome".into()));
             ui.end_row();
             ui.label("orientation");
             val(ui, if self.rotation() == 0 {
@@ -1691,8 +1703,13 @@ impl App {
                 None => val(ui, RichText::new("none (defaults)").weak()),
             };
             ui.end_row();
-            ui.label("mask");
-            val(ui, format!("{:?}, {} round(s)", info.mask, info.rounds));
+            if s.is_mono() {
+                ui.label("colour");
+                val(ui, "none: the sensor has no colour filter");
+            } else {
+                ui.label("mask");
+                val(ui, format!("{:?}, {} round(s)", info.mask, info.rounds));
+            }
             ui.end_row();
             if info.reconstruct {
                 ui.label("reconstruct");
@@ -1704,10 +1721,14 @@ impl App {
                 ui.end_row();
             }
             ui.label("timing");
-            val(ui, format!(
-                "decode {} · ingest {} · separate {} ms",
-                info.timing.decode_ms, info.timing.ingest_ms, info.timing.separate_ms
-            ));
+            val(ui, if s.is_mono() {
+                format!("decode {} · ingest {} ms", info.timing.decode_ms, info.timing.ingest_ms)
+            } else {
+                format!(
+                    "decode {} · ingest {} · separate {} ms",
+                    info.timing.decode_ms, info.timing.ingest_ms, info.timing.separate_ms
+                )
+            });
             ui.end_row();
             ui.label("preview");
             val(ui, format!(
@@ -1725,51 +1746,63 @@ impl App {
         self.histogram_section(ui);
         ui.collapsing("Development", |ui| {
             ui.label(RichText::new("Changes here recompute the picture.").weak());
-            ui.label(RichText::new("Separation, no demosaic.").weak());
-            egui::ComboBox::from_label("white balance")
-                .selected_text(match self.wb_choice {
-                    WbChoice::AsShot => "as shot",
-                    WbChoice::GrayWorld => "gray world",
-                    WbChoice::None => "none",
-                    WbChoice::Manual => "manual",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
-                });
-            if self.wb_choice == WbChoice::Manual {
-                ui.horizontal(|ui| {
-                    ui.label("R");
-                    ui.add(egui::DragValue::new(&mut self.wb_manual[0]).range(0.1..=8.0).speed(0.01));
-                    ui.label("B");
-                    ui.add(egui::DragValue::new(&mut self.wb_manual[2]).range(0.1..=8.0).speed(0.01));
-                });
-                self.wb_manual[1] = 1.0;
-            }
-            egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
-                ui,
-                |ui| {
-                    ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
-                    ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
-                    ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
-                },
-            );
-            ui.checkbox(&mut self.reconstruct, "reconstruct the last octave");
-            ui.checkbox(&mut self.fix_defects, "repair defects");
-            if self.reconstruct {
+            if s.is_mono() {
                 ui.label(
                     RichText::new(
-                        "Missing pixels are computed, not measured: where luminance and colour \
+                        "This sensor records luminance only. White balance, the mask and \
+                         reconstruction do not apply.",
+                    )
+                    .weak(),
+                );
+            } else {
+                ui.label(RichText::new("Separation, no demosaic.").weak());
+            }
+            if !s.is_mono() {
+                egui::ComboBox::from_label("white balance")
+                    .selected_text(match self.wb_choice {
+                        WbChoice::AsShot => "as shot",
+                        WbChoice::GrayWorld => "gray world",
+                        WbChoice::None => "none",
+                        WbChoice::Manual => "manual",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
+                    });
+                if self.wb_choice == WbChoice::Manual {
+                    ui.horizontal(|ui| {
+                        ui.label("R");
+                        ui.add(egui::DragValue::new(&mut self.wb_manual[0]).range(0.1..=8.0).speed(0.01));
+                        ui.label("B");
+                        ui.add(egui::DragValue::new(&mut self.wb_manual[2]).range(0.1..=8.0).speed(0.01));
+                    });
+                    self.wb_manual[1] = 1.0;
+                }
+                egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
+                        ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
+                        ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
+                    },
+                );
+                ui.checkbox(&mut self.reconstruct, "reconstruct the last octave");
+                if self.reconstruct {
+                    ui.label(
+                        RichText::new(
+                            "Missing pixels are computed, not measured: where luminance and colour \
                          overlap at the pixel grid, a per-pixel direction decision replaces the \
                          linear filter. Sharper fine detail, but no longer a fixed-weight sum of \
                          measured values. The sidecar records where.",
-                    )
-                    .small()
-                    .color(egui::Color32::from_rgb(230, 170, 60)),
-                );
+                        )
+                        .small()
+                        .color(egui::Color32::from_rgb(230, 170, 60)),
+                    );
+                }
             }
+            ui.checkbox(&mut self.fix_defects, "repair defects");
             let differs = self.develop_params() != s.develop;
             if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
                 self.busy = Some("re-developing".into());
@@ -1824,10 +1857,14 @@ impl App {
                 "The full-resolution linear mix before any placing or curve, drawn on a gamma-2.2 axis. \
                  black/white: pixels at 0 and 65535 in 16 bit",
             );
-            ui.radio_value(&mut self.hist_source, HistSource::Raw, "raw").on_hover_text(
+            let raw_tip = if self.session.as_ref().is_some_and(|s| s.is_mono()) {
+                "The sensor as shot, one channel, normalised by its black and white level, on a gamma-2.2 axis. \
+                 The percentage is pixels at the white level."
+            } else {
                 "The four sensor channels as shot (R, G1, G2, B by tile position), each normalised by its \
-                 black and white level, on a gamma-2.2 axis. The percentages are pixels at the white level.",
-            );
+                 black and white level, on a gamma-2.2 axis. The percentages are pixels at the white level."
+            };
+            ui.radio_value(&mut self.hist_source, HistSource::Raw, "raw").on_hover_text(raw_tip);
             ui.checkbox(&mut self.hist_log, "log");
         });
         let width = ui.available_width().min(300.0);
@@ -1986,29 +2023,38 @@ impl App {
 
     /// Mix as one row, placing, the bar, the grades and the paper's ends.
     fn zones_column(&mut self, ui: &mut egui::Ui, width: f32) {
+        let mono = self.session.as_ref().is_some_and(|s| s.is_mono());
         ui.horizontal(|ui| {
-            ui.label(RichText::new("mix").weak());
-            self.mix_combo(ui);
-            let cur = self.weights();
-            let (mut r, mut b) = (cur.r, cur.b);
-            ui.label(RichText::new("R").weak());
-            if ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed()
-            {
-                self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
-            }
-            ui.label(RichText::new("B").weak());
-            if ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed()
-            {
-                self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
-            }
-            let w = self.weights();
-            let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
-            let raw = w.balanced_to_raw(wb);
-            ui.label(RichText::new(format!("G {:.3}", w.g)).weak()).on_hover_text(format!(
-                "R + G + B = 1 on the balanced channels.\nOn the sensor channels before white balance: \
+            if mono {
+                ui.label(RichText::new("The sensor has no colour filter. This is the measurement.").weak());
+            } else {
+                ui.label(RichText::new("mix").weak());
+                self.mix_combo(ui);
+                let cur = self.weights();
+                let (mut r, mut b) = (cur.r, cur.b);
+                ui.label(RichText::new("R").weak());
+                if ui
+                    .add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.002).fixed_decimals(3))
+                    .changed()
+                {
+                    self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
+                }
+                ui.label(RichText::new("B").weak());
+                if ui
+                    .add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.002).fixed_decimals(3))
+                    .changed()
+                {
+                    self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
+                }
+                let w = self.weights();
+                let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
+                let raw = w.balanced_to_raw(wb);
+                ui.label(RichText::new(format!("G {:.3}", w.g)).weak()).on_hover_text(format!(
+                    "R + G + B = 1 on the balanced channels.\nOn the sensor channels before white balance: \
                  R {:.3} G {:.3} B {:.3}",
-                raw.r, raw.g, raw.b
-            ));
+                    raw.r, raw.g, raw.b
+                ));
+            }
             // Stays in this row, so the window does not grow when the exposures
             // leave the base. Right edge of the glass, not of the unclipped row.
             if self.edit.recipe.curve.as_paper().is_some() {

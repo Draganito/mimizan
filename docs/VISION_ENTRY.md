@@ -6,7 +6,7 @@ wording is Dragan's. Two pieces, ready to paste.
 ## 1. Table row for "Projects: local folder ↔ GitHub repo"
 
 ```
-| `mimizan` | [mimizan](https://github.com/Draganito/mimizan) | GPL-3.0-or-later | v0.11.13 (Debian `.deb` + Linux tarball + Windows x64 zip + Apple silicon app, CI). The demosaic comparison stays in v0.10.12 and on branch `demosaic` |
+| `mimizan` | [mimizan](https://github.com/Draganito/mimizan) | GPL-3.0-or-later | v0.11.14 (Debian `.deb` + Linux tarball + Windows x64 zip + Apple silicon app, CI). The demosaic comparison stays in v0.10.12 and on branch `demosaic` |
 ```
 
 ## 2. Paragraph under "Line 2: Splitgrade darkroom" (or a third line, see note)
@@ -34,7 +34,8 @@ Shipped as `mimizan` (CLI: info, dump, negative, print, bench, calibrate,
 synth, measure) and `mimizan-gui` (egui desktop app: live preview from a
 downscaled separation, exports in a background thread). Test camera Nikon
 Z f; a full-frame monochrome camera (sensor without colour filter array)
-serves as the reference and passes through without separation. On the
+serves as the reference and passes through without separation. The desktop
+opens such a file as that measured plane; the Bayer darkroom is unchanged. On the
 Ryzen 7 5700U a 24.4 MP negative separates in 2.3 s, and in 4.5 s with
 reconstruct, which the desktop starts with. Camera and look calibration are
 fitted from charts (`calibrate wedge|weights|star`): the shipped reference

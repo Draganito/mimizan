@@ -139,7 +139,11 @@ fn develop_frame(
     develop: DevelopParams,
     status: &dyn Fn(String),
 ) -> Result<Session> {
-    status("separating".into());
+    status(if matches!(frame.kind, mimizan_core::decode::SensorKind::Mono) {
+        "reading the sensor".into()
+    } else {
+        "separating".into()
+    });
     let params = develop.negative_params(camera_file.clone());
     let negative: Negative = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
     status("building preview".into());
@@ -160,14 +164,17 @@ fn export(
 ) -> Result<Event> {
     let t = Instant::now();
     recipe.validate()?;
-    status("mixing".into());
-    let plane = mix(s.separation(), &weights);
+    status(if s.is_mono() { "placing".into() } else { "mixing".into() });
+    // Bayer mixes the separation. A monochrome plane is already the picture;
+    // the recipe weights stay in the sidecar and do not rewrite it.
+    let mixed = (!s.is_mono()).then(|| mix(s.separation(), &weights));
+    let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
     let mask = s.mask_plane();
     let mut info = s.negative.info.clone();
     info.weights = weights;
     info.weights_raw = weights.balanced_to_raw(s.wb());
     let src = PrintSource {
-        plane: &plane,
+        plane,
         mask: Some(&mask),
         orientation,
         name: s.path.display().to_string(),

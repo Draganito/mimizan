@@ -2,6 +2,9 @@
 //! re-development skips the decoder), the full-resolution separation (so the
 //! weights can be re-mixed without separating again) and a downscaled,
 //! upright copy of the separation for the interactive preview.
+//!
+//! A monochrome sensor has no colour filter. The GUI keeps the measured
+//! plane and a preview of it. It does not invent chrominance planes.
 
 use mimizan_core::calib::CameraFile;
 use mimizan_core::cfa::Color;
@@ -85,8 +88,9 @@ pub struct Session {
 
 /// Histogram of the four sensor channels (one per 2x2 tile position) over
 /// the active area, normalised by black and white level and binned on a
-/// gamma-2.2 axis like the negative histogram. Nothing but the frame goes
-/// in, so it is computed once per file.
+/// gamma-2.2 axis like the negative histogram. A monochrome sensor is one
+/// channel in `bins[0]`. Nothing but the frame goes in, so it is computed
+/// once per file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawHistogram {
     /// Tile positions (0,0), (1,0), (0,1), (1,1), as `RawFrame::black_tile`.
@@ -95,11 +99,13 @@ pub struct RawHistogram {
     /// Pixels at or above the white level, per channel.
     pub clipped: [usize; 4],
     pub total: [usize; 4],
+    /// One measured channel, no colour filter.
+    pub mono: bool,
 }
 
 impl RawHistogram {
     pub fn empty() -> Self {
-        Self { bins: [[0; 256]; 4], colors: [Color::G; 4], clipped: [0; 4], total: [0; 4] }
+        Self { bins: [[0; 256]; 4], colors: [Color::G; 4], clipped: [0; 4], total: [0; 4], mono: false }
     }
 
     pub fn of_frame(frame: &RawFrame) -> Self {
@@ -118,9 +124,10 @@ impl RawHistogram {
                 let mut bins = [[0u32; 256]; 4];
                 let mut clipped = [0usize; 4];
                 let mut total = [0usize; 4];
+                let mono = matches!(frame.kind, SensorKind::Mono);
                 let base = y * frame.width;
                 for x in x0..x1 {
-                    let t = (y & 1) * 2 + (x & 1);
+                    let t = if mono { 0 } else { (y & 1) * 2 + (x & 1) };
                     let black = frame.black_at(x, y);
                     let white = frame.white_at(x, y);
                     let v = (frame.data.get(base + x) - black) / (white - black).max(1.0);
@@ -143,10 +150,13 @@ impl RawHistogram {
             }
         }
         // Tile position t = (y & 1) * 2 + (x & 1) in absolute sensor coordinates.
-        if let SensorKind::Bayer(phase) = frame.kind {
-            for t in 0..4 {
-                out.colors[t] = phase.color_at(t & 1, t >> 1);
+        match frame.kind {
+            SensorKind::Bayer(phase) => {
+                for t in 0..4 {
+                    out.colors[t] = phase.color_at(t & 1, t >> 1);
+                }
             }
+            SensorKind::Mono => out.mono = true,
         }
         out
     }
@@ -162,6 +172,11 @@ impl RawHistogram {
 }
 
 impl Session {
+    /// A monochrome sensor: one measured plane, no separation.
+    pub fn is_mono(&self) -> bool {
+        self.negative.separation.is_none()
+    }
+
     pub fn separation(&self) -> &Separation {
         self.negative.separation.as_ref().expect("session negatives keep their separation")
     }
@@ -197,9 +212,12 @@ impl Session {
     }
 }
 
-/// Build the preview planes from a negative that kept its separation.
+/// Build the preview planes. A Bayer negative keeps its separation. A
+/// monochrome negative previews the measured plane and stores no colour.
 pub fn preview_planes(neg: &Negative) -> PreviewPlanes {
-    let sep = neg.separation.as_ref().expect("keep_separation");
+    let Some(sep) = neg.separation.as_ref() else {
+        return preview_measured(neg);
+    };
     let o = neg.orientation;
     let lum = orient(&sep.lum, o);
     let (w, h) = (lum.width, lum.height);
@@ -230,6 +248,35 @@ pub fn preview_planes(neg: &Negative) -> PreviewPlanes {
         computed: sep.computed,
     };
     PreviewPlanes { sep: sep_small, mask, scale: pw as f64 / w as f64 }
+}
+
+/// Preview of a measured plane. Chrominance stays empty at preview size so
+/// the existing mix draws the measurement and nothing else.
+fn preview_measured(neg: &Negative) -> PreviewPlanes {
+    let o = neg.orientation;
+    let lum = orient(&neg.plane, o);
+    let (w, h) = (lum.width, lum.height);
+    let (pw, ph) = fit_dims(w, h, PREVIEW_MAX, PREVIEW_MAX);
+    let (pw, ph) = (pw.min(w), ph.min(h));
+    let lum = if (w, h) == (pw, ph) { lum } else { resize(&lum, pw, ph) };
+    let mask_full = Plane::from_vec(
+        neg.plane.width,
+        neg.plane.height,
+        neg.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect(),
+    );
+    let mask_up = orient(&mask_full, o);
+    let mask = if (mask_up.width, mask_up.height) == (pw, ph) { mask_up } else { resize(&mask_up, pw, ph) };
+    let zero = Plane::zeros(pw, ph);
+    let sep = Separation {
+        lum,
+        c1: zero.clone(),
+        c2: zero.clone(),
+        mask_max: zero,
+        rounds: 0,
+        phase: mimizan_core::cfa::BayerPhase::RGGB,
+        computed: 0.0,
+    };
+    PreviewPlanes { sep, mask, scale: pw as f64 / w as f64 }
 }
 
 /// Everything the preview depends on besides the session. The preview is the
@@ -416,6 +463,9 @@ pub fn render_detail(
     table: &ToneTable,
     codes: Option<&[u16]>,
 ) -> Option<DetailImage> {
+    if s.is_mono() {
+        return render_measured(s, v, ask, table, codes);
+    }
     let step = ask.step();
     let sep = s.separation();
     let (sw, sh) = (sep.lum.width, sep.lum.height);
@@ -540,6 +590,122 @@ fn show_sample(v: f64, place: f64, table: &ToneTable) -> u8 {
     table.show[q]
 }
 
+/// 1:1 and the screen grid of a monochrome negative. Samples the measured
+/// plane. The clamp is the same one `render_detail` uses for Bayer.
+fn render_measured(
+    s: &Session,
+    v: &ViewParams,
+    ask: DetailAsk,
+    table: &ToneTable,
+    codes: Option<&[u16]>,
+) -> Option<DetailImage> {
+    let step = ask.step();
+    let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
+    let orientation = rotated(s.negative.orientation, v.rotation);
+    let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
+    let (x, y, origin) = match v.crop {
+        Some(c) => {
+            let (fw, fh) = s.upright_size();
+            let t = c.turned(v.rotation, fw as u32, fh as u32).sanitized(uw as u32, uh as u32);
+            (
+                ask.x.saturating_add(t.x as usize),
+                ask.y.saturating_add(t.y as usize),
+                (t.x as usize, t.y as usize),
+            )
+        }
+        None => (ask.x, ask.y, (0, 0)),
+    };
+    if x >= uw || y >= uh || ask.w == 0 || ask.h == 0 {
+        return None;
+    }
+    let w = ask.w.min((uw - x).div_ceil(step));
+    let h = ask.h.min((uh - y).div_ceil(step));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let gray = measured_gray(s, v, table, codes, MeasuredSpan { sw, sh, orientation, x, y, w, h, step });
+    debug_assert_eq!(gray.len(), w * h);
+    Some(DetailImage {
+        ask: DetailAsk { x: x.saturating_sub(origin.0), y: y.saturating_sub(origin.1), w, h, step },
+        gray,
+    })
+}
+
+struct MeasuredSpan {
+    sw: usize,
+    sh: usize,
+    orientation: u16,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    step: usize,
+}
+
+fn measured_gray(
+    s: &Session,
+    v: &ViewParams,
+    table: &ToneTable,
+    codes: Option<&[u16]>,
+    span: MeasuredSpan,
+) -> Vec<u8> {
+    let MeasuredSpan { sw, sh, orientation, x, y, w, h, step } = span;
+    let n = &s.negative;
+    let rect = DetailRect { x, y, w, h };
+    if step == 1 {
+        if v.show_mask {
+            let src = source_rect(orientation, sw, sh, rect);
+            let mut m = Plane::zeros(src.w, src.h);
+            m.data.par_chunks_mut(src.w).enumerate().for_each(|(yy, row)| {
+                let base = (src.y + yy) * n.plane.width + src.x;
+                for (xx, o) in row.iter_mut().enumerate() {
+                    *o = f64::from(n.mask8[base + xx]) / 255.0;
+                }
+            });
+            let upright = orient(&m, orientation);
+            return upright.data.par_iter().map(|&p| (p.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
+        }
+        let src = source_rect(orientation, sw, sh, rect);
+        if v.place == 0.0 {
+            if let Some(codes) = codes.filter(|c| c.len() == sw * sh) {
+                return display_codes(codes, sw, sh, orientation, rect, table);
+            }
+        }
+        return display_bytes(&orient(&crop(&n.plane, src), orientation), v.place, table);
+    }
+    let codes = codes.filter(|c| c.len() == sw * sh);
+    let mut out = vec![0u8; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(j, row)| {
+        let oy = y + j * step;
+        for (i, o) in row.iter_mut().enumerate() {
+            let ox = x + i * step;
+            let (sx, sy) = sensor_xy(orientation, sw, sh, ox, oy);
+            *o = if v.show_mask {
+                n.mask8[sy * n.plane.width + sx]
+            } else if v.place == 0.0 {
+                if let Some(codes) = codes {
+                    table.show[codes[sy * sw + sx] as usize]
+                } else {
+                    show_sample(n.plane.at(sx, sy), 0.0, table)
+                }
+            } else {
+                show_sample(n.plane.at(sx, sy), v.place, table)
+            };
+        }
+    });
+    out
+}
+
+/// The upright window the print and the loupe enlarge. Bayer mixes the
+/// separation. A monochrome sensor enlarges the measured plane.
+fn measured_window(s: &Session, weights: &Weights, src: DetailRect, orientation: u16) -> Plane {
+    if s.is_mono() {
+        orient(&crop(&s.negative.plane, src), orientation)
+    } else {
+        mixed_upright(s.separation(), weights, src, orientation)
+    }
+}
+
 fn mixed_upright(sep: &Separation, weights: &Weights, src: DetailRect, orientation: u16) -> Plane {
     let small = Separation {
         lum: crop(&sep.lum, src),
@@ -566,8 +732,7 @@ pub fn render_print_detail(
     if v.show_mask {
         return render_detail(s, v, DetailAsk::pixels(rect), table, None);
     }
-    let sep = s.separation();
-    let (sensor_w, sensor_h) = (sep.lum.width, sep.lum.height);
+    let (sensor_w, sensor_h) = (s.negative.plane.width, s.negative.plane.height);
     let orientation = rotated(s.negative.orientation, v.rotation);
     let (full_w, full_h) =
         if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
@@ -590,7 +755,7 @@ pub fn render_print_detail(
     }
     let upright = DetailRect { x: x0 + ox, y: y0 + oy, w: x1 - x0, h: y1 - y0 };
     let sensor = source_rect(orientation, sensor_w, sensor_h, upright);
-    let mixed = mixed_upright(sep, &v.weights, sensor, orientation);
+    let mixed = measured_window(s, &v.weights, sensor, orientation);
     debug_assert_eq!((mixed.width, mixed.height), (upright.w, upright.h));
     let window = PlaneWindow { plane: &mixed, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
     let picture = resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix);
@@ -692,8 +857,7 @@ pub fn render_sharpen_loupe(
 ) -> SharpenLoupe {
     let view = view.clamp(1, 4096);
     let params = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
-    let sep = s.separation();
-    let (sensor_w, sensor_h) = (sep.lum.width, sep.lum.height);
+    let (sensor_w, sensor_h) = (s.negative.plane.width, s.negative.plane.height);
     let (full_w, full_h) =
         if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
     let (sx, sy, ex, ey) = loupe_source_rect(full_w, full_h, &params, nx, ny, view);
@@ -703,7 +867,7 @@ pub fn render_sharpen_loupe(
     let (linear, mask) = if ex > sx && ey > sy {
         let upright_rect = DetailRect { x: sx, y: sy, w: ex - sx, h: ey - sy };
         let sensor = source_rect(orientation, sensor_w, sensor_h, upright_rect);
-        let mixed = mixed_upright(sep, weights, sensor, orientation);
+        let mixed = measured_window(s, weights, sensor, orientation);
         let mask = want_mask.then(|| orient(&crop_mask(s, sensor), orientation));
         (mixed, mask)
     } else {
@@ -1020,6 +1184,60 @@ impl Histogram {
         )
     }
 
+    /// The same counts as [`of_separation`] on a plane that has no colour.
+    /// A monochrome negative is that plane. Weights do not enter.
+    pub fn of_plane(
+        plane: &Plane,
+        tone: &ToneMap,
+        place: f64,
+        window: Option<(usize, usize, usize, usize)>,
+    ) -> (Self, Self) {
+        let table = ToneTable::build(tone);
+        let lut_neg = neg_lut();
+        let width = plane.width;
+        let height = plane.height;
+        let (x0, y0, x1, y1) = match window {
+            Some((x, y, w, h)) => {
+                let x0 = x.min(width);
+                let y0 = y.min(height);
+                (x0, y0, (x + w).min(width).max(x0), (y + h).min(height).max(y0))
+            }
+            None => (0, 0, width, height),
+        };
+        let global = 2f64.powf(place);
+        let parts: Vec<Counts> = (y0..y1)
+            .into_par_iter()
+            .map(|y| {
+                let row = plane.row(y);
+                let mut c = Counts::default();
+                for &m in row.iter().take(x1).skip(x0) {
+                    let q = q16(m);
+                    c.neg[lut_neg[q] as usize] += 1;
+                    c.neg_low += (q == 0) as usize;
+                    c.neg_high += (q == 65535) as usize;
+                    let qv = q16(m * global);
+                    let bin = table.view[qv];
+                    c.view[bin as usize] += 1;
+                    match table.clip[qv] {
+                        1 => c.view_low += 1,
+                        2 => c.view_high += 1,
+                        _ => {}
+                    }
+                }
+                c
+            })
+            .collect();
+        let mut all = Counts::default();
+        for c in parts {
+            all.add(&c);
+        }
+        let total = (x1 - x0) * (y1 - y0);
+        (
+            Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
+            Self::from_bins(all.view, total, all.view_low, all.view_high),
+        )
+    }
+
     /// The same counts as [`of_separation`] from cached `q16(mix)` codes.
     /// `place == 0` is exact: the view index is the code. A placing
     /// dequantises the code before scaling, which can move a bin at the
@@ -1169,7 +1387,7 @@ fn hist_window(s: &Session, v: &ViewParams) -> Option<(usize, usize, usize, usiz
     v.crop.map(|c| {
         let (fw, fh) = s.upright_size();
         let c = c.sanitized(fw as u32, fh as u32);
-        let (sw, sh) = (s.separation().lum.width, s.separation().lum.height);
+        let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
         let r = source_rect(
             s.negative.orientation,
             sw,
@@ -1183,6 +1401,17 @@ fn hist_window(s: &Session, v: &ViewParams) -> Option<(usize, usize, usize, usiz
 impl HistCache {
     fn ensure(&mut self, s: &Session, w: &Weights) {
         let ptr = s as *const Session;
+        if s.is_mono() {
+            if self.session == Some(ptr) && self.width == s.negative.plane.width && !self.codes.is_empty() {
+                return;
+            }
+            self.width = s.negative.plane.width;
+            self.codes = s.negative.plane.data.iter().map(|&v| q16(v) as u16).collect();
+            self.session = Some(ptr);
+            self.weights = None;
+            self.hist_key = None;
+            return;
+        }
         if self.session == Some(ptr) && self.weights.as_ref() == Some(w) {
             return;
         }
@@ -1217,6 +1446,9 @@ impl HistCache {
             let hists = if v.place == 0.0 {
                 self.ensure(s, &v.weights);
                 Histogram::of_codes(&self.codes, self.width, table, 0.0, window)
+            } else if s.is_mono() {
+                self.session = Some(ptr);
+                Histogram::of_plane(&s.negative.plane, tone, v.place, window)
             } else {
                 self.session = Some(ptr);
                 Histogram::of_separation(s.separation(), &v.weights, tone, v.place, window)
@@ -1560,5 +1792,110 @@ mod histogram_tests {
             let expect = ((code as f64 / 65535.0) * 255.0).round() as u8;
             assert_eq!(*byte, expect);
         }
+    }
+
+    /// A plane with no colour counts the same as a mix of that plane.
+    #[test]
+    fn of_plane_matches_a_mix_with_no_colour() {
+        use mimizan_core::cfa::BayerPhase;
+        let mut lum = Plane::zeros(5, 4);
+        for (i, v) in lum.data.iter_mut().enumerate() {
+            *v = i as f64 / 19.0;
+        }
+        let sep = Separation {
+            lum: lum.clone(),
+            c1: Plane::zeros(5, 4),
+            c2: Plane::zeros(5, 4),
+            mask_max: Plane::zeros(5, 4),
+            rounds: 0,
+            phase: BayerPhase::RGGB,
+            computed: 0.0,
+        };
+        let w = Weights { r: 0.2, g: 0.5, b: 0.3 };
+        let tone = Tone::paper().compile();
+        let (n1, v1) = Histogram::of_separation(&sep, &w, &tone, 0.4, None);
+        let (n2, v2) = Histogram::of_plane(&lum, &tone, 0.4, None);
+        assert_eq!(n1, n2);
+        assert_eq!(v1, v2);
+    }
+
+    /// A monochrome file opens onto its measured plane. Weights do not
+    /// rewrite it, and the window does not ask for a separation.
+    #[test]
+    fn a_monochrome_negative_is_the_measured_plane() {
+        use mimizan_core::decode::{RawData, Rect, SensorKind};
+        use mimizan_core::pipeline::{self, NegativeParams};
+        use std::sync::Arc;
+        let (w, h) = (8usize, 6usize);
+        let raw: Vec<u16> = (0..w * h).map(|i| (i * 40) as u16).collect();
+        let frame = RawFrame {
+            make: "Leica".into(),
+            model: "M11 Monochrom".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 14,
+            kind: SensorKind::Mono,
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let mut params = NegativeParams::default();
+        params.keep_separation = true;
+        let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        assert!(neg.separation.is_none());
+        assert!(!neg.info.reconstruct);
+        let preview = preview_planes(&neg);
+        assert_eq!(preview.sep.lum.data, neg.plane.data);
+        assert!(preview.sep.c1.data.iter().all(|&v| v == 0.0));
+        assert!(preview.sep.c2.data.iter().all(|&v| v == 0.0));
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let session = Session {
+            path: "mono.dng".into(),
+            frame: Arc::new(frame),
+            negative: neg,
+            camera_file: None,
+            camera_file_path: None,
+            develop: DevelopParams::default(),
+            preview,
+            raw_hist,
+        };
+        assert!(session.is_mono());
+        assert!(session.raw_hist.mono);
+        assert_eq!(session.raw_hist.total[0], w * h);
+        assert_eq!(session.raw_hist.total[1], 0);
+        let mut cache = HistCache::default();
+        let native = Weights::default();
+        let shifted = Weights { r: 0.1, g: 0.2, b: 0.7 };
+        let a = cache.codes_for(&session, &native).to_vec();
+        let b = cache.codes_for(&session, &shifted).to_vec();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), w * h);
+        assert_eq!(a[0], q16(session.negative.plane.at(0, 0)) as u16);
+        let tone = Tone::paper().compile();
+        let table = ToneTable::build(&tone);
+        let view = ViewParams {
+            weights: shifted,
+            tone: Tone::paper(),
+            place: 0.0,
+            show_mask: false,
+            rotation: 0,
+            crop: None,
+        };
+        let detail = render_detail(
+            &session,
+            &view,
+            DetailAsk::pixels(DetailRect { x: 0, y: 0, w, h }),
+            &table,
+            Some(&a),
+        )
+        .unwrap();
+        assert_eq!(detail.gray, display_bytes(&session.negative.plane, 0.0, &table));
     }
 }

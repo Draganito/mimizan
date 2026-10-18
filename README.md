@@ -4,6 +4,8 @@ A darkroom for the digital negative.
 
 You open a colour RAW. Mimizan Lab makes a monochrome negative from it and prints that negative the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one.
 
+A sensor with no colour filter is an additional path. That file opens as the measurement. The colour darkroom stays as it is.
+
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
@@ -35,14 +37,14 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 Debian and Ubuntu:
 
 ```bash
-sudo apt install ./mimizan_0.11.13-1_amd64.deb
+sudo apt install ./mimizan_0.11.14-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.13-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
+Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.14-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
 
-Apple silicon: unzip `mimizan-0.11.13-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS.
+Apple silicon: unzip `mimizan-0.11.14-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS.
 
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 

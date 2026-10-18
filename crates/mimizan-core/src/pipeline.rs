@@ -178,6 +178,10 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         }
         None => {
             let Mosaic { saturated, plane, .. } = mosaic;
+            // The measurement is the picture. Reconstruction and the colour
+            // mask were not run, so the record must not say they were.
+            info.reconstruct = false;
+            info.computed = 0.0;
             // No carriers on a mono sensor: sharpening allowed except at saturation.
             let allowed = (crate::separate::FIXED_MASK_VALUE * 255.0).round() as u8;
             let mask8 = saturated.iter().map(|&s| if s != 0 { 255 } else { allowed }).collect();

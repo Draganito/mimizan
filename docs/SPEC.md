@@ -32,8 +32,8 @@ CFA array (`RawImage.data`), never a demosaiced image.
 | Black level | `blacklevel.levels`: one value for every photosite, or a 2×2 tile (CFA order); any other tile size is an error | subtract per photosite |
 | White level | `whitelevel.0`; one value or four (RGBE order by colour) | divide per photosite |
 | CFA phase | `photometric = Cfa(cfg)`, `cfg.cfa.name` ∈ {RGGB, BGGR, GRBG, GBRG}, relative to the full sensor (before the crop) | required; a camera file may only confirm it, not override it |
-| Crop | `crop_area` (the manufacturer's recommendation); if `None`: `active_area`; if `None`: the whole image | the crop origin must be even, otherwise shift it inward by 1 so the phase is kept |
-| Monochrome | `photometric = LinearRaw` or `BlackIsZero` with `cpp = 1` | no separation; `L = m` |
+| Crop | `crop_area` (the manufacturer's recommendation); if `None`: `active_area`; if `None`: the whole image | on a Bayer file the crop origin must be even, otherwise shift it inward by 1 so the phase is kept. A monochrome file keeps the crop as written, including an odd origin |
+| Monochrome | `photometric = LinearRaw` or `BlackIsZero` with `cpp = 1` | no separation; `L = m`. The desktop opens this as the measured plane: no chrominance planes, no white balance, no mix, no reconstruction. Repair defects, placing, the two exposures, the crop and the TIFF stay. The raw histogram is one channel. Recipe weights are recorded and do not change the plane |
 
 Normalisation: `m = (raw − black) / (white − black)`. Values below 0 stay
 negative (noise must not be clipped), values above 1 stay above 1 until

@@ -263,9 +263,12 @@ the same, so there the estimator, not the detector, is the limit).
 | `mimizan-gui`  | Desktop darkroom: walk the folder as a film strip, judge mix, placing and the two split-grade exposures interactively, export the print recipe as a 16-bit TIFF |
 
 Supported input: Bayer RAWs that [rawler](https://crates.io/crates/rawler)
-decodes (verified: Nikon Z f NEF). Monochrome sensors (DNG without a colour
-filter array) pass through without separation. Not supported by design:
-X-Trans, Quad-Bayer, Foveon, Nikon HE/HE* NEF.
+decodes (verified: Nikon Z f NEF). A monochrome sensor (DNG without a colour
+filter array; verified: Leica M Monochrom Typ 246 and Leica M11 Monochrom)
+is an additional path. The window opens it as the measured plane: no
+separation, no mix, no white balance. Placing, the two exposures, the crop
+and the TIFF stay on that plane. The Bayer darkroom is unchanged. Not
+supported by design: X-Trans, Quad-Bayer, Foveon, Nikon HE/HE* NEF.
 
 Output: 16-bit grey TIFF, linear (negative, with a grey ICC profile and a
 JSON description of every parameter) or gamma 2.2 (print), plus an 8-bit
@@ -295,7 +298,7 @@ right-click and Open.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.13-1_amd64.deb
+sudo apt install ./mimizan_0.11.14-1_amd64.deb
 mimizan --version
 ```
 
@@ -495,7 +498,8 @@ linear or log), all from the full-resolution data, never from the preview
 copy: *print* (after placing and the paper: what the TIFF gets),
 *negative* (the linear mix on a gamma-2.2 axis) and *raw* (the four sensor
 channels R, G1, G2, B as shot, each against its own black and white level,
-with the fraction at the white level per channel). The black/white readout
+with the fraction at the white level per channel). On a monochrome file
+*raw* is that one sensor, and *Development* keeps only repair defects. The black/white readout
 counts the pixels that are 0 or 65535 in the 16-bit output, i.e. the TIFF's
 own clipping. Exports run in a background thread; the preview (a downscaled
 copy of the separation) updates in milliseconds. `Reset` returns the
