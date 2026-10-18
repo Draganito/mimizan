@@ -262,7 +262,7 @@ pub struct App {
     loupe_key: Option<(usize, Weights, Recipe, u16, [f64; 2], usize)>,
     /// Box side asked for this frame, in print pixels (one screen pixel each).
     loupe_px: usize,
-    /// The print window was on screen this frame, so its box is part of the pair.
+    /// The print window was drawn this frame, so the box is requested after the sliders.
     loupe_open: bool,
     loupe_tex: Option<TextureHandle>,
     loupe_size: [usize; 2],

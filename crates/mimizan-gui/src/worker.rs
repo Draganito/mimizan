@@ -221,8 +221,8 @@ impl Preview {
         thread::Builder::new()
             .name("mimizan-preview".into())
             .spawn(move || {
-                // What the last render was based on, so a pan only re-renders
-                // the 1:1 window and a slider only the whole image.
+                // What the last render was based on. A pan re-renders only the
+                // 1:1 window. A new exposure re-renders the fit copy and that window.
                 let mut last: Option<(*const Session, ViewParams)> = None;
                 let mut last_detail: Option<DetailRect> = None;
                 let mut last_inspect: Option<Recipe> = None;

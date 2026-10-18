@@ -474,20 +474,9 @@ pub fn render_sharpen_loupe(
     let (linear, mask) = if ex > sx && ey > sy {
         let upright_rect = DetailRect { x: sx, y: sy, w: ex - sx, h: ey - sy };
         let sensor = source_rect(orientation, sensor_w, sensor_h, upright_rect);
-        let mixed = mix(
-            &Separation {
-                lum: crop(&sep.lum, sensor),
-                c1: crop(&sep.c1, sensor),
-                c2: crop(&sep.c2, sensor),
-                mask_max: Plane::zeros(1, 1),
-                rounds: sep.rounds,
-                phase: sep.phase,
-                computed: sep.computed,
-            },
-            weights,
-        );
+        let mixed = mixed_upright(sep, weights, sensor, orientation);
         let mask = want_mask.then(|| orient(&crop_mask(s, sensor), orientation));
-        (orient(&mixed, orientation), mask)
+        (mixed, mask)
     } else {
         (Plane::zeros(1, 1), None)
     };
@@ -1053,10 +1042,9 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
         mixed = window_plane(&mixed, scaled);
     }
     let gray = display_bytes(&mixed, v.place, table);
-    let plane = mixed;
     PreviewImage {
-        width: plane.width,
-        height: plane.height,
+        width: mixed.width,
+        height: mixed.height,
         rotation: v.rotation,
         gray,
         hist_view,
