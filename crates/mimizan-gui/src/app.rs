@@ -3347,11 +3347,8 @@ fn exposure_rail_width(row: f32, value: f32, gap: f32) -> f32 {
 /// One exposure. The filter number sits in the handle; the stops sit beside the rail.
 fn exposure_slider(ui: &mut egui::Ui, rail: f32, mark: &str, v: &mut f64, hint: &str) {
     let row = ui.horizontal(|ui| {
-        let thickness = ui
-            .text_style_height(&egui::TextStyle::Body)
-            .max(ui.spacing().interact_size.y);
-        let (rect, response) =
-            ui.allocate_exact_size(Vec2::new(rail, thickness), Sense::click_and_drag());
+        let thickness = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y);
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(rail, thickness), Sense::click_and_drag());
         let handle = exposure_handle_size(ui, thickness);
         if response.has_focus() {
             ui.memory_mut(|m| {
@@ -3361,8 +3358,7 @@ fn exposure_slider(ui: &mut egui::Ui, rail: f32, mark: &str, v: &mut f64, hint: 
                 );
             });
             let step = ui.input(|i| {
-                i.num_presses(egui::Key::ArrowRight) as i32
-                    - i.num_presses(egui::Key::ArrowLeft) as i32
+                i.num_presses(egui::Key::ArrowRight) as i32 - i.num_presses(egui::Key::ArrowLeft) as i32
             });
             if step != 0 {
                 *v = (*v + f64::from(step) * EXPOSURE_STEP).clamp(-SLIDER_STOPS, SLIDER_STOPS);
@@ -3379,14 +3375,9 @@ fn exposure_slider(ui: &mut egui::Ui, rail: f32, mark: &str, v: &mut f64, hint: 
         if ui.is_rect_visible(rect) {
             paint_exposure_slider(ui, rect, handle, *v, mark, &response);
         }
-        let stepping = ui.input(|i| {
-            i.num_presses(egui::Key::ArrowUp) > 0 || i.num_presses(egui::Key::ArrowDown) > 0
-        });
-        let speed = if stepping {
-            EXPOSURE_STEP
-        } else {
-            (2.0 * SLIDER_STOPS) / f64::from(rail.max(1.0))
-        };
+        let stepping =
+            ui.input(|i| i.num_presses(egui::Key::ArrowUp) > 0 || i.num_presses(egui::Key::ArrowDown) > 0);
+        let speed = if stepping { EXPOSURE_STEP } else { (2.0 * SLIDER_STOPS) / f64::from(rail.max(1.0)) };
         ui.add(
             egui::DragValue::new(v)
                 .range(-SLIDER_STOPS..=SLIDER_STOPS)
@@ -3440,13 +3431,7 @@ fn paint_exposure_slider(
     let left = exposure_handle_left(rect.left(), rect.width(), handle.x, stops);
     let knob = Rect::from_min_size(Pos2::new(left, rect.center().y - handle.y * 0.5), handle)
         .expand(visuals.expansion);
-    painter.rect(
-        knob,
-        visuals.corner_radius,
-        visuals.bg_fill,
-        visuals.fg_stroke,
-        egui::StrokeKind::Inside,
-    );
+    painter.rect(knob, visuals.corner_radius, visuals.bg_fill, visuals.fg_stroke, egui::StrokeKind::Inside);
     painter.text(
         knob.center(),
         egui::Align2::CENTER_CENTER,
@@ -3772,9 +3757,8 @@ mod crop_drag_tests {
 #[cfg(test)]
 mod dock_tests {
     use super::{
-        docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer,
-        place_docks, strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, EXPOSURE_RAIL, PANEL_GAP, PANEL_W,
-        SLIDER_STOPS,
+        docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer, place_docks,
+        strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, EXPOSURE_RAIL, PANEL_GAP, PANEL_W, SLIDER_STOPS,
     };
     use egui::{Pos2, Rect, Vec2};
 
@@ -3880,8 +3864,7 @@ mod dock_tests {
         assert!((end + handle - (left + rail)).abs() < 0.01);
         assert!(exposure_stops_from_pointer(left, rail, handle, left + rail / 2.0).abs() < 1e-9);
         assert!(
-            (exposure_stops_from_pointer(left, rail, handle, left + handle / 2.0) + SLIDER_STOPS)
-                .abs()
+            (exposure_stops_from_pointer(left, rail, handle, left + handle / 2.0) + SLIDER_STOPS).abs()
                 < 1e-9
         );
     }
