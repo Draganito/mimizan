@@ -23,6 +23,8 @@ egui = "0.36"
 egui-file-dialog = "0.15"
 rayon.workspace = true
 image.workspace = true
+# Core load in the negative panel. CPU only: no process list, no extra thread pool.
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 # GNOME Wayland draws no server-side frame: let winit draw the Adwaita-style
 # client-side decorations itself, with the window title centred in the bar.

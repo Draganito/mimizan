@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod app;
 mod browser;
+mod cpu;
 mod edit;
 mod histogram;
 mod session;

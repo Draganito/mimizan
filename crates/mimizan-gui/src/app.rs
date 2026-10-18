@@ -3,6 +3,7 @@
 //! them to the workers.
 
 use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{DetailRect, DevelopParams, Histogram, Session, ViewParams};
@@ -242,6 +243,8 @@ pub struct App {
 
     busy: Option<String>,
     log: Vec<String>,
+    /// Core loads for the negative panel. Sampled only while that section is open.
+    cpu: CpuMeter,
 
     /// The development being edited (weights, recipe, turns) and its
     /// history. The export renders exactly `edit`.
@@ -396,6 +399,7 @@ impl App {
             current_path: None,
             busy: None,
             log: Vec::new(),
+            cpu: CpuMeter::new(),
             edit: Edit::new(Weights::default()),
             history: History::new(Edit::new(Weights::default())),
             size_mode: SizeMode::Native,
@@ -1617,7 +1621,7 @@ impl App {
     }
 
     /// Left panel: what the file is, the histograms, the development
-    /// settings that recompute the negative, the log.
+    /// settings that recompute the negative, the log, the cores.
     fn analysis_panel(&mut self, ui: &mut egui::Ui) {
         let Some(s) = self.session.clone() else {
             ui.label("Open a RAW file or drop it here.");
@@ -1780,6 +1784,33 @@ impl App {
                 }
             });
         });
+        ui.collapsing("CPU", |ui| self.cpu_section(ui));
+    }
+
+    /// The machine's cores. The body runs only while the section is open,
+    /// and that is the only time a reading is taken.
+    fn cpu_section(&mut self, ui: &mut egui::Ui) {
+        ui.ctx().request_repaint_after(crate::cpu::SAMPLE_EVERY);
+        ui.label(RichText::new("The machine's cores, four times a second.").weak().small());
+        match self.cpu.sample() {
+            CpuView::Waiting => {
+                ui.label(RichText::new("reading…").weak());
+            }
+            CpuView::Cores(loads) if loads.is_empty() => {
+                ui.label(RichText::new("no cores").weak());
+            }
+            CpuView::Cores(loads) => {
+                for (i, load) in loads.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            Vec2::new(28.0, ui.spacing().interact_size.y),
+                            egui::Label::new(RichText::new(format!("{i}")).weak().small()),
+                        );
+                        ui.add(egui::ProgressBar::new((load / 100.0).clamp(0.0, 1.0)).show_percentage());
+                    });
+                }
+            }
+        }
     }
 
     fn histogram_section(&mut self, ui: &mut egui::Ui) {

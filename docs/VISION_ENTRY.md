@@ -6,7 +6,7 @@ wording is Dragan's. Two pieces, ready to paste.
 ## 1. Table row for "Projects: local folder ↔ GitHub repo"
 
 ```
-| `mimizan` | [mimizan](https://github.com/Draganito/mimizan) | GPL-3.0-or-later | v0.11.11 (Debian `.deb` + Linux tarball + Windows x64 zip + Apple silicon app, CI). The demosaic comparison stays in v0.10.12 and on branch `demosaic` |
+| `mimizan` | [mimizan](https://github.com/Draganito/mimizan) | GPL-3.0-or-later | v0.11.12 (Debian `.deb` + Linux tarball + Windows x64 zip + Apple silicon app, CI). The demosaic comparison stays in v0.10.12 and on branch `demosaic` |
 ```
 
 ## 2. Paragraph under "Line 2: Splitgrade darkroom" (or a third line, see note)
