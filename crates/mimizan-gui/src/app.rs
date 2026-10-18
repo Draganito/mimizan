@@ -293,9 +293,11 @@ pub struct App {
     tex_size: [usize; 2],
     /// Rotation the shown texture was rendered with.
     tex_rotation: u8,
-    /// Fit scale (points per texel) of the last frame, and an absolute scale
-    /// the next frame must restore after the texture changed shape.
+    /// Fit scale (points per texel) of the last frame, the opening it was
+    /// measured in, and an absolute scale the next frame must restore after
+    /// the texture changed shape.
     last_fit: Option<f32>,
+    last_stage: Option<Rect>,
     keep_scale: Option<f32>,
     /// 1:1 window of the full negative for the zoomed view (upright, rotated
     /// pixel coordinates) and its texture.
@@ -424,6 +426,7 @@ impl App {
             tex_size: [0, 0],
             tex_rotation: 0,
             last_fit: None,
+            last_stage: None,
             keep_scale: None,
             detail_texture: None,
             detail_rect: None,
@@ -2425,15 +2428,20 @@ impl App {
         )
     }
 
-    fn preview_panel(&mut self, ui: &mut egui::Ui) {
-        let avail = ui.available_rect_before_wrap();
-        let response = ui.allocate_rect(avail, Sense::click_and_drag());
-        let painter = ui.painter_at(avail);
-        painter.rect_filled(avail, 0.0, Color32::from_gray(28));
+    /// `stage` is the opening between the windows, and the fit is measured
+    /// there. Zoomed, the sheet keeps that scale and that centre and runs on
+    /// into the room, and the windows lie on it. `docks` are those windows.
+    fn preview_panel(&mut self, ui: &mut egui::Ui, stage: Rect, docks: [Option<Rect>; 3]) {
+        let room = ui.available_rect_before_wrap();
+        let hit = if picture_is_fitted(self.zoom) { stage } else { room };
+        let response = ui.allocate_rect(hit, Sense::click_and_drag());
+        let on_dock = |p: Pos2| docks.iter().flatten().any(|r| r.contains(p));
         let Some(tex) = self.texture.as_ref().map(|t| t.id()) else {
+            let painter = ui.painter_at(stage);
+            painter.rect_filled(stage, 0.0, Color32::from_gray(28));
             if self.session.is_none() {
                 painter.text(
-                    avail.center(),
+                    stage.center(),
                     egui::Align2::CENTER_CENTER,
                     "Mimizan Lab",
                     egui::FontId::proportional(28.0),
@@ -2462,14 +2470,26 @@ impl App {
             (0.0, 0.0, 0, 0)
         };
         let border_tex = black_tex + white_tex;
-        // The sheet (picture plus both rings) is what fits the stage.
-        let fit = (avail.width() / (tw as f32 + 2.0 * border_tex))
-            .min(avail.height() / (th as f32 + 2.0 * border_tex));
-        self.last_fit = Some(fit);
+        // The sheet (picture plus both rings) is what fits the opening.
+        // A zoom grows it from this same fit, so the first step does not jump.
+        let fit = (stage.width() / (tw as f32 + 2.0 * border_tex))
+            .min(stage.height() / (th as f32 + 2.0 * border_tex));
         if let Some(scale) = self.keep_scale.take() {
             self.zoom = (scale / fit).clamp(1.0, MAX_ZOOM);
+        } else if let (Some(old_fit), Some(old_stage)) = (self.last_fit, self.last_stage) {
+            // A window or the strip changed the opening. A chosen magnification
+            // stays, and the sheet stays where it was. Fit still refits.
+            if opening_moved(old_stage, stage) {
+                let (zoom, pan) =
+                    hold_magnification(self.zoom, self.pan, old_fit, fit, old_stage.center(), stage.center());
+                self.zoom = zoom;
+                self.pan = pan;
+            }
         }
-        if response.hovered() {
+        self.last_fit = Some(fit);
+        self.last_stage = Some(stage);
+        let over_picture = response.hovered() && response.hover_pos().is_none_or(|p| !on_dock(p));
+        if over_picture {
             let zoom_delta = ui.input(|i| i.zoom_delta());
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             let factor = if zoom_delta != 1.0 { zoom_delta } else { (scroll / 300.0).exp() };
@@ -2478,7 +2498,7 @@ impl App {
                 self.zoom = (self.zoom * factor).clamp(1.0, MAX_ZOOM);
                 // Zoom about the pointer: keep the image point under it fixed.
                 if let Some(ptr) = response.hover_pos() {
-                    let c = avail.center() + self.pan;
+                    let c = stage.center() + self.pan;
                     let rel = ptr - c;
                     self.pan += rel - rel * (self.zoom / old);
                 }
@@ -2501,9 +2521,9 @@ impl App {
             let white_pts = white_tex * scale;
             let black_pts = black_tex * scale;
             let border_pts = white_pts + black_pts;
-            let max_pan = ((size + Vec2::splat(2.0 * border_pts) - avail.size()) * 0.5).max(Vec2::ZERO);
+            let max_pan = pan_limit(size + Vec2::splat(2.0 * border_pts), stage.size());
             let pan = pan.clamp(-max_pan, max_pan);
-            (Rect::from_center_size(avail.center() + pan, size), white_pts, black_pts, max_pan, pan)
+            (sheet_rect(stage, pan, size), white_pts, black_pts, max_pan, pan)
         };
         let (rect_now, _, _, _, _) = place(self.zoom, self.pan);
         let on_cross = |rect: Rect, p: Pos2| {
@@ -2515,12 +2535,13 @@ impl App {
         };
         // A double click on the crosshair leaves the zoom alone. One beside
         // it still toggles fit and 1:1.
-        let pressed_on_cross = ui.input(|i| i.pointer.press_origin()).is_some_and(|p| on_cross(rect_now, p));
+        let pressed_on_cross =
+            ui.input(|i| i.pointer.press_origin()).is_some_and(|p| !on_dock(p) && on_cross(rect_now, p));
         if response.double_clicked() && !pressed_on_cross {
             let old = self.zoom;
-            self.zoom = if (self.zoom - 1.0).abs() < 1e-3 { zoom_1to1 } else { 1.0 };
+            self.zoom = if picture_is_fitted(self.zoom) { zoom_1to1 } else { 1.0 };
             if let Some(ptr) = response.interact_pointer_pos() {
-                let c = avail.center() + self.pan;
+                let c = stage.center() + self.pan;
                 let rel = ptr - c;
                 self.pan += rel - rel * (self.zoom / old);
             }
@@ -2562,13 +2583,18 @@ impl App {
         // The strip is the way in. It leaves when a click on the picture is
         // released, or when a drag of the crosshair is released. The close
         // is not written down, so the next launch still opens on the strip.
-        let clicked_on_picture =
-            response.clicked() && response.interact_pointer_pos().is_some_and(|p| rect.contains(p));
+        let clicked_on_picture = response.clicked()
+            && response.interact_pointer_pos().is_some_and(|p| rect.contains(p) && !on_dock(p));
         if self.pending_leave.is_none()
             && strip_closes(self.show_strip, true, clicked_on_picture, crosshair_released)
         {
             self.show_strip = false;
         }
+        // Fitted, the sheet stays in the opening. Zoomed, it paints across
+        // the room; the windows are drawn afterwards and lie on it.
+        let clip = if picture_is_fitted(self.zoom) { stage } else { room };
+        let painter = ui.painter_at(clip);
+        ui.painter_at(stage).rect_filled(stage, 0.0, Color32::from_gray(28));
         let border_pts = white_pts + black_pts;
         if border_pts > 0.0 {
             painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
@@ -2592,7 +2618,9 @@ impl App {
         // 0.999 absorbs the rounding of the 1:1 zoom, which lands on 1.
         let show_file = if inspecting { mag >= 0.999 } else { texel_px > 1.0 };
         self.wanted_detail = if show_file && uw > 0 && uh > 0 {
-            let vis = avail.intersect(rect);
+            // Zoomed, this is the whole room, so the sharp picture continues
+            // under the windows.
+            let vis = clip.intersect(rect);
             let x0 = ((vis.left() - rect.left()) / pts_per_px).floor().max(0.0) as usize;
             let y0 = ((vis.top() - rect.top()) / pts_per_px).floor().max(0.0) as usize;
             let x1 = (((vis.right() - rect.left()) / pts_per_px).ceil() as usize).min(uw);
@@ -2653,7 +2681,7 @@ impl App {
             };
             let galley =
                 painter.layout_no_wrap(txt, egui::FontId::proportional(13.0), Color32::from_gray(220));
-            let pos = avail.left_bottom() + Vec2::new(8.0, -8.0 - galley.size().y);
+            let pos = stage.left_bottom() + Vec2::new(8.0, -8.0 - galley.size().y);
             let bg = Rect::from_min_size(pos, galley.size()).expand(4.0);
             painter.rect_filled(bg, 3.0, Color32::from_black_alpha(150));
             painter.galley(pos, galley, Color32::from_gray(220));
@@ -3245,16 +3273,19 @@ impl eframe::App for App {
                 self.persist();
             }
         }
-        // What is left is the darkroom: the three docked windows and, in
-        // the room between them, the picture — never under a window. The
-        // ground is opaque, so a resize cannot leave the previous print,
-        // enlarger or picture showing through the glass.
+        // Fitted, the picture sits in the opening. Zoomed, it fills this
+        // room and Negative, Enlarger and Print lie on it. The strip is a
+        // panel of its own, outside this room.
         let fill = ui.visuals().panel_fill;
         let docks = egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(fill))
             .show(ui, |ui| {
-                let docks = self.docks(ui.available_rect_before_wrap());
-                ui.scope_builder(egui::UiBuilder::new().max_rect(docks.stage), |ui| self.preview_panel(ui));
+                let full = ui.available_rect_before_wrap();
+                let docks = self.docks(full);
+                let covered = [docks.left, docks.right, docks.bottom];
+                ui.scope_builder(egui::UiBuilder::new().max_rect(full), |ui| {
+                    self.preview_panel(ui, docks.stage, covered);
+                });
                 self.dock_windows(ui, &docks);
                 docks
             })
@@ -3528,6 +3559,50 @@ fn show_dock(
     (hide, content_h + margin.sum().y)
 }
 
+/// Zoomed means the sheet has left the fit. The threshold absorbs the
+/// rounding of a zoom that lands on 1.
+fn picture_is_fitted(zoom: f32) -> bool {
+    zoom <= 1.0 + 1e-3
+}
+
+/// The opening changed enough that a fitted sheet would move.
+fn opening_moved(old: Rect, new: Rect) -> bool {
+    (old.min - new.min).length_sq() > 0.25 || (old.max - new.max).length_sq() > 0.25
+}
+
+/// Keep a magnification the user set when the opening changes. The absolute
+/// scale `fit * zoom` stays, and the pan holds the sheet still on screen.
+/// A fitted sheet is left alone, so it can sit in the new opening.
+fn hold_magnification(
+    zoom: f32,
+    pan: Vec2,
+    old_fit: f32,
+    new_fit: f32,
+    old_center: Pos2,
+    new_center: Pos2,
+) -> (f32, Vec2) {
+    if picture_is_fitted(zoom) || !(old_fit > 0.0 && new_fit > 0.0) {
+        return (zoom, pan);
+    }
+    let zoom = ((old_fit * zoom) / new_fit).clamp(1.0, MAX_ZOOM);
+    if picture_is_fitted(zoom) {
+        (zoom, Vec2::ZERO)
+    } else {
+        (zoom, pan + (old_center - new_center))
+    }
+}
+
+/// How far the sheet may slide and still cover the opening. The rest runs
+/// past the opening, into the room and under the windows.
+fn pan_limit(sheet: Vec2, opening: Vec2) -> Vec2 {
+    ((sheet - opening) * 0.5).max(Vec2::ZERO)
+}
+
+/// The sheet stays centred on the opening. Pan moves it inside [`pan_limit`].
+fn sheet_rect(opening: Rect, pan: Vec2, size: Vec2) -> Rect {
+    Rect::from_center_size(opening.center() + pan, size)
+}
+
 /// The strip closes on the release of a click on the picture, or on the
 /// release of a drag that started on the crosshair. It is not written down.
 fn strip_closes(show: bool, picture_up: bool, clicked_on_picture: bool, crosshair_released: bool) -> bool {
@@ -3757,7 +3832,8 @@ mod crop_drag_tests {
 #[cfg(test)]
 mod dock_tests {
     use super::{
-        docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer, place_docks,
+        docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer,
+        hold_magnification, opening_moved, pan_limit, picture_is_fitted, place_docks, sheet_rect,
         strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, EXPOSURE_RAIL, PANEL_GAP, PANEL_W, SLIDER_STOPS,
     };
     use egui::{Pos2, Rect, Vec2};
@@ -3867,5 +3943,42 @@ mod dock_tests {
             (exposure_stops_from_pointer(left, rail, handle, left + handle / 2.0) + SLIDER_STOPS).abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn a_zoomed_sheet_runs_past_the_opening() {
+        let room = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0));
+        let opening = Rect::from_min_max(Pos2::new(330.0, 0.0), Pos2::new(670.0, 560.0));
+        assert!(picture_is_fitted(1.0));
+        assert!(!picture_is_fitted(1.2));
+        assert_eq!(pan_limit(opening.size(), opening.size()), Vec2::ZERO);
+        let gap = Pos2::new(opening.left() - 6.0, opening.center().y);
+        let fitted = sheet_rect(opening, Vec2::ZERO, opening.size());
+        assert!(!fitted.contains(gap));
+        let sheet = opening.size() * 2.0;
+        let zoomed = sheet_rect(opening, Vec2::ZERO, sheet);
+        assert!(room.intersect(zoomed).contains(gap));
+        assert!(zoomed.contains(opening.center()));
+        let limit = pan_limit(sheet, opening.size());
+        let slid = sheet_rect(opening, Vec2::new(limit.x, 0.0), sheet);
+        assert!((slid.left() - opening.left()).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_chosen_magnification_survives_a_new_opening() {
+        let old = Rect::from_min_max(Pos2::new(100.0, 40.0), Pos2::new(700.0, 500.0));
+        let shrunk = Rect::from_min_max(Pos2::new(100.0, 40.0), Pos2::new(500.0, 400.0));
+        assert!(opening_moved(old, shrunk));
+        assert!(!opening_moved(old, old));
+        let (fitted, pan) =
+            hold_magnification(1.0, Vec2::new(12.0, 4.0), 0.2, 0.1, old.center(), shrunk.center());
+        assert!(picture_is_fitted(fitted));
+        assert_eq!(pan, Vec2::new(12.0, 4.0));
+        let (zoom, pan) = hold_magnification(4.0, Vec2::ZERO, 0.2, 0.1, old.center(), shrunk.center());
+        assert!((0.2 * 4.0 - 0.1 * zoom).abs() < 1e-3);
+        assert_eq!(pan, old.center() - shrunk.center());
+        let (back, pan) = hold_magnification(1.5, Vec2::new(8.0, 8.0), 0.2, 0.5, old.center(), old.center());
+        assert!(picture_is_fitted(back));
+        assert_eq!(pan, Vec2::ZERO);
     }
 }
