@@ -4,7 +4,7 @@ A darkroom for the digital negative.
 
 You open a colour RAW. Mimizan Lab makes a monochrome negative from it and prints that negative the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one.
 
-A sensor with no colour filter is an additional path. That file opens as the measurement. The colour darkroom stays as it is.
+Mimizan Lab also accepts a file from a monochrome sensor, for anyone who wants to develop it here. That sensor has no colour filter, so the file opens as the measurement.
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
