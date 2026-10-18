@@ -270,9 +270,103 @@ pub struct DetailRect {
     pub h: usize,
 }
 
-/// 1:1 crop of the negative for the zoomed view.
+/// Samples kept ready around the visible window, in screen pixels, so a
+/// short pan is already on screen.
+pub const DETAIL_MARGIN: usize = 64;
+
+/// The zoomed window the view asks for.
+///
+/// `step` is the file pixels from one sample to the next. `1` is every
+/// pixel: that is the 1:1 view, and it is what the TIFF stores. A larger
+/// step is the screen's own grid, one nearest file pixel per screen pixel,
+/// while the picture is still smaller than 1:1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DetailAsk {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+    pub step: usize,
+}
+
+impl DetailAsk {
+    pub fn pixels(rect: DetailRect) -> Self {
+        Self { x: rect.x, y: rect.y, w: rect.w, h: rect.h, step: 1 }
+    }
+
+    pub fn step(&self) -> usize {
+        self.step.max(1)
+    }
+
+    /// `self` already holds every sample of `inner`, on the same grid.
+    pub fn covers(&self, inner: &Self) -> bool {
+        let step = self.step();
+        inner.step() == step
+            && inner.x >= self.x
+            && inner.y >= self.y
+            && inner.x + inner.w.saturating_mul(step) <= self.x + self.w.saturating_mul(step)
+            && inner.y + inner.h.saturating_mul(step) <= self.y + self.h.saturating_mul(step)
+    }
+
+    /// The grid of `step` that covers the file window `[x0, x1) × [y0, y1)`,
+    /// clamped to a `lim_w` × `lim_h` picture. `step` of 1 is that window.
+    pub fn covering(
+        x0: usize,
+        y0: usize,
+        x1: usize,
+        y1: usize,
+        step: usize,
+        lim_w: usize,
+        lim_h: usize,
+    ) -> Option<Self> {
+        let step = step.max(1);
+        if x1 <= x0 || y1 <= y0 || x0 >= lim_w || y0 >= lim_h {
+            return None;
+        }
+        let x1 = x1.min(lim_w);
+        let y1 = y1.min(lim_h);
+        let x = x0 - x0 % step;
+        let y = y0 - y0 % step;
+        let w = (x1 - x).div_ceil(step).min((lim_w - x).div_ceil(step));
+        let h = (y1 - y).div_ceil(step).min((lim_h - y).div_ceil(step));
+        (w > 0 && h > 0).then_some(Self { x, y, w, h, step })
+    }
+
+    /// The same grid, grown by `margin` samples on every side, still inside
+    /// the picture and still covering `self`.
+    pub fn expand(&self, margin: usize, lim_w: usize, lim_h: usize) -> Self {
+        let step = self.step();
+        let x = self.x.saturating_sub(margin.saturating_mul(step));
+        let y = self.y.saturating_sub(margin.saturating_mul(step));
+        let x = x - x % step;
+        let y = y - y % step;
+        let x1 = self
+            .x
+            .saturating_add(self.w.saturating_mul(step))
+            .saturating_add(margin.saturating_mul(step))
+            .min(lim_w);
+        let y1 = self
+            .y
+            .saturating_add(self.h.saturating_mul(step))
+            .saturating_add(margin.saturating_mul(step))
+            .min(lim_h);
+        let w = if x < x1 { (x1 - x).div_ceil(step) } else { self.w };
+        let h = if y < y1 { (y1 - y).div_ceil(step) } else { self.h };
+        let w = if x < lim_w { w.min((lim_w - x).div_ceil(step)).max(1) } else { self.w.max(1) };
+        let h = if y < lim_h { h.min((lim_h - y).div_ceil(step)).max(1) } else { self.h.max(1) };
+        Self { x, y, w, h, step }
+    }
+}
+
+/// 1:1 crop of the negative for the zoomed view, or a coarser grid of it.
 pub struct DetailImage {
-    pub rect: DetailRect,
+    pub ask: DetailAsk,
+    pub gray: Vec<u8>,
+}
+
+/// A rendered ask, kept so the next pan can reuse the overlap.
+pub struct DetailTile {
+    pub ask: DetailAsk,
     pub gray: Vec<u8>,
 }
 
@@ -308,82 +402,142 @@ fn crop(p: &Plane, r: DetailRect) -> Plane {
     out
 }
 
-/// Render `rect` of the negative at full resolution.
+/// Render `ask` of the negative.
 ///
-/// The mask is the sidecar. Otherwise the pixels are the 8-bit face of the
-/// file: with `codes` and no placing, a lookup in the cached mix; else the
-/// visible window is mixed and looked up in `table`. The rectangle is
-/// clamped to the image; the returned `rect` is the one actually rendered.
+/// `step` of 1 is every file pixel. A larger step reads only that grid, the
+/// nearest file pixel of each screen pixel. The mask is the sidecar.
+/// Otherwise the pixels are the 8-bit face of the file: with `codes` and no
+/// placing, a lookup in the cached mix; else the samples are mixed and
+/// looked up in `table`. The ask is clamped to the image.
 pub fn render_detail(
     s: &Session,
     v: &ViewParams,
-    rect: DetailRect,
+    ask: DetailAsk,
     table: &ToneTable,
     codes: Option<&[u16]>,
 ) -> Option<DetailImage> {
+    let step = ask.step();
     let sep = s.separation();
     let (sw, sh) = (sep.lum.width, sep.lum.height);
     let orientation = rotated(s.negative.orientation, v.rotation);
     let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
-    // A committed crop: `rect` is in the window. Shift it onto the full upright.
-    let (rect, origin) = match v.crop {
+    // A committed crop: the ask is in the window. Shift it onto the full upright.
+    let (x, y, origin) = match v.crop {
         Some(c) => {
             let (fw, fh) = s.upright_size();
             let t = c.turned(v.rotation, fw as u32, fh as u32).sanitized(uw as u32, uh as u32);
             (
-                DetailRect {
-                    x: rect.x.saturating_add(t.x as usize),
-                    y: rect.y.saturating_add(t.y as usize),
-                    w: rect.w,
-                    h: rect.h,
-                },
+                ask.x.saturating_add(t.x as usize),
+                ask.y.saturating_add(t.y as usize),
                 (t.x as usize, t.y as usize),
             )
         }
-        None => (rect, (0, 0)),
+        None => (ask.x, ask.y, (0, 0)),
     };
-    if rect.x >= uw || rect.y >= uh {
+    if x >= uw || y >= uh || ask.w == 0 || ask.h == 0 {
         return None;
     }
-    let rect = DetailRect {
-        x: rect.x,
-        y: rect.y,
-        w: rect.w.min(uw - rect.x).max(1),
-        h: rect.h.min(uh - rect.y).max(1),
-    };
-    let gray = if v.show_mask {
-        let src = source_rect(orientation, sw, sh, rect);
-        let n = &s.negative;
-        let mut m = Plane::zeros(src.w, src.h);
-        m.data.par_chunks_mut(src.w).enumerate().for_each(|(y, row)| {
-            let base = (src.y + y) * n.plane.width + src.x;
-            for (x, o) in row.iter_mut().enumerate() {
-                *o = f64::from(n.mask8[base + x]) / 255.0;
-            }
-        });
-        let upright = orient(&m, orientation);
-        debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
-        upright.data.par_iter().map(|&x| (x.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
-    } else if v.place == 0.0 {
-        if let Some(codes) = codes.filter(|c| c.len() == sw * sh) {
-            display_codes(codes, sw, sh, orientation, rect, table)
-        } else {
-            let src = source_rect(orientation, sw, sh, rect);
-            display_bytes(&mixed_upright(sep, &v.weights, src, orientation), 0.0, table)
-        }
-    } else {
-        let src = source_rect(orientation, sw, sh, rect);
-        display_bytes(&mixed_upright(sep, &v.weights, src, orientation), v.place, table)
-    };
+    let w = ask.w.min((uw - x).div_ceil(step));
+    let h = ask.h.min((uh - y).div_ceil(step));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let rect = DetailRect { x, y, w, h };
+    let src = DetailSource { s, v, sep, sw, sh, orientation, table, codes };
+    let gray = if step == 1 { src.dense(rect) } else { src.grid(x, y, w, h, step) };
+    debug_assert_eq!(gray.len(), w * h);
     Some(DetailImage {
-        rect: DetailRect {
-            x: rect.x.saturating_sub(origin.0),
-            y: rect.y.saturating_sub(origin.1),
-            w: rect.w,
-            h: rect.h,
-        },
+        ask: DetailAsk { x: x.saturating_sub(origin.0), y: y.saturating_sub(origin.1), w, h, step },
         gray,
     })
+}
+
+/// What one sample of the negative needs. Shared by the dense 1:1 path and
+/// the coarser screen grid.
+#[derive(Clone, Copy)]
+struct DetailSource<'a> {
+    s: &'a Session,
+    v: &'a ViewParams,
+    sep: &'a Separation,
+    sw: usize,
+    sh: usize,
+    orientation: u16,
+    table: &'a ToneTable,
+    codes: Option<&'a [u16]>,
+}
+
+impl DetailSource<'_> {
+    /// Every file pixel of `rect`. The path 1:1 has always used.
+    fn dense(&self, rect: DetailRect) -> Vec<u8> {
+        let Self { s, v, sep, sw, sh, orientation, table, codes } = *self;
+        if v.show_mask {
+            let src = source_rect(orientation, sw, sh, rect);
+            let n = &s.negative;
+            let mut m = Plane::zeros(src.w, src.h);
+            m.data.par_chunks_mut(src.w).enumerate().for_each(|(y, row)| {
+                let base = (src.y + y) * n.plane.width + src.x;
+                for (x, o) in row.iter_mut().enumerate() {
+                    *o = f64::from(n.mask8[base + x]) / 255.0;
+                }
+            });
+            let upright = orient(&m, orientation);
+            debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
+            upright.data.par_iter().map(|&x| (x.clamp(0.0, 1.0) * 255.0).round() as u8).collect()
+        } else if v.place == 0.0 {
+            if let Some(codes) = codes.filter(|c| c.len() == sw * sh) {
+                display_codes(codes, sw, sh, orientation, rect, table)
+            } else {
+                let src = source_rect(orientation, sw, sh, rect);
+                display_bytes(&mixed_upright(sep, &v.weights, src, orientation), 0.0, table)
+            }
+        } else {
+            let src = source_rect(orientation, sw, sh, rect);
+            display_bytes(&mixed_upright(sep, &v.weights, src, orientation), v.place, table)
+        }
+    }
+
+    /// One sample every `step` file pixels. Sample `(i, j)` is the file pixel
+    /// `(x + i·step, y + j·step)`, the nearest file pixel of one screen pixel.
+    fn grid(&self, x: usize, y: usize, w: usize, h: usize, step: usize) -> Vec<u8> {
+        let Self { s, v, sep, sw, sh, orientation, table, codes } = *self;
+        let mut out = vec![0u8; w * h];
+        let codes = codes.filter(|c| c.len() == sw * sh);
+        let n = &s.negative;
+        out.par_chunks_mut(w).enumerate().for_each(|(j, row)| {
+            let oy = y + j * step;
+            for (i, o) in row.iter_mut().enumerate() {
+                let ox = x + i * step;
+                let (sx, sy) = sensor_xy(orientation, sw, sh, ox, oy);
+                *o = if v.show_mask {
+                    n.mask8[sy * n.plane.width + sx]
+                } else if v.place == 0.0 {
+                    if let Some(codes) = codes {
+                        table.show[codes[sy * sw + sx] as usize]
+                    } else {
+                        show_sample(mix_at(sep, &v.weights, sx, sy), 0.0, table)
+                    }
+                } else {
+                    show_sample(mix_at(sep, &v.weights, sx, sy), v.place, table)
+                };
+            }
+        });
+        out
+    }
+}
+
+fn mix_at(sep: &Separation, w: &Weights, x: usize, y: usize) -> f64 {
+    let l = sep.lum.at(x, y);
+    if w.is_native() {
+        return l;
+    }
+    let k1 = w.g - w.r - w.b;
+    let k2 = 2.0 * (w.r - w.b);
+    l + k1 * sep.c1.at(x, y) + k2 * sep.c2.at(x, y)
+}
+
+fn show_sample(v: f64, place: f64, table: &ToneTable) -> u8 {
+    let q = if place == 0.0 { q16(v) } else { q16(v * 2f64.powf(place)) };
+    table.show[q]
 }
 
 fn mixed_upright(sep: &Separation, weights: &Weights, src: DetailRect, orientation: u16) -> Plane {
@@ -410,7 +564,7 @@ pub fn render_print_detail(
     table: &ToneTable,
 ) -> Option<DetailImage> {
     if v.show_mask {
-        return render_detail(s, v, rect, table, None);
+        return render_detail(s, v, DetailAsk::pixels(rect), table, None);
     }
     let sep = s.separation();
     let (sensor_w, sensor_h) = (sep.lum.width, sep.lum.height);
@@ -441,7 +595,82 @@ pub fn render_print_detail(
     let window = PlaneWindow { plane: &mixed, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
     let picture = resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix);
     let gray = display_bytes(&picture, v.place, table);
-    Some(DetailImage { rect, gray })
+    Some(DetailImage { ask: DetailAsk::pixels(rect), gray })
+}
+
+/// `have` supplies every sample that already sits on this grid. The rest is
+/// rendered: a pan is the newly uncovered strip, a jump or a new step is the
+/// whole ask. `render` returns `w * h` samples for the ask it is given.
+pub fn cover_detail(
+    have: Option<&DetailTile>,
+    ask: DetailAsk,
+    mut render: impl FnMut(DetailAsk) -> Vec<u8>,
+) -> DetailTile {
+    let Some(old) = have else {
+        return DetailTile { gray: render(ask), ask };
+    };
+    let step = ask.step();
+    let aligned = ask.x.is_multiple_of(step)
+        && ask.y.is_multiple_of(step)
+        && old.ask.step() == step
+        && old.ask.x.is_multiple_of(step)
+        && old.ask.y.is_multiple_of(step)
+        && old.gray.len() == old.ask.w.saturating_mul(old.ask.h);
+    let (Some(shift_i), Some(shift_j)) = (
+        aligned.then(|| grid_shift(ask.x, old.ask.x, step)).flatten(),
+        aligned.then(|| grid_shift(ask.y, old.ask.y, step)).flatten(),
+    ) else {
+        return DetailTile { gray: render(ask), ask };
+    };
+    let mut gray = vec![0u8; ask.w.saturating_mul(ask.h)];
+    let ni0 = (-shift_i).max(0) as usize;
+    let ni1 = (old.ask.w as isize - shift_i).clamp(0, ask.w as isize) as usize;
+    let nj0 = (-shift_j).max(0) as usize;
+    let nj1 = (old.ask.h as isize - shift_j).clamp(0, ask.h as isize) as usize;
+    if ni0 >= ni1 || nj0 >= nj1 {
+        return DetailTile { gray: render(ask), ask };
+    }
+    for nj in nj0..nj1 {
+        let oj = (nj as isize + shift_j) as usize;
+        let src = oj * old.ask.w + (ni0 as isize + shift_i) as usize;
+        let dst = nj * ask.w + ni0;
+        let n = ni1 - ni0;
+        gray[dst..dst + n].copy_from_slice(&old.gray[src..src + n]);
+    }
+    if ni0 == 0 && ni1 == ask.w && nj0 == 0 && nj1 == ask.h {
+        return DetailTile { ask, gray };
+    }
+    let mut gaps = Vec::with_capacity(4);
+    if ni0 > 0 {
+        gaps.push((0, 0, ni0, ask.h));
+    }
+    if ni1 < ask.w {
+        gaps.push((ni1, 0, ask.w - ni1, ask.h));
+    }
+    if nj0 > 0 && ni1 > ni0 {
+        gaps.push((ni0, 0, ni1 - ni0, nj0));
+    }
+    if nj1 < ask.h && ni1 > ni0 {
+        gaps.push((ni0, nj1, ni1 - ni0, ask.h - nj1));
+    }
+    for (gx, gy, gw, gh) in gaps {
+        let sub = DetailAsk { x: ask.x + gx * step, y: ask.y + gy * step, w: gw, h: gh, step };
+        let got = render(sub);
+        if got.len() != gw * gh {
+            return DetailTile { gray: render(ask), ask };
+        }
+        for j in 0..gh {
+            let dst = (gy + j) * ask.w + gx;
+            let src = j * gw;
+            gray[dst..dst + gw].copy_from_slice(&got[src..src + gw]);
+        }
+    }
+    DetailTile { ask, gray }
+}
+
+fn grid_shift(new_origin: usize, old_origin: usize, step: usize) -> Option<isize> {
+    let d = new_origin as isize - old_origin as isize;
+    (step > 0 && d % step as isize == 0).then_some(d / step as isize)
 }
 
 pub struct SharpenLoupe {
@@ -1105,6 +1334,90 @@ mod tests {
         let codes = mix_codes(&sep, &wts);
         let got = display_codes(&codes, w, h, o, rect, &table);
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn one_to_one_covers_the_window_exactly() {
+        let ask = DetailAsk::covering(2, 5, 9, 12, 1, 40, 30).unwrap();
+        assert_eq!((ask.x, ask.y, ask.w, ask.h, ask.step), (2, 5, 7, 7, 1));
+    }
+
+    /// Below 1:1 the grid starts on a sample boundary and reaches the far edge.
+    #[test]
+    fn a_coarse_grid_covers_the_visible_window() {
+        let ask = DetailAsk::covering(10, 3, 20, 15, 4, 100, 80).unwrap();
+        assert_eq!(ask.step, 4);
+        assert_eq!((ask.x, ask.y), (8, 0));
+        assert!(ask.x + ask.w * ask.step >= 20);
+        assert!(ask.y + ask.h * ask.step >= 15);
+        assert!(ask.x + (ask.w - 1) * ask.step < 100);
+        let grown = ask.expand(2, 100, 80);
+        assert!(grown.covers(&ask));
+        assert!(grown.x + grown.w * grown.step <= 100);
+        assert!(grown.y + grown.h * grown.step <= 80);
+    }
+
+    #[test]
+    fn mix_at_matches_the_mixed_plane() {
+        let (w, h) = (6usize, 4usize);
+        let mut lum = Plane::zeros(w, h);
+        let mut c1 = Plane::zeros(w, h);
+        let mut c2 = Plane::zeros(w, h);
+        for (i, ((l, a), b)) in
+            lum.data.iter_mut().zip(c1.data.iter_mut()).zip(c2.data.iter_mut()).enumerate()
+        {
+            *l = 0.2 + 0.05 * i as f64;
+            *a = 0.01 * (i as f64 - 3.0);
+            *b = -0.02 * ((i % 3) as f64);
+        }
+        let sep = Separation {
+            lum,
+            c1,
+            c2,
+            mask_max: Plane::zeros(1, 1),
+            rounds: 1,
+            phase: mimizan_core::cfa::BayerPhase::RGGB,
+            computed: 0.0,
+        };
+        let wts = Weights { r: 0.2, g: 0.5, b: 0.3 };
+        let mixed = mix(&sep, &wts);
+        for y in 0..h {
+            for x in 0..w {
+                let got = mix_at(&sep, &wts, x, y);
+                assert!((got - mixed.at(x, y)).abs() < 1e-12, "at {x},{y}");
+            }
+        }
+    }
+
+    /// A diagonal pan keeps the shared samples and asks only for the new strips.
+    #[test]
+    fn a_pan_fills_only_the_new_strip() {
+        fn paint(ask: DetailAsk) -> Vec<u8> {
+            (0..ask.h)
+                .flat_map(|j| {
+                    (0..ask.w).map(move |i| ((ask.x / ask.step + i) * 3 + (ask.y / ask.step + j)) as u8)
+                })
+                .collect()
+        }
+        let first = DetailAsk { x: 0, y: 0, w: 6, h: 4, step: 2 };
+        let have = cover_detail(None, first, paint);
+        assert_eq!(have.gray, paint(first));
+        let next = DetailAsk { x: 4, y: 2, w: 6, h: 4, step: 2 };
+        let mut strips = 0usize;
+        let got = cover_detail(Some(&have), next, |ask| {
+            strips += 1;
+            assert!(ask.w * ask.h < next.w * next.h, "a pan must not rebuild the window");
+            paint(ask)
+        });
+        assert_eq!(got.gray, paint(next));
+        assert!((1..=4).contains(&strips), "strips {strips}");
+        let mut again = 0usize;
+        let same = cover_detail(Some(&got), next, |_| {
+            again += 1;
+            Vec::new()
+        });
+        assert_eq!(again, 0);
+        assert_eq!(same.gray, paint(next));
     }
 
     /// The desktop program starts with the last octave reconstructed. The

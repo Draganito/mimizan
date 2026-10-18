@@ -6,7 +6,7 @@ use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbSta
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
-use crate::session::{DetailRect, DevelopParams, Histogram, Session, ViewParams};
+use crate::session::{DetailAsk, DevelopParams, Histogram, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
     Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, Preview, PreviewRequest, PreviewResult,
 };
@@ -302,13 +302,13 @@ pub struct App {
     last_fit: Option<f32>,
     last_stage: Option<Rect>,
     keep_scale: Option<f32>,
-    /// 1:1 window of the full negative for the zoomed view (upright, rotated
-    /// pixel coordinates) and its texture.
+    /// Sharp window of the zoomed view and its texture. At 1:1, `step` is 1
+    /// and every file pixel is here. Below that, `step` is the screen grid.
     detail_texture: Option<TextureHandle>,
-    detail_rect: Option<DetailRect>,
+    detail_rect: Option<DetailAsk>,
     /// Window the view currently wants (None when the fit preview suffices).
-    wanted_detail: Option<DetailRect>,
-    last_detail_request: Option<DetailRect>,
+    wanted_detail: Option<DetailAsk>,
+    last_detail_request: Option<DetailAsk>,
     /// Fitted-print recipe last sent for the 100% window. `None` is the negative.
     last_inspect: Option<Recipe>,
     generation: u64,
@@ -1346,17 +1346,17 @@ impl App {
             self.hist_negative = im.hist_negative;
         }
         if let Some(d) = r.detail {
-            let img = ColorImage::from_gray([d.rect.w, d.rect.h], &d.gray);
-            // Shown at >= 1 screen pixel per image pixel: no filtering, the
-            // pixels are the point.
+            let img = ColorImage::from_gray([d.ask.w, d.ask.h], &d.gray);
+            // One sample is one screen pixel, or one file pixel at 1:1.
+            // Nearest keeps that sample; it does not blend it with a neighbour.
             let opts = TextureOptions::NEAREST;
             match &mut self.detail_texture {
-                Some(t) if self.detail_rect.is_some_and(|r| (r.w, r.h) == (d.rect.w, d.rect.h)) => {
+                Some(t) if self.detail_rect.is_some_and(|r| (r.w, r.h) == (d.ask.w, d.ask.h)) => {
                     t.set(img, opts)
                 }
                 _ => self.detail_texture = Some(ctx.load_texture("detail", img, opts)),
             }
-            self.detail_rect = Some(d.rect);
+            self.detail_rect = Some(d.ask);
         }
     }
 
@@ -2648,7 +2648,12 @@ impl App {
         let inspecting = self.inspect_recipe().is_some();
         // 0.999 absorbs the rounding of the 1:1 zoom, which lands on 1.
         let show_file = if inspecting { mag >= 0.999 } else { texel_px > 1.0 };
-        self.wanted_detail = if show_file && uw > 0 && uh > 0 {
+        // Below 1:1 each screen pixel already shows one file pixel. The step
+        // is that ratio, so the window is the size of the screen. At 1:1 the
+        // step is 1 and every file pixel in view is rendered.
+        let step =
+            if inspecting || mag >= 0.999 { 1 } else { (1.0 / mag.max(1.0e-3)).floor().max(1.0) as usize };
+        let visible = if show_file && uw > 0 && uh > 0 {
             // Zoomed, this is the whole room, so the sharp picture continues
             // under the windows.
             let vis = clip.intersect(rect);
@@ -2656,16 +2661,25 @@ impl App {
             let y0 = ((vis.top() - rect.top()) / pts_per_px).floor().max(0.0) as usize;
             let x1 = (((vis.right() - rect.left()) / pts_per_px).ceil() as usize).min(uw);
             let y1 = (((vis.bottom() - rect.top()) / pts_per_px).ceil() as usize).min(uh);
-            (x1 > x0 && y1 > y0).then_some(DetailRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+            (x1 > x0 && y1 > y0).then(|| DetailAsk::covering(x0, y0, x1, y1, step, uw, uh)).flatten()
         } else {
             None
+        };
+        // A pan that stays inside the margin is already rendered. The tile
+        // keeps its place on the picture, so the hand just slides it.
+        self.wanted_detail = match visible {
+            Some(v) if self.detail_rect.is_some_and(|have| have.covers(&v)) => self.detail_rect,
+            Some(v) => Some(v.expand(DETAIL_MARGIN, uw, uh)),
+            None => None,
         };
         if self.wanted_detail.is_none() {
             self.detail_rect = None;
         }
         if let (Some(dt), Some(dr)) = (&self.detail_texture, self.detail_rect) {
+            let step = dr.step() as f32;
             let min = rect.min + Vec2::new(dr.x as f32, dr.y as f32) * pts_per_px;
-            let drect = Rect::from_min_size(min, Vec2::new(dr.w as f32, dr.h as f32) * pts_per_px);
+            let drect =
+                Rect::from_min_size(min, Vec2::new(dr.w as f32 * step, dr.h as f32 * step) * pts_per_px);
             painter.image(
                 dt.id(),
                 drect,

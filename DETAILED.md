@@ -295,7 +295,7 @@ right-click and Open.
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 ```bash
-sudo apt install ./mimizan_0.11.12-1_amd64.deb
+sudo apt install ./mimizan_0.11.13-1_amd64.deb
 mimizan --version
 ```
 

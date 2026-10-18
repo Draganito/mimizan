@@ -4,9 +4,9 @@
 //! same way, the pixels the TIFF gets.
 
 use crate::session::{
-    preview_planes, render_detail, render_preview, render_print_detail, render_sharpen_loupe, DetailImage,
-    DetailRect, DevelopParams, HistCache, PreviewImage, RawHistogram, Session, SharpenLoupe, ToneHold,
-    ViewParams,
+    cover_detail, preview_planes, render_detail, render_preview, render_print_detail, render_sharpen_loupe,
+    DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams, HistCache, PreviewImage, RawHistogram,
+    Session, SharpenLoupe, ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -191,10 +191,10 @@ fn export(
 pub struct PreviewRequest {
     pub session: Arc<Session>,
     pub view: ViewParams,
-    /// Full-resolution window the zoomed view needs, if any.
-    /// Without `inspect` the coordinates are negative pixels. With it, they
-    /// are pixels of the fitted print.
-    pub detail: Option<DetailRect>,
+    /// Window the zoomed view needs, if any. Without `inspect` the
+    /// coordinates are negative pixels and `step` may skip to the screen
+    /// grid. With `inspect` they are pixels of the fitted print, step 1.
+    pub detail: Option<DetailAsk>,
     /// Set when a centimetre size makes 100% a window of the fitted print.
     pub inspect: Option<Recipe>,
     pub generation: u64,
@@ -224,8 +224,12 @@ impl Preview {
                 // What the last render was based on. A pan re-renders only the
                 // 1:1 window. A new exposure re-renders the fit copy and that window.
                 let mut last: Option<(*const Session, ViewParams)> = None;
-                let mut last_detail: Option<DetailRect> = None;
+                let mut last_detail: Option<DetailAsk> = None;
                 let mut last_inspect: Option<Recipe> = None;
+                // The last sharp window. A pan reuses it and renders only the
+                // strip that came into view. A new exposure drops it.
+                let mut held: Option<DetailTile> = None;
+                let mut held_print = false;
                 let mut hists = HistCache::default();
                 let mut tones = ToneHold::default();
                 while let Ok(mut req) = reqs.recv() {
@@ -236,21 +240,44 @@ impl Preview {
                     let t = Instant::now();
                     let key = (Arc::as_ptr(&req.session), req.view.clone());
                     let view_changed = last.as_ref() != Some(&key);
+                    // The held window is the previous exposure. Drop it even
+                    // when this frame shows no sharp window, or the next zoom
+                    // would reuse those pixels.
+                    if view_changed {
+                        held = None;
+                    }
                     let table = tones.get(&req.view.tone);
                     let image =
                         view_changed.then(|| render_preview(&req.session, &req.view, &mut hists, table));
                     let detail_due = req.detail.is_some()
                         && (view_changed || last_detail != req.detail || last_inspect != req.inspect);
                     let detail = if detail_due {
-                        let r = req.detail.unwrap();
-                        if let Some(recipe) = &req.inspect {
-                            render_print_detail(&req.session, &req.view, recipe, r, table)
-                        } else if req.view.show_mask || req.view.place != 0.0 {
-                            render_detail(&req.session, &req.view, r, table, None)
-                        } else {
-                            let codes = hists.codes_for(&req.session, &req.view.weights);
-                            render_detail(&req.session, &req.view, r, table, Some(codes))
+                        let ask = req.detail.unwrap();
+                        let print = req.inspect.is_some();
+                        if view_changed || print != held_print {
+                            held = None;
                         }
+                        held_print = print;
+                        let tile = if let Some(recipe) = &req.inspect {
+                            let recipe = recipe.clone();
+                            cover_detail(held.as_ref(), ask, |sub| {
+                                let rect = DetailRect { x: sub.x, y: sub.y, w: sub.w, h: sub.h };
+                                render_print_detail(&req.session, &req.view, &recipe, rect, table)
+                                    .map(|d| d.gray)
+                                    .unwrap_or_default()
+                            })
+                        } else {
+                            let codes = (req.view.place == 0.0 && !req.view.show_mask)
+                                .then(|| hists.codes_for(&req.session, &req.view.weights));
+                            cover_detail(held.as_ref(), ask, |sub| {
+                                render_detail(&req.session, &req.view, sub, table, codes)
+                                    .map(|d| d.gray)
+                                    .unwrap_or_default()
+                            })
+                        };
+                        let image = DetailImage { ask: tile.ask, gray: tile.gray.clone() };
+                        held = Some(tile);
+                        Some(image)
                     } else {
                         None
                     };
