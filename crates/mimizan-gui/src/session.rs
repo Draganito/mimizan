@@ -1846,8 +1846,7 @@ mod histogram_tests {
             exposure: Default::default(),
             data: RawData::Integer(raw),
         };
-        let mut params = NegativeParams::default();
-        params.keep_separation = true;
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         assert!(neg.separation.is_none());
         assert!(!neg.info.reconstruct);

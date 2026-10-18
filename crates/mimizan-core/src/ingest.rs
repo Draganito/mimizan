@@ -490,7 +490,7 @@ mod tests {
     fn mono_keeps_an_odd_crop_origin() {
         let (w, h) = (8usize, 8usize);
         let mut raw = vec![0u16; w * h];
-        raw[1 * w + 1] = 500;
+        raw[w + 1] = 500;
         let frame = |kind| RawFrame {
             make: String::new(),
             model: String::new(),
@@ -509,8 +509,7 @@ mod tests {
             exposure: Default::default(),
             data: crate::decode::RawData::Integer(raw.clone()),
         };
-        let mut p = IngestParams::default();
-        p.fix_defects = false;
+        let p = IngestParams { fix_defects: false, ..IngestParams::default() };
         let mono = ingest(&frame(SensorKind::Mono), &p);
         assert_eq!((mono.plane.width, mono.plane.height), (5, 5));
         assert!((mono.plane.at(0, 0) - 0.5).abs() < 1e-12);
