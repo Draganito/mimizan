@@ -166,7 +166,7 @@ pub fn run_scene(scene: Scene, w: usize, h: usize, sp: &SynthParams, p: &Separat
     SceneResult { scene, width: w, height: h, synth: *sp, separate: *p, truth_star, mimizan: ours, baseline }
 }
 
-/// Markdown table row set for RESULTS.md.
+/// Markdown table of a bench run.
 pub fn markdown(results: &[SceneResult]) -> String {
     let mut s = String::new();
     s.push_str("| Scene | Size | Estimator | RMSE | RMSE/σ | p99 | Interior RMSE/σ | MTF50 axis | MTF50 diag | MTF10 axis | Ring | Carrier max | Wedge slope | Wedge resid | ms (rounds) |\n");

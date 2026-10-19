@@ -42,9 +42,8 @@ pub struct DevelopParams {
 
 impl Default for DevelopParams {
     fn default() -> Self {
-        // Pixel-adaptive Dubois separation is the default (RESULTS.md, Kodak
-        // benchmark); the fixed estimator and the block mask stay available
-        // under Development.
+        // Pixel-adaptive Dubois separation is the default; the fixed estimator
+        // and the block mask stay available under Development.
         Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois, fix_defects: false, reconstruct: true }
     }
 }

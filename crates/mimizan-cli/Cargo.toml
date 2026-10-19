@@ -54,6 +54,5 @@ assets = [
     ["../../dist/icons/mimizan-128.png", "usr/share/icons/hicolor/128x128/apps/mimizan.png", "644"],
     ["../../dist/icons/mimizan-256.png", "usr/share/icons/hicolor/256x256/apps/mimizan.png", "644"],
     ["../../README.md", "usr/share/doc/mimizan/", "644"],
-    ["../../DETAILED.md", "usr/share/doc/mimizan/", "644"],
     ["../../LICENSE", "usr/share/doc/mimizan/LICENSE.txt", "644"],
 ]

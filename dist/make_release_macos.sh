@@ -4,7 +4,7 @@
 # Result (always under dist/, not committed):
 #   dist/mimizan-<version>-aarch64-macos.zip
 #     Mimizan Lab.app  (double click starts mimizan-gui; no Terminal)
-#     README.md, DETAILED.md, LICENSE
+#     README.md, LICENSE
 #
 # The two programs link only the frameworks that ship with macOS.
 # cameras/ and look/ sit beside them inside Contents/MacOS.
@@ -45,7 +45,7 @@ trap 'rm -rf "$STAGE"' EXIT
 NAME="mimizan-$VERSION-aarch64-macos"
 mkdir -p "$STAGE/$NAME"
 "$PROJECT_DIR/dist/assemble_macos_app.sh" "$CLI" "$GUI" "$STAGE/$NAME/Mimizan Lab.app" "$VERSION"
-cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
+cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
 
 DIST="$PROJECT_DIR/dist"
 mkdir -p "$DIST"

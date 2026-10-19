@@ -11,7 +11,7 @@
 //! interpolating kernel smoother than linear has negative lobes and rings at a
 //! hard edge; the only member of the cubic family without them is the
 //! B-spline, and it halves the MTF at 0.4 c/px. The step overshoot and the
-//! MTF of each kernel are in `docs/RESULTS.md` ("Resampling kernels"); the
+//! MTF of each kernel were measured on the bench; the
 //! choice is recorded in the print's description.
 
 use crate::plane::Plane;

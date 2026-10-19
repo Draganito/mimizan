@@ -1,5 +1,5 @@
-//! Criterion benches for the hot stages (SPEC section 12). Run with
-//! `cargo bench -p mimizan-core`; the figures in docs/RESULTS.md come from here
+//! Criterion benches for the hot stages. Run with
+//! `cargo bench -p mimizan-core`. The numbers come from here
 //! and from `mimizan negative` on the real samples.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};

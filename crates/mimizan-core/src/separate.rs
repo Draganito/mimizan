@@ -40,7 +40,7 @@ pub struct SeparateParams {
 impl Default for SeparateParams {
     fn default() -> Self {
         // rounds_max = 1: the cross-term refinement changed no bench figure
-        // beyond the fourth digit while doubling the run time (RESULTS.md).
+        // beyond the fourth digit while doubling the run time.
         Self {
             cutoff: 0.15,
             transition: 0.05,

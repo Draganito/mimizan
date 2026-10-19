@@ -1,6 +1,6 @@
 //! mimizan-core: Bayer RAW to linear monochrome negative.
 //!
-//! The contract for every number in this crate is `docs/SPEC.md`.
+//! The method is written up in `docs/PAPER.md`. The code and its tests are the contract.
 
 pub mod baseline;
 pub mod bench;

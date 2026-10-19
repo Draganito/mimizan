@@ -3,9 +3,8 @@
 **The Mimizan algorithm — a complete description**
 
 Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.8
-(`github.com/Draganito/mimizan`, GPL-3.0-or-later). Normative values are
-those of `docs/SPEC.md`; where this text and the code disagree, the code
-and its tests are right and this text has a bug.
+(`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
+code disagree, the code and its tests are right and this text has a bug.
 
 ---
 
@@ -789,8 +788,8 @@ nonlinear step can only lose.
   JOSA 62(1), 1972; L. B. Lucy, Astron. J. 79, 1974.
 - Liu, Yang, Chen, "Frequency Enhancement for Image Demosaicking",
   arXiv:2503.15800 (as a bound only; no network in this method).
-- D. Bojovic, `docs/whitepaper_v1.pdf` (the original idea), `docs/SPEC.md`
-  (normative constants), `docs/RESULTS.md` (all measurements).
+- D. Bojovic, `docs/whitepaper_v1.pdf` (the original idea). Where this text
+  and the code disagree, the code and its tests are right.
 
 ---
 

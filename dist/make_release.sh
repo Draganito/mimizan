@@ -3,7 +3,7 @@
 #
 # Result (always under dist/, not committed):
 #   dist/mimizan_<version>_amd64.deb                 both binaries, cameras/, look/,
-#                                                     desktop file, README, manual, license
+#                                                     desktop file, README, license
 #   dist/mimizan-<version>-x86_64-linux.tar.gz       the same as a plain tarball
 #
 # Usage:  dist/make_release.sh [--skip-build]
@@ -40,7 +40,7 @@ NAME="mimizan-$VERSION-x86_64-linux"
 mkdir -p "$STAGE/$NAME"
 cp "$CLI" "$GUI" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
-cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
+cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/dist/mimizan-gui.desktop" "$STAGE/$NAME/"
 mkdir -p "$STAGE/$NAME/icons"
 cp "$PROJECT_DIR"/dist/icons/mimizan-*.png "$STAGE/$NAME/icons/"
@@ -64,7 +64,6 @@ if command -v cargo-deb >/dev/null; then
         ./usr/share/icons/hicolor/256x256/apps/mimizan.png \
         ./usr/share/icons/hicolor/48x48/apps/mimizan.png \
         ./usr/share/doc/mimizan/README.md \
-        ./usr/share/doc/mimizan/DETAILED.md \
         ./usr/share/doc/mimizan/LICENSE.txt
     do
         grep -q " $f\$" <<<"$LISTING" || { echo "ERROR: $f missing in deb"; exit 1; }

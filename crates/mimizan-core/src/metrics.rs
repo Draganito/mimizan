@@ -285,7 +285,7 @@ mod tests {
         let l = rgb.luminance();
         let rep = star_mtf(&l, n as f64 / 2.0, n as f64 / 2.0, STAR_SPOKES, 20.0, 230.0);
         // The pixel aperture (4x4 supersampling) plus the contrast sampling of
-        // the star limit the truth itself to about 0.27 c/px (RESULTS.md).
+        // the star limit the truth itself to about 0.27 c/px.
         assert!(rep.mtf50_axis.unwrap() > 0.25, "{:?}", rep.mtf50_axis);
         assert!(rep.mtf50_diag.unwrap() > 0.25, "{:?}", rep.mtf50_diag);
     }

@@ -554,7 +554,7 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
     }
     s.push_str("\nlibraw: `dcraw_emu -4 -o 0 -r 1 1 1 1 -c 0 -H 0 -q N` (linear 16-bit, camera channels, unit balance). \
                 RawTherapee: `rawtherapee-cli -n -b16 -p <neutral profile with the demosaicer>`, sRGB transfer curve inverted on read. \
-                Both were verified to return the source channels unchanged on a smooth picture (see `docs/RESULTS.md`).\n\n");
+                Both were verified to return the source channels unchanged on a smooth picture.\n\n");
 
     let n = r.images.len();
     let header_methods: Vec<&str> = METHODS.iter().map(|m| m.name).collect();

@@ -54,7 +54,7 @@ New-Item -ItemType Directory -Path $Root -Force | Out-Null
 Copy-Item -LiteralPath $Cli, $Gui -Destination $Root
 Copy-Item -LiteralPath (Join-Path $ProjectDir "cameras") -Destination $Root -Recurse
 Copy-Item -LiteralPath (Join-Path $ProjectDir "look") -Destination $Root -Recurse
-foreach ($doc in @("README.md", "DETAILED.md", "LICENSE")) {
+foreach ($doc in @("README.md", "LICENSE")) {
     Copy-Item -LiteralPath (Join-Path $ProjectDir $doc) -Destination $Root
 }
 

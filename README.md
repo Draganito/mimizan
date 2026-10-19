@@ -26,9 +26,9 @@ The folder lies along the bottom as a strip of negatives. It closes when you cli
 
 A colour sensor records luminance and chrominance in one mosaic. Mimizan Lab takes the luminance straight from that mosaic. The default path does not demosaic. There is no hidden tone curve. Every step is measured, and the same recipe gives the same bytes.
 
-On photographs a lens can take, that negative leads when the picture is band-limited and sits in the leading group when a lens-like picture still reaches the sensor. With reconstruct it has the highest mean of those photographic tests. The tables, and the pixel-sharp test where it trails, are in the [detailed README](DETAILED.md#where-it-stands).
-
 The print is a sheet of Ilford Multigrade. The soft pass is the measured grade-00 curve (ISO R 160). The hard pass is grade 5 (ISO R 50). The preview is that print.
+
+It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no colour output, no noise reduction, no lens correction. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
 
 ## Get it
 
@@ -42,9 +42,18 @@ sudo apt install ./mimizan_0.11.14-1_amd64.deb
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.14-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. Building from source, the command line and the camera file are in the [detailed README](DETAILED.md#install).
+Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.14-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation.
 
-Apple silicon: unzip `mimizan-0.11.14-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS.
+Apple silicon: unzip `mimizan-0.11.14-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+
+From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and a working OpenGL for the GUI):
+
+```bash
+git clone https://github.com/Draganito/mimizan
+cd mimizan
+cargo build --release
+./target/release/mimizan-gui
+```
 
 ![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
@@ -52,10 +61,18 @@ The same paper is on the phone: [Mimizan Lab for Android](https://github.com/Dra
 
 Free software, GPL-3.0-or-later.
 
-## Go further
+## The command
 
-- [Handbook](docs/HANDBOOK.md) — why the darkroom is built this way, in four chapters ([booklet](docs/handbook.pdf))
-- [Detailed README](DETAILED.md) — the session in full, install, command line, and where the measurements stand
-- [The method](docs/PAPER.md) — the signal, the formulas, the constants
-- [The specification](docs/SPEC.md) — the contract
-- [The measurements](docs/RESULTS.md) — every number, by the version that produced it
+The window is the darkroom. The command is there when the print is already decided.
+
+```bash
+mimizan info photo.nef
+mimizan negative photo.nef -o photo_neg.tif
+mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --paper 0,-0.5 --border-mm 20
+```
+
+`info` says what is in the file. `negative` writes a 16-bit linear TIFF, and a mask beside it. `print` writes the sheet: half a stop less hard light, a 20 mm paper-white border. The rest is `mimizan --help`.
+
+## The method
+
+The formulas and the constants are in [the paper](docs/PAPER.md). The note it started from is [the whitepaper](docs/whitepaper_v1.pdf).
