@@ -1214,6 +1214,10 @@ impl App {
                 continue;
             }
             self.shown_generation = r.generation;
+            if let Some(msg) = r.failed {
+                self.log(format!("preview failed: {msg}"));
+                continue;
+            }
             self.accept_preview(ctx, r);
         }
         let dropped: Vec<PathBuf> =

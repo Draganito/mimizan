@@ -290,7 +290,8 @@ mod tests {
         let fixed = crate::separate::separate(
             &m,
             &crate::separate::SeparateParams { mask: crate::separate::MaskMode::Off, ..Default::default() },
-        );
+        )
+        .expect("synthetic mosaic has a phase");
         let err = |p: &Plane| {
             let mut e = 0.0;
             for y in 32..h - 32 {

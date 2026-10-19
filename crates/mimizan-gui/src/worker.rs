@@ -54,51 +54,80 @@ pub enum Event {
 pub struct Heavy {
     tx: Sender<Job>,
     rx: Receiver<Event>,
+    ctx: egui::Context,
 }
 
 impl Heavy {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (tx, jobs) = channel::<Job>();
-        let (events, rx) = channel::<Event>();
-        thread::Builder::new()
-            .name("mimizan-heavy".into())
-            .spawn(move || {
-                while let Ok(job) = jobs.recv() {
-                    let status = |s: String| {
-                        let _ = events.send(Event::Status(s));
-                        ctx.request_repaint();
-                    };
-                    let r = match job {
-                        Job::Open { path, develop, cameras_dir } => {
-                            open(&path, develop, &cameras_dir, &status).map(|s| Event::Opened(Arc::new(s)))
-                        }
-                        Job::Redevelop { session, develop } => {
-                            redevelop(&session, develop, &status).map(|s| Event::Opened(Arc::new(s)))
-                        }
-                        Job::Export { session, weights, recipe, path, orientation } => {
-                            export(&session, weights, recipe, &path, orientation, &status)
-                        }
-                    };
-                    let ev = match r {
-                        Ok(ev) => ev,
-                        Err(e) => Event::Failed(format!("{e:#}")),
-                    };
-                    let _ = events.send(ev);
-                    ctx.request_repaint();
-                }
-            })
-            .expect("spawn heavy worker");
-        Self { tx, rx }
+        let (tx, rx) = start_heavy(&ctx);
+        Self { tx, rx, ctx }
     }
 
-    pub fn send(&self, job: Job) {
-        let _ = self.tx.send(job);
+    pub fn send(&mut self, job: Job) {
+        if let Err(std::sync::mpsc::SendError(job)) = self.tx.send(job) {
+            self.restart();
+            let _ = self.tx.send(job);
+        }
     }
 
-    pub fn poll(&self) -> Option<Event> {
+    pub fn poll(&mut self) -> Option<Event> {
         match self.rx.try_recv() {
             Ok(e) => Some(e),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.restart();
+                None
+            }
+        }
+    }
+
+    fn restart(&mut self) {
+        tracing::error!("open and export stopped; starting them again");
+        let (tx, rx) = start_heavy(&self.ctx);
+        self.tx = tx;
+        self.rx = rx;
+    }
+}
+
+fn start_heavy(ctx: &egui::Context) -> (Sender<Job>, Receiver<Event>) {
+    let (tx, jobs) = channel::<Job>();
+    let (events, rx) = channel::<Event>();
+    let ctx = ctx.clone();
+    thread::Builder::new()
+        .name("mimizan-heavy".into())
+        .spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_heavy(job, &events, &ctx)));
+                let ev = match outcome {
+                    Ok(Ok(ev)) => ev,
+                    Ok(Err(e)) => Event::Failed(format!("{e:#}")),
+                    Err(payload) => Event::Failed(format!("stopped: {}", panic_message(&payload))),
+                };
+                if events.send(ev).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .expect("spawn heavy worker");
+    (tx, rx)
+}
+
+fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Event> {
+    let status = |s: String| {
+        let _ = events.send(Event::Status(s));
+        ctx.request_repaint();
+    };
+    match job {
+        Job::Open { path, develop, cameras_dir } => {
+            open(&path, develop, &cameras_dir, &status).map(|s| Event::Opened(Arc::new(s)))
+        }
+        Job::Redevelop { session, develop } => {
+            redevelop(&session, develop, &status).map(|s| Event::Opened(Arc::new(s)))
+        }
+        Job::Export { session, weights, recipe, path, orientation } => {
+            export(&session, weights, recipe, &path, orientation, &status)
         }
     }
 }
@@ -148,7 +177,7 @@ fn develop_frame(
     let negative: Negative = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
     status("building preview".into());
     let t = Instant::now();
-    let preview = preview_planes(&negative);
+    let preview = preview_planes(&negative)?;
     let raw_hist = RawHistogram::of_frame(&frame);
     info!("preview planes + raw histogram {} ms", t.elapsed().as_millis());
     Ok(Session { path, frame, negative, camera_file, camera_file_path, develop, preview, raw_hist })
@@ -167,9 +196,16 @@ fn export(
     status(if s.is_mono() { "placing".into() } else { "mixing".into() });
     // Bayer mixes the separation. A monochrome plane is already the picture;
     // the recipe weights stay in the sidecar and do not rewrite it.
-    let mixed = (!s.is_mono()).then(|| mix(s.separation(), &weights));
+    let mixed = if s.is_mono() {
+        None
+    } else {
+        let Some(sep) = s.separation() else {
+            return Err(anyhow::anyhow!("this negative has no separation"));
+        };
+        Some(mix(sep, &weights))
+    };
     let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
-    let mask = s.mask_plane();
+    let mask = s.mask_plane()?;
     let mut info = s.negative.info.clone();
     info.weights = weights;
     info.weights_raw = weights.balanced_to_raw(s.wb());
@@ -214,111 +250,171 @@ pub struct PreviewResult {
     /// New 1:1 window, when one was requested and changed.
     pub detail: Option<DetailImage>,
     pub ms: u128,
+    /// Set when this request panicked. The picture stays as it was.
+    pub failed: Option<String>,
 }
 
 pub struct Preview {
     tx: Sender<PreviewRequest>,
     rx: Receiver<PreviewResult>,
+    ctx: egui::Context,
 }
 
 impl Preview {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (tx, reqs) = channel::<PreviewRequest>();
-        let (results, rx) = channel::<PreviewResult>();
-        thread::Builder::new()
-            .name("mimizan-preview".into())
-            .spawn(move || {
-                // What the last render was based on. A pan re-renders only the
-                // 1:1 window. A new exposure re-renders the fit copy and that window.
-                let mut last: Option<(*const Session, ViewParams)> = None;
-                let mut last_detail: Option<DetailAsk> = None;
-                let mut last_inspect: Option<Recipe> = None;
-                // The last sharp window. A pan reuses it and renders only the
-                // strip that came into view. A new exposure drops it.
-                let mut held: Option<DetailTile> = None;
-                let mut held_print = false;
-                let mut hists = HistCache::default();
-                let mut tones = ToneHold::default();
-                while let Ok(mut req) = reqs.recv() {
-                    // Coalesce: only the newest request matters.
-                    while let Ok(newer) = reqs.try_recv() {
-                        req = newer;
-                    }
-                    let t = Instant::now();
-                    let key = (Arc::as_ptr(&req.session), req.view.clone());
-                    let view_changed = last.as_ref() != Some(&key);
-                    // The held window is the previous exposure. Drop it even
-                    // when this frame shows no sharp window, or the next zoom
-                    // would reuse those pixels.
-                    if view_changed {
-                        held = None;
-                    }
-                    let table = tones.get(&req.view.tone);
-                    let image =
-                        view_changed.then(|| render_preview(&req.session, &req.view, &mut hists, table));
-                    let detail_due = req.detail.is_some()
-                        && (view_changed || last_detail != req.detail || last_inspect != req.inspect);
-                    let detail = if detail_due {
-                        let ask = req.detail.unwrap();
-                        let print = req.inspect.is_some();
-                        if view_changed || print != held_print {
-                            held = None;
-                        }
-                        held_print = print;
-                        let tile = if let Some(recipe) = &req.inspect {
-                            let recipe = recipe.clone();
-                            cover_detail(held.as_ref(), ask, |sub| {
-                                let rect = DetailRect { x: sub.x, y: sub.y, w: sub.w, h: sub.h };
-                                render_print_detail(&req.session, &req.view, &recipe, rect, table)
-                            })
-                        } else {
-                            let codes = (req.view.place == 0.0 && !req.view.show_mask)
-                                .then(|| hists.codes_for(&req.session, &req.view.weights));
-                            cover_detail(held.as_ref(), ask, |sub| {
-                                render_detail(&req.session, &req.view, sub, table, codes)
-                            })
-                        };
-                        let image = DetailImage { ask: tile.ask, gray: tile.gray.clone() };
-                        held = Some(tile);
-                        Some(image)
-                    } else {
-                        None
-                    };
-                    last = Some(key);
-                    last_detail = req.detail;
-                    last_inspect = req.inspect;
-                    if image.is_none() && detail.is_none() {
-                        continue;
-                    }
-                    let r = PreviewResult {
-                        generation: req.generation,
-                        image,
-                        detail,
-                        ms: t.elapsed().as_millis(),
-                    };
-                    if results.send(r).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
-                }
-            })
-            .expect("spawn preview worker");
-        Self { tx, rx }
+        let (tx, rx) = start_preview(&ctx);
+        Self { tx, rx, ctx }
     }
 
-    pub fn request(&self, r: PreviewRequest) {
-        let _ = self.tx.send(r);
+    pub fn request(&mut self, r: PreviewRequest) {
+        if let Err(std::sync::mpsc::SendError(r)) = self.tx.send(r) {
+            self.restart();
+            let _ = self.tx.send(r);
+        }
     }
 
     /// All finished results since the last poll, oldest first (an image and
     /// a window may arrive as separate results).
-    pub fn poll(&self) -> Vec<PreviewResult> {
+    pub fn poll(&mut self) -> Vec<PreviewResult> {
         let mut all = Vec::new();
-        while let Ok(r) = self.rx.try_recv() {
-            all.push(r);
+        loop {
+            match self.rx.try_recv() {
+                Ok(r) => all.push(r),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.restart();
+                    break;
+                }
+            }
         }
         all
     }
+
+    fn restart(&mut self) {
+        tracing::error!("preview stopped; starting it again");
+        let (tx, rx) = start_preview(&self.ctx);
+        self.tx = tx;
+        self.rx = rx;
+    }
+}
+
+struct PreviewHold {
+    last: Option<(*const Session, ViewParams)>,
+    last_detail: Option<DetailAsk>,
+    last_inspect: Option<Recipe>,
+    held: Option<DetailTile>,
+    held_print: bool,
+    hists: HistCache,
+    tones: ToneHold,
+}
+
+impl Default for PreviewHold {
+    fn default() -> Self {
+        Self {
+            last: None,
+            last_detail: None,
+            last_inspect: None,
+            held: None,
+            held_print: false,
+            hists: HistCache::default(),
+            tones: ToneHold::default(),
+        }
+    }
+}
+
+fn start_preview(ctx: &egui::Context) -> (Sender<PreviewRequest>, Receiver<PreviewResult>) {
+    let (tx, reqs) = channel::<PreviewRequest>();
+    let (results, rx) = channel::<PreviewResult>();
+    let ctx = ctx.clone();
+    thread::Builder::new()
+        .name("mimizan-preview".into())
+        .spawn(move || {
+            let mut hold = PreviewHold::default();
+            while let Ok(mut req) = reqs.recv() {
+                while let Ok(newer) = reqs.try_recv() {
+                    req = newer;
+                }
+                let generation = req.generation;
+                let started = Instant::now();
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| paint_preview(&mut hold, req)));
+                let result = match outcome {
+                    Ok(image) => image,
+                    Err(payload) => {
+                        // The hold may be half updated. Drop it and start clean.
+                        hold = PreviewHold::default();
+                        Some(PreviewResult {
+                            generation,
+                            image: None,
+                            detail: None,
+                            ms: started.elapsed().as_millis(),
+                            failed: Some(format!("stopped: {}", panic_message(&payload))),
+                        })
+                    }
+                };
+                let Some(r) = result else { continue };
+                if results.send(r).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .expect("spawn preview worker");
+    (tx, rx)
+}
+
+fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewResult> {
+    let t = Instant::now();
+    let key = (Arc::as_ptr(&req.session), req.view.clone());
+    let view_changed = hold.last.as_ref() != Some(&key);
+    // The held window is the previous exposure. Drop it even when this
+    // frame shows no sharp window, or the next zoom would reuse those pixels.
+    if view_changed {
+        hold.held = None;
+    }
+    let table = hold.tones.get(&req.view.tone);
+    let image = view_changed.then(|| render_preview(&req.session, &req.view, &mut hold.hists, table));
+    let detail_due = req.detail.is_some()
+        && (view_changed || hold.last_detail != req.detail || hold.last_inspect != req.inspect);
+    let detail = if detail_due {
+        let ask = req.detail?;
+        let print = req.inspect.is_some();
+        if view_changed || print != hold.held_print {
+            hold.held = None;
+        }
+        hold.held_print = print;
+        let tile = if let Some(recipe) = &req.inspect {
+            let recipe = recipe.clone();
+            cover_detail(hold.held.as_ref(), ask, |sub| {
+                let rect = DetailRect { x: sub.x, y: sub.y, w: sub.w, h: sub.h };
+                render_print_detail(&req.session, &req.view, &recipe, rect, table)
+            })
+        } else {
+            let codes = (req.view.place == 0.0 && !req.view.show_mask)
+                .then(|| hold.hists.codes_for(&req.session, &req.view.weights));
+            cover_detail(hold.held.as_ref(), ask, |sub| {
+                render_detail(&req.session, &req.view, sub, table, codes)
+            })
+        };
+        let image = DetailImage { ask: tile.ask, gray: tile.gray.clone() };
+        hold.held = Some(tile);
+        Some(image)
+    } else {
+        None
+    };
+    hold.last = Some(key);
+    hold.last_detail = req.detail;
+    hold.last_inspect = req.inspect;
+    if image.is_none() && detail.is_none() {
+        return None;
+    }
+    Some(PreviewResult {
+        generation: req.generation,
+        image,
+        detail,
+        ms: t.elapsed().as_millis(),
+        failed: None,
+    })
 }
 
 /// One 1:1 box of the print. Coalesced like the preview: a slider drag
@@ -343,65 +439,89 @@ pub struct LoupeResult {
 pub struct Loupe {
     tx: Sender<LoupeRequest>,
     rx: Receiver<LoupeResult>,
+    ctx: egui::Context,
 }
 
 impl Loupe {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (tx, reqs) = channel::<LoupeRequest>();
-        let (results, rx) = channel::<LoupeResult>();
-        thread::Builder::new()
-            .name("mimizan-loupe".into())
-            .spawn(move || {
-                while let Ok(mut req) = reqs.recv() {
-                    while let Ok(newer) = reqs.try_recv() {
-                        req = newer;
-                    }
-                    let generation = req.generation;
-                    // A panic used to kill this thread. The box then kept the
-                    // last texture forever, and every later size, dpi or
-                    // kernel change looked frozen.
-                    let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        render_sharpen_loupe(
-                            &req.session,
-                            &req.weights,
-                            &req.recipe,
-                            req.orientation,
-                            req.nx,
-                            req.ny,
-                            req.view,
-                        )
-                    }));
-                    let image = match rendered {
-                        Ok(image) => image,
-                        Err(payload) => {
-                            tracing::error!("loupe render failed: {}", panic_message(&payload));
-                            SharpenLoupe { gray: Vec::new(), width: 0, height: 0 }
-                        }
-                    };
-                    if results.send(LoupeResult { generation, image }).is_err() {
-                        break;
-                    }
-                    ctx.request_repaint();
-                }
-            })
-            .expect("spawn loupe worker");
-        Self { tx, rx }
+        let (tx, rx) = start_loupe(&ctx);
+        Self { tx, rx, ctx }
     }
 
-    pub fn request(&self, r: LoupeRequest) {
-        let _ = self.tx.send(r);
+    pub fn request(&mut self, r: LoupeRequest) {
+        if let Err(std::sync::mpsc::SendError(r)) = self.tx.send(r) {
+            self.restart();
+            let _ = self.tx.send(r);
+        }
     }
 
     /// The newest finished box since the last poll. Older ones are dropped:
     /// a slider drag may have completed several, and only the latest matches
     /// the controls.
-    pub fn poll(&self) -> Option<LoupeResult> {
+    pub fn poll(&mut self) -> Option<LoupeResult> {
         let mut last = None;
-        while let Ok(r) = self.rx.try_recv() {
-            last = Some(r);
+        loop {
+            match self.rx.try_recv() {
+                Ok(r) => last = Some(r),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.restart();
+                    break;
+                }
+            }
         }
         last
     }
+
+    fn restart(&mut self) {
+        tracing::error!("print box stopped; starting it again");
+        let (tx, rx) = start_loupe(&self.ctx);
+        self.tx = tx;
+        self.rx = rx;
+    }
+}
+
+fn start_loupe(ctx: &egui::Context) -> (Sender<LoupeRequest>, Receiver<LoupeResult>) {
+    let (tx, reqs) = channel::<LoupeRequest>();
+    let (results, rx) = channel::<LoupeResult>();
+    let ctx = ctx.clone();
+    thread::Builder::new()
+        .name("mimizan-loupe".into())
+        .spawn(move || {
+            while let Ok(mut req) = reqs.recv() {
+                while let Ok(newer) = reqs.try_recv() {
+                    req = newer;
+                }
+                let generation = req.generation;
+                // A panic used to kill this thread. The box then kept the
+                // last texture forever, and every later size, dpi or kernel
+                // change looked frozen.
+                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    render_sharpen_loupe(
+                        &req.session,
+                        &req.weights,
+                        &req.recipe,
+                        req.orientation,
+                        req.nx,
+                        req.ny,
+                        req.view,
+                    )
+                }));
+                let image = match rendered {
+                    Ok(image) => image,
+                    Err(payload) => {
+                        tracing::error!("loupe render failed: {}", panic_message(&payload));
+                        SharpenLoupe { gray: Vec::new(), width: 0, height: 0 }
+                    }
+                };
+                if results.send(LoupeResult { generation, image }).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .expect("spawn loupe worker");
+    (tx, rx)
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {

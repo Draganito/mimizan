@@ -123,7 +123,7 @@ pub fn mosaic_rgb(rgb: &Rgb, phase: BayerPhase, noise: NoiseModel, name: &str) -
 #[cfg(feature = "decode-rawler")]
 pub fn binned_raw(path: &Path) -> Result<(Rgb, NoiseModel)> {
     let frame = crate::pipeline::decode(path)?;
-    let mosaic = crate::ingest::ingest(&frame, &crate::ingest::IngestParams::default());
+    let mosaic = crate::ingest::ingest(&frame, &crate::ingest::IngestParams::default())?;
     let phase = match mosaic.phase {
         Some(p) => p,
         None => return Err(Error::Invalid(format!("{}: not a Bayer file", path.display()))),

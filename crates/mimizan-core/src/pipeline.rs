@@ -115,7 +115,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     p.weights.validate()?;
 
     let t = Instant::now();
-    let mosaic = ingest(frame, &p.ingest);
+    let mosaic = ingest(frame, &p.ingest)?;
     let ingest_ms = t.elapsed().as_millis();
     info!("ingest {} ms: {}", ingest_ms, serde_json::to_string(&mosaic.report)?);
 
@@ -155,7 +155,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     let (plane, mask8, saturated, separation) = match mosaic.phase {
         Some(_) => {
             let t = Instant::now();
-            let sep = separate(&mosaic, &p.separate);
+            let sep = separate(&mosaic, &p.separate)?;
             info.timing.separate_ms = t.elapsed().as_millis();
             info.rounds = sep.rounds;
             info.computed = sep.computed;
@@ -166,7 +166,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             // The mosaic plane is no longer needed: free it before mixing.
             let Mosaic { saturated, plane: mosaic_plane, .. } = mosaic;
             drop(mosaic_plane);
-            let mask8 = mask_sidecar(&sep.mask_max, &saturated);
+            let mask8 = mask_sidecar(&sep.mask_max, &saturated)?;
             let t = Instant::now();
             let (plane, separation) = if p.keep_separation {
                 (mix(&sep, &weights), Some(sep))
@@ -200,11 +200,31 @@ pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
     negative_from_frame(&frame, p, decode_ms)
 }
 
-pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Vec<u8> {
-    mask_max
+pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
+    if mask_max.data.len() != saturated.len() {
+        return Err(crate::Error::Invalid(format!(
+            "mask has {} samples and saturation has {}",
+            mask_max.data.len(),
+            saturated.len()
+        )));
+    }
+    Ok(mask_max
         .data
         .par_iter()
         .zip(saturated.par_iter())
         .map(|(&m, &s)| if s != 0 { 255 } else { (m.clamp(0.0, 1.0) * 255.0).round() as u8 })
-        .collect()
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_saturation_list_is_an_error() {
+        let mask = Plane::zeros(2, 2);
+        let err = mask_sidecar(&mask, &[0, 1]).unwrap_err();
+        assert!(err.to_string().contains("4"), "{err}");
+        assert!(err.to_string().contains("2"), "{err}");
+    }
 }

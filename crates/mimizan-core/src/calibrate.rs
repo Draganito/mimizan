@@ -328,7 +328,7 @@ pub fn wedge_self_test(size: usize, with_noise: bool) -> WedgeSelfTest {
     let sp =
         SynthParams { noise: if with_noise { Some(Default::default()) } else { None }, ..Default::default() };
     let s = synth::mosaic(Scene::Wedge, size, size, &sp);
-    let sep = separate(&s.mosaic, &SeparateParams::default());
+    let sep = separate(&s.mosaic, &SeparateParams::default()).expect("synthetic mosaic has a phase");
     let steps = 16;
     let rects = grid_rects(Rect { x: 0, y: 0, w: size - size % steps, h: size }, steps, 1, 0.3);
     let pairs: Vec<(f64, f64)> = rects

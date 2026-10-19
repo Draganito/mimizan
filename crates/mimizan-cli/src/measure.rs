@@ -223,7 +223,7 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
                 if let Some(dir) = previews {
                     std::fs::create_dir_all(dir)?;
                     let s = synth::mosaic(sc, *size, *size, &sp);
-                    let sep = mimizan_core::separate::separate(&s.mosaic, &p);
+                    let sep = mimizan_core::separate::separate(&s.mosaic, &p)?;
                     let base = mimizan_core::baseline::bilinear_luminance(&s.mosaic.plane, sp.phase);
                     let tag = format!("{sc:?}").to_ascii_lowercase();
                     mimizan_core::preview::write_png(

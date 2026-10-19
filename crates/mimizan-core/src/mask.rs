@@ -602,7 +602,7 @@ mod tests {
         use crate::separate::{separate, SeparateParams};
         use crate::synth::{mosaic, Scene, SynthParams};
         let s = mosaic(Scene::Patches, 1024, 1024, &SynthParams::default());
-        let sep = separate(&s.mosaic, &SeparateParams::default());
+        let sep = separate(&s.mosaic, &SeparateParams::default()).expect("synthetic mosaic has a phase");
         let (pw, ph) = (1024 / 6, 1024 / 4);
         for row in 0..4 {
             for col in 0..6 {

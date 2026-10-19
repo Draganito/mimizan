@@ -103,8 +103,9 @@ proptest! {
     ) {
         let (w, h) = (192, 160);
         let m = wrap(mosaic_of(phase, w, h, |_, _| (r, g, b)), phase);
-        let fixed = separate(&m, &SeparateParams { mask: mimizan_core::separate::MaskMode::Off, ..Default::default() });
-        let adaptive = separate(&m, &SeparateParams::default());
+        let fixed = separate(&m, &SeparateParams { mask: mimizan_core::separate::MaskMode::Off, ..Default::default() })
+            .expect("synthetic mosaic has a phase");
+        let adaptive = separate(&m, &SeparateParams::default()).expect("synthetic mosaic has a phase");
         for (a, f) in adaptive.lum.data.iter().zip(&fixed.lum.data) {
             prop_assert!((a - f).abs() < 1e-12);
         }
@@ -201,9 +202,10 @@ proptest! {
 fn separation_is_deterministic_across_thread_counts() {
     use mimizan_core::synth::{mosaic, Scene, SynthParams};
     let s = mosaic(Scene::Fabric, 512, 384, &SynthParams::default());
-    let a = separate(&s.mosaic, &SeparateParams::default());
+    let a = separate(&s.mosaic, &SeparateParams::default()).expect("synthetic mosaic has a phase");
     let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
-    let b = pool.install(|| separate(&s.mosaic, &SeparateParams::default()));
+    let b = pool
+        .install(|| separate(&s.mosaic, &SeparateParams::default()).expect("synthetic mosaic has a phase"));
     assert_eq!(a.lum.data, b.lum.data);
     assert_eq!(a.c1.data, b.c1.data);
     assert_eq!(a.c2.data, b.c2.data);

@@ -549,7 +549,7 @@ pub fn sharpen_window(
     nx: f64,
     ny: f64,
     view: usize,
-) -> Plane {
+) -> crate::Result<Plane> {
     let (ox, oy, sw, sh) = source_window(linear.full_w, linear.full_h, p.recipe.crop);
     let lay = layout(linear.full_w, linear.full_h, 1, p);
     let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
@@ -579,7 +579,7 @@ pub fn sharpen_window(
     let mask = mask.map(|m| window_frame(m, ox, oy, sw, sh));
     if g.pic_w > 0 && g.pic_h > 0 {
         let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
-        let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic);
+        let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic)?;
         crate::tone::render(&mut picture, p.recipe.place, &tone);
         let ox = g.pic_x + g.border - g.tile_x;
         let oy = g.pic_y + g.border - g.tile_y;
@@ -592,7 +592,7 @@ pub fn sharpen_window(
         // taps only then. Resampling it anyway reads off the window.
         if p.recipe.sharpen.usm_amount() > 0.0 {
             if let (Some(m), Some(dst)) = (mask, mask_tile.as_mut()) {
-                let resampled = resize_rect(m, g.image_w, g.image_h, ResampleKernel::Lanczos3, pic);
+                let resampled = resize_rect(m, g.image_w, g.image_h, ResampleKernel::Lanczos3, pic)?;
                 for y in 0..g.pic_h {
                     dst.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(resampled.row(y));
                 }
@@ -606,7 +606,7 @@ pub fn sharpen_window(
     for y in 0..g.view_h {
         out.row_mut(y).copy_from_slice(&tile.row(oy + y)[ox..ox + g.view_w]);
     }
-    out
+    Ok(out)
 }
 
 /// Paint `value` into the part of `tile` that overlaps the sheet rectangle
@@ -1224,7 +1224,8 @@ mod tests {
                 nx,
                 ny,
                 11,
-            );
+            )
+            .expect("loupe window");
             let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 11);
             for y in 0..got.height {
                 for x in 0..got.width {
@@ -1304,7 +1305,8 @@ mod tests {
                             nx,
                             ny,
                             16,
-                        );
+                        )
+                        .expect("loupe window");
                         let g = loupe_geom(&lay, sharpen, nx, ny, 16);
                         assert_eq!((got.width, got.height), (g.view_w, g.view_h));
                         for y in 0..got.height {

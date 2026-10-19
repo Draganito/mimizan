@@ -336,7 +336,7 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                 bail!("weights need a Bayer sensor");
             };
             let params = IngestParams { wb: crate::cmd::parse_wb(wb)?, ..IngestParams::default() };
-            let mosaic = ingest(&frame, &params);
+            let mosaic = ingest(&frame, &params)?;
             info!("balance {} R {:.4} B {:.4}", mosaic.report.wb_source, mosaic.wb[0], mosaic.wb[2]);
             let mut samples = Vec::with_capacity(rects.len());
             let mut dropped = 0;

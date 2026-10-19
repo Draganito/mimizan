@@ -246,7 +246,7 @@ pub fn even_crop(c: Rect) -> Rect {
     r
 }
 
-pub fn ingest(frame: &RawFrame, p: &IngestParams) -> Mosaic {
+pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
     // A Bayer crop with an odd origin would move the phase. A monochrome
     // sensor has no phase, so every pixel of the file's crop stays.
     let crop = match frame.kind {
@@ -287,6 +287,10 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> Mosaic {
     let saturated = dilate(&sat_raw, w, h, p.sat_dilate);
     let sat_dilated_count = saturated.iter().filter(|&&s| s != 0).count();
 
+    // A NaN fails the sort in the defect median and used to kill the thread.
+    if norm.iter().any(|v| v.is_nan()) {
+        return Err(crate::Error::Invalid("a sensor sample is not a number".into()));
+    }
     let step = if phase.is_some() { 2usize } else { 1usize };
     let (plane_data, defects, hot_rows) =
         if p.fix_defects { repair_defects(&norm, &saturated, w, h, step, p) } else { (norm, 0, Vec::new()) };
@@ -312,7 +316,7 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> Mosaic {
         }
     }
 
-    Mosaic {
+    Ok(Mosaic {
         plane,
         phase,
         saturated,
@@ -339,7 +343,7 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> Mosaic {
             wb,
             wb_source,
         },
-    }
+    })
 }
 
 /// Chebyshev dilation of a 0/1 mask by `r` pixels (separable max filter).
@@ -368,7 +372,8 @@ pub fn dilate(mask: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
 }
 
 fn median_of(v: &mut [f64]) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in mosaic"));
+    // Ingest refuses a NaN before repair. A later caller still must not abort.
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
     if n % 2 == 1 {
         v[n / 2]
@@ -469,6 +474,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_nan_sample_is_an_error() {
+        let (w, h) = (4usize, 4usize);
+        let frame = RawFrame {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 12,
+            kind: SensorKind::Mono,
+            black_tile: [0.0; 4],
+            white_rgb: [0.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: crate::decode::RawData::Integer(vec![0; w * h]),
+        };
+        let err = ingest(&frame, &IngestParams::default()).unwrap_err();
+        assert!(err.to_string().contains("not a number"), "{err}");
+    }
+
+    #[test]
     fn dilate_grows_by_radius() {
         let (w, h) = (7, 7);
         let mut m = vec![0u8; w * h];
@@ -510,10 +540,10 @@ mod tests {
             data: crate::decode::RawData::Integer(raw.clone()),
         };
         let p = IngestParams { fix_defects: false, ..IngestParams::default() };
-        let mono = ingest(&frame(SensorKind::Mono), &p);
+        let mono = ingest(&frame(SensorKind::Mono), &p).unwrap();
         assert_eq!((mono.plane.width, mono.plane.height), (5, 5));
         assert!((mono.plane.at(0, 0) - 0.5).abs() < 1e-12);
-        let bayer = ingest(&frame(SensorKind::Bayer(BayerPhase::RGGB)), &p);
+        let bayer = ingest(&frame(SensorKind::Bayer(BayerPhase::RGGB)), &p).unwrap();
         assert_eq!((bayer.plane.width, bayer.plane.height), (4, 4));
         assert!(bayer.plane.at(0, 0).abs() < 1e-12);
     }

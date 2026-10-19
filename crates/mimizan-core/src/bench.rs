@@ -150,7 +150,7 @@ fn interior_stats(est: &crate::plane::Plane, truth: &crate::plane::Plane, rects:
 pub fn run_scene(scene: Scene, w: usize, h: usize, sp: &SynthParams, p: &SeparateParams) -> SceneResult {
     let s = mosaic(scene, w, h, sp);
     let t = Instant::now();
-    let sep = separate(&s.mosaic, p);
+    let sep = separate(&s.mosaic, p).expect("synthetic mosaic has a phase");
     let ms = t.elapsed().as_millis();
     let ours = evaluate("mimizan", scene, &s, &sep.lum, sep.rounds, ms);
 

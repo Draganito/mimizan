@@ -303,10 +303,10 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
         let dng = a.out.join(format!("{stem}.dng"));
         kodak::write_dng(&dng, w, h, &fb.samples, phase, &stem)?;
 
-        let mim_fixed = mix(&separate(&fb.mosaic, &fixed), &native);
-        let mim_block = mix(&separate(&fb.mosaic, &block), &native);
-        let mim = mix(&separate(&fb.mosaic, &default), &native);
-        let sep_rec = separate(&fb.mosaic, &reconstruct);
+        let mim_fixed = mix(&separate(&fb.mosaic, &fixed)?, &native);
+        let mim_block = mix(&separate(&fb.mosaic, &block)?, &native);
+        let mim = mix(&separate(&fb.mosaic, &default)?, &native);
+        let sep_rec = separate(&fb.mosaic, &reconstruct)?;
         let computed = sep_rec.computed;
         let mim_rec = mix(&sep_rec, &native);
         drop(sep_rec);

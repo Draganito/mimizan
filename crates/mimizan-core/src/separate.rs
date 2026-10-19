@@ -154,18 +154,18 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
     Separation { lum, c1, c2: c2a, mask_max, rounds: 1, phase, computed: 0.0 }
 }
 
-pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> Separation {
-    let mut sep = separate_linear(mosaic, p);
+pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
+    let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
+    let mut sep = separate_linear(mosaic, phase, p);
     if let Some(r) = &p.reconstruct {
         let t = std::time::Instant::now();
         sep.computed = crate::reconstruct::apply(&mut sep, &mosaic.plane, &mosaic.noise, r);
         tracing::debug!("reconstruct {} ms, computed {:.3}", t.elapsed().as_millis(), sep.computed);
     }
-    sep
+    Ok(sep)
 }
 
-fn separate_linear(mosaic: &Mosaic, p: &SeparateParams) -> Separation {
-    let phase = mosaic.phase.expect("separate() needs a Bayer mosaic");
+fn separate_linear(mosaic: &Mosaic, phase: crate::cfa::BayerPhase, p: &SeparateParams) -> Separation {
     let m = &mosaic.plane;
     if p.mask == MaskMode::Dubois {
         return crate::dubois::separate_dubois(mosaic, phase, &p.dubois);

@@ -306,9 +306,22 @@ pub fn resize_rect(
     dst_h: usize,
     kernel: ResampleKernel,
     rect: PixelRect,
-) -> Plane {
+) -> crate::Result<Plane> {
     let (dx, dy, dw, dh) = (rect.x, rect.y, rect.w, rect.h);
-    assert!(dw > 0 && dh > 0, "window must be non-empty");
+    if dw == 0 || dh == 0 {
+        return Err(crate::Error::Invalid("resize window is empty".into()));
+    }
+    let samples = src.plane.width.checked_mul(src.plane.height).ok_or_else(|| {
+        crate::Error::Invalid(format!("plane {}×{} does not fit", src.plane.width, src.plane.height))
+    })?;
+    if src.plane.data.len() != samples {
+        return Err(crate::Error::Invalid(format!(
+            "plane is {}×{} but has {} samples",
+            src.plane.width,
+            src.plane.height,
+            src.plane.data.len()
+        )));
+    }
     if dst_w == src.full_w && dst_h == src.full_h {
         let mut out = Plane::zeros(dw, dh);
         for y in 0..dh {
@@ -316,10 +329,10 @@ pub fn resize_rect(
                 out.set(x, y, src.at(dx + x, dy + y));
             }
         }
-        return out;
+        return Ok(out);
     }
     let rows_first = src.full_h * dst_w + dst_w * dst_h <= src.full_w * dst_h + dst_w * dst_h;
-    if rows_first {
+    Ok(if rows_first {
         let (sy0, sy1) = axis_span(src.full_h, dst_h, kernel, dy, dy + dh);
         let mid = resize_rows_window(src, dst_w, kernel, dx, dx + dw, sy0, sy1);
         if dst_h == src.full_h {
@@ -335,7 +348,7 @@ pub fn resize_rect(
         } else {
             resize_rows_partial(&mid, sx0, src.full_w, dst_w, kernel, dx, dx + dw)
         }
-    }
+    })
 }
 
 fn resize_rows_window(
@@ -588,7 +601,7 @@ mod tests {
                 let full = resize_with(&src, dw, dh, kernel);
                 for (dx, dy, ww, hh) in [(0, 0, 5, 4), (dw - 6, dh - 5, 6, 5), (dw / 3, dh / 4, 7, 6)] {
                     let rect = PixelRect { x: dx, y: dy, w: ww, h: hh };
-                    let got = resize_rect(PlaneWindow::full(&src), dw, dh, kernel, rect);
+                    let got = resize_rect(PlaneWindow::full(&src), dw, dh, kernel, rect).unwrap();
                     for y in 0..hh {
                         for x in 0..ww {
                             assert_eq!(
@@ -606,11 +619,19 @@ mod tests {
                         }
                     }
                     let win = PlaneWindow { plane: &crop, origin_x: sx, origin_y: sy, full_w: w, full_h: h };
-                    let from_crop = resize_rect(win, dw, dh, kernel, rect);
+                    let from_crop = resize_rect(win, dw, dh, kernel, rect).unwrap();
                     assert_eq!(from_crop.data, got.data);
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_empty_window_is_an_error() {
+        let src = Plane::zeros(4, 4);
+        let rect = PixelRect { x: 0, y: 0, w: 0, h: 2 };
+        let err = resize_rect(PlaneWindow::full(&src), 4, 4, ResampleKernel::BSpline, rect).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]

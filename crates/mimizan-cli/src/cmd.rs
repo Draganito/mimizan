@@ -383,7 +383,7 @@ pub fn dump(
     info!("decoded in {} ms", t.elapsed().as_millis());
     let params = IngestParams { fix_defects, ..IngestParams::default() };
     let t = Instant::now();
-    let mosaic = ingest(&frame, &params);
+    let mosaic = ingest(&frame, &params)?;
     info!("ingest in {} ms: {}", t.elapsed().as_millis(), serde_json::to_string(&mosaic.report)?);
     let desc = json!({
         "mimizan": env!("CARGO_PKG_VERSION"),

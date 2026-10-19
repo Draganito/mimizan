@@ -343,72 +343,114 @@ pub struct ThumbResult {
 pub struct Thumbs {
     tx: Sender<Vec<ThumbJob>>,
     rx: Receiver<ThumbResult>,
+    ctx: egui::Context,
+    cameras_dir: PathBuf,
 }
 
 impl Thumbs {
     pub fn spawn(ctx: egui::Context, cameras_dir: PathBuf) -> Self {
-        let (tx, queues) = channel::<Vec<ThumbJob>>();
-        let (results, rx) = channel::<ThumbResult>();
-        let cache = cache_dir();
-        thread::Builder::new()
-            .name("mimizan-thumbs".into())
-            .spawn(move || {
-                let mut queue: Vec<ThumbJob> = Vec::new();
-                let mut done: HashSet<(u64, PathBuf)> = HashSet::new();
-                loop {
-                    // Newest list wins; block only when there is nothing to do.
-                    let newest = if queue.is_empty() {
-                        match queues.recv() {
-                            Ok(q) => Some(q),
-                            Err(_) => return,
-                        }
-                    } else {
-                        None
-                    };
-                    let mut latest = newest;
-                    while let Ok(q) = queues.try_recv() {
-                        latest = Some(q);
-                    }
-                    if let Some(q) = latest {
-                        if let Some(first) = q.first() {
-                            done.retain(|(g, _)| *g == first.generation);
-                        }
-                        queue = q;
-                        queue.reverse(); // pop() takes the front
-                    }
-                    let Some(job) = queue.pop() else { continue };
-                    if !done.insert((job.generation, job.path.clone())) {
-                        continue;
-                    }
-                    let t = Instant::now();
-                    let result = make_thumb(&job, cache.as_deref(), &cameras_dir);
-                    let r = ThumbResult {
-                        generation: job.generation,
-                        path: job.path,
-                        result,
-                        ms: t.elapsed().as_millis(),
-                    };
-                    if results.send(r).is_err() {
-                        return;
-                    }
-                    ctx.request_repaint();
-                }
-            })
-            .expect("spawn thumbs worker");
-        Self { tx, rx }
+        let (tx, rx) = start_thumbs(&ctx, &cameras_dir);
+        Self { tx, rx, ctx, cameras_dir }
     }
 
     /// Replace the worker's list: the first entries are wanted first.
-    pub fn want(&self, jobs: Vec<ThumbJob>) {
-        let _ = self.tx.send(jobs);
+    pub fn want(&mut self, jobs: Vec<ThumbJob>) {
+        if let Err(std::sync::mpsc::SendError(jobs)) = self.tx.send(jobs) {
+            self.restart();
+            let _ = self.tx.send(jobs);
+        }
     }
 
-    pub fn poll(&self) -> Vec<ThumbResult> {
+    pub fn poll(&mut self) -> Vec<ThumbResult> {
         let mut all = Vec::new();
-        while let Ok(r) = self.rx.try_recv() {
-            all.push(r);
+        loop {
+            match self.rx.try_recv() {
+                Ok(r) => all.push(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.restart();
+                    break;
+                }
+            }
         }
         all
+    }
+
+    fn restart(&mut self) {
+        tracing::error!("thumbnails stopped; starting them again");
+        let (tx, rx) = start_thumbs(&self.ctx, &self.cameras_dir);
+        self.tx = tx;
+        self.rx = rx;
+    }
+}
+
+fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob>>, Receiver<ThumbResult>) {
+    let (tx, queues) = channel::<Vec<ThumbJob>>();
+    let (results, rx) = channel::<ThumbResult>();
+    let ctx = ctx.clone();
+    let cameras_dir = cameras_dir.to_path_buf();
+    let cache = cache_dir();
+    thread::Builder::new()
+        .name("mimizan-thumbs".into())
+        .spawn(move || {
+            let mut queue: Vec<ThumbJob> = Vec::new();
+            let mut done: HashSet<(u64, PathBuf)> = HashSet::new();
+            loop {
+                // Newest list wins; block only when there is nothing to do.
+                let newest = if queue.is_empty() {
+                    match queues.recv() {
+                        Ok(q) => Some(q),
+                        Err(_) => return,
+                    }
+                } else {
+                    None
+                };
+                let mut latest = newest;
+                while let Ok(q) = queues.try_recv() {
+                    latest = Some(q);
+                }
+                if let Some(q) = latest {
+                    if let Some(first) = q.first() {
+                        done.retain(|(g, _)| *g == first.generation);
+                    }
+                    queue = q;
+                    queue.reverse(); // pop() takes the front
+                }
+                let Some(job) = queue.pop() else { continue };
+                if !done.insert((job.generation, job.path.clone())) {
+                    continue;
+                }
+                let t = Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    make_thumb(&job, cache.as_deref(), &cameras_dir)
+                }));
+                let result = match result {
+                    Ok(r) => r,
+                    Err(payload) => Err(format!("stopped: {}", panic_message(&payload))),
+                };
+                let r = ThumbResult {
+                    generation: job.generation,
+                    path: job.path,
+                    result,
+                    ms: t.elapsed().as_millis(),
+                };
+                if results.send(r).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        })
+        .expect("spawn thumbs worker");
+    (tx, rx)
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".into()
     }
 }
 
