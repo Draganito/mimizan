@@ -1,6 +1,7 @@
 //! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
 //! one pass. Upright -> crop window -> size -> place -> curve -> black edge ->
-//! white border -> [Richardson–Lucy ->] USM -> one quantisation ->
+//! white border -> [Richardson–Lucy ->] USM -> peak on the picture ->
+//! one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
 //! print decision (viewing model constant, sidecar use).
@@ -450,7 +451,15 @@ struct LoupeGeom {
     image_h: usize,
 }
 
-fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> LoupeGeom {
+fn peak_halo_px(recipe: &Recipe) -> usize {
+    if recipe.peak.applies() {
+        kernel_radius(recipe.peak.radius)
+    } else {
+        0
+    }
+}
+
+fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize, peak_halo: usize) -> LoupeGeom {
     let (image_w, image_h) = (lay.image_w, lay.image_h);
     // Picture inset: white on the outside, black between that and the picture.
     let border = lay.border_px + lay.black_px;
@@ -465,11 +474,12 @@ fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> 
     top = top.clamp(0, sheet_h as isize - vh as isize);
     let passes = sharpen.deconv_passes() as usize;
     let usm = sharpen.usm_amount() > 0.0;
-    let halo = if lay.resample_sigma_px > 0.0 && (passes > 0 || usm) {
+    let from_sharpen = if lay.resample_sigma_px > 0.0 && (passes > 0 || usm) {
         sharpen_halo(lay.resample_sigma_px, passes, usm)
     } else {
         0
-    } as isize;
+    };
+    let halo = from_sharpen.saturating_add(peak_halo) as isize;
     let tile_x = (left - halo).max(0) as usize;
     let tile_y = (top - halo).max(0) as usize;
     let tile_r = (left + vw as isize + halo).min(sheet_w as isize) as usize;
@@ -520,7 +530,7 @@ pub fn loupe_source_rect(
 ) -> (usize, usize, usize, usize) {
     let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
     let lay = layout(full_w, full_h, 1, p);
-    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe));
     if g.pic_w == 0 || g.pic_h == 0 {
         return (0, 0, 0, 0);
     }
@@ -552,7 +562,7 @@ pub fn sharpen_window(
 ) -> crate::Result<Plane> {
     let (ox, oy, sw, sh) = source_window(linear.full_w, linear.full_h, p.recipe.crop);
     let lay = layout(linear.full_w, linear.full_h, 1, p);
-    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe));
     let tone = p.recipe.curve.compile();
     let white = tone.white();
     let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
@@ -600,6 +610,11 @@ pub fn sharpen_window(
         }
     }
     tile = apply_sharpen(tile, mask_tile.as_ref(), &p.recipe, &lay).0;
+    if g.pic_w > 0 && g.pic_h > 0 {
+        let pic_x = g.pic_x + g.border - g.tile_x;
+        let pic_y = g.pic_y + g.border - g.tile_y;
+        apply_peak_picture(&mut tile, &p.recipe, pic_x, pic_y, g.pic_w, g.pic_h);
+    }
     let mut out = Plane::zeros(g.view_w, g.view_h);
     let ox = g.view_x - g.tile_x;
     let oy = g.view_y - g.tile_y;
@@ -643,6 +658,26 @@ pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
         row[b..b + p.width].copy_from_slice(p.row(y - b));
     });
     out
+}
+
+/// Peak on the picture rectangle only. The paper and the black edge stay
+/// as they were, and the blur reflects inside the picture, not into the
+/// border. A rectangle that does not fit the plane is left alone.
+fn apply_peak_picture(plane: &mut Plane, recipe: &Recipe, x0: usize, y0: usize, width: usize, height: usize) {
+    if !recipe.peak.applies() || width == 0 || height == 0 {
+        return;
+    }
+    if x0.saturating_add(width) > plane.width || y0.saturating_add(height) > plane.height {
+        return;
+    }
+    let mut picture = Plane::zeros(width, height);
+    for y in 0..height {
+        picture.row_mut(y).copy_from_slice(&plane.row(y0 + y)[x0..x0 + width]);
+    }
+    let sharp = unsharp(&picture, recipe.peak.radius, recipe.peak.amount, None);
+    for y in 0..height {
+        plane.row_mut(y0 + y)[x0..x0 + width].copy_from_slice(sharp.row(y));
+    }
 }
 
 /// Richardson–Lucy and USM at the enlargement σ. A width of zero leaves
@@ -722,7 +757,11 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         }
     }
 
-    let (plane, deconv_n) = apply_sharpen(plane, mask.as_ref(), r, &lay);
+    let (mut plane, deconv_n) = apply_sharpen(plane, mask.as_ref(), r, &lay);
+    apply_peak_picture(&mut plane, r, frame, frame, lay.image_w, lay.image_h);
+    if r.peak.applies() {
+        info!("peak radius {:.2} px, amount {:.2}, border left as it was", r.peak.radius, r.peak.amount);
+    }
     if deconv_n > 0 {
         info!(
             "richardson-lucy {deconv_n} iterations, enlargement sigma {:.2} px, no mask",
@@ -1226,7 +1265,7 @@ mod tests {
                 11,
             )
             .expect("loupe window");
-            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 11);
+            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 11, peak_halo_px(&params.recipe));
             for y in 0..got.height {
                 for x in 0..got.width {
                     let expect = full.plane.at(g.view_x + x, g.view_y + y);
@@ -1307,7 +1346,7 @@ mod tests {
                             16,
                         )
                         .expect("loupe window");
-                        let g = loupe_geom(&lay, sharpen, nx, ny, 16);
+                        let g = loupe_geom(&lay, sharpen, nx, ny, 16, peak_halo_px(&params.recipe));
                         assert_eq!((got.width, got.height), (g.view_w, g.view_h));
                         for y in 0..got.height {
                             for x in 0..got.width {
@@ -1464,7 +1503,7 @@ mod tests {
         // The boost sits on the shoulder of the ramp, a few pixels off the
         // 50 % point. A viewing-distance halo of ~7 px would still be up
         // well past that.
-        assert!((peak_at as isize - edge as isize).abs() <= 6, "peak at {peak_at}, edge {edge}");
+        assert!((peak_at as isize - edge as isize).abs() <= 6, "boost at {peak_at}, edge {edge}");
         for dx in [14, 18] {
             for x in [edge - dx, edge + dx] {
                 assert!(
@@ -1474,6 +1513,85 @@ mod tests {
                     urow[x],
                     row[x]
                 );
+            }
+        }
+    }
+
+    /// Peak lifts the picture and leaves the paper. The 1:1 box is those
+    /// same pixels, including where the box sits on the border.
+    #[test]
+    fn peak_matches_the_loupe_and_leaves_the_border() {
+        let (w, h) = (72, 48);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, if x < w / 2 { 0.15 } else { 0.75 });
+            }
+        }
+        let mut recipe = Recipe::on_paper();
+        recipe.dpi = 254.0;
+        recipe.border_mm = 1.0;
+        recipe.black_mm = 0.5;
+        recipe.peak.on = true;
+        recipe.peak.radius = 1.0;
+        recipe.peak.amount = 0.8;
+        let params = PrintParams { recipe, ..PrintParams::default() };
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "t".into(), description: None };
+        let full = render_planes(&src, &params);
+        let frame = full.info.border_px + full.info.black_px;
+        assert!(frame >= 5, "frame {frame}");
+        let mut quiet = params.clone();
+        quiet.recipe.peak.on = false;
+        let plain = render_planes(&src, &quiet);
+        assert_eq!(full.plane.at(0, 0), plain.plane.at(0, 0), "paper");
+        assert_eq!(
+            full.plane.at(full.info.border_px, 2),
+            plain.plane.at(full.info.border_px, 2),
+            "black edge"
+        );
+        let inside = frame + 4;
+        let y = frame + h / 2;
+        assert!((full.plane.at(inside, y) - plain.plane.at(inside, y)).abs() < 1e-6, "flat field");
+        let edge = frame + w / 2;
+        assert!(
+            (full.plane.at(edge, y) - plain.plane.at(edge, y)).abs() > 1e-3,
+            "edge {} vs {}",
+            full.plane.at(edge, y),
+            plain.plane.at(edge, y)
+        );
+
+        let lay = layout(w, h, 1, &params);
+        for (nx, ny) in [(0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.5, 0.0)] {
+            let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 15);
+            let (lc, origin_x, origin_y) = if ex > sx && ey > sy {
+                let mut lc = Plane::zeros(ex - sx, ey - sy);
+                for yy in 0..lc.height {
+                    for xx in 0..lc.width {
+                        lc.set(xx, yy, plane.at(sx + xx, sy + yy));
+                    }
+                }
+                (lc, sx, sy)
+            } else {
+                (plane.clone(), 0, 0)
+            };
+            let got = sharpen_window(
+                PlaneWindow { plane: &lc, origin_x, origin_y, full_w: w, full_h: h },
+                None,
+                &params,
+                nx,
+                ny,
+                15,
+            )
+            .expect("loupe");
+            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 15, peak_halo_px(&params.recipe));
+            assert_eq!((got.width, got.height), (g.view_w, g.view_h));
+            for yy in 0..got.height {
+                for xx in 0..got.width {
+                    let expect = full.plane.at(g.view_x + xx, g.view_y + yy);
+                    let v = got.at(xx, yy);
+                    assert!((v - expect).abs() < 1e-9, "at {nx},{ny} +{xx},{yy}: {v} vs {expect}");
+                }
             }
         }
     }

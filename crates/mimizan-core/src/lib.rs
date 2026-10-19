@@ -21,6 +21,7 @@ pub mod mask;
 pub mod metrics;
 pub mod mix;
 pub mod paper;
+pub mod peak;
 pub mod pipeline;
 pub mod plane;
 pub mod preview;

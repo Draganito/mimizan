@@ -8,7 +8,8 @@ use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{DetailAsk, DevelopParams, Histogram, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
-    Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, Preview, PreviewRequest, PreviewResult,
+    Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest,
+    PreviewResult,
 };
 use crate::zone_bar::zone_bar;
 use egui::{
@@ -255,6 +256,14 @@ pub struct App {
     paper_cm: [f64; 2],
     /// Where the loupe looks, as a fraction of the upright picture.
     sharpen_at: Option<[f64; 2]>,
+    /// The user edited radius or amount on this file. A measurement will not
+    /// replace those numbers.
+    peak_held: bool,
+    /// Start one measurement on the next frame. Cleared when it starts.
+    peak_arm: bool,
+    /// Identifies the measurement in flight. A new file advances it.
+    peak_gen: u64,
+    peak_measure: Option<PeakMeasure>,
     /// The pointer went down on the crosshair, so this gesture moves the spot.
     cross_drag: bool,
     loupe: Loupe,
@@ -405,6 +414,10 @@ impl App {
             size_mode: SizeMode::Native,
             paper_cm: [30.0, 40.0],
             sharpen_at: None,
+            peak_held: false,
+            peak_arm: false,
+            peak_gen: 0,
+            peak_measure: None,
             cross_drag: false,
             loupe: Loupe::spawn(cc.egui_ctx.clone()),
             loupe_sent: 0,
@@ -995,6 +1008,12 @@ impl App {
         self.tex_rotation = 0;
         self.keep_scale = None;
         self.show_mask = false;
+        // Drop a measurement that is still running. Fresh opens arm a new
+        // one after this; a reset keeps the default radius and amount.
+        self.peak_measure = None;
+        self.peak_arm = false;
+        self.peak_held = true;
+        self.peak_gen = self.peak_gen.wrapping_add(1);
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.close_crop();
@@ -1010,13 +1029,13 @@ impl App {
     fn load_recipe(&mut self, path: &Path) {
         match Recipe::load(path) {
             Ok(mut r) => {
-                // The desktop print does not sharpen. The file may still
-                // name the step; the phone and the CLI keep using it.
+                // The phone's sharpening mode stays off. Peak in the file is kept.
                 r.sharpen = Sharpen::Off;
                 let mut e = self.edit.clone();
                 e.recipe = r;
                 self.set_edit(e);
                 self.close_crop();
+                self.note_peak_source();
                 self.log(format!("loaded recipe {}", path.display()));
             }
             Err(e) => self.log(format!("recipe not loaded: {e}")),
@@ -1169,6 +1188,7 @@ impl App {
                             self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
                         }
                         self.recipe_baseline = self.edit.recipe.clone();
+                        self.note_peak_source();
                     }
                     self.busy = None;
                     self.last_view = None;
@@ -1188,6 +1208,7 @@ impl App {
                 self.accept_loupe(ctx, r);
             }
         }
+        self.poll_peak();
         for r in self.thumbs.poll() {
             let Some(f) = &mut self.folder else { continue };
             if r.generation != f.generation {
@@ -2197,6 +2218,8 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
+        self.peak_controls(ui);
+        ui.add_space(6.0);
         let idle = self.busy.is_none();
         let has = self.session.is_some();
         let hover = self.export_hover_text();
@@ -2214,18 +2237,18 @@ impl App {
         }
     }
 
-    /// The desktop print does not sharpen. A loaded recipe may still name
-    /// the step; the phone and the CLI keep using it. Assigned only when
-    /// it is not already off, so the history stays still.
+    /// The phone's sharpening mode stays off on the desktop. Peak is a
+    /// separate field and is not cleared here. Assigned only when it is
+    /// not already off, so the history stays still.
     fn clear_desktop_sharpen(&mut self) {
         if self.edit.recipe.sharpen != Sharpen::Off {
             self.edit.recipe.sharpen = Sharpen::Off;
         }
     }
 
-    /// The print: size, resolution, border and resampling. The desktop
-    /// export does not sharpen; that stays in the core for the phone.
-    /// The 1:1 box is the print pixels, for judging the size step.
+    /// The print: size, resolution, border and resampling. The phone's
+    /// sharpening mode stays off. Peak, below the tile, is the desktop
+    /// high-pass. The 1:1 box is the print pixels.
     fn print_section(&mut self, ui: &mut egui::Ui) {
         self.clear_desktop_sharpen();
         let mut mode = self.size_mode;
@@ -2392,7 +2415,8 @@ impl App {
     }
 
     /// The 1:1 box, as wide as this panel. Print pixels after the size
-    /// step, the same ones the TIFF gets, with no sharpening.
+    /// step, the same ones the TIFF gets. Peak is in them only while the
+    /// checkbox is on.
     fn sharpen_loupe(&mut self, ui: &mut egui::Ui) {
         self.loupe_open = true;
         let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
@@ -2507,10 +2531,123 @@ impl App {
         };
         let r = &self.edit.recipe;
         let local = if r.place != 0.0 { format!(", place {:+.2}", r.place) } else { String::new() };
+        let sharpen = if r.peak.on {
+            format!(", radius {:.2} px, amount {:.2}", r.peak.radius, r.peak.amount)
+        } else {
+            ", no sharpening".to_string()
+        };
         format!(
             "Writes the print on the {look}{rot}{local}:\n\
-             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC, no sharpening, recipe in the description"
+             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC{sharpen}, recipe in the description"
         )
+    }
+
+    /// A new file, or a recipe just loaded. A saved peak is kept. Otherwise
+    /// the next frame measures this print and fills radius and amount.
+    fn note_peak_source(&mut self) {
+        self.peak_measure = None;
+        self.peak_gen = self.peak_gen.wrapping_add(1);
+        self.peak_held = !self.edit.recipe.peak.is_unset();
+        self.peak_arm = !self.peak_held && self.session.is_some() && self.screenshot_to.is_none();
+    }
+
+    fn start_peak_tune(&mut self, ctx: &egui::Context) {
+        let Some(session) = self.session.clone() else { return };
+        let mut recipe = self.print_recipe();
+        recipe.sharpen = Sharpen::Off;
+        recipe.peak.on = false;
+        self.peak_measure = Some(PeakMeasure::start(
+            ctx.clone(),
+            self.peak_gen,
+            session,
+            self.weights(),
+            recipe,
+            self.export_orientation(),
+        ));
+    }
+
+    fn poll_peak(&mut self) {
+        let poll = self.peak_measure.as_ref().map(PeakMeasure::poll);
+        match poll {
+            Some(PeakPoll::Ready(result)) => {
+                self.peak_measure = None;
+                if result.generation == self.peak_gen && !self.peak_held {
+                    self.apply_measured_peak(result.radius, result.amount, result.found);
+                }
+            }
+            Some(PeakPoll::Lost) => {
+                self.peak_measure = None;
+                self.log("peak measure failed");
+            }
+            Some(PeakPoll::Waiting) | None => {}
+        }
+    }
+
+    /// Fill the fields from the measurement. The checkbox is left as it is.
+    /// The baseline takes the same numbers, so opening a file does not by
+    /// itself ask to save.
+    fn apply_measured_peak(&mut self, radius: f64, amount: f64, found: bool) {
+        self.edit.recipe.peak.radius = radius;
+        self.edit.recipe.peak.amount = amount;
+        self.recipe_baseline.peak.radius = radius;
+        self.recipe_baseline.peak.amount = amount;
+        self.history.fill_peak(radius, amount);
+        if found {
+            self.log(format!("peak {radius:.2} px, amount {amount:.2}"));
+        } else {
+            self.log("peak found no edge");
+        }
+    }
+
+    /// Radius, amount and the checkbox, directly above Export. The fields
+    /// stay editable while the checkbox is off. The tile and the TIFF
+    /// sharpen only while it is on.
+    fn peak_controls(&mut self, ui: &mut egui::Ui) {
+        let has = self.session.is_some();
+        ui.horizontal(|ui| {
+            print_field_label(ui, "sharpen");
+            let mut on = self.edit.recipe.peak.on;
+            let response = ui
+                .add_enabled(has, egui::Checkbox::new(&mut on, ""))
+                .on_hover_text("Sharpen this print. The tile and the TIFF use the radius and the amount. Off leaves both as they were.");
+            if response.changed() {
+                self.edit.recipe.peak.on = on;
+            }
+            if self.peak_measure.is_some() {
+                ui.label(RichText::new("measuring").weak());
+            }
+        });
+        ui.horizontal(|ui| {
+            print_field_label(ui, "radius");
+            let response = ui
+                .add_enabled(
+                    has,
+                    egui::DragValue::new(&mut self.edit.recipe.peak.radius)
+                        .range(mimizan_core::recipe::PEAK_RADIUS_MIN..=mimizan_core::recipe::PEAK_RADIUS_MAX)
+                        .speed(0.05)
+                        .fixed_decimals(2)
+                        .suffix(" px"),
+                )
+                .on_hover_text("Gaussian radius in print pixels. Peak fills this from the picture. The field stays editable.");
+            if response.changed() {
+                self.peak_held = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            print_field_label(ui, "amount");
+            let response = ui
+                .add_enabled(
+                    has,
+                    egui::DragValue::new(&mut self.edit.recipe.peak.amount)
+                        .range(0.0..=mimizan_core::recipe::PEAK_AMOUNT_MAX)
+                        .speed(0.02)
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("How much of the high-pass is added back. Zero leaves the picture as it was. The field stays editable while sharpen is off.");
+            if response.changed() {
+                self.peak_held = true;
+            }
+        });
     }
 
     /// `stage` is the opening between the windows, and the fit is measured
@@ -3419,6 +3556,12 @@ impl eframe::App for App {
         // so a request from inside it would still carry the previous exposure.
         if self.loupe_open {
             self.request_loupe();
+        }
+        if self.peak_arm {
+            self.peak_arm = false;
+            if !self.peak_held {
+                self.start_peak_tune(&ctx);
+            }
         }
         self.strip_keys(&ctx);
         self.save_prompt(&ctx);

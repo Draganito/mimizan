@@ -87,6 +87,15 @@ impl History {
     pub fn position(&self) -> (usize, usize) {
         (self.cursor + 1, self.entries.len())
     }
+
+    /// Write a measured radius and amount into every step. The checkbox is
+    /// left as each step had it, and this is not a new step of its own.
+    pub fn fill_peak(&mut self, radius: f64, amount: f64) {
+        for e in &mut self.entries {
+            e.recipe.peak.radius = radius;
+            e.recipe.peak.amount = amount;
+        }
+    }
 }
 
 #[cfg(test)]

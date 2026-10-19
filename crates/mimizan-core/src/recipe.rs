@@ -19,6 +19,76 @@ use std::path::Path;
 /// Largest USM amount a recipe accepts (the GUI slider ends here too).
 pub const USM_MAX: f64 = 1.5;
 
+/// Gaussian σ of the peak high-pass, in print pixels. The search in
+/// [`crate::peak`] starts at the same radius.
+pub const PEAK_RADIUS_DEFAULT: f64 = 0.7;
+/// Finest and widest radius the print panel will store.
+pub const PEAK_RADIUS_MIN: f64 = 0.3;
+pub const PEAK_RADIUS_MAX: f64 = 8.0;
+/// Largest peak amount. The search itself stops near 1.5; the field goes
+/// further so a measured value can be pushed by hand.
+pub const PEAK_AMOUNT_MAX: f64 = 4.0;
+
+fn default_peak_radius() -> f64 {
+    PEAK_RADIUS_DEFAULT
+}
+
+/// Peak high-pass on the picture. The paper border is not part of it.
+/// `on` is the checkbox: radius and amount stay when it is off, and neither
+/// the tile nor the TIFF is sharpened.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Peak {
+    #[serde(default)]
+    pub on: bool,
+    /// Gaussian σ in print pixels.
+    #[serde(default = "default_peak_radius")]
+    pub radius: f64,
+    /// `x + amount · (x − blur(radius))`.
+    #[serde(default)]
+    pub amount: f64,
+}
+
+impl Default for Peak {
+    fn default() -> Self {
+        Self { on: false, radius: default_peak_radius(), amount: 0.0 }
+    }
+}
+
+impl Peak {
+    /// The high-pass runs. Off, or a zero amount, leaves every pixel as it was.
+    pub fn applies(&self) -> bool {
+        self.on && self.radius > 0.0 && self.amount > 0.0
+    }
+
+    /// Omitted from a recipe file. A saved radius or a ticked checkbox is kept.
+    pub fn is_unset(&self) -> bool {
+        !self.on && self.amount == 0.0 && self.radius == PEAK_RADIUS_DEFAULT
+    }
+
+    /// A measured pair, pulled into the range [`Self::validate`] accepts.
+    pub fn clamp_measured(radius: f64, amount: f64) -> (f64, f64) {
+        let radius = if radius.is_finite() { radius } else { PEAK_RADIUS_DEFAULT };
+        let amount = if amount.is_finite() { amount } else { 0.0 };
+        (radius.clamp(PEAK_RADIUS_MIN, PEAK_RADIUS_MAX), amount.clamp(0.0, PEAK_AMOUNT_MAX))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.radius.is_finite() || !(PEAK_RADIUS_MIN..=PEAK_RADIUS_MAX).contains(&self.radius) {
+            return Err(Error::Invalid(format!(
+                "peak radius {} not within {PEAK_RADIUS_MIN}..{PEAK_RADIUS_MAX}",
+                self.radius
+            )));
+        }
+        if !self.amount.is_finite() || !(0.0..=PEAK_AMOUNT_MAX).contains(&self.amount) {
+            return Err(Error::Invalid(format!(
+                "peak amount {} not within 0..{PEAK_AMOUNT_MAX}",
+                self.amount
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Scale compensation after the curve: the enlargement blur, if any.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
@@ -131,6 +201,9 @@ pub struct Recipe {
     pub black_mm: f64,
     #[serde(default)]
     pub sharpen: Sharpen,
+    /// Peak high-pass. Absent in older recipes, which stay unsharpened.
+    #[serde(default, skip_serializing_if = "Peak::is_unset")]
+    pub peak: Peak,
     /// Window on the upright negative, whole pixels, before the size step.
     /// `None` is the full frame. Old recipes omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +222,7 @@ impl Default for Recipe {
             border_mm: 0.0,
             black_mm: 0.0,
             sharpen: Sharpen::Off,
+            peak: Peak::default(),
             crop: None,
         }
     }
@@ -324,7 +398,8 @@ impl Recipe {
                 return Err(Error::Invalid("crop must cover at least one pixel".into()));
             }
         }
-        self.sharpen.validate()
+        self.sharpen.validate()?;
+        self.peak.validate()
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -379,6 +454,7 @@ mod tests {
         assert!(!json.contains("place") && !json.contains("border") && !json.contains("black"));
         assert!(json.contains(r#""resample":"b-spline""#), "{json}");
         assert!(json.contains(r#""sharpen":{"mode":"off"}"#), "{json}");
+        assert!(!json.contains("peak"), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
     }
@@ -430,6 +506,17 @@ mod tests {
         let bad = Recipe { curve: Tone::Paper(crate::paper::SplitGrade::new(0.0, 9.0)), ..Recipe::default() };
         assert!(bad.validate().is_err());
         Recipe::on_paper().validate().unwrap();
+        let peak_on = Recipe { peak: Peak { on: true, radius: 1.4, amount: 0.35 }, ..Recipe::default() };
+        peak_on.validate().unwrap();
+        let json = serde_json::to_string(&peak_on).unwrap();
+        let back: Recipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.peak, peak_on.peak, "{json}");
+        let off = Recipe { peak: Peak { on: false, radius: 1.4, amount: 0.35 }, ..Recipe::default() };
+        let kept: Recipe = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!kept.peak.on);
+        assert!((kept.peak.radius - 1.4).abs() < 1e-12);
+        let bad = Recipe { peak: Peak { on: true, radius: 0.1, amount: 0.2 }, ..Recipe::default() };
+        assert!(bad.validate().is_err());
         assert!(Sharpen::Usm { amount: 1.5 }.validate().is_ok());
         assert!(Sharpen::Usm { amount: 1.6 }.validate().is_err());
         assert!(!Sharpen::Deconv { passes: 3, usm_amount: 0.0 }.uses_mask());

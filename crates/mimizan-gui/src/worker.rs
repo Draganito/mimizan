@@ -12,8 +12,9 @@ use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
+use mimizan_core::plane::Plane;
 use mimizan_core::print::{self as pr, PrintParams, PrintSource};
-use mimizan_core::recipe::Recipe;
+use mimizan_core::recipe::{Recipe, Sharpen};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -33,7 +34,8 @@ pub enum Job {
     },
     /// One export, one file: `path` (16-bit TIFF, the recipe rendered in one
     /// pass against the negative: placing, paper or look, size and border.
-    /// The desktop GUI sends sharpening off).
+    /// The desktop GUI sends the phone's sharpening mode off. Peak, when
+    /// the recipe has it on, is part of that same pass).
     Export {
         session: Arc<Session>,
         weights: Weights,
@@ -183,6 +185,112 @@ fn develop_frame(
     Ok(Session { path, frame, negative, camera_file, camera_file_path, develop, preview, raw_hist })
 }
 
+/// The plane the print is made from. A monochrome sensor is already the
+/// picture. Bayer mixes the separation; the weights stay out of that plane.
+fn mixed_plane(s: &Session, weights: &Weights) -> Result<Option<Plane>> {
+    if s.is_mono() {
+        return Ok(None);
+    }
+    let Some(sep) = s.separation() else {
+        return Err(anyhow::anyhow!("this negative has no separation"));
+    };
+    Ok(Some(mix(sep, weights)))
+}
+
+/// Radius and amount for the unsharpened print. The phone's sharpening mode
+/// and the checkbox are off for the measurement, so the numbers describe the
+/// picture the checkbox will lift.
+pub fn measure_peak(
+    s: &Session,
+    weights: &Weights,
+    mut recipe: Recipe,
+    orientation: u16,
+) -> Result<(f64, f64, bool)> {
+    recipe.sharpen = Sharpen::Off;
+    recipe.peak.on = false;
+    let mixed = mixed_plane(s, weights)?;
+    let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
+    let src =
+        PrintSource { plane, mask: None, orientation, name: s.path.display().to_string(), description: None };
+    let out = pr::render_planes(&src, &PrintParams { recipe, ..PrintParams::default() });
+    let frame = out.info.border_px.saturating_add(out.info.black_px);
+    let (x0, y0, pw, ph) = picture_box(out.plane.width, out.plane.height, frame);
+    let mut samples = Vec::with_capacity(pw.saturating_mul(ph));
+    for y in 0..ph {
+        let row = out.plane.row(y0 + y);
+        for &v in &row[x0..x0 + pw] {
+            samples.push(v as f32);
+        }
+    }
+    let tuned = mimizan_core::peak::tune(&samples, pw, ph);
+    let (radius, amount) = mimizan_core::recipe::Peak::clamp_measured(tuned.radius, tuned.amount);
+    Ok((radius, amount, tuned.found))
+}
+
+fn picture_box(width: usize, height: usize, frame: usize) -> (usize, usize, usize, usize) {
+    if frame == 0 || width <= frame.saturating_mul(2) || height <= frame.saturating_mul(2) {
+        (0, 0, width, height)
+    } else {
+        (frame, frame, width - 2 * frame, height - 2 * frame)
+    }
+}
+
+pub struct PeakMeasured {
+    pub generation: u64,
+    pub radius: f64,
+    pub amount: f64,
+    pub found: bool,
+}
+
+pub enum PeakPoll {
+    Waiting,
+    Ready(PeakMeasured),
+    Lost,
+}
+
+/// One measurement of the open print. A newer one drops this receiver.
+pub struct PeakMeasure {
+    rx: Receiver<PeakMeasured>,
+}
+
+impl PeakMeasure {
+    pub fn start(
+        ctx: egui::Context,
+        generation: u64,
+        session: Arc<Session>,
+        weights: Weights,
+        recipe: Recipe,
+        orientation: u16,
+    ) -> Self {
+        let (tx, rx) = channel();
+        thread::Builder::new()
+            .name("mimizan-peak".into())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    measure_peak(&session, &weights, recipe, orientation)
+                }));
+                match outcome {
+                    Ok(Ok((radius, amount, found))) => {
+                        let _ = tx.send(PeakMeasured { generation, radius, amount, found });
+                    }
+                    Ok(Err(e)) => tracing::error!("peak measure failed: {e:#}"),
+                    Err(_) => tracing::error!("peak measure stopped"),
+                }
+                ctx.request_repaint();
+            })
+            .expect("spawn peak measure");
+        Self { rx }
+    }
+
+    pub fn poll(&self) -> PeakPoll {
+        match self.rx.try_recv() {
+            Ok(v) => PeakPoll::Ready(v),
+            Err(TryRecvError::Empty) => PeakPoll::Waiting,
+            Err(TryRecvError::Disconnected) => PeakPoll::Lost,
+        }
+    }
+}
+
 fn export(
     s: &Session,
     weights: Weights,
@@ -194,16 +302,7 @@ fn export(
     let t = Instant::now();
     recipe.validate()?;
     status(if s.is_mono() { "placing".into() } else { "mixing".into() });
-    // Bayer mixes the separation. A monochrome plane is already the picture;
-    // the recipe weights stay in the sidecar and do not rewrite it.
-    let mixed = if s.is_mono() {
-        None
-    } else {
-        let Some(sep) = s.separation() else {
-            return Err(anyhow::anyhow!("this negative has no separation"));
-        };
-        Some(mix(sep, &weights))
-    };
+    let mixed = mixed_plane(s, &weights)?;
     let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
     let mask = s.mask_plane()?;
     let mut info = s.negative.info.clone();
