@@ -16,7 +16,7 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
-![A session in Mimizan Lab: the print in the middle, the enlarger below, the sheet on the right, the folder as a film strip](docs/gui.png)
+![Mimizan Lab before a file is opened: the enlarger below, the sheet on the right, the folder as a film strip](docs/gui.png)
 
 ## The negative
 
@@ -70,8 +70,6 @@ cd mimizan
 cargo build --release
 ./target/release/mimizan-gui
 ```
-
-![Mimizan Lab on 64-bit Windows](docs/windows.png)
 
 The same paper is on the phone: [Mimizan Lab for Android](https://github.com/Draganito/mimizan-lab-mobile).
 
