@@ -762,16 +762,29 @@ pub fn render_print_detail(
     Some(DetailImage { ask: DetailAsk::pixels(rect), gray })
 }
 
+/// A render that clipped the ask, or failed, still has to come back as a
+/// tile whose buffer is exactly `ask.w * ask.h`. The clipped ask is the one
+/// that gets kept: the screen asked for a corner the picture does not have.
+fn painted(ask: DetailAsk, rendered: Option<DetailImage>) -> DetailTile {
+    if let Some(d) = rendered {
+        if d.ask.step() == ask.step() && d.gray.len() == d.ask.w.saturating_mul(d.ask.h) {
+            return DetailTile { ask: d.ask, gray: d.gray };
+        }
+    }
+    DetailTile { ask, gray: vec![0; ask.w.saturating_mul(ask.h)] }
+}
+
 /// `have` supplies every sample that already sits on this grid. The rest is
 /// rendered: a pan is the newly uncovered strip, a jump or a new step is the
-/// whole ask. `render` returns `w * h` samples for the ask it is given.
+/// whole ask. `render` may clip the ask to the picture. The tile then carries
+/// that clipped ask, and its buffer is that ask's `w * h`.
 pub fn cover_detail(
     have: Option<&DetailTile>,
     ask: DetailAsk,
-    mut render: impl FnMut(DetailAsk) -> Vec<u8>,
+    mut render: impl FnMut(DetailAsk) -> Option<DetailImage>,
 ) -> DetailTile {
     let Some(old) = have else {
-        return DetailTile { gray: render(ask), ask };
+        return painted(ask, render(ask));
     };
     let step = ask.step();
     let aligned = ask.x.is_multiple_of(step)
@@ -784,7 +797,7 @@ pub fn cover_detail(
         aligned.then(|| grid_shift(ask.x, old.ask.x, step)).flatten(),
         aligned.then(|| grid_shift(ask.y, old.ask.y, step)).flatten(),
     ) else {
-        return DetailTile { gray: render(ask), ask };
+        return painted(ask, render(ask));
     };
     let mut gray = vec![0u8; ask.w.saturating_mul(ask.h)];
     let ni0 = (-shift_i).max(0) as usize;
@@ -792,7 +805,7 @@ pub fn cover_detail(
     let nj0 = (-shift_j).max(0) as usize;
     let nj1 = (old.ask.h as isize - shift_j).clamp(0, ask.h as isize) as usize;
     if ni0 >= ni1 || nj0 >= nj1 {
-        return DetailTile { gray: render(ask), ask };
+        return painted(ask, render(ask));
     }
     for nj in nj0..nj1 {
         let oj = (nj as isize + shift_j) as usize;
@@ -819,14 +832,18 @@ pub fn cover_detail(
     }
     for (gx, gy, gw, gh) in gaps {
         let sub = DetailAsk { x: ask.x + gx * step, y: ask.y + gy * step, w: gw, h: gh, step };
-        let got = render(sub);
-        if got.len() != gw * gh {
-            return DetailTile { gray: render(ask), ask };
+        let Some(got) = render(sub) else {
+            return painted(ask, render(ask));
+        };
+        // A clip changes the rectangle. The strip no longer fits the gap,
+        // so the whole ask is rendered again and keeps the clipped size.
+        if got.ask.w != gw || got.ask.h != gh || got.gray.len() != gw * gh {
+            return painted(ask, render(ask));
         }
         for j in 0..gh {
             let dst = (gy + j) * ask.w + gx;
             let src = j * gw;
-            gray[dst..dst + gw].copy_from_slice(&got[src..src + gw]);
+            gray[dst..dst + gw].copy_from_slice(&got.gray[src..src + gw]);
         }
     }
     DetailTile { ask, gray }
@@ -1623,16 +1640,17 @@ mod tests {
     /// A diagonal pan keeps the shared samples and asks only for the new strips.
     #[test]
     fn a_pan_fills_only_the_new_strip() {
-        fn paint(ask: DetailAsk) -> Vec<u8> {
-            (0..ask.h)
+        fn paint(ask: DetailAsk) -> Option<DetailImage> {
+            let gray = (0..ask.h)
                 .flat_map(|j| {
                     (0..ask.w).map(move |i| ((ask.x / ask.step + i) * 3 + (ask.y / ask.step + j)) as u8)
                 })
-                .collect()
+                .collect();
+            Some(DetailImage { ask, gray })
         }
         let first = DetailAsk { x: 0, y: 0, w: 6, h: 4, step: 2 };
         let have = cover_detail(None, first, paint);
-        assert_eq!(have.gray, paint(first));
+        assert_eq!(have.gray, paint(first).unwrap().gray);
         let next = DetailAsk { x: 4, y: 2, w: 6, h: 4, step: 2 };
         let mut strips = 0usize;
         let got = cover_detail(Some(&have), next, |ask| {
@@ -1640,15 +1658,41 @@ mod tests {
             assert!(ask.w * ask.h < next.w * next.h, "a pan must not rebuild the window");
             paint(ask)
         });
-        assert_eq!(got.gray, paint(next));
+        assert_eq!(got.gray, paint(next).unwrap().gray);
         assert!((1..=4).contains(&strips), "strips {strips}");
         let mut again = 0usize;
         let same = cover_detail(Some(&got), next, |_| {
             again += 1;
-            Vec::new()
+            None
         });
         assert_eq!(again, 0);
-        assert_eq!(same.gray, paint(next));
+        assert_eq!(same.gray, paint(next).unwrap().gray);
+    }
+
+    /// The 1:1 window can hang off the picture. The renderer clips it. The
+    /// tile must keep that clipped size, or the screen panics on the upload.
+    #[test]
+    fn a_window_past_the_picture_keeps_the_pixels_that_exist() {
+        fn clip(ask: DetailAsk) -> Option<DetailImage> {
+            let (lim_w, lim_h) = (40usize, 30usize);
+            if ask.x >= lim_w || ask.y >= lim_h || ask.w == 0 || ask.h == 0 {
+                return None;
+            }
+            let ask = DetailAsk { w: ask.w.min(lim_w - ask.x), h: ask.h.min(lim_h - ask.y), ..ask };
+            let gray = vec![7u8; ask.w * ask.h];
+            Some(DetailImage { ask, gray })
+        }
+        let ask = DetailAsk { x: 30, y: 20, w: 20, h: 20, step: 1 };
+        let tile = cover_detail(None, ask, clip);
+        assert_eq!((tile.ask.x, tile.ask.y, tile.ask.w, tile.ask.h), (30, 20, 10, 10));
+        assert_eq!(tile.gray.len(), tile.ask.w * tile.ask.h);
+        // A later pan that still hangs off the corner must not pair the old
+        // size with the clipped buffer.
+        let further = DetailAsk { x: 32, y: 22, w: 20, h: 20, step: 1 };
+        let next = cover_detail(Some(&tile), further, clip);
+        assert_eq!(next.gray.len(), next.ask.w * next.ask.h);
+        assert!(next.ask.x + next.ask.w <= 40);
+        assert!(next.ask.y + next.ask.h <= 30);
     }
 
     /// The desktop program starts with the last octave reconstructed. The

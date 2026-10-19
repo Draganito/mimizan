@@ -47,14 +47,14 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 Debian and Ubuntu:
 
 ```bash
-sudo apt install ./mimizan_0.11.15-1_amd64.deb
+sudo apt install ./mimizan_0.11.16-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.15-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation.
+Windows, 64-bit Intel and AMD: unzip `mimizan-0.11.16-x86_64-windows.zip` and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation.
 
-Apple silicon: unzip `mimizan-0.11.15-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+Apple silicon: unzip `mimizan-0.11.16-aarch64-macos.zip` and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
 From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and a working OpenGL for the GUI):
 

@@ -1343,17 +1343,26 @@ impl App {
                 }
             }
             self.tex_rotation = im.rotation;
-            let img = ColorImage::from_gray([im.width, im.height], &im.gray);
-            let opts = TextureOptions::LINEAR;
-            match &mut self.texture {
-                Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
-                _ => self.texture = Some(ctx.load_texture("preview", img, opts)),
+            if im.width > 0 && im.height > 0 && im.gray.len() == im.width.saturating_mul(im.height) {
+                let img = ColorImage::from_gray([im.width, im.height], &im.gray);
+                let opts = TextureOptions::LINEAR;
+                match &mut self.texture {
+                    Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
+                    _ => self.texture = Some(ctx.load_texture("preview", img, opts)),
+                }
+                self.tex_size = [im.width, im.height];
+            } else {
+                self.log("preview was the wrong size");
             }
-            self.tex_size = [im.width, im.height];
             self.hist_view = im.hist_view;
             self.hist_negative = im.hist_negative;
         }
         if let Some(d) = r.detail {
+            let n = d.ask.w.saturating_mul(d.ask.h);
+            if d.ask.w == 0 || d.ask.h == 0 || d.gray.len() != n {
+                self.log("detail window was the wrong size");
+                return;
+            }
             let img = ColorImage::from_gray([d.ask.w, d.ask.h], &d.gray);
             // One sample is one screen pixel, or one file pixel at 1:1.
             // Nearest keeps that sample; it does not blend it with a neighbour.

@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-cli"
-version = "0.11.15"
+version = "0.11.16"
 dependencies = [
  "anyhow",
  "clap",
@@ -1882,7 +1882,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-core"
-version = "0.11.15"
+version = "0.11.16"
 dependencies = [
  "criterion",
  "image",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-gui"
-version = "0.11.15"
+version = "0.11.16"
 dependencies = [
  "anyhow",
  "eframe",

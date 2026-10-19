@@ -270,16 +270,12 @@ impl Preview {
                             cover_detail(held.as_ref(), ask, |sub| {
                                 let rect = DetailRect { x: sub.x, y: sub.y, w: sub.w, h: sub.h };
                                 render_print_detail(&req.session, &req.view, &recipe, rect, table)
-                                    .map(|d| d.gray)
-                                    .unwrap_or_default()
                             })
                         } else {
                             let codes = (req.view.place == 0.0 && !req.view.show_mask)
                                 .then(|| hists.codes_for(&req.session, &req.view.weights));
                             cover_detail(held.as_ref(), ask, |sub| {
                                 render_detail(&req.session, &req.view, sub, table, codes)
-                                    .map(|d| d.gray)
-                                    .unwrap_or_default()
                             })
                         };
                         let image = DetailImage { ask: tile.ask, gray: tile.gray.clone() };
