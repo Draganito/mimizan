@@ -3662,6 +3662,36 @@ fn dock_scroll(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| add(ui));
 }
 
+/// The negative window scrolls. One quiet line stays centred on its floor.
+/// A tall window leaves the dark glass between the CPU section and the name.
+/// A window too short for that line scrolls as before, so the name is never cut.
+fn negative_body(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let credit_h = ui.text_style_height(&egui::TextStyle::Small);
+    let spacing = ui.spacing().item_spacing.y;
+    let room = ui.available_height().max(0.0);
+    let reserve = credit_h + spacing;
+    if room <= reserve {
+        dock_scroll(ui, add);
+        return;
+    }
+    // The default minimum would hold the scroll open and push the line
+    // through the floor of a short window.
+    egui::ScrollArea::vertical()
+        .max_height(room - reserve)
+        .min_scrolled_height(0.0)
+        .auto_shrink([false, false])
+        .show(ui, add);
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, credit_h), egui::Sense::hover());
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "© 2026 Dragan Bojovic",
+        egui::TextStyle::Small.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
+}
+
 /// The dark translucent glass the panels are made of. Plain alpha, no
 /// backdrop blur: it has to look the same on every GPU driver and in software.
 /// The shadow stays inside the dock; the clip is set before this is painted.
@@ -3834,7 +3864,7 @@ impl App {
         let mut hide = [false; 3];
         if let Some(r) = docks.left {
             hide[0] = show_dock(ui, "dock-negative", r, "Negative", |ui| {
-                dock_scroll(ui, |ui| self.analysis_panel(ui));
+                negative_body(ui, |ui| self.analysis_panel(ui));
             })
             .0;
         }
