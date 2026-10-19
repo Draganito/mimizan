@@ -3060,6 +3060,9 @@ impl App {
         let scroll_to = std::mem::take(&mut self.scroll_to_selected);
         let mut clicked: Option<PathBuf> = None;
         let mut go_dir: Option<PathBuf> = None;
+        // Names whose thumbnail buffer does not match its size. Logged once
+        // the strip is done borrowing the folder.
+        let mut bad_thumbs: Vec<String> = Vec::new();
         // (distance from the viewport centre, index) of tiles that still
         // need a thumbnail; visible ones first, then two screens around.
         let mut wanted: Vec<(f32, usize)> = Vec::new();
@@ -3152,7 +3155,19 @@ impl App {
                         continue;
                     }
                     if e.texture.is_none() {
-                        if let Some(t) = &e.thumb {
+                        let bad = e.thumb.as_ref().is_some_and(|t| {
+                            t.width == 0
+                                || t.height == 0
+                                || t.gray.len() != t.width.saturating_mul(t.height)
+                        });
+                        if bad {
+                            // Same failure as the 1:1 window: from_gray closes
+                            // the process. Drop the buffer so the next frame
+                            // does not try again.
+                            bad_thumbs.push(e.name.clone());
+                            e.thumb = None;
+                            e.state = ThumbState::Failed;
+                        } else if let Some(t) = &e.thumb {
                             let img = if negative {
                                 ColorImage::from_gray_iter(
                                     [t.width, t.height],
@@ -3287,6 +3302,9 @@ impl App {
                 .collect();
             self.thumbs.want(jobs);
             self.last_wanted = paths;
+        }
+        if !bad_thumbs.is_empty() {
+            self.log(format!("thumbnail was the wrong size: {}", bad_thumbs.join(", ")));
         }
         if let Some(p) = clicked {
             self.open(p);
