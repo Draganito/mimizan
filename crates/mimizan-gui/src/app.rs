@@ -3156,9 +3156,7 @@ impl App {
                     }
                     if e.texture.is_none() {
                         let bad = e.thumb.as_ref().is_some_and(|t| {
-                            t.width == 0
-                                || t.height == 0
-                                || t.gray.len() != t.width.saturating_mul(t.height)
+                            t.width == 0 || t.height == 0 || t.gray.len() != t.width.saturating_mul(t.height)
                         });
                         if bad {
                             // Same failure as the 1:1 window: from_gray closes
