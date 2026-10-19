@@ -19,7 +19,7 @@ use egui_file_dialog::FileDialog;
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
-use mimizan_core::print::{box_for_picture_height, box_for_picture_width, PrintSize};
+use mimizan_core::print::{box_for_picture_height, box_for_picture_width, peak_print_radius, PrintSize};
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
@@ -2532,7 +2532,8 @@ impl App {
         let r = &self.edit.recipe;
         let local = if r.place != 0.0 { format!(", place {:+.2}", r.place) } else { String::new() };
         let sharpen = if r.peak.on {
-            format!(", radius {:.2} px, amount {:.2}", r.peak.radius, r.peak.amount)
+            let radius = peak_print_radius(r.peak.radius, self.peak_scale());
+            format!(", radius {radius:.2} px, amount {:.2}", r.peak.amount)
         } else {
             ", no sharpening".to_string()
         };
@@ -2540,6 +2541,15 @@ impl App {
             "Writes the print on the {look}{rot}{local}:\n\
              <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC{sharpen}, recipe in the description"
         )
+    }
+
+    /// Long-side enlargement of the print. Native size and a reduction are 1,
+    /// so the radius field shows the negative's radius until the picture grows.
+    fn peak_scale(&self) -> f64 {
+        match self.print_layout() {
+            Some(l) if l.enlargement > 1.0 => l.enlargement,
+            _ => 1.0,
+        }
     }
 
     /// A new file, or a recipe just loaded. A saved peak is kept. Otherwise
@@ -2617,20 +2627,32 @@ impl App {
                 ui.label(RichText::new("measuring").weak());
             }
         });
+        let scale = self.peak_scale();
         ui.horizontal(|ui| {
             print_field_label(ui, "radius");
+            let mut shown = self.edit.recipe.peak.radius * scale;
             let response = ui
                 .add_enabled(
                     has,
-                    egui::DragValue::new(&mut self.edit.recipe.peak.radius)
-                        .range(mimizan_core::recipe::PEAK_RADIUS_MIN..=mimizan_core::recipe::PEAK_RADIUS_MAX)
-                        .speed(0.05)
+                    egui::DragValue::new(&mut shown)
+                        .range(
+                            mimizan_core::recipe::PEAK_RADIUS_MIN * scale
+                                ..=mimizan_core::recipe::PEAK_RADIUS_MAX * scale,
+                        )
+                        .speed(0.05 * scale)
                         .fixed_decimals(2)
                         .suffix(" px"),
                 )
-                .on_hover_text("Gaussian radius in print pixels. Peak fills this from the picture. The field stays editable.");
+                .on_hover_text(
+                    "Gaussian radius in print pixels. Peak measures it on the negative. An enlargement multiplies it; the amount stays.",
+                );
             if response.changed() {
-                self.peak_held = true;
+                let stored = (shown / scale)
+                    .clamp(mimizan_core::recipe::PEAK_RADIUS_MIN, mimizan_core::recipe::PEAK_RADIUS_MAX);
+                if (stored - self.edit.recipe.peak.radius).abs() > 1e-9 {
+                    self.edit.recipe.peak.radius = stored;
+                    self.peak_held = true;
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -2643,7 +2665,9 @@ impl App {
                         .speed(0.02)
                         .fixed_decimals(2),
                 )
-                .on_hover_text("How much of the high-pass is added back. Zero leaves the picture as it was. The field stays editable while sharpen is off.");
+                .on_hover_text(
+                    "How much of the high-pass is added back. An enlargement does not change it. Zero leaves the picture as it was.",
+                );
             if response.changed() {
                 self.peak_held = true;
             }

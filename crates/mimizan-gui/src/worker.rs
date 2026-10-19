@@ -197,9 +197,10 @@ fn mixed_plane(s: &Session, weights: &Weights) -> Result<Option<Plane>> {
     Ok(Some(mix(sep, weights)))
 }
 
-/// Radius and amount for the unsharpened print. The phone's sharpening mode
-/// and the checkbox are off for the measurement, so the numbers describe the
-/// picture the checkbox will lift.
+/// Radius and amount on the negative's own pixels. The size step is left
+/// out, so an enlargement does not widen the measurement. The print
+/// multiplies the radius later. The phone's sharpening mode and the
+/// checkbox are off.
 pub fn measure_peak(
     s: &Session,
     weights: &Weights,
@@ -208,6 +209,7 @@ pub fn measure_peak(
 ) -> Result<(f64, f64, bool)> {
     recipe.sharpen = Sharpen::Off;
     recipe.peak.on = false;
+    recipe.size = None;
     let mixed = mixed_plane(s, weights)?;
     let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
     let src =

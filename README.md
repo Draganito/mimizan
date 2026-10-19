@@ -50,17 +50,17 @@ The folder lies along the bottom as a strip of negatives. It closes when you cli
 
 Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/releases).
 
-Debian and Ubuntu: [mimizan_0.11.20-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.11.20/mimizan_0.11.20-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.11.21-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.11.21/mimizan_0.11.21-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.11.20-1_amd64.deb
+sudo apt install ./mimizan_0.11.21-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.11.20-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.11.20/mimizan-0.11.20-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation.
+Windows, 64-bit Intel and AMD: [mimizan-0.11.21-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.11.21/mimizan-0.11.21-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation.
 
-Apple silicon: [mimizan-0.11.20-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.11.20/mimizan-0.11.20-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+Apple silicon: [mimizan-0.11.21-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.11.21/mimizan-0.11.21-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
 From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and a working OpenGL for the GUI):
 

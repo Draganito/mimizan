@@ -451,9 +451,20 @@ struct LoupeGeom {
     image_h: usize,
 }
 
-fn peak_halo_px(recipe: &Recipe) -> usize {
+/// Radius in print pixels. Above 1× the negative's radius is multiplied by
+/// the enlargement. At native size and when shrinking it is unchanged, and
+/// the amount is never scaled.
+pub fn peak_print_radius(radius: f64, enlargement: f64) -> f64 {
+    if enlargement > 1.0 {
+        radius * enlargement
+    } else {
+        radius
+    }
+}
+
+fn peak_halo_px(recipe: &Recipe, enlargement: f64) -> usize {
     if recipe.peak.applies() {
-        kernel_radius(recipe.peak.radius)
+        kernel_radius(peak_print_radius(recipe.peak.radius, enlargement))
     } else {
         0
     }
@@ -530,7 +541,7 @@ pub fn loupe_source_rect(
 ) -> (usize, usize, usize, usize) {
     let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
     let lay = layout(full_w, full_h, 1, p);
-    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe));
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe, lay.enlargement));
     if g.pic_w == 0 || g.pic_h == 0 {
         return (0, 0, 0, 0);
     }
@@ -562,7 +573,7 @@ pub fn sharpen_window(
 ) -> crate::Result<Plane> {
     let (ox, oy, sw, sh) = source_window(linear.full_w, linear.full_h, p.recipe.crop);
     let lay = layout(linear.full_w, linear.full_h, 1, p);
-    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe));
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe, lay.enlargement));
     let tone = p.recipe.curve.compile();
     let white = tone.white();
     let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
@@ -613,7 +624,15 @@ pub fn sharpen_window(
     if g.pic_w > 0 && g.pic_h > 0 {
         let pic_x = g.pic_x + g.border - g.tile_x;
         let pic_y = g.pic_y + g.border - g.tile_y;
-        apply_peak_picture(&mut tile, &p.recipe, pic_x, pic_y, g.pic_w, g.pic_h);
+        apply_peak_picture(
+            &mut tile,
+            &p.recipe,
+            pic_x,
+            pic_y,
+            g.pic_w,
+            g.pic_h,
+            peak_print_radius(p.recipe.peak.radius, lay.enlargement),
+        );
     }
     let mut out = Plane::zeros(g.view_w, g.view_h);
     let ox = g.view_x - g.tile_x;
@@ -663,7 +682,15 @@ pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
 /// Peak on the picture rectangle only. The paper and the black edge stay
 /// as they were, and the blur reflects inside the picture, not into the
 /// border. A rectangle that does not fit the plane is left alone.
-fn apply_peak_picture(plane: &mut Plane, recipe: &Recipe, x0: usize, y0: usize, width: usize, height: usize) {
+fn apply_peak_picture(
+    plane: &mut Plane,
+    recipe: &Recipe,
+    x0: usize,
+    y0: usize,
+    width: usize,
+    height: usize,
+    print_radius: f64,
+) {
     if !recipe.peak.applies() || width == 0 || height == 0 {
         return;
     }
@@ -674,7 +701,7 @@ fn apply_peak_picture(plane: &mut Plane, recipe: &Recipe, x0: usize, y0: usize, 
     for y in 0..height {
         picture.row_mut(y).copy_from_slice(&plane.row(y0 + y)[x0..x0 + width]);
     }
-    let sharp = unsharp(&picture, recipe.peak.radius, recipe.peak.amount, None);
+    let sharp = unsharp(&picture, print_radius, recipe.peak.amount, None);
     for y in 0..height {
         plane.row_mut(y0 + y)[x0..x0 + width].copy_from_slice(sharp.row(y));
     }
@@ -758,9 +785,13 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     }
 
     let (mut plane, deconv_n) = apply_sharpen(plane, mask.as_ref(), r, &lay);
-    apply_peak_picture(&mut plane, r, frame, frame, lay.image_w, lay.image_h);
+    let print_radius = peak_print_radius(r.peak.radius, lay.enlargement);
+    apply_peak_picture(&mut plane, r, frame, frame, lay.image_w, lay.image_h, print_radius);
     if r.peak.applies() {
-        info!("peak radius {:.2} px, amount {:.2}, border left as it was", r.peak.radius, r.peak.amount);
+        info!(
+            "peak radius {:.2} px, amount {:.2}, enlargement {:.2}, border left as it was",
+            print_radius, r.peak.amount, lay.enlargement
+        );
     }
     if deconv_n > 0 {
         info!(
@@ -1265,7 +1296,14 @@ mod tests {
                 11,
             )
             .expect("loupe window");
-            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 11, peak_halo_px(&params.recipe));
+            let g = loupe_geom(
+                &lay,
+                params.recipe.sharpen,
+                nx,
+                ny,
+                11,
+                peak_halo_px(&params.recipe, lay.enlargement),
+            );
             for y in 0..got.height {
                 for x in 0..got.width {
                     let expect = full.plane.at(g.view_x + x, g.view_y + y);
@@ -1346,7 +1384,14 @@ mod tests {
                             16,
                         )
                         .expect("loupe window");
-                        let g = loupe_geom(&lay, sharpen, nx, ny, 16, peak_halo_px(&params.recipe));
+                        let g = loupe_geom(
+                            &lay,
+                            sharpen,
+                            nx,
+                            ny,
+                            16,
+                            peak_halo_px(&params.recipe, lay.enlargement),
+                        );
                         assert_eq!((got.width, got.height), (g.view_w, g.view_h));
                         for y in 0..got.height {
                             for x in 0..got.width {
@@ -1517,6 +1562,49 @@ mod tests {
         }
     }
 
+    /// A stored radius of 1 px at 2× is the same high-pass as 2 px on the print.
+    /// Shrinking does not divide the radius.
+    #[test]
+    fn an_enlargement_multiplies_the_peak_radius() {
+        assert!((peak_print_radius(1.4, 1.0) - 1.4).abs() < 1e-12);
+        assert!((peak_print_radius(1.4, 0.5) - 1.4).abs() < 1e-12);
+        assert!((peak_print_radius(1.4, 2.0) - 2.8).abs() < 1e-12);
+
+        let (w, h) = (32, 24);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, if x < w / 2 { 0.2 } else { 0.8 });
+            }
+        }
+        let mut recipe = Recipe::on_paper();
+        recipe.dpi = 100.0;
+        recipe.size = Some(PrintSize::Physical { width_in: 0.64, height_in: 0.48 });
+        recipe.peak.on = true;
+        recipe.peak.radius = 1.0;
+        recipe.peak.amount = 0.8;
+        let params = PrintParams { recipe, ..PrintParams::default() };
+        let lay = layout(w, h, 1, &params);
+        assert!((lay.enlargement - 2.0).abs() < 1e-9, "{}", lay.enlargement);
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "t".into(), description: None };
+        let got = render_planes(&src, &params);
+        let mut bare = params.clone();
+        bare.recipe.peak.on = false;
+        let plain = render_planes(&src, &bare);
+        let mut picture = Plane::zeros(lay.image_w, lay.image_h);
+        for y in 0..lay.image_h {
+            picture.row_mut(y).copy_from_slice(&plain.plane.row(y)[..lay.image_w]);
+        }
+        let expect = unsharp(&picture, 2.0, 0.8, None);
+        let y = lay.image_h / 2;
+        for x in 0..lay.image_w {
+            let a = got.plane.at(x, y);
+            let b = expect.at(x, y);
+            assert!((a - b).abs() < 1e-9, "x {x}: {a} vs {b}");
+        }
+    }
+
     /// Peak lifts the picture and leaves the paper. The 1:1 box is those
     /// same pixels, including where the box sits on the border.
     #[test]
@@ -1584,7 +1672,14 @@ mod tests {
                 15,
             )
             .expect("loupe");
-            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 15, peak_halo_px(&params.recipe));
+            let g = loupe_geom(
+                &lay,
+                params.recipe.sharpen,
+                nx,
+                ny,
+                15,
+                peak_halo_px(&params.recipe, lay.enlargement),
+            );
             assert_eq!((got.width, got.height), (g.view_w, g.view_h));
             for yy in 0..got.height {
                 for xx in 0..got.width {

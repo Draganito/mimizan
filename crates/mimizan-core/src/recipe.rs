@@ -19,7 +19,7 @@ use std::path::Path;
 /// Largest USM amount a recipe accepts (the GUI slider ends here too).
 pub const USM_MAX: f64 = 1.5;
 
-/// Gaussian σ of the peak high-pass, in print pixels. The search in
+/// Gaussian σ of the peak high-pass, in pixels of the negative. The search in
 /// [`crate::peak`] starts at the same radius.
 pub const PEAK_RADIUS_DEFAULT: f64 = 0.7;
 /// Finest and widest radius the print panel will store.
@@ -40,7 +40,8 @@ fn default_peak_radius() -> f64 {
 pub struct Peak {
     #[serde(default)]
     pub on: bool,
-    /// Gaussian σ in print pixels.
+    /// Gaussian σ in pixels of the negative. An enlargement multiplies it;
+    /// a reduction leaves it as it is.
     #[serde(default = "default_peak_radius")]
     pub radius: f64,
     /// `x + amount · (x − blur(radius))`.
