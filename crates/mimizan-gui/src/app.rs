@@ -2199,12 +2199,6 @@ impl App {
         {
             self.start_export();
         }
-        ui.label(
-            RichText::new(
-                "Renders this recipe against the negative in one pass: the print as a 16-bit TIFF.",
-            )
-            .weak(),
-        );
     }
 
     /// The desktop print does not sharpen. A loaded recipe may still name
@@ -2222,7 +2216,8 @@ impl App {
     fn print_section(&mut self, ui: &mut egui::Ui) {
         self.clear_desktop_sharpen();
         let mut mode = self.size_mode;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
+            print_field_label(ui, "size");
             ui.selectable_value(&mut mode, SizeMode::Native, "native")
                 .on_hover_text("The negative's pixels, printed at the dpi below");
             ui.selectable_value(&mut mode, SizeMode::Paper, "paper")
@@ -2242,52 +2237,61 @@ impl App {
                     }
                 }
                 let dpi_before = self.edit.recipe.dpi;
-                ui.horizontal(|ui| {
-                    let width = ui
-                        .add(
-                            egui::DragValue::new(&mut self.paper_cm[0])
-                                .range(0.1..=2000.0)
-                                .speed(0.1)
-                                .fixed_decimals(1)
-                                .suffix(" cm"),
+                let (width_changed, height_changed) = ui
+                    .horizontal(|ui| {
+                        print_field_label(ui, "");
+                        let width = ui
+                            .add(
+                                egui::DragValue::new(&mut self.paper_cm[0])
+                                    .range(0.1..=2000.0)
+                                    .speed(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" cm"),
+                            )
+                            .on_hover_text(
+                                "Width of the picture. The height follows the negative, one scale for both sides. The black edge and the white border are added around this.",
+                            );
+                        ui.label("×");
+                        let height = ui
+                            .add(
+                                egui::DragValue::new(&mut self.paper_cm[1])
+                                    .range(0.1..=2000.0)
+                                    .speed(0.1)
+                                    .fixed_decimals(1)
+                                    .suffix(" cm"),
+                            )
+                            .on_hover_text(
+                                "Height of the picture. The width follows the negative, one scale for both sides. The black edge and the white border are added around this.",
+                            );
+                        (width.changed(), height.changed())
+                    })
+                    .inner;
+                let dpi_changed = ui
+                    .horizontal(|ui| {
+                        print_field_label(ui, "dpi");
+                        ui.add(
+                            egui::DragValue::new(&mut self.edit.recipe.dpi)
+                                .range(36.0..=1200.0)
+                                .speed(1.0)
+                                .suffix(" dpi"),
                         )
-                        .on_hover_text(
-                            "Width of the picture. The height follows the negative, one scale for both sides. The black edge and the white border are added around this.",
-                        );
-                    ui.label("×");
-                    let height = ui
-                        .add(
-                            egui::DragValue::new(&mut self.paper_cm[1])
-                                .range(0.1..=2000.0)
-                                .speed(0.1)
-                                .fixed_decimals(1)
-                                .suffix(" cm"),
-                        )
-                        .on_hover_text(
-                            "Height of the picture. The width follows the negative, one scale for both sides. The black edge and the white border are added around this.",
-                        );
-                    ui.label(RichText::new("at").weak());
-                    let dpi = ui.add(
-                        egui::DragValue::new(&mut self.edit.recipe.dpi)
-                            .range(36.0..=1200.0)
-                            .speed(1.0)
-                            .suffix(" dpi"),
-                    );
-                    if width.changed() {
-                        self.apply_picture(PictureSide::Width);
-                    } else if height.changed() {
-                        self.apply_picture(PictureSide::Height);
-                    } else if dpi.changed() && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
-                        self.apply_picture(PictureSide::Width);
-                    } else if let Some(cm) = self.picture_cm() {
-                        self.paper_cm = cm;
-                    }
-                });
+                        .changed()
+                    })
+                    .inner;
+                if width_changed {
+                    self.apply_picture(PictureSide::Width);
+                } else if height_changed {
+                    self.apply_picture(PictureSide::Height);
+                } else if dpi_changed && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
+                    self.apply_picture(PictureSide::Width);
+                } else if let Some(cm) = self.picture_cm() {
+                    self.paper_cm = cm;
+                }
             }
             SizeMode::Native => {
                 self.edit.recipe.size = None;
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("dpi").weak());
+                    print_field_label(ui, "dpi");
                     ui.add(
                         egui::DragValue::new(&mut self.edit.recipe.dpi)
                             .range(36.0..=1200.0)
@@ -2298,18 +2302,16 @@ impl App {
                 });
             }
         }
+        self.print_sheet_line(ui);
         let border_before = self.edit.recipe.border_mm;
         let black_before = self.edit.recipe.black_mm;
         if self.edit.recipe.black_mm > self.edit.recipe.border_mm {
             self.edit.recipe.black_mm = self.edit.recipe.border_mm.max(0.0);
         }
-        // One row of border, black and resample is wider than the dock.
-        // The side windows take their width from the content, so that row
-        // pushed Print leftwards over the enlarger. The two millimetres
-        // stay together; the kernel is the next line. Wrapped, so a long
-        // value breaks inside the column instead of widening it.
+        // border and black share the row. Wrapped, so a long value breaks
+        // inside the column instead of widening the dock.
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("border").weak());
+            print_field_label(ui, "border");
             ui.add(
                 egui::DragValue::new(&mut self.edit.recipe.border_mm)
                     .range(0.0..=100.0)
@@ -2338,7 +2340,7 @@ impl App {
             self.apply_picture(PictureSide::Width);
         }
         ui.horizontal(|ui| {
-            ui.label(RichText::new("resample").weak());
+            print_field_label(ui, "resample");
             let r = &mut self.edit.recipe.resample;
             egui::ComboBox::from_id_salt("resample").selected_text(r.name()).show_ui(ui, |ui| {
                 for k in ResampleKernel::ALL {
@@ -2354,36 +2356,26 @@ impl App {
             });
         });
         self.sharpen_loupe(ui);
-        if let Some(l) = self.print_layout() {
-            let (uw, uh) = self.picture_size();
-            let txt = if l.black_px > 0 {
-                format!(
-                    "{uw} × {uh} → {} × {} px picture + {} px black + {} px white = {} × {} px",
-                    l.image_w, l.image_h, l.black_px, l.border_px, l.out_w, l.out_h
-                )
-            } else if l.border_px > 0 {
-                format!(
-                    "{uw} × {uh} → {} × {} px picture + {} px border = {} × {} px",
-                    l.image_w, l.image_h, l.border_px, l.out_w, l.out_h
-                )
-            } else if (l.image_w, l.image_h) != (uw, uh) {
-                format!("{uw} × {uh} → {} × {} px", l.image_w, l.image_h)
-            } else {
-                format!("{uw} × {uh} px, no size step")
-            };
-            ui.label(RichText::new(txt).weak());
-            let dpi = self.edit.recipe.dpi;
-            if dpi > 0.0 {
-                let cm = |px: usize| px as f64 / dpi * 2.54;
-                let sheet = format!("{:.1} × {:.1} cm", cm(l.out_w), cm(l.out_h));
-                let sheet = if l.border_px > 0 || l.black_px > 0 {
-                    format!("{sheet}, border included")
-                } else {
-                    sheet
-                };
-                ui.label(RichText::new(sheet).weak());
-            }
+    }
+
+    /// Pixels of the TIFF and the sheet in centimetres. Absent until a file is open.
+    fn print_sheet_line(&self, ui: &mut egui::Ui) {
+        let Some(l) = self.print_layout() else { return };
+        let dpi = self.edit.recipe.dpi;
+        if dpi <= 0.0 {
+            return;
         }
+        let cm = |px: usize| px as f64 / dpi * 2.54;
+        ui.label(
+            RichText::new(format!(
+                "{} × {} px · {:.1} × {:.1} cm",
+                l.out_w,
+                l.out_h,
+                cm(l.out_w),
+                cm(l.out_h)
+            ))
+            .weak(),
+        );
     }
 
     /// The 1:1 box, as wide as this panel. Print pixels after the size
@@ -2393,14 +2385,16 @@ impl App {
         let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
         let side = (ui.available_width() * ppp).round() as usize;
         self.loupe_px = side.clamp(64, 960);
-        let scale = self.loupe_layout().map(|l| l.enlargement);
-        if let Some(scale) = scale {
-            let text = if scale > 1.0 { format!("{scale:.2}×") } else { "no enlargement".into() };
+        if let Some(scale) = self.loupe_layout().map(|l| l.enlargement) {
+            let mut text = if scale > 1.0 { format!("{scale:.2}×") } else { "no enlargement".to_string() };
+            if self.loupe_shown != self.loupe_sent {
+                text.push_str(" · updating");
+            }
             ui.label(RichText::new(text).weak());
         }
         let mut drag = None;
         if self.session.is_none() {
-            ui.label(RichText::new("Open a RAW file.").weak());
+            print_frame(ui, "Open a RAW file.");
         } else if let Some(tex) = &self.loupe_tex {
             let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
             let [w, h] = self.loupe_size;
@@ -2413,18 +2407,19 @@ impl App {
             }
             let id = tex.id();
             ui.painter().image(id, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            ui.painter().rect(
+                rect,
+                0.0,
+                Color32::TRANSPARENT,
+                egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+                egui::StrokeKind::Inside,
+            );
+            let resp = resp.on_hover_text(format!("{w} × {h} print px · 1:1 · drag to move"));
             if resp.dragged() {
                 drag = Some((resp.drag_delta(), ppp));
             }
-            let updating = self.loupe_shown != self.loupe_sent;
-            let note = if updating {
-                format!("{w} × {h} print px · 1:1 · drag to move · updating")
-            } else {
-                format!("{w} × {h} print px · 1:1 · drag to move")
-            };
-            ui.label(RichText::new(note).small().weak());
         } else {
-            ui.label(RichText::new("rendering the print box…").weak());
+            print_frame(ui, "rendering the print box…");
         }
         if let Some((delta, ppp)) = drag {
             // The picture follows the hand. One screen pixel is one print pixel.
@@ -3591,6 +3586,44 @@ fn panel_heading(ui: &mut egui::Ui, title: &str) -> bool {
     });
     ui.separator();
     hide
+}
+
+/// Left column of the print dock. Wide enough for the longest word, so
+/// dpi, border and resample start their numbers on the same line.
+fn print_field_label(ui: &mut egui::Ui, text: &str) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let width = ui.painter().layout_no_wrap("resample".to_owned(), font.clone(), Color32::WHITE).size().x;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, ui.spacing().interact_size.y), Sense::hover());
+    if text.is_empty() {
+        return;
+    }
+    ui.painter().text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font,
+        ui.visuals().weak_text_color(),
+    );
+}
+
+/// The 1:1 slot when it has no pixels yet. Same square the picture will fill.
+fn print_frame(ui: &mut egui::Ui, text: &str) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, w), Sense::hover());
+    ui.painter().rect(
+        rect,
+        0.0,
+        Color32::from_gray(20),
+        egui::Stroke::new(1.0, Color32::from_white_alpha(20)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::TextStyle::Body.resolve(ui.style()),
+        ui.visuals().weak_text_color(),
+    );
 }
 
 /// The body of a side dock, under the title line. The window no longer
