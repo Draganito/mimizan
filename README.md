@@ -12,6 +12,24 @@ The name is the beach at Mimizan, where the idea came up watching the surf: sepa
 
 ![A session in Mimizan Lab: the print in the middle, the enlarger below, the sheet on the right, the folder as a film strip](docs/gui.png)
 
+## The negative
+
+A colour sensor records one signal. The luminance sits in the low frequencies. The colour rides on carriers at the highest frequency the sensor can hold. Alleysson, Süsstrunk and Hérault described that signal. Dubois showed how to lift the colour off the carriers. Their papers reconstruct a colour picture. A monochrome photograph needs only what remains once the colour is gone.
+
+A RAW converter invents a red, a green and a blue at every photosite, by interpolation and, in the methods that lead these comparisons, by a guess about the local edge. A later step adds the three and keeps one. The guesses stay in the grey: zippers, mazes, and a colour error that has become fine texture. On a large print that texture is the part that never belonged to the lens.
+
+Mimizan Lab subtracts the colour and keeps the luminance. On this path a pixel is a sum of photosites the sensor measured. Detail the lens put on the mosaic stays detail.
+
+Alleysson and Dubois were not quite enough for a photograph. The separation runs on white-balanced photosites, as the camera metered them, so a grey subject puts nothing on the carriers and those carriers can carry real detail. The colour is estimated in two directions, in the way Dubois estimates it, and the copy the luminance has leaked into is trusted less. Where both copies agree, the colour band is opened and the detail underneath comes back. The white balance before the separation, the use of both colour components, and that agreement test are the part built here.
+
+The command stops there. The window goes one step further, where luminance and colour really overlap: those samples are computed, and the mask beside the negative records, pixel by pixel, how much was calculated. On the Kodak set at the band limit of a lens, that share is 5%. On the Nikon Z f files at the sharpness the camera recorded, it is 0.5%. Where a lens-like picture still reaches the sensor, it is 12%.
+
+The print is a measured sheet of Ilford Multigrade. Soft is grade 00, ISO R 160. Hard is grade 5, ISO R 50. There is no hidden tone curve. The preview is that paper, and the TIFF is that sheet. The same recipe gives the same bytes.
+
+On the Kodak set, brought to the band limit of a photograph, the linear negative is 50.8 dB. The best demosaicer in the test, RCD, is 48.9 dB. Twenty-three of the twenty-four pictures are above every demosaicer we ran: bilinear, AHD, DHT and AMaZE in libraw, RCD in RawTherapee. With the window's extra step the mean is 52.0 dB, 5% of the pixels are computed, and all twenty-four pictures are at or above the best of them. On four Nikon Z f files at the sharpness the camera recorded, the linear mean is 51.9 dB against 50.7 dB for RCD. Three of the four are above it. One is 0.13 dB below. Where a lens-like picture still reaches the sensor, the linear mean is 50.2 dB and RCD is 50.6 dB. The window's step puts that mean at 51.9 dB, with 12% computed. On detail sharper than any lens delivers, AMaZE leads the linear negative, 40.7 dB to 36.6 dB. The extra step passes that Kodak test at 42.0 dB, and 49% of the pixels are computed. On the four Z f files made twice as sharp as the camera saw them, RCD still leads, with the step and without it. The means, and how many pictures lead, are in the paper.
+
+It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no colour output, no noise reduction, no lens correction. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
+
 ## A session
 
 The folder lies along the bottom as a strip of negatives. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. The picture in the middle is the print. A white border is added around it, and a black edge can sit inside that white, never wider than it, so the sheet is judged as it will go on the wall.
@@ -21,14 +39,6 @@ The folder lies along the bottom as a strip of negatives. It closes when you cli
 *Crop* frames a darkroom ratio: 4×5, 5×7, 8×10, 11×14, 16×20, 20×24, or square. *Turn* stands that ratio portrait on a landscape negative. *Apply* makes the window the picture, in whole pixels.
 
 *Print* sets the sheet, the dpi and the border, and writes one 16-bit TIFF. The recipe is saved next to the RAW and comes back when the file is opened. Leaving a changed recipe asks first.
-
-## The negative
-
-A colour sensor records luminance and chrominance in one mosaic. Mimizan Lab takes the luminance straight from that mosaic. The default path does not demosaic. There is no hidden tone curve. Every step is measured, and the same recipe gives the same bytes.
-
-The print is a sheet of Ilford Multigrade. The soft pass is the measured grade-00 curve (ISO R 160). The hard pass is grade 5 (ISO R 50). The preview is that print.
-
-It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no colour output, no noise reduction, no lens correction. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
 
 ## Get it
 
