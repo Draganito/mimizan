@@ -8,6 +8,12 @@ Mimizan Lab also accepts a file from a monochrome sensor, for anyone who wants t
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
+> Lift the colour off. Print what remains.
+>
+> Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Only a small remainder is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
+>
+> Dragan Bojovic
+
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
 ![A session in Mimizan Lab: the print in the middle, the enlarger below, the sheet on the right, the folder as a film strip](docs/gui.png)
