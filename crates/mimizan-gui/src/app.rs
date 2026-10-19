@@ -264,6 +264,9 @@ pub struct App {
     /// Identifies the measurement in flight. A new file advances it.
     peak_gen: u64,
     peak_measure: Option<PeakMeasure>,
+    /// Radius and amount Peak measured on this negative, in negative pixels.
+    /// The fields may have been moved; reset puts these back.
+    peak_measured: Option<(f64, f64)>,
     /// The pointer went down on the crosshair, so this gesture moves the spot.
     cross_drag: bool,
     loupe: Loupe,
@@ -418,6 +421,7 @@ impl App {
             peak_arm: false,
             peak_gen: 0,
             peak_measure: None,
+            peak_measured: None,
             cross_drag: false,
             loupe: Loupe::spawn(cc.egui_ctx.clone()),
             loupe_sent: 0,
@@ -1009,9 +1013,12 @@ impl App {
         self.keep_scale = None;
         self.show_mask = false;
         // Drop a measurement that is still running. Fresh opens arm a new
-        // one after this; a reset keeps the default radius and amount.
+        // one after this. A reset keeps the default radius and amount, and
+        // finishes a measurement that has not landed yet so the print reset
+        // still has a target. One that already landed stays.
         self.peak_measure = None;
-        self.peak_arm = false;
+        self.peak_arm =
+            !fresh && self.peak_measured.is_none() && self.session.is_some() && self.screenshot_to.is_none();
         self.peak_held = true;
         self.peak_gen = self.peak_gen.wrapping_add(1);
         self.zoom = 1.0;
@@ -2552,13 +2559,14 @@ impl App {
         }
     }
 
-    /// A new file, or a recipe just loaded. A saved peak is kept. Otherwise
-    /// the next frame measures this print and fills radius and amount.
+    /// A new file, or a recipe just loaded. A saved peak stays in the fields.
+    /// The measurement still runs, so reset can return to it.
     fn note_peak_source(&mut self) {
         self.peak_measure = None;
+        self.peak_measured = None;
         self.peak_gen = self.peak_gen.wrapping_add(1);
         self.peak_held = !self.edit.recipe.peak.is_unset();
-        self.peak_arm = !self.peak_held && self.session.is_some() && self.screenshot_to.is_none();
+        self.peak_arm = self.session.is_some() && self.screenshot_to.is_none();
     }
 
     fn start_peak_tune(&mut self, ctx: &egui::Context) {
@@ -2581,8 +2589,11 @@ impl App {
         match poll {
             Some(PeakPoll::Ready(result)) => {
                 self.peak_measure = None;
-                if result.generation == self.peak_gen && !self.peak_held {
-                    self.apply_measured_peak(result.radius, result.amount, result.found);
+                if result.generation == self.peak_gen {
+                    self.peak_measured = Some((result.radius, result.amount));
+                    if !self.peak_held {
+                        self.apply_measured_peak(result.radius, result.amount, result.found);
+                    }
                 }
             }
             Some(PeakPoll::Lost) => {
@@ -2670,6 +2681,45 @@ impl App {
                 );
             if response.changed() {
                 self.peak_held = true;
+            }
+        });
+        self.peak_reset_row(ui, has);
+    }
+
+    fn peak_at_measured(&self) -> bool {
+        let Some((radius, amount)) = self.peak_measured else {
+            return false;
+        };
+        (self.edit.recipe.peak.radius - radius).abs() < 1e-6
+            && (self.edit.recipe.peak.amount - amount).abs() < 1e-6
+    }
+
+    fn peak_reset_hint(&self, has: bool) -> &'static str {
+        if !has {
+            "Open a RAW file first."
+        } else if self.peak_measure.is_some() {
+            "Peak is still measuring this negative."
+        } else if self.peak_measured.is_none() {
+            "No measurement for this negative."
+        } else {
+            "Radius and amount are already the measured values."
+        }
+    }
+
+    /// Put the measured radius and amount back. The checkbox stays.
+    fn peak_reset_row(&mut self, ui: &mut egui::Ui, has: bool) {
+        ui.horizontal(|ui| {
+            print_field_label(ui, "");
+            let ready = has && self.peak_measured.is_some() && !self.peak_at_measured();
+            let response = ui
+                .add_enabled(ready, egui::Button::new("reset"))
+                .on_hover_text("Back to the radius and amount Peak measured. The checkbox stays as it is.")
+                .on_disabled_hover_text(self.peak_reset_hint(has));
+            if response.clicked() {
+                if let Some((radius, amount)) = self.peak_measured {
+                    self.edit.recipe.peak.radius = radius;
+                    self.edit.recipe.peak.amount = amount;
+                }
             }
         });
     }
@@ -3583,9 +3633,9 @@ impl eframe::App for App {
         }
         if self.peak_arm {
             self.peak_arm = false;
-            if !self.peak_held {
-                self.start_peak_tune(&ctx);
-            }
+            // Always measure. A saved peak stays in the fields (`peak_held`);
+            // the result is kept beside them so reset can put it back.
+            self.start_peak_tune(&ctx);
         }
         self.strip_keys(&ctx);
         self.save_prompt(&ctx);
