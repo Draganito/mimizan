@@ -298,6 +298,7 @@ impl Preview {
     }
 }
 
+#[derive(Default)]
 struct PreviewHold {
     last: Option<(*const Session, ViewParams)>,
     last_detail: Option<DetailAsk>,
@@ -306,20 +307,6 @@ struct PreviewHold {
     held_print: bool,
     hists: HistCache,
     tones: ToneHold,
-}
-
-impl Default for PreviewHold {
-    fn default() -> Self {
-        Self {
-            last: None,
-            last_detail: None,
-            last_inspect: None,
-            held: None,
-            held_print: false,
-            hists: HistCache::default(),
-            tones: ToneHold::default(),
-        }
-    }
 }
 
 fn start_preview(ctx: &egui::Context) -> (Sender<PreviewRequest>, Receiver<PreviewResult>) {

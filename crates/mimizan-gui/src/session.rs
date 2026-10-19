@@ -443,7 +443,7 @@ pub(crate) fn source_rect(orientation: u16, w: usize, h: usize, r: DetailRect) -
 }
 
 fn crop(p: &Plane, r: DetailRect) -> Option<Plane> {
-    let Some(n) = p.width.checked_mul(p.height) else { return None };
+    let n = p.width.checked_mul(p.height)?;
     if p.data.len() != n || r.w == 0 || r.h == 0 {
         return None;
     }
@@ -485,7 +485,7 @@ pub fn render_detail(
         return render_measured(s, v, ask, table, codes);
     }
     let step = ask.step();
-    let Some(sep) = s.separation() else { return None };
+    let sep = s.separation()?;
     let (sw, sh) = (sep.lum.width, sep.lum.height);
     let orientation = rotated(s.negative.orientation, v.rotation);
     let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
@@ -946,7 +946,7 @@ pub fn render_sharpen_loupe(
 
 fn crop_mask(s: &Session, r: DetailRect) -> Option<Plane> {
     let n = &s.negative;
-    let Some(samples) = n.plane.width.checked_mul(n.plane.height) else { return None };
+    let samples = n.plane.width.checked_mul(n.plane.height)?;
     if n.mask8.len() != samples || r.w == 0 || r.h == 0 {
         return None;
     }
