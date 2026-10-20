@@ -40,7 +40,7 @@ function Find-SdkTool([string]$Name) {
 function Save-Tile([string]$Source, [string]$Dest, [int]$Width, [int]$Height) {
     $src = New-Object System.Windows.Media.Imaging.BitmapImage
     $src.BeginInit()
-    $src.UriSource = [Uri](Resolve-Path -LiteralPath $Source)
+    $src.UriSource = [System.Uri]::new((Resolve-Path -LiteralPath $Source).ProviderPath)
     $src.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
     $src.EndInit()
     $src.Freeze()
