@@ -62,6 +62,14 @@ Windows, 64-bit Intel and AMD: [mimizan-0.11.22-x86_64-windows.zip](https://gith
 
 Apple silicon: [mimizan-0.11.22-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.11.22/mimizan-0.11.22-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
+Apple silicon: [mimizan-0.11.22-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.11.22/mimizan-0.11.22-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+
+If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
+
+```bash
+xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
+
+
 From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and a working OpenGL for the GUI):
 
 ```bash
