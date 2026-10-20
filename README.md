@@ -68,7 +68,7 @@ If macOS says the app is damaged and should be moved to the Trash, it is blockin
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
-
+```
 
 From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and a working OpenGL for the GUI):
 
