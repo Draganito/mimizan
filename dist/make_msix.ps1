@@ -256,16 +256,22 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "ERROR: installed mimizan measure synth failed" }
     Write-Host "==> installed $($installed.PackageFullName)"
 
+    # -a picks the format from the extension. .msixupload is not a name it
+    # knows, so the archive has to be born as a .zip and renamed after.
     $UploadDir = Join-Path $Stage "upload"
+    $UploadZip = Join-Path $Stage "upload.zip"
     New-Item -ItemType Directory -Path $UploadDir -Force | Out-Null
     Copy-Item -LiteralPath $Msix -Destination $UploadDir
-    tar.exe -C $UploadDir -a -c -f $Upload (Split-Path -Leaf $Msix)
+    tar.exe -C $UploadDir -a -c -f $UploadZip (Split-Path -Leaf $Msix)
     if ($LASTEXITCODE -ne 0) { throw "ERROR: msixupload failed" }
+    Move-Item -LiteralPath $UploadZip -Destination $Upload -Force
     $listed = @(& tar.exe -tf $Upload | ForEach-Object { $_.Trim() })
     if ($LASTEXITCODE -ne 0) { throw "ERROR: could not list msixupload" }
     if ($listed -notcontains (Split-Path -Leaf $Msix)) {
         throw "ERROR: msixupload does not contain $(Split-Path -Leaf $Msix)"
     }
+    $magic = [System.IO.File]::ReadAllBytes($Upload)[0..1]
+    if ($magic[0] -ne 0x50 -or $magic[1] -ne 0x4B) { throw "ERROR: msixupload is not a zip" }
     Write-Host "==> $Upload"
     Get-Item -LiteralPath $Msix, $Upload | Select-Object FullName, Length
 } finally {
