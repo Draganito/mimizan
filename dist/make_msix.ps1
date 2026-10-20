@@ -112,6 +112,9 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 $PackageVersion = "$Version.0"
 Write-Host "==> version $PackageVersion"
 
+& $Cli measure synth --scene wedge --size 256 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "ERROR: measure synth failed" }
+
 $MakeAppx = Find-SdkTool "makeappx.exe"
 $SignTool = Find-SdkTool "signtool.exe"
 Write-Host "==> $MakeAppx"
@@ -236,9 +239,6 @@ try {
             throw "ERROR: installed package is missing $rel"
         }
     }
-    $installedCli = Join-Path $installed.InstallLocation "mimizan.exe"
-    & $installedCli measure synth --scene wedge --size 256 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "ERROR: installed mimizan measure synth failed" }
     Write-Host "==> installed $($installed.PackageFullName)"
 
     # -a picks the format from the extension. .msixupload is not a name it
