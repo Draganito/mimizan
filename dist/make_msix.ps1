@@ -5,6 +5,8 @@
 #   dist/mimizan-<version>-x64.msixupload
 # The upload file is what Partner Center takes. The Store signs it again.
 # The certificate made here only lets this machine install the package for the check.
+# mimizan.exe sits next to the window. It is not its own app: an individual
+# Store account cannot submit an app without a window.
 #
 # Usage:  pwsh -STA -File dist/make_msix.ps1 [-SkipBuild]
 
@@ -145,9 +147,8 @@ try {
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-  IgnorableNamespaces="uap5 rescap">
+  IgnorableNamespaces="rescap">
   <Identity
     Name="$IdentityName"
     Publisher="$Publisher"
@@ -174,22 +175,6 @@ try {
         Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
       </uap:VisualElements>
-    </Application>
-    <Application Id="Cli" Executable="mimizan.exe" EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements
-        AppListEntry="none"
-        DisplayName="mimizan"
-        Description="Mimizan Lab command line."
-        BackgroundColor="#000000"
-        Square150x150Logo="Assets\Square150x150Logo.png"
-        Square44x44Logo="Assets\Square44x44Logo.png" />
-      <Extensions>
-        <uap5:Extension Category="windows.appExecutionAlias">
-          <uap5:AppExecutionAlias>
-            <uap5:ExecutionAlias Alias="mimizan.exe" />
-          </uap5:AppExecutionAlias>
-        </uap5:Extension>
-      </Extensions>
     </Application>
   </Applications>
   <Capabilities>
