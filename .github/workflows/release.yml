@@ -40,6 +40,11 @@ jobs:
           name: windows-release
           path: dist/mimizan-*-x86_64-windows.zip
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-store
+          path: dist/mimizan-*-x64.msixupload
+          if-no-files-found: error
 
   macos:
     runs-on: macos-latest
@@ -63,6 +68,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: "*-release"
           path: release-assets
           merge-multiple: true
       - name: Upload to the release

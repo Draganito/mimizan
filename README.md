@@ -83,6 +83,10 @@ The same paper is on the phone: [Mimizan Lab for Android](https://github.com/Dra
 
 Free software, GPL-3.0-or-later.
 
+## Privacy
+
+Mimizan Lab runs on your computer. It does not send photographs, settings, or anything else anywhere.
+
 ## The command
 
 The window is the darkroom. The command is there when the print is already decided.

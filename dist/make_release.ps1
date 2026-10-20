@@ -3,6 +3,8 @@
 # Result (always under dist/, not committed):
 #   dist/mimizan-<version>-x86_64-windows.zip
 #     mimizan.exe, mimizan-gui.exe, cameras/, look/, README, manual, license
+#   dist/mimizan-<version>-x64.msixupload
+#     the Store package (make_msix.ps1)
 # The programs carry the Visual C++ runtime. mimizan-gui.exe opens no console.
 #
 # Usage:  dist/make_release.ps1 [-SkipBuild]
@@ -68,3 +70,6 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Remove-Item -LiteralPath $Stage -Recurse -Force
 Write-Host "==> $Zip"
 Get-Item -LiteralPath $Zip | Select-Object FullName, Length
+
+& pwsh -NoProfile -STA -ExecutionPolicy Bypass -File "$PSScriptRoot\make_msix.ps1" -SkipBuild
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

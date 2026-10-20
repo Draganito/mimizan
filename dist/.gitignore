@@ -1,3 +1,5 @@
 /mimizan_*.deb
 /mimizan-*.tar.gz
 /mimizan-*.zip
+/mimizan-*.msix
+/mimizan-*.msixupload

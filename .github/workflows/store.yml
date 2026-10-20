@@ -1,0 +1,20 @@
+name: Store
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the store package
+        shell: pwsh
+        run: pwsh -NoProfile -STA -ExecutionPolicy Bypass -File ./dist/make_msix.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-store
+          path: dist/mimizan-*-x64.msixupload
+          if-no-files-found: error
