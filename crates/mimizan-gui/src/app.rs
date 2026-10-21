@@ -53,6 +53,8 @@ enum PaperFormat {
     R16x20,
     R20x24,
     Square,
+    /// The open picture's own ratio, read from its pixels.
+    Image,
 }
 
 impl PaperFormat {
@@ -68,7 +70,28 @@ impl PaperFormat {
             Self::R16x20 => "16×20",
             Self::R20x24 => "20×24",
             Self::Square => "1:1",
+            // The picture's writing is computed from its pixels.
+            Self::Image => "1:1",
         }
+    }
+
+    /// The same ratio written the other way. A square stays `1:1`.
+    fn swapped(self) -> &'static str {
+        match self {
+            Self::R4x5 => "5×4",
+            Self::R5x7 => "7×5",
+            Self::R8x10 => "10×8",
+            Self::R11x14 => "14×11",
+            Self::R16x20 => "20×16",
+            Self::R20x24 => "24×20",
+            Self::Square => "1:1",
+            Self::Image => "1:1",
+        }
+    }
+
+    /// The side the frame is on. A square is always `1:1`.
+    fn framed(self, turned: bool) -> &'static str {
+        if turned { self.swapped() } else { self.label() }
     }
 
     fn parts(self) -> (u32, u32) {
@@ -80,6 +103,7 @@ impl PaperFormat {
             Self::R16x20 => (16, 20),
             Self::R20x24 => (20, 24),
             Self::Square => (1, 1),
+            Self::Image => (1, 1),
         }
     }
 
@@ -100,8 +124,13 @@ impl PaperFormat {
     }
 
     /// `turned` swaps the two sides, so a landscape frame can stand portrait.
+    /// The picture's own format uses the pixels it was given.
     fn frame(self, img_w: u32, img_h: u32, turned: bool) -> (u32, u32) {
-        let (a, b) = self.oriented(img_w, img_h);
+        let (a, b) = if self == Self::Image {
+            (img_w.max(1), img_h.max(1))
+        } else {
+            self.oriented(img_w, img_h)
+        };
         if turned && a != b {
             (b, a)
         } else {
@@ -110,24 +139,72 @@ impl PaperFormat {
     }
 
     /// The format closest to a window, and whether that window is turned
-    /// against the picture's long side.
+    /// against the picture's long side. The whole picture is its own format.
     fn match_window(img_w: u32, img_h: u32, cw: u32, ch: u32) -> (Self, bool) {
-        Self::ALL
+        let (format, turned, err) = Self::ALL
             .into_iter()
             .map(|f| {
                 let (a, b) = f.oriented(img_w, img_h);
-                let along = (i64::from(cw) * i64::from(b) - i64::from(ch) * i64::from(a)).abs();
-                let across = (i64::from(cw) * i64::from(a) - i64::from(ch) * i64::from(b)).abs();
-                if a != b && across < along {
-                    (f, true, across)
-                } else {
-                    (f, false, along)
-                }
+                let (turned, err) = ratio_turn(a, b, cw, ch);
+                (f, turned, err)
             })
             .min_by_key(|(_, _, err)| *err)
-            .map(|(f, turned, _)| (f, turned))
-            .unwrap_or((Self::R8x10, false))
+            .unwrap_or((Self::R8x10, false, i64::MAX));
+        let (image_turned, image_err) = ratio_turn(img_w, img_h, cw, ch);
+        let whole = cw == img_w && ch == img_h;
+        if image_err < err || (image_err == err && whole) {
+            (Self::Image, image_turned)
+        } else {
+            (format, turned)
+        }
     }
+}
+
+/// Whether `cw`:`ch` sits across `a`:`b`, and how far the two ratios are.
+fn ratio_turn(a: u32, b: u32, cw: u32, ch: u32) -> (bool, i64) {
+    let along = (i64::from(cw) * i64::from(b) - i64::from(ch) * i64::from(a)).abs();
+    let across = (i64::from(cw) * i64::from(a) - i64::from(ch) * i64::from(b)).abs();
+    if a != b && across < along {
+        (true, across)
+    } else {
+        (false, along)
+    }
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
+}
+
+/// A short writing of a picture's ratio, width then height.
+/// Exact when the reduced numbers are small, otherwise the nearest pair up to 24.
+fn picture_terms(w: u32, h: u32) -> (u32, u32) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let g = gcd(w, h);
+    let (rw, rh) = (w / g, h / g);
+    if rw <= 24 && rh <= 24 {
+        return (rw, rh);
+    }
+    let mut best_n = 1u32;
+    let mut best_d = 1u32;
+    let mut best_err = u64::MAX;
+    for d in 1..=24 {
+        let n = ((u64::from(w) * u64::from(d) + u64::from(h) / 2) / u64::from(h)).clamp(1, 24) as u32;
+        let err = (u64::from(w) * u64::from(d)).abs_diff(u64::from(h) * u64::from(n));
+        let closer = u128::from(err) * u128::from(best_d) < u128::from(best_err) * u128::from(d);
+        if closer {
+            best_n = n;
+            best_d = d;
+            best_err = err;
+        }
+    }
+    let g = gcd(best_n, best_d);
+    (best_n / g, best_d / g)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1483,128 +1560,224 @@ impl App {
         }
     }
 
+    /// Three always-visible groups. The windows sit on the left, the picture
+    /// in the middle, the way back on the right. Each group is a flat well,
+    /// and the bar shows between them.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let id = ui.id();
+        let full = ui.available_width();
+        let lw = ui.ctx().data(|d| d.get_temp::<f32>(id.with("win")).unwrap_or(300.0));
+        let pw = ui.ctx().data(|d| d.get_temp::<f32>(id.with("pic")).unwrap_or(340.0));
+        let hw = ui.ctx().data(|d| d.get_temp::<f32>(id.with("hist")).unwrap_or(150.0));
+        let (gap_l, gap_r) = toolbar_gaps(full, lw, pw, hw);
+        ui.spacing_mut().item_spacing.x = 0.0;
         ui.horizontal(|ui| {
-            if ui
-                .selectable_label(self.show_strip, "Strip")
-                .on_hover_text(
-                    "Show or hide the film strip (B): the folder's RAW files, the way in. It closes when you start on an open picture. ←/→ open the neighbouring file either way.",
-                )
-                .clicked()
-            {
-                self.toggle_strip();
-            }
-            // Panel indices: 0 left, 1 right, 2 bottom — shown in the order
-            // of the three steps.
-            for (i, name, hover) in [
-                (
-                    0,
-                    "Negative",
-                    "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
-                ),
-                (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
-                (1, "Print", "3 · The print: size, border, export"),
-            ] {
-                let hover = if self.waiting[i] {
-                    "No room at this size. It returns when the window is larger. Click to close it."
-                } else {
-                    hover
-                };
-                if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
-                    self.panels[i] = !self.panels[i];
-                    self.persist();
-                }
-            }
-            let has = self.session.is_some();
-            let mut crop_on = self.crop_open;
-            if ui
-                .add_enabled(has, egui::Checkbox::new(&mut crop_on, "Crop"))
-                .on_hover_text("Frame the negative. Apply makes that window the picture.")
-                .changed()
-            {
-                if crop_on {
-                    self.arm_crop();
-                } else {
-                    self.close_crop();
-                }
-            }
-            ui.add_enabled_ui(has && self.crop_open, |ui| {
-                egui::ComboBox::from_id_salt("crop_format").selected_text(self.crop_format.label()).show_ui(
-                    ui,
-                    |ui| {
-                        for f in PaperFormat::ALL {
-                            if ui.selectable_value(&mut self.crop_format, f, f.label()).clicked() {
-                                self.reinscribe();
-                            }
-                        }
-                    },
-                );
-            });
-            if ui
-                .add_enabled(
-                    has && self.crop_open && self.crop_format != PaperFormat::Square,
-                    egui::Button::new("Turn").selected(self.crop_turned),
-                )
-                .on_hover_text("Turn the ratio between landscape and portrait.")
-                .clicked()
-            {
-                self.crop_turned = !self.crop_turned;
-                self.reinscribe();
-            }
-            if ui
-                .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
-                .on_hover_text(
-                    "Keep this window (Enter). The print, the histograms and the export use only it.",
-                )
-                .clicked()
-            {
-                self.apply_crop();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(has, egui::Button::new("⟳ 90°"))
-                .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
-                .clicked()
-            {
-                self.edit.rotation = (self.edit.rotation + 1) % 4;
-            }
-            ui.separator();
-            let (pos, len) = self.history.position();
-            if ui
-                .add_enabled(self.history.can_undo(), egui::Button::new("↺"))
-                .on_hover_text(format!("Undo (Ctrl+Z) — step {pos} of {len}"))
-                .clicked()
-            {
-                self.undo();
-            }
-            if ui
-                .add_enabled(self.history.can_redo(), egui::Button::new("↻"))
-                .on_hover_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
-                .clicked()
-            {
-                self.redo();
-            }
-            if ui
-                .button("Reset")
-                .on_hover_text(
-                    "Controls back to defaults; the negative stays. Closing, or opening another file, still asks whether to keep this.",
-                )
-                .clicked()
-            {
-                self.reset(false);
-            }
-            // Status text takes only what is left and is cut, never painted
-            // over the buttons.
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let windows = tool_well(ui, |ui| self.toolbar_windows(ui));
+            ui.add_space(gap_l);
+            let picture = tool_well(ui, |ui| self.toolbar_picture(ui));
+            ui.add_space(gap_r);
+            let history = tool_well(ui, |ui| self.toolbar_history(ui));
+            ui.add_space(12.0);
+            // The note takes only what is left and is cut, never painted over the wells.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.set_max_width(ui.available_width());
-                if let Some(b) = self.busy.clone() {
-                    ui.spinner();
-                    ui.add(egui::Label::new(b).truncate());
-                } else if let Some(msg) = self.log.last().cloned() {
-                    ui.add(egui::Label::new(RichText::new(msg).weak()).truncate());
-                }
+                self.toolbar_status(ui);
+            });
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(id.with("win"), windows.rect.width());
+                d.insert_temp(id.with("pic"), picture.rect.width());
+                d.insert_temp(id.with("hist"), history.rect.width());
             });
         });
+    }
+
+    fn toolbar_windows(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .selectable_label(self.show_strip, "Strip")
+            .on_hover_text(
+                "Show or hide the film strip (B): the folder's RAW files, the way in. It closes when you start on an open picture. ←/→ open the neighbouring file either way.",
+            )
+            .clicked()
+        {
+            self.toggle_strip();
+        }
+        // Panel indices: 0 left, 1 right, 2 bottom — shown in the order
+        // of the three steps.
+        for (i, name, hover) in [
+            (0, "Negative", "1 · Judge the negative: file, histograms, development (Tab hides every panel)"),
+            (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
+            (1, "Print", "3 · The print: size, border, export"),
+        ] {
+            let hover = if self.waiting[i] {
+                "No room at this size. It returns when the window is larger. Click to close it."
+            } else {
+                hover
+            };
+            if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
+                self.panels[i] = !self.panels[i];
+                self.persist();
+            }
+        }
+    }
+
+    fn toolbar_picture(&mut self, ui: &mut egui::Ui) {
+        let has = self.session.is_some();
+        let mut crop_on = self.crop_open;
+        if ui
+            .add_enabled(has, egui::Checkbox::new(&mut crop_on, "Crop"))
+            .on_hover_text("Frame the negative. Apply makes that window the picture.")
+            .changed()
+        {
+            if crop_on {
+                self.arm_crop();
+            } else {
+                self.close_crop();
+            }
+        }
+        ui.add_enabled_ui(has && self.crop_open, |ui| {
+            let response = egui::ComboBox::from_id_salt("crop_format")
+                .width(framed_combo_width(ui))
+                .height(280.0)
+                .selected_text(self.frame_box_label())
+                .show_ui(ui, |ui| self.crop_format_table(ui))
+                .response;
+            response.on_hover_text("The sheet, and which way it stands.").on_disabled_hover_text(
+                "The sheet, and which way it stands.",
+            );
+        });
+        if ui
+            .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
+            .on_hover_text("Keep this window (Enter). The print, the histograms and the export use only it.")
+            .clicked()
+        {
+            self.apply_crop();
+        }
+        // The picture's turn, apart from the frame.
+        ui.add_space(16.0);
+        if ui
+            .add_enabled(has, egui::Button::new("⟳ 90°"))
+            .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
+            .clicked()
+        {
+            self.edit.rotation = (self.edit.rotation + 1) % 4;
+        }
+    }
+
+    /// What the closed box shows. Papers keep their names; the picture is read from its pixels.
+    fn frame_box_label(&self) -> String {
+        if self.crop_format != PaperFormat::Image {
+            return self.crop_format.framed(self.crop_turned).to_owned();
+        }
+        let (w, h) = self.export_size();
+        let (a, b) = if self.crop_turned { (h, w) } else { (w, h) };
+        let (a, b) = picture_terms(a as u32, b as u32);
+        format!("{a}:{b}")
+    }
+
+    /// Two columns: the written ratio, and the same ratio the other way.
+    /// The first row is the picture itself. The square is one cell across both.
+    fn crop_format_table(&mut self, ui: &mut egui::Ui) {
+        let cell = frame_side_button_width(ui);
+        let gap = 4.0;
+        ui.set_min_width(cell * 2.0 + gap);
+        let (pw, ph) = self.export_size();
+        let picture = (pw > 0 && ph > 0).then(|| {
+            let (a, b) = picture_terms(pw as u32, ph as u32);
+            (format!("{a}:{b}"), format!("{b}:{a}"), format!("The picture is {pw}×{ph}."), a == b)
+        });
+        if let Some((along, _, hint, true)) = &picture {
+            if frame_cell(ui, along, self.crop_format == PaperFormat::Image, cell * 2.0 + gap)
+                .on_hover_text(hint)
+                .clicked()
+            {
+                self.choose_frame(PaperFormat::Image, false);
+            }
+        }
+        egui::Grid::new("crop_sides").num_columns(2).spacing(egui::vec2(gap, 2.0)).show(ui, |ui| {
+            if let Some((along, across, hint, false)) = &picture {
+                self.frame_side_cell(ui, PaperFormat::Image, false, cell, along, Some(hint));
+                self.frame_side_cell(ui, PaperFormat::Image, true, cell, across, Some(hint));
+                ui.end_row();
+            }
+            for format in PaperFormat::ALL {
+                if format == PaperFormat::Square {
+                    continue;
+                }
+                self.frame_side_cell(ui, format, false, cell, format.framed(false), None);
+                self.frame_side_cell(ui, format, true, cell, format.framed(true), None);
+                ui.end_row();
+            }
+        });
+        if frame_cell(ui, PaperFormat::Square.label(), self.crop_format == PaperFormat::Square, cell * 2.0 + gap)
+            .clicked()
+        {
+            self.choose_frame(PaperFormat::Square, false);
+        }
+    }
+
+    fn frame_side_cell(
+        &mut self,
+        ui: &mut egui::Ui,
+        format: PaperFormat,
+        turned: bool,
+        width: f32,
+        label: &str,
+        hint: Option<&str>,
+    ) {
+        let active = self.crop_format == format && self.crop_turned == turned;
+        let mut response = frame_cell(ui, label, active, width);
+        if let Some(hint) = hint {
+            response = response.on_hover_text(hint);
+        }
+        if response.clicked() {
+            self.choose_frame(format, turned);
+        }
+    }
+
+    fn choose_frame(&mut self, format: PaperFormat, turned: bool) {
+        if self.crop_format == format && self.crop_turned == turned {
+            return;
+        }
+        self.crop_format = format;
+        self.crop_turned = turned;
+        self.reinscribe();
+    }
+
+    fn toolbar_history(&mut self, ui: &mut egui::Ui) {
+        let (pos, len) = self.history.position();
+        if ui
+            .add_enabled(self.history.can_undo(), egui::Button::new("↺"))
+            .on_hover_text(format!("Undo (Ctrl+Z) — step {pos} of {len}"))
+            .clicked()
+        {
+            self.undo();
+        }
+        if ui
+            .add_enabled(self.history.can_redo(), egui::Button::new("↻"))
+            .on_hover_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
+            .clicked()
+        {
+            self.redo();
+        }
+        if ui
+            .button("Reset")
+            .on_hover_text(
+                "Controls back to defaults; the negative stays. Closing, or opening another file, still asks whether to keep this.",
+            )
+            .clicked()
+        {
+            self.reset(false);
+        }
+    }
+
+    fn toolbar_status(&mut self, ui: &mut egui::Ui) {
+        if let Some(b) = self.busy.clone() {
+            ui.spinner();
+            ui.add(egui::Label::new(b).truncate());
+        } else if let Some(msg) = self.log.last().cloned() {
+            ui.add(egui::Label::new(RichText::new(msg).weak()).truncate());
+        }
     }
 
     /// Left panel: what the file is, the histograms, the development
@@ -3043,6 +3216,76 @@ fn crumb_label(path: &Path) -> String {
     }
 }
 
+/// Gaps that put the picture group on the centre of the bar and the history
+/// group against the status note. A narrow bar keeps a short gap instead.
+fn toolbar_gaps(full: f32, windows: f32, picture: f32, history: f32) -> (f32, f32) {
+    let min_gap = 16.0;
+    let status = (full * 0.2).clamp(40.0, 240.0);
+    let spare = full - windows - picture - history - status;
+    if spare < 2.0 * min_gap {
+        return (8.0, 8.0);
+    }
+    let picture_left =
+        ((full - picture) * 0.5).clamp(windows + min_gap, full - status - history - min_gap - picture);
+    let gap_l = picture_left - windows;
+    let gap_r = (full - status - history) - (picture_left + picture);
+    (gap_l, gap_r)
+}
+
+/// The widest of `8×10` and `10×8`, in the button font.
+fn widest_frame_text(ui: &egui::Ui) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    PaperFormat::ALL
+        .into_iter()
+        .flat_map(|format| [format.label(), format.swapped()])
+        .map(|label| ui.painter().layout_no_wrap(label.to_owned(), font.clone(), Color32::WHITE).size().x)
+        .fold(0.0_f32, f32::max)
+}
+
+/// One cell of the format table. Every ratio fits, so the two columns stay even.
+fn frame_side_button_width(ui: &egui::Ui) -> f32 {
+    let gaps = ui.spacing().icon_spacing * 2.0;
+    let pad = ui.spacing().button_padding.x * 2.0;
+    (widest_frame_text(ui) + gaps + pad + 2.0).max(ui.spacing().interact_size.x)
+}
+
+/// The closed box. Wide enough for `20×24` and the arrow, so `1:1` does not shrink it.
+fn framed_combo_width(ui: &egui::Ui) -> f32 {
+    let icon = ui.spacing().icon_spacing + ui.spacing().icon_width;
+    let pad = ui.spacing().button_padding.x * 2.0;
+    widest_frame_text(ui) + icon + pad + 2.0
+}
+
+/// A table cell. The side that is framed is sunk; the others stay ordinary buttons.
+fn frame_cell(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
+    let mut button = egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow())).frame(true);
+    if active {
+        button = button
+            .fill(ui.visuals().extreme_bg_color)
+            .stroke(egui::Stroke::new(1.0, Color32::from_gray(96)));
+    }
+    ui.add_sized([width, ui.spacing().interact_size.y], button)
+}
+
+/// One flat tray. The bar stays visible around it, so the three groups separate.
+fn tool_well(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let panel = ui.visuals().panel_fill;
+    let fill = Color32::from_rgb(
+        panel.r().saturating_add(16),
+        panel.g().saturating_add(16),
+        panel.b().saturating_add(16),
+    );
+    egui::Frame::new()
+        .fill(fill)
+        .corner_radius(6)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            add(ui);
+        })
+        .response
+}
+
 /// Where the strip starts when nothing is remembered: the pictures folder
 /// if there is one, else home.
 fn start_folder() -> Option<PathBuf> {
@@ -4118,7 +4361,7 @@ impl App {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{crumb_label, without_verbatim_prefix};
+    use super::{crumb_label, toolbar_gaps, without_verbatim_prefix};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -4138,11 +4381,26 @@ mod path_tests {
             assert_eq!(crumb_label(Path::new(r"C:\Users")), "Users");
         }
     }
+
+    #[test]
+    fn the_picture_group_sits_in_the_middle_when_there_is_room() {
+        let (left, right) = toolbar_gaps(1200.0, 300.0, 340.0, 150.0);
+        let picture_center = 300.0 + left + 170.0;
+        assert!((picture_center - 600.0).abs() < 1.0);
+        assert!(left >= 16.0 && right >= 16.0);
+    }
+
+    #[test]
+    fn a_narrow_bar_keeps_a_short_gap() {
+        assert_eq!(toolbar_gaps(400.0, 300.0, 340.0, 150.0), (8.0, 8.0));
+    }
 }
 
 #[cfg(test)]
 mod crop_drag_tests {
-    use super::{hit_crop, moved_crop, recipe_needs_saving, tile_must_wait, CropHit, PaperFormat};
+    use super::{
+        hit_crop, moved_crop, picture_terms, recipe_needs_saving, tile_must_wait, CropHit, PaperFormat,
+    };
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
 
     #[test]
@@ -4193,6 +4451,26 @@ mod crop_drag_tests {
         assert_eq!(PaperFormat::R4x5.frame(80, 100, false), (4, 5));
         assert_eq!(PaperFormat::R4x5.frame(80, 100, true), (5, 4));
         assert_eq!(PaperFormat::Square.frame(100, 80, true), (1, 1));
+    }
+
+    #[test]
+    fn the_closed_box_names_the_side_that_is_framed() {
+        assert_eq!(PaperFormat::R8x10.framed(false), "8×10");
+        assert_eq!(PaperFormat::R8x10.framed(true), "10×8");
+        assert_eq!(PaperFormat::R20x24.framed(true), "24×20");
+        assert_eq!(PaperFormat::Square.framed(false), "1:1");
+        assert_eq!(PaperFormat::Square.framed(true), "1:1");
+    }
+
+    #[test]
+    fn the_picture_row_is_read_from_its_pixels() {
+        assert_eq!(picture_terms(6048, 4024), (3, 2));
+        assert_eq!(picture_terms(4024, 6048), (2, 3));
+        assert_eq!(picture_terms(100, 80), (5, 4));
+        assert_eq!(PaperFormat::Image.frame(6048, 4024, false), (6048, 4024));
+        assert_eq!(PaperFormat::Image.frame(6048, 4024, true), (4024, 6048));
+        assert_eq!(PaperFormat::match_window(6048, 4024, 6048, 4024), (PaperFormat::Image, false));
+        assert_eq!(PaperFormat::match_window(100, 80, 50, 40), (PaperFormat::R4x5, false));
     }
 
     #[test]
