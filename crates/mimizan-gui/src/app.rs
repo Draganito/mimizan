@@ -15,7 +15,7 @@ use crate::zone_bar::zone_bar;
 use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
-use egui_file_dialog::FileDialog;
+use egui_file_dialog::{FileDialog, OpeningMode};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
@@ -150,8 +150,8 @@ enum SaveChoice {
     Cancel,
 }
 
-/// A negative is open and its recipe is no longer the one it was opened
-/// with, or the one Reset put back.
+/// A negative is open and its recipe is no longer the one it was opened with.
+/// Reset leaves this baseline alone, so the defaults still ask to be saved.
 fn recipe_needs_saving(has_negative: bool, current: &Recipe, saved: &Recipe) -> bool {
     has_negative && current != saved
 }
@@ -181,13 +181,6 @@ enum HistSource {
     Negative,
     /// The four sensor channels as shot (per 2x2 tile position).
     Raw,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DialogPurpose {
-    Export,
-    SaveRecipe,
-    LoadRecipe,
 }
 
 /// What the main picture and the print box both render: the exposure,
@@ -343,7 +336,6 @@ pub struct App {
     crop_drag: Option<CropDrag>,
 
     dialog: FileDialog,
-    dialog_purpose: DialogPurpose,
     cameras_dir: PathBuf,
     /// Recipe as opened, as reset, or as last saved next to the RAW.
     recipe_baseline: Recipe,
@@ -469,8 +461,13 @@ impl App {
             crop_turned: false,
             crop_draft: CropRect { x: 0, y: 0, w: 1, h: 1 },
             crop_drag: None,
-            dialog: FileDialog::new(),
-            dialog_purpose: DialogPurpose::Export,
+            // A launch from the Store has its working directory in System32.
+            // The save dialog always opens on the directory set for this export.
+            dialog: {
+                let mut dialog = FileDialog::new();
+                dialog.config_mut().opening_mode = OpeningMode::AlwaysInitialDir;
+                dialog
+            },
             cameras_dir,
             recipe_baseline: Recipe::on_paper(),
             pending_leave: None,
@@ -510,8 +507,9 @@ impl App {
     fn set_folder(&mut self, path: &Path) {
         self.folder_generation += 1;
         // Absolute, so the breadcrumb shows the whole way and a relative
-        // CLI argument survives a restart from another directory.
-        let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // CLI argument survives a restart from another directory. The
+        // Windows `\\?\` prefix is a kernel form, not a path to show.
+        let path = &readable_path(path);
         match Folder::scan(path, self.sort, self.folder_generation) {
             Ok(f) => {
                 self.log(format!(
@@ -964,12 +962,24 @@ impl App {
             .as_ref()
             .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
             .unwrap_or_else(|| "mimizan".into());
-        self.start_dialog(DialogPurpose::Export, Some(format!("{stem}.tif")));
+        if let Some(dir) = self.export_directory() {
+            self.dialog.config_mut().initial_directory = dir;
+        }
+        self.dialog.config_mut().default_file_name = format!("{stem}.tif");
+        self.dialog.save_file();
+    }
+
+    /// The TIFF belongs next to the RAW. With no file open, the strip's
+    /// folder is the place. The process working directory is not used.
+    fn export_directory(&self) -> Option<PathBuf> {
+        let beside_the_file =
+            self.session.as_ref().and_then(|s| s.path.parent()).filter(|p| p.is_dir()).map(Path::to_path_buf);
+        beside_the_file.or_else(|| self.folder.as_ref().map(|f| f.path.clone()).filter(|p| p.is_dir()))
     }
 
     fn open(&mut self, path: PathBuf) {
         // Absolute like the strip's entries, so the tile lights up.
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let path = readable_path(&path);
         if self.session.as_ref().is_some_and(|s| s.path == path) {
             return;
         }
@@ -1004,11 +1014,9 @@ impl App {
             self.history = History::new(e.clone());
         }
         self.set_edit(e);
-        if !fresh {
-            // The working recipe is the default again. The file next to the
-            // RAW stays until a later save.
-            self.recipe_baseline = self.edit.recipe.clone();
-        }
+        // The baseline stays the recipe the file was opened with. Reset is a
+        // different development, so closing or opening another file still asks.
+        // The file next to the RAW is written only when that question is saved.
         self.tex_rotation = 0;
         self.keep_scale = None;
         self.show_mask = false;
@@ -1459,36 +1467,19 @@ impl App {
         self.last_inspect = inspect;
     }
 
-    fn start_dialog(&mut self, purpose: DialogPurpose, default_name: Option<String>) {
-        self.dialog_purpose = purpose;
-        if let Some(n) = default_name {
-            self.dialog.config_mut().default_file_name = n;
-        }
-        match purpose {
-            DialogPurpose::LoadRecipe => self.dialog.pick_file(),
-            DialogPurpose::Export | DialogPurpose::SaveRecipe => self.dialog.save_file(),
-        }
-    }
-
     fn handle_dialog(&mut self, ctx: &egui::Context) {
         self.dialog.update(ctx);
         let Some(path) = self.dialog.take_picked() else { return };
-        match self.dialog_purpose {
-            DialogPurpose::Export => {
-                if let Some(s) = &self.session {
-                    let path = with_ext(path, "tif");
-                    self.busy = Some("exporting".into());
-                    self.heavy.send(Job::Export {
-                        session: Arc::clone(s),
-                        weights: self.weights(),
-                        recipe: self.print_recipe(),
-                        path,
-                        orientation: self.export_orientation(),
-                    });
-                }
-            }
-            DialogPurpose::SaveRecipe => self.save_recipe(&with_ext(path, "json")),
-            DialogPurpose::LoadRecipe => self.load_recipe(&path),
+        if let Some(s) = &self.session {
+            let path = with_ext(path, "tif");
+            self.busy = Some("exporting".into());
+            self.heavy.send(Job::Export {
+                session: Arc::clone(s),
+                weights: self.weights(),
+                recipe: self.print_recipe(),
+                path,
+                orientation: self.export_orientation(),
+            });
         }
     }
 
@@ -1596,69 +1587,12 @@ impl App {
             if ui
                 .button("Reset")
                 .on_hover_text(
-                    "Controls back to defaults; the negative stays. The recipe file next to the RAW is left as it is.",
+                    "Controls back to defaults; the negative stays. Closing, or opening another file, still asks whether to keep this.",
                 )
                 .clicked()
             {
                 self.reset(false);
             }
-            ui.separator();
-            ui.menu_button("Recipe", |ui| {
-                ui.set_min_width(200.0);
-                ui.label(RichText::new("The development as a parameter set (JSON).").weak());
-                let sidecar = self.recipe_sidecar();
-                if ui
-                    .add_enabled(has, egui::Button::new("Save next to the RAW"))
-                    .on_hover_text(
-                        sidecar
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "<name>.recipe.json".into()),
-                    )
-                    .clicked()
-                {
-                    if let Some(p) = sidecar {
-                        self.save_recipe(&p);
-                    }
-                    ui.close();
-                }
-                if ui.add_enabled(has, egui::Button::new("Save as…")).clicked() {
-                    let name = self
-                        .session
-                        .as_ref()
-                        .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
-                        .unwrap_or_else(|| "mimizan".into());
-                    self.start_dialog(DialogPurpose::SaveRecipe, Some(format!("{name}.recipe.json")));
-                    ui.close();
-                }
-                if ui.button("Load…").clicked() {
-                    self.start_dialog(DialogPurpose::LoadRecipe, None);
-                    ui.close();
-                }
-            });
-            ui.separator();
-            // The view: fit / 1:1 and the two overlays.
-            if ui
-                .add_enabled(has, egui::Button::new("fit"))
-                .on_hover_text("Whole picture in the window")
-                .clicked()
-            {
-                self.zoom = 1.0;
-                self.pan = Vec2::ZERO;
-            }
-            if ui
-                .add_enabled(has, egui::Button::new("1:1"))
-                .on_hover_text("One negative pixel per screen pixel (double-click toggles)")
-                .clicked()
-            {
-                self.zoom_to_1to1 = true;
-            }
-            let mask_tip = if self.session.as_ref().is_some_and(|s| s.is_mono()) {
-                "White where the sensor clipped"
-            } else {
-                "USM mask: white = chroma treated as texture"
-            };
-            ui.checkbox(&mut self.show_mask, "mask").on_hover_text(mask_tip);
             // Status text takes only what is left and is cut, never painted
             // over the buttons.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3071,6 +3005,44 @@ fn crop_cursor(hit: CropHit, dragging: bool) -> CursorIcon {
     }
 }
 
+/// Absolute, and without the Windows `\\?\` prefix `canonicalize` adds.
+fn readable_path(path: &Path) -> PathBuf {
+    let absolute = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    without_verbatim_prefix(&absolute)
+}
+
+/// `\\?\C:\Users` is `C:\Users`. `\\?\UNC\server\share` is `\\server\share`.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest.to_string())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// One step of the folder breadcrumb. A directory keeps its name. The root
+/// is `/` on Unix and `C:` on Windows.
+fn crumb_label(path: &Path) -> String {
+    if let Some(name) = path.file_name() {
+        let name = name.to_string_lossy();
+        if !name.is_empty() {
+            return name.into_owned();
+        }
+    }
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Where the strip starts when nothing is remembered: the pictures folder
 /// if there is one, else home.
 fn start_folder() -> Option<PathBuf> {
@@ -3159,14 +3131,11 @@ impl App {
                     ui.label(RichText::new("No folder. Drop a folder or a RAW file on the window.").weak());
                 }
                 Some(f) => {
-                    // Breadcrumb: every ancestor is a button.
+                    // Breadcrumb: every ancestor is a button. The root is `/`
+                    // on Unix and the drive (`C:`) on Windows.
                     let comps: Vec<PathBuf> = f.path.ancestors().map(Path::to_path_buf).collect();
-                    for (i, anc) in comps.iter().rev().enumerate() {
-                        let name = if i == 0 {
-                            "/".to_string()
-                        } else {
-                            anc.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-                        };
+                    for anc in comps.iter().rev() {
+                        let name = crumb_label(anc);
                         if name.is_empty() {
                             continue;
                         }
@@ -4143,6 +4112,30 @@ impl App {
         }
         if redo {
             self.redo();
+        }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{crumb_label, without_verbatim_prefix};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_verbatim_windows_path_is_a_drive_path() {
+        assert_eq!(without_verbatim_prefix(Path::new(r"\\?\C:\Users")), PathBuf::from(r"C:\Users"));
+        assert_eq!(without_verbatim_prefix(Path::new(r"\\?\UNC\nas\photos")), PathBuf::from(r"\\nas\photos"));
+        assert_eq!(without_verbatim_prefix(Path::new("/home/dragan")), PathBuf::from("/home/dragan"));
+    }
+
+    #[test]
+    fn the_breadcrumb_root_keeps_its_name() {
+        assert_eq!(crumb_label(Path::new("/")), "/");
+        assert_eq!(crumb_label(Path::new("/home")), "home");
+        #[cfg(windows)]
+        {
+            assert_eq!(crumb_label(Path::new(r"C:\")), "C:");
+            assert_eq!(crumb_label(Path::new(r"C:\Users")), "Users");
         }
     }
 }
