@@ -91,7 +91,11 @@ impl PaperFormat {
 
     /// The side the frame is on. A square is always `1:1`.
     fn framed(self, turned: bool) -> &'static str {
-        if turned { self.swapped() } else { self.label() }
+        if turned {
+            self.swapped()
+        } else {
+            self.label()
+        }
     }
 
     fn parts(self) -> (u32, u32) {
@@ -126,11 +130,8 @@ impl PaperFormat {
     /// `turned` swaps the two sides, so a landscape frame can stand portrait.
     /// The picture's own format uses the pixels it was given.
     fn frame(self, img_w: u32, img_h: u32, turned: bool) -> (u32, u32) {
-        let (a, b) = if self == Self::Image {
-            (img_w.max(1), img_h.max(1))
-        } else {
-            self.oriented(img_w, img_h)
-        };
+        let (a, b) =
+            if self == Self::Image { (img_w.max(1), img_h.max(1)) } else { self.oriented(img_w, img_h) };
         if turned && a != b {
             (b, a)
         } else {
@@ -1642,9 +1643,9 @@ impl App {
                 .selected_text(self.frame_box_label())
                 .show_ui(ui, |ui| self.crop_format_table(ui))
                 .response;
-            response.on_hover_text("The sheet, and which way it stands.").on_disabled_hover_text(
-                "The sheet, and which way it stands.",
-            );
+            response
+                .on_hover_text("The sheet, and which way it stands.")
+                .on_disabled_hover_text("The sheet, and which way it stands.");
         });
         if ui
             .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
@@ -1709,8 +1710,13 @@ impl App {
                 ui.end_row();
             }
         });
-        if frame_cell(ui, PaperFormat::Square.label(), self.crop_format == PaperFormat::Square, cell * 2.0 + gap)
-            .clicked()
+        if frame_cell(
+            ui,
+            PaperFormat::Square.label(),
+            self.crop_format == PaperFormat::Square,
+            cell * 2.0 + gap,
+        )
+        .clicked()
         {
             self.choose_frame(PaperFormat::Square, false);
         }
@@ -3260,9 +3266,8 @@ fn framed_combo_width(ui: &egui::Ui) -> f32 {
 fn frame_cell(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui::Response {
     let mut button = egui::Button::new((egui::Atom::grow(), label, egui::Atom::grow())).frame(true);
     if active {
-        button = button
-            .fill(ui.visuals().extreme_bg_color)
-            .stroke(egui::Stroke::new(1.0, Color32::from_gray(96)));
+        button =
+            button.fill(ui.visuals().extreme_bg_color).stroke(egui::Stroke::new(1.0, Color32::from_gray(96)));
     }
     ui.add_sized([width, ui.spacing().interact_size.y], button)
 }
