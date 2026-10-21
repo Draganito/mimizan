@@ -58,7 +58,9 @@ fn main() -> eframe::Result {
             Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])
         })
         .unwrap_or([1360.0, 860.0]);
-    let options = eframe::NativeOptions {
+    // `mut` is only used on Windows, where the renderer is switched to DirectX 12.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut options = eframe::NativeOptions {
         // Fits a 1366x768 laptop at scale 1 and an HiDPI screen at scale 2;
         // the panels float, scroll and can be moved, Ctrl+/- zooms the whole UI.
         viewport: egui::ViewportBuilder::default()
@@ -71,5 +73,16 @@ fn main() -> eframe::Result {
             .with_app_id("mimizan-gui"),
         ..Default::default()
     };
+    // OpenGL is not part of Windows. The Store test is a virtual machine
+    // without an OpenGL driver, and the window then closes at once.
+    // DirectX 12 is part of Windows: the graphics card when there is one,
+    // the built-in software renderer when there is not.
+    #[cfg(target_os = "windows")]
+    {
+        options.renderer = eframe::Renderer::Wgpu;
+        let mut wgpu = eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+        wgpu.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        options.wgpu_options.wgpu_setup = eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu);
+    }
     eframe::run_native("Mimizan Lab", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))))
 }

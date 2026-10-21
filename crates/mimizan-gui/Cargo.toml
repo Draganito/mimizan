@@ -28,14 +28,19 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 
 # GNOME Wayland draws no server-side frame: let winit draw the Adwaita-style
 # client-side decorations itself, with the window title centred in the bar.
-# macOS and Windows keep the native frame. Glow is the shared renderer, and
-# on macOS that is the system OpenGL framework, not a library to install.
+# macOS keeps the native frame and the system OpenGL framework.
+# Windows draws with DirectX 12, which ships with the system. A virtual
+# machine has no OpenGL driver, and the Store test runs in one. With a
+# graphics card DirectX 12 uses it. Without one, Windows draws on the CPU.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
 
-[target.'cfg(not(target_os = "linux"))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

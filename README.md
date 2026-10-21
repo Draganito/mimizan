@@ -70,7 +70,7 @@ If macOS says the app is damaged and should be moved to the Trash, it is blockin
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
 ```
 
-From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and a working OpenGL for the GUI):
+From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and on Linux and macOS a working OpenGL for the window; Windows uses DirectX 12, which comes with the system):
 
 ```bash
 git clone https://github.com/Draganito/mimizan
