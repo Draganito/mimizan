@@ -16,7 +16,7 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
-![Mimizan Lab before a file is opened: the enlarger below, the sheet on the right, the folder as a film strip](docs/gui.png)
+![Mimizan Lab with a file open: the negative on the left, the print in the middle, the enlarger below, the sheet and its 1:1 box on the right](docs/gui.jpg)
 
 ## The negative
 
