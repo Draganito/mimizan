@@ -39,6 +39,3 @@ pub mod usm;
 pub mod zone;
 
 pub use error::{Error, Result};
-
-/// Crate version, the `mimizan` field every negative and print records.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");

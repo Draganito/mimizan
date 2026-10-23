@@ -15,7 +15,7 @@ use mimizan_core::paper::{SplitGrade, STOP_LIMIT};
 use mimizan_core::zone;
 
 /// Height of the bar, points.
-pub const BAR_H: f32 = 44.0;
+const BAR_H: f32 = 44.0;
 
 /// Print value shown as the print grey.
 fn grey(v: f64) -> Color32 {
@@ -26,7 +26,7 @@ fn grey(v: f64) -> Color32 {
 pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
-    let visuals = ui.visuals().clone();
+    let weak = ui.visuals().weak_text_color();
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), BAR_H));
     let zones = zone::bar_zones();
 
@@ -123,7 +123,7 @@ pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
             );
         }
     }
-    let frame = Stroke::new(1.0, visuals.weak_text_color().linear_multiply(0.6));
+    let frame = Stroke::new(1.0, weak.linear_multiply(0.6));
     painter.rect_stroke(bar, 0.0, frame, egui::StrokeKind::Inside);
 
     // Boundaries: thin lines, dark on the light end, light on the dark end.
@@ -151,7 +151,7 @@ pub fn zone_bar(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
         let k = k as usize;
         let l = if k == 0 { zone::linear(0) } else { zone::linear(k) };
         let v = curve.eval(l);
-        response.clone().on_hover_text(format!(
+        response.on_hover_text(format!(
             "Zone {}: prints at {v:.3} (density {:.2}), {:.0} % of the paper\n\
              drag: both exposures, the tone under the pointer follows",
             zone::numeral(k),

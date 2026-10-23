@@ -1,4 +1,4 @@
-//! The measurement bench: synthetic scene -> estimator -> numbers (SPEC section 8).
+//! The measurement bench: synthetic scene -> estimator -> numbers.
 
 use crate::baseline::bilinear_luminance;
 use crate::decode::Rect;
@@ -11,22 +11,36 @@ use crate::synth::{mosaic, wedge_level, Scene, SynthParams, Synthetic, STAR_SPOK
 use serde::Serialize;
 use std::time::Instant;
 
+/// One estimator's numbers on one scene.
 #[derive(Clone, Debug, Serialize)]
 pub struct EstimatorResult {
+    /// `mimizan` or the baseline's name.
     pub name: String,
+    /// Error against the truth, `border` pixels of the edge excluded.
     pub error: ErrorStats,
-    /// Error relative to the mean noise sigma of the truth (SPEC: ≤ 1.5 sigma on neutral scenes).
+    /// Error relative to the mean noise sigma of the truth; the target is
+    /// 1.5 sigma or less on neutral scenes.
     pub rmse_over_sigma: f64,
+    /// Mean noise sigma of the truth, the denominator above.
+    pub sigma: f64,
+    /// Star scene only.
     pub star: Option<StarReport>,
+    /// Largest carrier-to-noise ratio over the flat patches, `None` when no
+    /// patch was wide enough for a carrier block.
     pub carrier_flat_max: Option<f64>,
+    /// Per-patch carrier reports, patch scenes only.
     pub carrier_per_patch: Option<Vec<CarrierReport>>,
     /// Error restricted to patch interiors (16 px inset), i.e. without the colour edges.
     pub interior_error: Option<ErrorStats>,
+    /// Wedge scene only.
     pub wedge: Option<WedgeFit>,
+    /// Wall time of the estimator, milliseconds.
     pub ms: u128,
+    /// Mask rounds the adaptive separation ran (0 otherwise).
     pub rounds: usize,
 }
 
+/// One scene: its parameters and both estimators.
 #[derive(Clone, Debug, Serialize)]
 pub struct SceneResult {
     pub scene: Scene,
@@ -34,6 +48,7 @@ pub struct SceneResult {
     pub height: usize,
     pub synth: SynthParams,
     pub separate: SeparateParams,
+    /// The star measured on the truth itself (what a perfect estimator gives).
     pub truth_star: Option<StarReport>,
     pub mimizan: EstimatorResult,
     pub baseline: EstimatorResult,
@@ -41,14 +56,18 @@ pub struct SceneResult {
 
 fn mean_sigma(s: &Synthetic) -> f64 {
     let nm = s.mosaic.noise;
-    let n = s.l_true.data.len() as f64;
+    let n = s.l_true.data.len().max(1) as f64;
     s.l_true.data.iter().map(|&v| nm.sigma(v)).sum::<f64>() / n
 }
 
+/// `cols × rows` patches tiling `w × h`, each shrunk by `inset` on every
+/// side. The inset is clamped so a small picture gives empty patches, not
+/// an underflow.
 fn patch_rects(w: usize, h: usize, cols: usize, rows: usize, inset: usize) -> Vec<Rect> {
-    let pw = w / cols;
-    let ph = h / rows;
-    let mut v = Vec::new();
+    let pw = w / cols.max(1);
+    let ph = h / rows.max(1);
+    let inset = inset.min(pw / 2).min(ph / 2);
+    let mut v = Vec::with_capacity(cols * rows);
     for r in 0..rows {
         for c in 0..cols {
             v.push(Rect { x: c * pw + inset, y: r * ph + inset, w: pw - 2 * inset, h: ph - 2 * inset });
@@ -73,6 +92,7 @@ fn evaluate(
         name: name.into(),
         error,
         rmse_over_sigma: error.rmse / sigma.max(1e-12),
+        sigma,
         star: None,
         carrier_flat_max: None,
         carrier_per_patch: None,
@@ -81,8 +101,10 @@ fn evaluate(
         ms,
         rounds,
     };
+    // `None` when no patch held a carrier block, rather than a zero that
+    // reads as "measured and clean".
     let carrier_max = |reps: &[CarrierReport]| {
-        reps.iter().flat_map(|c| c.ratio.iter().cloned()).filter(|v| v.is_finite()).fold(0.0, f64::max)
+        reps.iter().flat_map(|c| c.ratio.iter().cloned()).filter(|v| v.is_finite()).reduce(f64::max)
     };
     match scene {
         Scene::Star => {
@@ -99,7 +121,7 @@ fn evaluate(
             let rects = patch_rects(w, h, 6, 4, 8);
             let reps: Vec<CarrierReport> =
                 rects.iter().map(|&rc| carrier_energy(est, &s.mosaic.noise, Some(rc), 0.15)).collect();
-            r.carrier_flat_max = Some(carrier_max(&reps));
+            r.carrier_flat_max = carrier_max(&reps);
             r.carrier_per_patch = Some(reps);
             r.interior_error = Some(interior_stats(est, &s.l_true, &patch_rects(w, h, 6, 4, 16)));
         }
@@ -113,10 +135,11 @@ fn evaluate(
                 .collect();
             r.wedge = Some(wedge_fit(&samples));
             // Carrier blocks need 64 px: use the full patch width (1024/16 = 64).
+            // Below that size no block fits and the maximum stays `None`.
             let full = patch_rects(w, h, steps, 1, 0);
             let reps: Vec<CarrierReport> =
                 full.iter().map(|&rc| carrier_energy(est, &s.mosaic.noise, Some(rc), 0.15)).collect();
-            r.carrier_flat_max = Some(carrier_max(&reps));
+            r.carrier_flat_max = carrier_max(&reps);
             r.carrier_per_patch = Some(reps);
             r.interior_error = Some(interior_stats(est, &s.l_true, &patch_rects(w, h, steps, 1, 16)));
         }
@@ -138,7 +161,7 @@ fn interior_stats(est: &crate::plane::Plane, truth: &crate::plane::Plane, rects:
         }
     }
     let n = errs.len();
-    errs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    errs.sort_by(f64::total_cmp);
     ErrorStats {
         rmse: (s2 / n.max(1) as f64).sqrt(),
         p99: errs.get((0.99 * (n.saturating_sub(1)) as f64) as usize).cloned().unwrap_or(f64::NAN),
@@ -147,12 +170,23 @@ fn interior_stats(est: &crate::plane::Plane, truth: &crate::plane::Plane, rects:
     }
 }
 
-pub fn run_scene(scene: Scene, w: usize, h: usize, sp: &SynthParams, p: &SeparateParams) -> SceneResult {
+/// Synthesise `scene` at `w × h`, run the separation and the baseline, and
+/// measure both against the truth. `separation` receives the separation so
+/// a caller that wants the planes (previews) does not have to run it twice.
+pub fn run_scene_with(
+    scene: Scene,
+    w: usize,
+    h: usize,
+    sp: &SynthParams,
+    p: &SeparateParams,
+    mut separation: impl FnMut(&Synthetic, &crate::separate::Separation),
+) -> SceneResult {
     let s = mosaic(scene, w, h, sp);
     let t = Instant::now();
     let sep = separate(&s.mosaic, p).expect("synthetic mosaic has a phase");
     let ms = t.elapsed().as_millis();
     let ours = evaluate("mimizan", scene, &s, &sep.lum, sep.rounds, ms);
+    separation(&s, &sep);
 
     let t = Instant::now();
     let base = bilinear_luminance(&s.mosaic.plane, sp.phase);
@@ -164,6 +198,11 @@ pub fn run_scene(scene: Scene, w: usize, h: usize, sp: &SynthParams, p: &Separat
     });
 
     SceneResult { scene, width: w, height: h, synth: *sp, separate: *p, truth_star, mimizan: ours, baseline }
+}
+
+/// [`run_scene_with`] without the planes.
+pub fn run_scene(scene: Scene, w: usize, h: usize, sp: &SynthParams, p: &SeparateParams) -> SceneResult {
+    run_scene_with(scene, w, h, sp, p, |_, _| {})
 }
 
 /// Markdown table of a bench run.
@@ -188,7 +227,7 @@ pub fn markdown(results: &[SceneResult]) -> String {
         for e in [&r.mimizan, &r.baseline] {
             let interior = e
                 .interior_error
-                .map(|ie| format!("{:.2}", ie.rmse / (e.error.rmse / e.rmse_over_sigma).max(1e-12)))
+                .map(|ie| format!("{:.2}", ie.rmse / e.sigma.max(1e-12)))
                 .unwrap_or_else(|| "-".into());
             let (m50a, m50d, m10a, ring) = match &e.star {
                 Some(st) => (

@@ -1,10 +1,22 @@
-//! Windowed 2-D block spectra in f64 (SPEC sections 5.2 and 8).
+//! Windowed 2-D block spectra in f64, for the adaptive mask and the
+//! carrier-energy measurement.
 
 use crate::plane::Plane;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
 
+/// Buffers one thread reuses from block to block: the complex block, the
+/// FFT's own scratch, and the power spectrum. Nothing is allocated per block
+/// once these have reached their size.
+#[derive(Default)]
+pub struct FftScratch {
+    data: Vec<Complex<f64>>,
+    fft: Vec<Complex<f64>>,
+    power: Vec<f64>,
+}
+
+/// A planned `n × n` forward FFT with its Hann window.
 pub struct BlockFft {
     pub n: usize,
     fft: Arc<dyn Fft<f64>>,
@@ -15,6 +27,7 @@ pub struct BlockFft {
 }
 
 impl BlockFft {
+    /// Plan the FFT for `n`-pixel blocks and build the window.
     pub fn new(n: usize) -> Self {
         let mut planner = FftPlanner::<f64>::new();
         let fft = planner.plan_fft_forward(n);
@@ -43,17 +56,20 @@ impl BlockFft {
 
     /// Windowed power spectrum |X|² of the n×n block at (x0, y0). The block mean
     /// is removed before windowing so the DC leakage does not dominate.
-    /// Returns (power, block_mean).
-    pub fn power(
+    /// Returns (power, block_mean); the power slice lives in `scratch` until
+    /// the next call. The block must lie inside the plane.
+    pub fn power<'s>(
         &self,
         plane: &Plane,
         x0: usize,
         y0: usize,
-        scratch: &mut Vec<Complex<f64>>,
-    ) -> (Vec<f64>, f64) {
+        scratch: &'s mut FftScratch,
+    ) -> (&'s [f64], f64) {
         let n = self.n;
-        scratch.clear();
-        scratch.resize(n * n, Complex::new(0.0, 0.0));
+        let data = &mut scratch.data;
+        data.clear();
+        data.resize(n * n, Complex::new(0.0, 0.0));
+        scratch.fft.resize(self.fft.get_inplace_scratch_len().max(1), Complex::new(0.0, 0.0));
         let mut mean = 0.0;
         for y in 0..n {
             let row = &plane.row(y0 + y)[x0..x0 + n];
@@ -65,25 +81,27 @@ impl BlockFft {
         for y in 0..n {
             let row = &plane.row(y0 + y)[x0..x0 + n];
             for x in 0..n {
-                scratch[y * n + x] = Complex::new((row[x] - mean) * self.window[y * n + x], 0.0);
+                data[y * n + x] = Complex::new((row[x] - mean) * self.window[y * n + x], 0.0);
             }
         }
-        // rows
+        // Rows: one call transforms all n consecutive rows.
+        self.fft.process_with_scratch(data, &mut scratch.fft);
+        // Columns: transpose in place, transform as rows, and read the power
+        // transposed back. |X|² is the same either way round.
         for y in 0..n {
-            self.fft.process(&mut scratch[y * n..(y + 1) * n]);
-        }
-        // columns
-        let mut col = vec![Complex::new(0.0, 0.0); n];
-        for x in 0..n {
-            for y in 0..n {
-                col[y] = scratch[y * n + x];
-            }
-            self.fft.process(&mut col);
-            for y in 0..n {
-                scratch[y * n + x] = col[y];
+            for x in (y + 1)..n {
+                data.swap(y * n + x, x * n + y);
             }
         }
-        let power: Vec<f64> = scratch.iter().map(|c| c.norm_sqr()).collect();
+        self.fft.process_with_scratch(data, &mut scratch.fft);
+        let power = &mut scratch.power;
+        power.clear();
+        power.resize(n * n, 0.0);
+        for y in 0..n {
+            for x in 0..n {
+                power[y * n + x] = data[x * n + y].norm_sqr();
+            }
+        }
         (power, mean)
     }
 
@@ -120,7 +138,7 @@ mod tests {
                 p.set(x, y, if (x + y) % 2 == 0 { 0.6 } else { 0.4 });
             }
         }
-        let mut s = Vec::new();
+        let mut s = FftScratch::default();
         let (pw, mean) = b.power(&p, 0, 0, &mut s);
         assert!((mean - 0.5).abs() < 1e-12);
         // A Hann-windowed tone exactly on a bin occupies that bin and its
@@ -158,7 +176,7 @@ mod tests {
             acc += *v * *v;
         }
         let var = acc / (n * n) as f64;
-        let mut s = Vec::new();
+        let mut s = FftScratch::default();
         let (pw, _) = b.power(&p, 0, 0, &mut s);
         let mean_bin: f64 = pw.iter().sum::<f64>() / (n * n) as f64;
         let expected = var * b.window_energy;

@@ -33,9 +33,10 @@ pub struct KodakArgs {
     /// Markdown report
     #[arg(long, default_value = "docs/KODAK.md")]
     pub report: PathBuf,
+    /// Bayer phase the pictures are mosaicked with: RGGB, BGGR, GRBG or GBRG
     #[arg(long, default_value = "RGGB")]
     pub phase: String,
-    /// Border (px) excluded from every metric
+    /// Border (px) excluded from every metric; must leave some picture
     #[arg(long, default_value_t = 16)]
     pub border: usize,
     /// Crop size (px, before 2x magnification) of the comparison strips
@@ -171,9 +172,16 @@ DualDemosaicAutoContrast=false\nDualDemosaicContrast=0\nPDAFLinesFilter=false\n\
     )
 }
 
+/// File name without directory and extension; the path must name a file.
+fn stem_of(path: &Path) -> Result<String> {
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("{} is not a file name", path.display()))
+}
+
 /// Run one external converter on `dng`; returns the demosaiced linear RGB.
 fn run_external(tool: Tool, dng: &Path, out_dir: &Path) -> Result<Option<mimizan_core::synth::Rgb>> {
-    let stem = dng.file_stem().unwrap().to_string_lossy().to_string();
+    let stem = stem_of(dng)?;
     match tool {
         Tool::Bilinear => Ok(None),
         Tool::Libraw(q) => {
@@ -268,7 +276,7 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
     files.sort();
     if let Some(only) = &a.only {
         let keep: Vec<&str> = only.split(',').map(str::trim).collect();
-        files.retain(|p| keep.contains(&p.file_stem().unwrap().to_string_lossy().as_ref()));
+        files.retain(|p| p.file_stem().is_some_and(|s| keep.contains(&s.to_string_lossy().as_ref())));
     }
     if files.is_empty() {
         bail!("no pictures in {}", a.images.display());
@@ -282,7 +290,7 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
     let mut images = Vec::new();
 
     for file in &files {
-        let stem = file.file_stem().unwrap().to_string_lossy().to_string();
+        let stem = stem_of(file)?;
         let (mut rgb, noise) = if a.raw.is_empty() {
             (kodak::load_srgb8(file)?, kodak::quantisation_noise())
         } else {
@@ -293,11 +301,13 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
             rgb = mimizan_core::synth::Rgb { r: up(&rgb.r), g: up(&rgb.g), b: up(&rgb.b) };
         }
         if a.blur > 0.0 {
-            let g = gaussian_kernel(a.blur);
-            let bl = |p: &Plane| mimizan_core::filter::lowpass(p, &g);
+            let bl = |p: &Plane| mimizan_core::usm::gaussian_blur(p, a.blur);
             rgb = mimizan_core::synth::Rgb { r: bl(&rgb.r), g: bl(&rgb.g), b: bl(&rgb.b) };
         }
         let (w, h) = (rgb.width(), rgb.height());
+        if w <= 2 * a.border || h <= 2 * a.border {
+            bail!("{stem}: {w}x{h} leaves nothing inside a border of {} px", a.border);
+        }
         let truth = rgb.luminance();
         let fb = kodak::mosaic_rgb(&rgb, phase, noise, &stem);
         let dng = a.out.join(format!("{stem}.dng"));
@@ -337,7 +347,7 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
                             h
                         );
                     }
-                    kodak::luminance(&rgb)
+                    rgb.luminance()
                 }
             };
             let q = kodak::quality(&mono, &truth, a.border);
@@ -446,29 +456,20 @@ fn pathdiff(target: &Path, base: &Path) -> PathBuf {
     out
 }
 
+/// Mean of the values, `None` of an empty sequence.
 fn mean(vals: impl Iterator<Item = f64>) -> Option<f64> {
-    let v: Vec<f64> = vals.collect();
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.iter().sum::<f64>() / v.len() as f64)
-    }
+    let (sum, n) = vals.fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
+    (n > 0).then(|| sum / n as f64)
 }
 
 fn fmt(v: Option<f64>, prec: usize) -> String {
     v.map(|x| format!("{x:.prec$}")).unwrap_or_else(|| "–".into())
 }
 
-fn gaussian_kernel(sigma: f64) -> Vec<f64> {
-    let r = (3.0 * sigma).ceil().max(1.0) as usize;
-    let k: Vec<f64> = (0..=2 * r)
-        .map(|i| {
-            let d = i as f64 - r as f64;
-            (-d * d / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let s: f64 = k.iter().sum();
-    k.into_iter().map(|v| v / s).collect()
+/// Did every picture fall back to the bilinear baseline as "best"? Then the
+/// report must not speak of external demosaicers.
+fn only_bilinear(r: &Report) -> bool {
+    r.images.iter().all(|im| im.best.is_none_or(|i| METHODS[i].tool == Tool::Bilinear))
 }
 
 fn markdown(r: &Report, strips_rel: &Path) -> String {
@@ -501,16 +502,14 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
              and the sharpness the camera actually delivers, not twice it. ",
             r.scale
         ));
-    } else if r.from_raw {
-        // condition described above
-    } else if r.scale > 1 {
+    } else if !r.from_raw && r.scale > 1 {
         s.push_str(&format!(
             "**Condition: {0}× magnified (Lanczos-3) before mosaicking**, so the content is band-limited to \
              1/{0} of Nyquist, the situation a lens and sensor produce (a real sensor never sees pixel-sharp \
              colour edges). ",
             r.scale
         ));
-    } else if r.blur > 0.0 {
+    } else if !r.from_raw && r.blur > 0.0 {
         let mtf50 = (2.0f64.ln() / (2.0 * std::f64::consts::PI.powi(2) * r.blur * r.blur)).sqrt();
         s.push_str(&format!(
             "**Condition: lens-like**, the pictures blurred with a Gaussian of σ = {:.2} px before mosaicking \
@@ -520,7 +519,7 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
             mtf50,
             100.0 * (-2.0 * std::f64::consts::PI.powi(2) * r.blur * r.blur * 0.25).exp()
         ));
-    } else {
+    } else if !r.from_raw {
         s.push_str(
             "**Condition: pixel-sharp**, the pictures as they are, the convention of the demosaicing literature \
              (colour edges one pixel wide, which no lens delivers). ",
@@ -599,10 +598,15 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
         mean(r.images.iter().map(|im| im.mimizan_reconstruct.psnr_db)).unwrap_or(f64::NAN),
         100.0 * mean(r.images.iter().map(|im| im.computed)).unwrap_or(f64::NAN)
     ));
-    s.push_str(
-        "Bold in the two Mimizan columns: at least as good as the best external demosaicer on that picture. \
-         \"computed\" is the share of the picture the reconstruction step took over (mean β).\n\n",
-    );
+    let reference = if only_bilinear(r) {
+        "the bilinear baseline (no external converter ran)"
+    } else {
+        "the best external demosaicer"
+    };
+    s.push_str(&format!(
+        "Bold in the two Mimizan columns: at least as good as {reference} on that picture. \
+         \"computed\" is the share of the picture the reconstruction step took over (mean β).\n\n"
+    ));
 
     // SSIM table
     s.push_str("## SSIM (luminance)\n\n");
@@ -652,7 +656,7 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
     }
     if compared > 0 {
         s.push_str(&format!(
-            "Mimizan is at or above the best external demosaicer on {wins} of {compared} pictures (PSNR); \
+            "Mimizan is at or above {reference} on {wins} of {compared} pictures (PSNR); \
              with the reconstruction step on {wins_rec} of {compared}. \
              \"Mimizan\" is the default pipeline (`--mask dubois`: pixel-adaptive weighting of the two C2 copies \
              and of two direction-dependent C1 bands, elongated pass bands). \"Mimizan fixed\" is the same \
@@ -669,7 +673,7 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
     // Gallery
     s.push_str("## Crops\n\n");
     s.push_str(&format!(
-        "Each strip: **mosaic** as the sensor records it (grey, CFA pattern visible) · **best external demosaicer → mono** · \
+        "Each strip: **mosaic** as the sensor records it (grey, CFA pattern visible) · **{reference} → mono** · \
          **Mimizan** · **ground truth**. {0}×{0} px window at 2× (nearest neighbour), chosen automatically as the region \
          with the largest combined error of the two estimates, i.e. the hardest spot for both, not a hand-picked win.\n\n",
         r.crop

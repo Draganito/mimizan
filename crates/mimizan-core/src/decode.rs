@@ -8,6 +8,7 @@ use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// A rectangle of sensor pixels: origin and size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Rect {
     pub x: usize,
@@ -16,12 +17,16 @@ pub struct Rect {
     pub h: usize,
 }
 
+/// What sits in front of the photosites.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub enum SensorKind {
+    /// A 2×2 Bayer filter with this phase at pixel (0, 0).
     Bayer(BayerPhase),
+    /// No colour filter: every photosite is the measurement.
     Mono,
 }
 
+/// The sensor samples as the file stores them, row-major, one per photosite.
 #[derive(Clone, Debug)]
 pub enum RawData {
     Integer(Vec<u16>),
@@ -29,6 +34,7 @@ pub enum RawData {
 }
 
 impl RawData {
+    /// Sample `i` as `f64`.
     #[inline]
     pub fn get(&self, i: usize) -> f64 {
         match self {
@@ -36,6 +42,7 @@ impl RawData {
             RawData::Float(v) => f64::from(v[i]),
         }
     }
+    /// Number of samples.
     pub fn len(&self) -> usize {
         match self {
             RawData::Integer(v) => v.len(),
@@ -110,7 +117,7 @@ pub struct RawFrame {
     /// White level per colour: R, G, B (index by `Color`), G used twice.
     pub white_rgb: [f64; 3],
     pub crop: Rect,
-    /// TIFF orientation value (1..8), 0 if unknown.
+    /// TIFF orientation value (1..=8), 0 if unknown.
     pub orientation: u16,
     /// XYZ -> camera matrix (rows R,G,B), if the file provides one.
     pub xyz_to_cam: Option<[[f64; 3]; 3]>,
@@ -120,10 +127,13 @@ pub struct RawFrame {
     pub data: RawData,
 }
 
+/// A source of raw frames. The desktop and the command use `rawler`; a
+/// mobile build constructs frames from the camera API instead.
 pub trait RawDecoder {
     fn decode(&self, path: &Path) -> Result<RawFrame>;
 }
 
+/// The `rawler` decoder: every file format rawler reads.
 #[cfg(feature = "decode-rawler")]
 pub struct RawlerDecoder;
 
@@ -178,7 +188,7 @@ impl RawDecoder for RawlerDecoder {
         let bl = &img.blacklevel;
         let black_tile: [f64; 4] = if bl.levels.len() == 1 {
             [f64::from(bl.levels[0].as_f32()); 4]
-        } else if bl.width == 2 && bl.height == 2 && bl.cpp == 1 {
+        } else if bl.width == 2 && bl.height == 2 && bl.cpp == 1 && bl.levels.len() == 4 {
             [
                 f64::from(bl.levels[0].as_f32()),
                 f64::from(bl.levels[1].as_f32()),
@@ -192,12 +202,21 @@ impl RawDecoder for RawlerDecoder {
             )));
         };
 
+        // rawler's white level is per component. A mosaic has one, so the
+        // one-entry form is what real files give; three or four entries are
+        // read as R, G, B in case a decoder lists them per colour.
         let wl = &img.whitelevel.0;
         let white_rgb: [f64; 3] = match wl.len() {
             1 => [f64::from(wl[0]); 3],
             3 | 4 => [f64::from(wl[0]), f64::from(wl[1]), f64::from(wl[2])],
             n => return Err(Error::Unsupported(format!("white level with {n} entries"))),
         };
+        if black_tile.iter().any(|b| white_rgb.iter().any(|w| w <= b)) {
+            return Err(Error::Unsupported(format!(
+                "white level {:?} is not above black level {:?}",
+                white_rgb, black_tile
+            )));
+        }
 
         let to_rect = |r: &rawler::imgop::Rect| Rect { x: r.p.x, y: r.p.y, w: r.d.w, h: r.d.h };
         let full = Rect { x: 0, y: 0, w: img.width, h: img.height };
@@ -309,17 +328,26 @@ impl RawFrame {
         (w + 1.0).log2().ceil() as usize
     }
 
-    /// Minimum/maximum raw sample value inside the crop.
+    /// Minimum/maximum raw sample value inside the crop. An empty or
+    /// out-of-frame crop gives `(inf, -inf)`.
     pub fn raw_range(&self) -> (f64, f64) {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for y in self.crop.y..self.crop.y + self.crop.h {
-            for x in self.crop.x..self.crop.x + self.crop.w {
-                let v = self.data.get(y * self.width + x);
-                lo = lo.min(v);
-                hi = hi.max(v);
-            }
+        use rayon::prelude::*;
+        let c = self.crop;
+        if c.x + c.w > self.width || c.y + c.h > self.height || self.data.len() < self.width * self.height {
+            return (f64::INFINITY, f64::NEG_INFINITY);
         }
-        (lo, hi)
+        (c.y..c.y + c.h)
+            .into_par_iter()
+            .map(|y| {
+                let mut lo = f64::INFINITY;
+                let mut hi = f64::NEG_INFINITY;
+                for x in c.x..c.x + c.w {
+                    let v = self.data.get(y * self.width + x);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                }
+                (lo, hi)
+            })
+            .reduce(|| (f64::INFINITY, f64::NEG_INFINITY), |a, b| (a.0.min(b.0), a.1.max(b.1)))
     }
 }

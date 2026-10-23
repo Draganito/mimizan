@@ -1,3 +1,7 @@
+//! The production commands: `negative`, `print`, `info`, `dump`, and the
+//! option parsers they share with the bench and calibration commands.
+
+use crate::measure::{parse_list, parse_rect};
 use anyhow::{bail, Context, Result};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::decode::{RawDecoder, RawlerDecoder, SensorKind};
@@ -5,13 +9,14 @@ use mimizan_core::icc::GrayTrc;
 use mimizan_core::ingest::{ingest, IngestParams, WhiteBalance};
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::pipeline::{self, NegativeParams};
-use mimizan_core::separate::MaskMode;
+use mimizan_core::separate::{MaskMode, SeparateParams};
 use mimizan_core::tiffout::{write_gray16, write_gray8, TiffMeta};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::{info, warn};
 
+/// Options of `mimizan negative`, already parsed by clap.
 pub struct NegativeArgs {
     pub raw: PathBuf,
     pub out: PathBuf,
@@ -31,8 +36,9 @@ pub struct NegativeArgs {
     pub crop: Option<String>,
 }
 
+/// `"r,g,b"` mix weights, validated.
 pub fn parse_weights(s: &str) -> Result<Weights> {
-    let v: Vec<f64> = s.split(',').map(|t| t.trim().parse::<f64>()).collect::<std::result::Result<_, _>>()?;
+    let v = parse_list(s)?;
     if v.len() != 3 {
         bail!("weights need three values r,g,b");
     }
@@ -41,6 +47,7 @@ pub fn parse_weights(s: &str) -> Result<Weights> {
     Ok(w)
 }
 
+/// `balanced` or `raw`.
 pub fn parse_weight_space(s: &str) -> Result<WeightSpace> {
     match s.to_ascii_lowercase().as_str() {
         "balanced" | "bal" => Ok(WeightSpace::Balanced),
@@ -49,18 +56,16 @@ pub fn parse_weight_space(s: &str) -> Result<WeightSpace> {
     }
 }
 
+/// `as-shot`, `gray`, `none` or manual `"r,g,b"` multipliers.
 pub fn parse_wb(s: &str) -> Result<WhiteBalance> {
     match s.to_ascii_lowercase().as_str() {
         "as-shot" | "asshot" | "camera" => Ok(WhiteBalance::AsShot),
         "gray" | "grey" | "gray-world" => Ok(WhiteBalance::GrayWorld),
         "none" | "off" => Ok(WhiteBalance::None),
         other => {
-            let v: Vec<f64> = other
-                .split(',')
-                .map(|t| t.trim().parse::<f64>())
-                .collect::<std::result::Result<_, _>>()
+            let v = parse_list(other)
                 .with_context(|| format!("white balance '{other}' is not as-shot|gray|none|r,g,b"))?;
-            if v.len() != 3 || v.iter().any(|x| *x <= 0.0) {
+            if v.len() != 3 || v.iter().any(|x| !(x.is_finite() && *x > 0.0)) {
                 bail!("manual white balance needs three positive values r,g,b");
             }
             Ok(WhiteBalance::Manual([v[0], v[1], v[2]]))
@@ -68,6 +73,7 @@ pub fn parse_wb(s: &str) -> Result<WhiteBalance> {
     }
 }
 
+/// `dubois`, `adaptive` or `off`.
 pub fn parse_mask(s: &str) -> Result<MaskMode> {
     match s.to_ascii_lowercase().as_str() {
         "off" => Ok(MaskMode::Off),
@@ -77,11 +83,25 @@ pub fn parse_mask(s: &str) -> Result<MaskMode> {
     }
 }
 
+/// Tell the user when `--cutoff` or `--rounds` were given but the chosen
+/// mask mode does not read them.
+pub fn warn_inert_flags(p: &SeparateParams, cutoff: f64, rounds: usize) {
+    let d = SeparateParams::default();
+    if p.mask == MaskMode::Dubois && cutoff != d.cutoff {
+        warn!("--cutoff has no effect with --mask dubois (its bands are fixed)");
+    }
+    if p.mask != MaskMode::Adaptive && rounds != d.rounds_max {
+        warn!("--rounds has no effect without --mask adaptive");
+    }
+}
+
+/// `<out stem>.mask.tif` next to the negative.
 pub fn sidecar_path(out: &Path) -> PathBuf {
     let stem = out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     out.with_file_name(format!("{stem}.mask.tif"))
 }
 
+/// `mimizan negative`: RAW → linear 16-bit negative TIFF plus mask sidecar.
 pub fn negative(a: &NegativeArgs) -> Result<()> {
     let t_all = Instant::now();
     let t = Instant::now();
@@ -95,6 +115,7 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     params.separate.mask = parse_mask(&a.mask)?;
     params.separate.cutoff = a.cutoff;
     params.separate.rounds_max = a.rounds;
+    warn_inert_flags(&params.separate, a.cutoff, a.rounds);
     if a.reconstruct {
         params.separate.reconstruct = Some(Default::default());
     }
@@ -145,27 +166,27 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     if let Some(p) = &a.preview {
         mimizan_core::preview::write_png(&neg.plane, p, a.preview_scale, true)?;
         if let Some(c) = &a.crop {
-            let v: Vec<usize> =
-                c.split(',').map(|t| t.trim().parse::<usize>()).collect::<std::result::Result<_, _>>()?;
-            if v.len() != 4 {
-                bail!("crop needs x,y,w,h");
-            }
+            let r = parse_rect(c).context("--crop")?;
             let cp = p.with_extension("crop.png");
-            mimizan_core::preview::write_png_crop(&neg.plane, &cp, v[0], v[1], v[2], v[3], true)?;
+            mimizan_core::preview::write_png_crop(&neg.plane, &cp, r.x, r.y, r.w, r.h, true)?;
             info!("crop {}", cp.display());
         }
         info!("preview {}", p.display());
     }
-    if neg.info.report.defects as f64 > 0.001 * neg.plane.data.len() as f64 {
+    let pixels = neg.plane.data.len().max(1) as f64;
+    if neg.info.report.defects as f64 > 0.001 * pixels {
         warn!(
             "defect rate {:.3} % is high; check the noise model",
-            100.0 * neg.info.report.defects as f64 / neg.plane.data.len() as f64
+            100.0 * neg.info.report.defects as f64 / pixels
         );
     }
     info!("total {} ms", t_all.elapsed().as_millis());
     Ok(())
 }
 
+/// Options of `mimizan print`, already parsed by clap. `usm_k` and
+/// `distance_mm` describe the viewing model; they are recorded in the print's
+/// metadata, not applied to the pixels.
 pub struct PrintArgs {
     pub negative: PathBuf,
     pub out: PathBuf,
@@ -276,10 +297,17 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     Ok(r)
 }
 
+/// `mimizan print`: negative TIFF → print TIFF through a recipe.
 pub fn print(a: &PrintArgs) -> Result<()> {
     use mimizan_core::print::{self as pr, PrintParams};
     if pr::is_jpeg_path(&a.out) {
         bail!("the print is written as a 16-bit TIFF; give -o a .tif path");
+    }
+    if !(a.usm_k.is_finite() && a.usm_k > 0.0) {
+        bail!("--usm-k must be positive");
+    }
+    if a.distance_mm.is_some_and(|d| !(d.is_finite() && d > 0.0)) {
+        bail!("--distance-mm must be positive");
     }
     let recipe = print_recipe(a)?;
     if let Some(p) = &a.write_recipe {
@@ -292,7 +320,7 @@ pub fn print(a: &PrintArgs) -> Result<()> {
     pr::write(&out, &a.out, &p)?;
     if out.info.deconvolution_iterations > 0 {
         info!(
-            "richardson-lucy: {} passes, enlargement sigma {:.2} px, every pixel",
+            "richardson-lucy: {} passes, scale sigma {:.2} px, picture area",
             out.info.deconvolution_iterations, out.info.resample_sigma_px
         );
     }
@@ -308,6 +336,7 @@ pub fn print(a: &PrintArgs) -> Result<()> {
     Ok(())
 }
 
+/// `mimizan info`: what the decoder reads from a RAW file.
 pub fn info(raw: &Path, as_json: bool) -> Result<()> {
     let t = Instant::now();
     let frame = RawlerDecoder.decode(raw).with_context(|| format!("decoding {}", raw.display()))?;
@@ -371,6 +400,7 @@ pub fn info(raw: &Path, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// `mimizan dump`: the balanced mosaic after ingest as a 16-bit TIFF.
 pub fn dump(
     raw: &Path,
     out: &Path,

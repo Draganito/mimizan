@@ -44,6 +44,7 @@ pub enum CpuView {
     Cores(Vec<f32>),
 }
 
+/// Per-core load sampled at a fixed interval; `sample()` is what the toolbar draws.
 pub struct CpuMeter {
     system: System,
     last: Instant,

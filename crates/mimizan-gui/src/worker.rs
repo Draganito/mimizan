@@ -1,12 +1,23 @@
-//! Background threads. `Heavy` decodes, separates and exports (seconds);
-//! `Preview` re-mixes the downscaled separation (milliseconds) and always
-//! works on the newest request only. `Loupe` renders one print box the
-//! same way, the pixels the TIFF gets.
+//! Background threads of the GUI. Nothing here draws; every thread takes a
+//! request, computes, and sends the result back through a channel.
+//!
+//! * `Heavy`: decode, separate, export (seconds). One job at a time, in
+//!   order; a panic in a job is caught and reported as `Event::Failed`.
+//! * `Preview`: re-mix and tone the downscaled separation plus the zoomed
+//!   detail window (milliseconds). Coalesces: only the newest request is
+//!   rendered, older ones are dropped unseen.
+//! * `Loupe`: one print box rendered exactly as the TIFF would be
+//!   (resize, sharpen, peak). Coalesces like `Preview`.
+//! * `PeakMeasure`: one-shot thread per measurement of the high-pass
+//!   radius; a newer measurement drops the receiver and the old result is
+//!   ignored.
+//!
+//! The thumbnail thread and the folder counter live in `browser`.
 
 use crate::session::{
-    cover_detail, preview_planes, render_detail, render_preview, render_print_detail, render_sharpen_loupe,
-    DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams, HistCache, PreviewImage, RawHistogram,
-    Session, SharpenLoupe, ToneHold, ViewParams,
+    cover_detail, next_session_id, preview_planes, render_detail, render_preview, render_print_detail,
+    render_sharpen_loupe, DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams, HistCache,
+    PreviewImage, RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -22,20 +33,16 @@ use std::thread;
 use std::time::Instant;
 use tracing::info;
 
+/// Work for the `Heavy` thread.
 pub enum Job {
-    Open {
-        path: PathBuf,
-        develop: DevelopParams,
-        cameras_dir: PathBuf,
-    },
-    Redevelop {
-        session: Arc<Session>,
-        develop: DevelopParams,
-    },
-    /// One export, one file: `path` (16-bit TIFF, the recipe rendered in one
+    /// Decode and develop a file.
+    Open { path: PathBuf, develop: DevelopParams, cameras_dir: PathBuf },
+    /// Develop the already decoded frame again with other parameters.
+    Redevelop { session: Arc<Session>, develop: DevelopParams },
+    /// One export, one file. The 16-bit TIFF is the recipe rendered in one
     /// pass against the negative: placing, paper or look, size and border.
-    /// The desktop GUI sends the phone's sharpening mode off. Peak, when
-    /// the recipe has it on, is part of that same pass).
+    /// The desktop GUI sends the sharpening mode off; peak, when the recipe
+    /// has it on, is part of that same pass.
     Export {
         session: Arc<Session>,
         weights: Weights,
@@ -46,13 +53,19 @@ pub enum Job {
     },
 }
 
+/// What the `Heavy` thread reports back.
 pub enum Event {
+    /// Progress text for the toolbar while a job runs.
     Status(String),
+    /// An `Open` or `Redevelop` finished.
     Opened(Arc<Session>),
+    /// An `Export` finished.
     Exported { tiff: PathBuf, width: usize, height: usize, ms: u128 },
+    /// The job failed or panicked; the text is for the log.
     Failed(String),
 }
 
+/// Handle to the `Heavy` thread; restarted if it ever dies.
 pub struct Heavy {
     tx: Sender<Job>,
     rx: Receiver<Event>,
@@ -60,11 +73,13 @@ pub struct Heavy {
 }
 
 impl Heavy {
+    /// Start the thread.
     pub fn spawn(ctx: egui::Context) -> Self {
         let (tx, rx) = start_heavy(&ctx);
         Self { tx, rx, ctx }
     }
 
+    /// Queue a job.
     pub fn send(&mut self, job: Job) {
         if let Err(std::sync::mpsc::SendError(job)) = self.tx.send(job) {
             self.restart();
@@ -72,6 +87,7 @@ impl Heavy {
         }
     }
 
+    /// The next event, if one is waiting.
     pub fn poll(&mut self) -> Option<Event> {
         match self.rx.try_recv() {
             Ok(e) => Some(e),
@@ -141,11 +157,16 @@ fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn
     let decode_ms = t.elapsed().as_millis();
     let frame = Arc::new(frame);
 
+    // The camera file only supplies suggested weights and the USM amount;
+    // a corrupt one must not keep the picture from opening.
     let camera_file_path = CameraFile::find(cameras_dir, &frame.clean_make, &frame.clean_model);
-    let camera_file = match &camera_file_path {
-        Some(p) => Some(CameraFile::load(p).with_context(|| format!("camera file {}", p.display()))?),
-        None => None,
-    };
+    let camera_file = camera_file_path.as_ref().and_then(|p| match CameraFile::load(p) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("camera file {} ignored: {e}", p.display());
+            None
+        }
+    });
     develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)
 }
 
@@ -182,7 +203,17 @@ fn develop_frame(
     let preview = preview_planes(&negative)?;
     let raw_hist = RawHistogram::of_frame(&frame);
     info!("preview planes + raw histogram {} ms", t.elapsed().as_millis());
-    Ok(Session { path, frame, negative, camera_file, camera_file_path, develop, preview, raw_hist })
+    Ok(Session {
+        id: next_session_id(),
+        path,
+        frame,
+        negative,
+        camera_file,
+        camera_file_path,
+        develop,
+        preview,
+        raw_hist,
+    })
 }
 
 /// The plane the print is made from. A monochrome sensor is already the
@@ -197,46 +228,35 @@ fn mixed_plane(s: &Session, weights: &Weights) -> Result<Option<Plane>> {
     Ok(Some(mix(sep, weights)))
 }
 
-/// Radius and amount on the negative's own pixels. The size step is left
-/// out, so an enlargement does not widen the measurement. The print
-/// multiplies the radius later. The phone's sharpening mode and the
-/// checkbox are off.
-pub fn measure_peak(
+/// Radius and amount on the negative's own pixels. The size step and the
+/// borders are left out, so neither the print's scale nor the paper enters
+/// the measurement; the print multiplies the radius later, above 1 and
+/// below. Sharpening and the peak itself are off for the render.
+fn measure_peak(
     s: &Session,
     weights: &Weights,
     mut recipe: Recipe,
     orientation: u16,
 ) -> Result<(f64, f64, bool)> {
+    use rayon::prelude::*;
     recipe.sharpen = Sharpen::Off;
     recipe.peak.on = false;
     recipe.size = None;
+    recipe.border_mm = 0.0;
+    recipe.black_mm = 0.0;
     let mixed = mixed_plane(s, weights)?;
     let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
     let src =
         PrintSource { plane, mask: None, orientation, name: s.path.display().to_string(), description: None };
     let out = pr::render_planes(&src, &PrintParams { recipe, ..PrintParams::default() });
-    let frame = out.info.border_px.saturating_add(out.info.black_px);
-    let (x0, y0, pw, ph) = picture_box(out.plane.width, out.plane.height, frame);
-    let mut samples = Vec::with_capacity(pw.saturating_mul(ph));
-    for y in 0..ph {
-        let row = out.plane.row(y0 + y);
-        for &v in &row[x0..x0 + pw] {
-            samples.push(v as f32);
-        }
-    }
-    let tuned = mimizan_core::peak::tune(&samples, pw, ph);
+    let samples: Vec<f32> = out.plane.data.par_iter().map(|&v| v as f32).collect();
+    let tuned = mimizan_core::peak::tune(&samples, out.plane.width, out.plane.height);
     let (radius, amount) = mimizan_core::recipe::Peak::clamp_measured(tuned.radius, tuned.amount);
     Ok((radius, amount, tuned.found))
 }
 
-fn picture_box(width: usize, height: usize, frame: usize) -> (usize, usize, usize, usize) {
-    if frame == 0 || width <= frame.saturating_mul(2) || height <= frame.saturating_mul(2) {
-        (0, 0, width, height)
-    } else {
-        (frame, frame, width - 2 * frame, height - 2 * frame)
-    }
-}
-
+/// Result of one peak measurement; `generation` tells the app whether it
+/// still belongs to the open picture.
 pub struct PeakMeasured {
     pub generation: u64,
     pub radius: f64,
@@ -244,9 +264,11 @@ pub struct PeakMeasured {
     pub found: bool,
 }
 
+/// State of a `PeakMeasure` as seen from the app.
 pub enum PeakPoll {
     Waiting,
     Ready(PeakMeasured),
+    /// The thread ended without a result (it logged why).
     Lost,
 }
 
@@ -256,6 +278,7 @@ pub struct PeakMeasure {
 }
 
 impl PeakMeasure {
+    /// Start the measurement on its own thread.
     pub fn start(
         ctx: egui::Context,
         generation: u64,
@@ -284,6 +307,7 @@ impl PeakMeasure {
         Self { rx }
     }
 
+    /// Has the measurement arrived?
     pub fn poll(&self) -> PeakPoll {
         match self.rx.try_recv() {
             Ok(v) => PeakPoll::Ready(v),
@@ -306,20 +330,21 @@ fn export(
     status(if s.is_mono() { "placing".into() } else { "mixing".into() });
     let mixed = mixed_plane(s, &weights)?;
     let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
-    let mask = s.mask_plane()?;
+    let params = PrintParams { recipe, ..Default::default() };
+    // The mask (a full f64 plane) is only read by the sharpening step.
+    let mask = if params.sharpens() { Some(s.mask_plane()?) } else { None };
     let mut info = s.negative.info.clone();
     info.weights = weights;
     info.weights_raw = weights.balanced_to_raw(s.wb());
     let src = PrintSource {
         plane,
-        mask: Some(&mask),
+        mask: mask.as_ref(),
         orientation,
         name: s.path.display().to_string(),
         description: serde_json::to_value(&info).ok(),
     };
 
     // The print: the recipe in one pass against the negative.
-    let params = PrintParams { recipe, ..Default::default() };
     status("rendering".into());
     let out = pr::render_planes(&src, &params);
     status(format!("writing {}", path.display()));
@@ -399,9 +424,11 @@ impl Preview {
     }
 }
 
+/// What the preview thread keeps between requests, so an unchanged view
+/// costs nothing and a pan reuses the overlap of the last detail tile.
 #[derive(Default)]
 struct PreviewHold {
-    last: Option<(*const Session, ViewParams)>,
+    last: Option<(u64, ViewParams)>,
     last_detail: Option<DetailAsk>,
     last_inspect: Option<Recipe>,
     held: Option<DetailTile>,
@@ -453,7 +480,7 @@ fn start_preview(ctx: &egui::Context) -> (Sender<PreviewRequest>, Receiver<Previ
 
 fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewResult> {
     let t = Instant::now();
-    let key = (Arc::as_ptr(&req.session), req.view.clone());
+    let key = (req.session.id, req.view.clone());
     let view_changed = hold.last.as_ref() != Some(&key);
     // The held window is the previous exposure. Drop it even when this
     // frame shows no sharp window, or the next zoom would reuse those pixels.
@@ -612,7 +639,8 @@ fn start_loupe(ctx: &egui::Context) -> (Sender<LoupeRequest>, Receiver<LoupeResu
     (tx, rx)
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+/// The text of a caught panic, for the log and the status line.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

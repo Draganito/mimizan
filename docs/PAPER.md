@@ -600,8 +600,12 @@ carries as JSON): mix → orientation → crop window (whole pixels of the
 upright negative; omitted, the full frame) → size → placing and tone in one
 step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
 paper border → [deconvolution →] USM → file. Resizing is separable in
-f64 with the kernel stretched by the scale factor when shrinking; the
-kernel is a parameter (B-spline default, Lanczos-3, Mitchell, Catmull-Rom). The tone is a *paper*, not a curve: a
+f64. The convolution kernels are stretched by the scale factor when
+shrinking; the kernel is a parameter (B-spline default, Lanczos-3,
+Mitchell, Catmull-Rom, or area). Area is the overlap of the pixel
+rectangles: the mean of the covered samples when shrinking, the sample
+held when enlarging, mixed only where an output pixel crosses a source
+edge. The tone is a *paper*, not a curve: a
 variable-contrast paper exposed in two passes (split grade), modelled as
 two emulsion components. The hard pass is a normal CDF in log exposure,
 $b = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from ISO R 50 (grade 5).
@@ -621,10 +625,12 @@ grey wedge against a monochrome camera's JPEG) remains for the
 measurement pipeline. Scale compensation of an enlargement uses
 $\sigma = k\,s$ print pixels, $s$ the long-side scale and $k$ fitted per
 kernel to the 10–90 % ramp of a step (Lanczos-3 0.281, Catmull–Rom 0.275,
-Mitchell 0.330, B-spline 0.515). USM is
+Mitchell 0.330, B-spline 0.515; area is 0, a hold rather than a fitted
+ramp). USM is
 $x + a(x - G_\sigma \ast x)$, masked as in 7.2; Richardson–Lucy inverts
 that same Gaussian, 1–10 passes, every pixel, before the USM. At native
-size and when shrinking, $\sigma = 0$ and that pass is a copy. The file
+size, when shrinking, and for an area enlargement, $\sigma = 0$ and that
+pass is a copy. The file
 still records the one-arc-minute radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
 that number is not applied. There is no
@@ -639,8 +645,10 @@ and the print is one file. None of this is part of the method's claim.
 
 Kodak set (24 pictures). 8-bit sRGB → linear → RGGB mosaic → 16 bit. The
 same samples go to Mimizan (`separate`, native mix) and, as a minimal CFA
-DNG (ColorMatrix1 = XYZ→sRGB, AsShotNeutral 1,1,1), to libraw 0.21
-(bilinear, AHD, DHT, AMaZE) and RawTherapee 5.11 (RCD); their RGB is reduced
+DNG (ColorMatrix1 = XYZ→sRGB, AsShotNeutral 1,1,1), to libraw 0.21 (VNG,
+PPG, AHD, DCB, DHT, AAHD) and RawTherapee 5.11 (fast, VNG4, AHD, EAHD, HPHD,
+DCB, LMMSE, IGV, AMaZE, RCD); bilinear is computed in-house. The tables
+below name the best of these per condition. Their RGB is reduced
 with $(R + 2G + B)/4$. Ground truth is the same luminance of the linear
 source. PSNR on sRGB-encoded 0..255 values, 16-px border excluded. Converter
 chains were verified on a smooth synthetic picture (every method ≥ 59 dB:
@@ -722,7 +730,9 @@ nonlinear step can only lose.
 ### 8.5 Other measurements
 
 - Siemens star on the Z f: MTF10 0.405 c/px separating on raw levels,
-  0.451 on balanced levels (= the true value of the chart).
+  0.451 on balanced levels (= the true value of the chart). The star
+  contrast is normalised to the outermost ring sampled, so the figures are
+  relative to the chart's own low-frequency contrast, not absolute MTF.
 - Weighting does not change resolution or pixel-to-pixel noise; a filter
   adds band-limited chroma noise only (red filter 19–21 % σ on smooth areas).
 - Synthetic bench (`measure synth --size 1024`, RMSE/σ): star 3.77 (MTF10

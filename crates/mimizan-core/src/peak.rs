@@ -1,21 +1,25 @@
-//! Peak's high-pass, measured on the print.
+//! Peak's high-pass, measured on the native-size render of the picture.
 //!
 //! The same search as the `peak` program: short steps across the picture,
 //! the soft ones dropped, the sharpest tenth averaged. Radius and amount are
-//! the smallest that bring that edge close to [`TARGET_MTF50`] without the
-//! contrast at a quarter cycle per pixel passing [`M25_CAP`]. A picture with
+//! the smallest that bring that edge close to `TARGET_MTF50` without the
+//! contrast at a quarter cycle per pixel passing `M25_CAP`. A picture with
 //! no such edge keeps the fallback radius and an amount of zero.
 //!
 //! `out = x + amount · (x − blur(σ))`. The blur is the same Gaussian the
-//! print's unsharp mask uses, so a measured amount applied with
-//! [`crate::usm::unsharp`] is the mask this search scored.
+//! print's unsharp mask uses ([`crate::filter::gaussian_kernel`]), so a
+//! measured amount applied with [`crate::usm::unsharp`] is the mask this
+//! search scored. The radius is in pixels of the negative; the print scales
+//! it with the picture ([`crate::print::peak_print_radius`]).
 
+use crate::filter::{gaussian_kernel, reflect};
 use std::f64::consts::PI;
 
-/// Blur radius, in print pixels, when the search finds no edge.
-pub const SIGMA_PX: f64 = 0.7;
+/// Blur radius, in pixels of the negative, when the search finds no edge:
+/// the recipe's default, so a measured recipe and an untouched one agree.
+const SIGMA_PX: f64 = crate::recipe::PEAK_RADIUS_DEFAULT;
 /// Where a measured edge should land, in cycles per pixel.
-pub const TARGET_MTF50: f64 = 0.35;
+const TARGET_MTF50: f64 = 0.35;
 /// Contrast at a quarter cycle per pixel. The rim appears above 0.80.
 /// The search stops a tenth earlier.
 const M25_CAP: f64 = 0.70;
@@ -41,15 +45,20 @@ struct Highpass {
 /// Radius and amount for one picture. `found` is false when no clean edge
 /// was measured; the picture is then left as it was.
 pub struct Tuned {
+    /// Gaussian σ, pixels of the negative.
     pub radius: f64,
+    /// Coefficient in `x + amount · (x − blur)`.
     pub amount: f64,
+    /// A clean edge was measured.
     pub found: bool,
 }
 
-/// Measure one picture. `picture` is the print, row-major, without the paper
-/// border. Values are the code values of the sheet, 0 to 1.
+/// Measure one picture. `picture` is the native-size print, row-major,
+/// without the paper border. Values are the code values of the sheet, 0 to
+/// 1. A buffer that does not match `width × height` is not measured.
 pub fn tune(picture: &[f32], width: usize, height: usize) -> Tuned {
-    let Some(esf) = sharp_esf(picture, width, height) else {
+    let fits = width.checked_mul(height).is_some_and(|n| n == picture.len());
+    let Some(esf) = fits.then(|| sharp_esf(picture, width, height)).flatten() else {
         let mask = for_gain(1.0);
         return Tuned { radius: mask.sigma, amount: mask.amount, found: false };
     };
@@ -68,25 +77,11 @@ fn for_sigma_gain(sigma: f64, nyquist_gain: f64) -> Highpass {
     Highpass { sigma, amount }
 }
 
+/// Response of the Gaussian at `freq` cycles per pixel.
 fn blurred(freq: f64, sigma: f64) -> f64 {
-    let k = kernel(sigma);
+    let k = gaussian_kernel(sigma);
     let r = k.len() / 2;
     k.iter().enumerate().map(|(i, w)| w * (2.0 * PI * freq * (i as f64 - r as f64)).cos()).sum()
-}
-
-fn kernel(sigma: f64) -> Vec<f64> {
-    let r = (3.0 * sigma).ceil().max(1.0) as usize;
-    let mut k = Vec::with_capacity(2 * r + 1);
-    let s2 = sigma * sigma;
-    for i in 0..=2 * r {
-        let t = i as f64 - r as f64;
-        k.push((-0.5 * t * t / s2).exp());
-    }
-    let sum: f64 = k.iter().sum();
-    for v in &mut k {
-        *v /= sum;
-    }
-    k
 }
 
 #[derive(Clone, Copy)]
@@ -138,35 +133,20 @@ fn lift_esf(esf: &[f64], sigma: f64, amount: f64) -> Vec<f64> {
     esf.iter().zip(blurred).map(|(v, b)| v + amount * (v - b)).collect()
 }
 
+/// Gaussian blur of one line, reflect-101 borders.
 fn blur_line(src: &[f64], sigma: f64) -> Vec<f64> {
-    let k = kernel(sigma);
+    let k = gaussian_kernel(sigma);
     let r = k.len() / 2;
-    let n = src.len() as isize;
-    let mut out = vec![0.0; src.len()];
+    let n = src.len();
+    let mut out = vec![0.0; n];
     for (x, dest) in out.iter_mut().enumerate() {
         let mut acc = 0.0;
         for (i, w) in k.iter().enumerate() {
-            let j = reflect(x as isize + i as isize - r as isize, n) as usize;
-            acc += w * src[j];
+            acc += w * src[reflect(x as isize + i as isize - r as isize, n)];
         }
         *dest = acc;
     }
     out
-}
-
-fn reflect(mut i: isize, n: isize) -> isize {
-    if n <= 1 {
-        return 0;
-    }
-    loop {
-        if i < 0 {
-            i = -i;
-        } else if i >= n {
-            i = 2 * n - 2 - i;
-        } else {
-            return i;
-        }
-    }
 }
 
 /// MTF50 and the contrast at 0.25 cycles per pixel.

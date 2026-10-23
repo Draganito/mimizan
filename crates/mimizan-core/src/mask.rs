@@ -1,6 +1,6 @@
-//! Adaptive block-spectrum mask and the adaptive separation (SPEC sections 5.2–5.4).
+//! Adaptive block-spectrum mask and the adaptive separation.
 
-use crate::blockfft::{BlockFft, CARRIERS};
+use crate::blockfft::{BlockFft, FftScratch, CARRIERS};
 use crate::cfa::BayerPhase;
 use crate::filter::{lowpass, LowpassSpec};
 use crate::ingest::Mosaic;
@@ -9,7 +9,9 @@ use crate::separate::{luminance, SeparateParams, Separation};
 use rayon::prelude::*;
 use tracing::debug;
 
+/// Side of one analysis block, pixels.
 pub const BLOCK: usize = 64;
+/// Distance between block origins: the blocks overlap by half.
 pub const STEP: usize = 32;
 /// Always-chroma core around each carrier (c/px).
 pub const CORE: f64 = 0.05;
@@ -27,11 +29,6 @@ pub struct MaskField {
 }
 
 impl MaskField {
-    /// Full-resolution plane of grid `k` (tests, previews).
-    pub fn plane(&self, k: usize, w: usize, h: usize) -> Plane {
-        interpolate_grid(&self.grids[k], self.blocks_x, self.blocks_y, w, h)
-    }
-
     /// Full-resolution `max(M_1, M_2a, M_2b)`.
     pub fn max_plane(&self, w: usize, h: usize) -> Plane {
         let s = GridSampler::new(self.blocks_x, self.blocks_y, w);
@@ -48,7 +45,8 @@ impl MaskField {
 }
 
 /// Bilinear sampling of a block grid at pixel positions, with the x tables
-/// precomputed once per plane width. Identical arithmetic to `interpolate_grid`.
+/// precomputed once per plane width. Block centres sit at
+/// `STEP·i + BLOCK/2`; outside the first and last centre the grid is clamped.
 pub struct GridSampler {
     bx: usize,
     by: usize,
@@ -66,6 +64,7 @@ pub struct GridRow<'a> {
 }
 
 impl GridSampler {
+    /// Tables for a `bx × by` grid sampled on a plane `w` pixels wide.
     pub fn new(bx: usize, by: usize, w: usize) -> Self {
         let half = (BLOCK / 2) as f64;
         let mut x0 = Vec::with_capacity(w);
@@ -81,6 +80,7 @@ impl GridSampler {
         Self { bx, by, x0, x1, fx }
     }
 
+    /// The two grid rows pixel row `y` interpolates between.
     pub fn row<'a>(&'a self, grid: &'a [f64], y: usize) -> GridRow<'a> {
         let half = (BLOCK / 2) as f64;
         let gy = ((y as f64 - half) / STEP as f64).clamp(0.0, (self.by.max(1) - 1) as f64);
@@ -96,6 +96,7 @@ impl GridSampler {
 }
 
 impl GridRow<'_> {
+    /// Interpolated grid value at pixel column `x`.
     #[inline]
     pub fn at(&self, x: usize) -> f64 {
         let (x0, x1, fx) = (self.s.x0[x], self.s.x1[x], self.s.fx[x]);
@@ -137,27 +138,18 @@ pub fn grid_dims(w: usize, h: usize) -> (usize, usize) {
 }
 
 /// Bilinear interpolation of block-centre values to pixels, clamped outside.
-pub fn interpolate_grid(grid: &[f64], bx: usize, by: usize, w: usize, h: usize) -> Plane {
+/// An empty grid gives a zero plane.
+#[cfg(test)]
+fn interpolate_grid(grid: &[f64], bx: usize, by: usize, w: usize, h: usize) -> Plane {
     let mut out = Plane::zeros(w, h);
     if bx == 0 || by == 0 {
         return out;
     }
-    let half = (BLOCK / 2) as f64;
+    let s = GridSampler::new(bx, by, w);
     out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        let gy = ((y as f64 - half) / STEP as f64).clamp(0.0, (by - 1) as f64);
-        let y0 = gy.floor() as usize;
-        let y1 = (y0 + 1).min(by - 1);
-        let fy = gy - y0 as f64;
+        let r = s.row(grid, y);
         for (x, o) in row.iter_mut().enumerate() {
-            let gx = ((x as f64 - half) / STEP as f64).clamp(0.0, (bx - 1) as f64);
-            let x0 = gx.floor() as usize;
-            let x1 = (x0 + 1).min(bx - 1);
-            let fx = gx - x0 as f64;
-            let a = grid[y0 * bx + x0];
-            let b = grid[y0 * bx + x1];
-            let c = grid[y1 * bx + x0];
-            let d = grid[y1 * bx + x1];
-            *o = (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy;
+            *o = r.at(x);
         }
     });
     out
@@ -178,7 +170,7 @@ pub const SIGMA: f64 = 3.0;
 pub const BAND_FLUCT: f64 = 8.0;
 pub const RING_FLUCT: f64 = 16.0;
 
-/// Per-block, per-carrier mask value (SPEC 5.2).
+/// Per-block, per-carrier mask value.
 ///
 /// `p_c`, `p_l`: measured band/ring power sums; `n_c`, `n_l`: bin counts;
 /// `n_bin`: expected noise power per bin. Returns M in [0,1], the share of the
@@ -227,8 +219,8 @@ pub fn erode_grid(grid: &[f64], bx: usize, by: usize) -> Vec<f64> {
     out
 }
 
-/// SPEC 5.2: per block and carrier mask from windowed block spectra; 0 in
-/// saturated blocks (> 25 % saturated pixels).
+/// Per block and carrier mask from windowed block spectra; 0 in saturated
+/// blocks (> 25 % saturated pixels).
 pub fn compute_mask(mosaic: &Mosaic) -> MaskField {
     let m = &mosaic.plane;
     let saturated = &mosaic.saturated;
@@ -241,7 +233,7 @@ pub fn compute_mask(mosaic: &Mosaic) -> MaskField {
 
     let values: Vec<[f64; 3]> = (0..nb)
         .into_par_iter()
-        .map_init(Vec::new, |scratch, bi| {
+        .map_init(FftScratch::default, |scratch, bi| {
             let gx = bi % bx;
             let gy = bi / bx;
             let x0 = gx * STEP;
@@ -346,12 +338,14 @@ impl HalfRow<'_> {
     }
 
     /// `x/2` has the fraction 0 or exactly 0.5, so the integer form is the
-    /// same arithmetic as `upsample2` without the float floor.
+    /// same arithmetic as `upsample2` without the float floor. `x >> 1` never
+    /// passes the last half-resolution column, since the full width is at
+    /// most `2·hw`.
     #[inline]
     fn at(&self, x: usize) -> f64 {
         let x0 = (x >> 1).min(self.hw - 1);
         let x1 = (x0 + 1).min(self.hw - 1);
-        let fx = if x & 1 == 1 && x0 == x >> 1 { 0.5 } else { (x as f64 / 2.0) - x0 as f64 };
+        let fx = if x & 1 == 1 { 0.5 } else { 0.0 };
         (self.r0[x0] * (1.0 - fx) + self.r0[x1] * fx) * (1.0 - self.fy)
             + (self.r1[x0] * (1.0 - fx) + self.r1[x1] * fx) * self.fy
     }
@@ -448,8 +442,7 @@ fn refine(m: &Plane, phase: BayerPhase, k: usize, c1: &Plane, c2: &Plane, kernel
 
 /// Apply the mask to the three wide estimates in place and combine C2.
 /// Returns `(c1, c2)`; `c2b` is consumed.
-fn apply_mask(field: &MaskField, mut c1: Plane, mut c2a: Plane, c2b: Plane) -> (Plane, Plane) {
-    let mut c2b = c2b;
+fn apply_mask(field: &MaskField, mut c1: Plane, mut c2a: Plane, mut c2b: Plane) -> (Plane, Plane) {
     let core = chroma_core_half(&c1);
     blend_in_place(&mut c1, &core, field, Gain::C1);
     let core = chroma_core_half(&c2a);
@@ -460,6 +453,9 @@ fn apply_mask(field: &MaskField, mut c1: Plane, mut c2a: Plane, c2b: Plane) -> (
     (c1, c2a)
 }
 
+/// The adaptive separation: the block mask decides, per carrier and place,
+/// how much of the ambiguous band stays luminance. Takes the three wide
+/// chroma estimates the fixed separation already made.
 pub fn separate_adaptive(
     mosaic: &Mosaic,
     phase: BayerPhase,
@@ -559,7 +555,7 @@ mod tests {
         let bf = BlockFft::new(BLOCK);
         let sets = bin_sets(&bf);
         let (bx, by) = grid_dims(1024, 1024);
-        let mut scratch = Vec::new();
+        let mut scratch = FftScratch::default();
         let (mut band_r, mut ring_r) = (Vec::new(), Vec::new());
         for gy in 0..by {
             for gx in 0..bx {

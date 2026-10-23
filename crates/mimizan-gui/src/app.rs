@@ -1,6 +1,7 @@
-//! Window layout: toolbar, file column (left), preview (centre), controls
-//! (right). Nothing here changes pixels; it only chooses parameters and hands
-//! them to the workers.
+//! Window layout: the toolbar, the film strip along the bottom, and the
+//! stage with three docked windows on it (Negative left, Print right,
+//! Enlarger below). Nothing here changes pixels; it only chooses
+//! parameters and hands them to the workers.
 
 use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::cpu::{CpuMeter, CpuView};
@@ -266,7 +267,8 @@ enum HistSource {
 /// is not part of it, so a drag of the crosshair updates the box alone.
 #[derive(Clone, PartialEq)]
 struct SharedPicture {
-    session: usize,
+    /// `Session::id`.
+    session: u64,
     weights: Weights,
     tone: Tone,
     place: f64,
@@ -279,6 +281,9 @@ fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
     tile_has_picture && !tile_matches_shown
 }
 
+/// The whole desktop state: the open session, the edit and its history,
+/// the folder strip, the worker handles and the per-frame UI bookkeeping.
+/// `App::new` builds it; `eframe::App::ui` draws one frame.
 pub struct App {
     heavy: Heavy,
     preview: Preview,
@@ -296,7 +301,7 @@ pub struct App {
     /// config file holds, so a drag is written once, when it ends.
     strip_height: f32,
     strip_height_saved: f32,
-    /// Floating panels shown: analysis, enlarger, print.
+    /// Docked windows open: 0 Negative (left), 1 Print (right), 2 Enlarger (bottom).
     panels: [bool; 3],
     /// Open panels that had no rectangle last frame. The toolbar button
     /// stays lit; the panel returns when the window has room again.
@@ -343,9 +348,9 @@ pub struct App {
     loupe: Loupe,
     loupe_sent: u64,
     loupe_shown: u64,
-    /// Last request, so an unchanged frame does not send another.
-    /// The last number is the box side in print pixels.
-    loupe_key: Option<(usize, Weights, Recipe, u16, [f64; 2], usize)>,
+    /// Last request (session id, weights, recipe, orientation, point, box
+    /// side in print pixels), so an unchanged frame does not send another.
+    loupe_key: Option<(u64, Weights, Recipe, u16, [f64; 2], usize)>,
     /// Box side asked for this frame, in print pixels (one screen pixel each).
     loupe_px: usize,
     /// The print window was drawn this frame, so the box is requested after the sliders.
@@ -450,6 +455,8 @@ fn resource_dir(name: &str) -> PathBuf {
 }
 
 impl App {
+    /// Start the workers, restore the saved settings and open `initial`
+    /// (a file or a folder); without one, show the last folder.
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         // The panels are always dark. Pin the preference as well, so the native
         // title bar follows. A light Windows caption would otherwise stay light.
@@ -457,6 +464,7 @@ impl App {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let cameras_dir = resource_dir("cameras");
         let persisted = Persisted::load();
+        let strip_height = persisted.strip_height.unwrap_or(STRIP_HEIGHT).clamp(STRIP_MIN_H, STRIP_MAX_H);
         let mut app = Self {
             heavy: Heavy::spawn(cc.egui_ctx.clone()),
             preview: Preview::spawn(cc.egui_ctx.clone()),
@@ -467,11 +475,8 @@ impl App {
             sort: persisted.sort,
             show_strip: persisted.strip.unwrap_or(true),
             strip_negative: persisted.strip_negative.unwrap_or(true),
-            strip_height: persisted.strip_height.unwrap_or(STRIP_HEIGHT).clamp(STRIP_MIN_H, STRIP_MAX_H),
-            strip_height_saved: persisted
-                .strip_height
-                .unwrap_or(STRIP_HEIGHT)
-                .clamp(STRIP_MIN_H, STRIP_MAX_H),
+            strip_height,
+            strip_height_saved: strip_height,
             panels: persisted.panels.unwrap_or([true; 3]),
             waiting: [false; 3],
             enlarger_h: None,
@@ -662,19 +667,11 @@ impl App {
     }
 
     /// Replace the whole development (undo, redo, a loaded recipe) and drop
-    /// tool state that pointed into the old one. An older recipe with the
-    /// neutral look is put on paper; any other look stays a look (the
-    /// Enlarger offers the paper instead of the bar).
-    fn set_edit(&mut self, mut e: Edit) {
+    /// tool state that pointed into the old one. The edit is taken as it
+    /// is, so undo and redo land exactly on the history's entries.
+    fn set_edit(&mut self, e: Edit) {
         if e.rotation != self.edit.rotation {
             self.keep_scale = None;
-        }
-        if let Tone::Look(l) = &e.recipe.curve {
-            if mimizan_core::curve::Curve::from_look(l).is_identity() {
-                e.recipe.curve = Tone::paper();
-            } else {
-                self.log(format!("recipe prints through the look \"{}\", not on paper", l.name));
-            }
         }
         self.edit = e;
         self.size_mode = match self.edit.recipe.size {
@@ -754,7 +751,7 @@ impl App {
     /// Record the frame's state once the pointer and keyboard let go of the
     /// widgets, so a slider drag is one history step, not sixty.
     fn commit_history(&mut self, ctx: &egui::Context) {
-        if ctx.egui_is_using_pointer() || ctx.egui_wants_keyboard_input() {
+        if ctx.egui_is_using_pointer() || text_edit_focused(ctx) {
             return;
         }
         self.history.commit(&self.edit);
@@ -822,12 +819,14 @@ impl App {
         recipe
     }
 
-    /// The recipe with its window turned into the current upright picture.
+    /// The recipe with its window turned into the current upright picture
+    /// and clamped to it (a sidecar from another file may be larger).
     fn print_recipe(&self) -> Recipe {
         let mut recipe = self.edit.recipe.clone();
         if let Some(c) = recipe.crop {
             let (fw, fh) = self.file_size();
-            recipe.crop = Some(c.turned(self.rotation(), fw, fh));
+            let (uw, uh) = self.export_size();
+            recipe.crop = Some(c.turned(self.rotation(), fw, fh).sanitized(uw as u32, uh as u32));
         }
         recipe
     }
@@ -1119,11 +1118,21 @@ impl App {
         Some(s.path.with_file_name(format!("{stem}.recipe.json")))
     }
 
+    /// Read a recipe file into the edit. The sharpening mode stays off (the
+    /// desktop has no control for it); peak in the file is kept. An older
+    /// recipe with the neutral look is put on paper; any other look stays a
+    /// look (the Enlarger offers the paper instead of the bar).
     fn load_recipe(&mut self, path: &Path) {
         match Recipe::load(path) {
             Ok(mut r) => {
-                // The phone's sharpening mode stays off. Peak in the file is kept.
                 r.sharpen = Sharpen::Off;
+                if let Tone::Look(l) = &r.curve {
+                    if mimizan_core::curve::Curve::from_look(l).is_identity() {
+                        r.curve = Tone::paper();
+                    } else {
+                        self.log(format!("recipe prints through the look \"{}\", not on paper", l.name));
+                    }
+                }
                 let mut e = self.edit.clone();
                 e.recipe = r;
                 self.set_edit(e);
@@ -1281,8 +1290,10 @@ impl App {
                             self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
                         }
                         self.recipe_baseline = self.edit.recipe.clone();
-                        self.note_peak_source();
                     }
+                    // A re-development has new pixels: the measured radius
+                    // belongs to the old ones.
+                    self.note_peak_source();
                     self.busy = None;
                     self.last_view = None;
                 }
@@ -1293,6 +1304,9 @@ impl App {
                 Event::Failed(e) => {
                     self.log(format!("error: {e}"));
                     self.busy = None;
+                    // A failed open leaves the previous picture on the stage;
+                    // the strip must point at that one, not at the failure.
+                    self.current_path = self.session.as_ref().map(|s| s.path.clone());
                 }
             }
         }
@@ -1350,8 +1364,10 @@ impl App {
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot_to.clone() else { return };
         match self.screenshot_state {
-            // Wait until a preview is on screen (or there is nothing to open).
-            0 if self.texture.is_some() && self.busy.is_none() => {
+            // Wait until a preview is on screen, or until the open has
+            // failed or there was nothing to open: the capture then shows
+            // the empty stage instead of never happening.
+            0 if self.busy.is_none() && (self.texture.is_some() || self.session.is_none()) => {
                 if std::env::var_os("MIMIZAN_SCREENSHOT_1TO1").is_some() {
                     self.zoom_to_1to1 = true;
                     self.screenshot_state = 4;
@@ -1401,7 +1417,7 @@ impl App {
         let session = self.session.as_ref()?;
         let r = &self.edit.recipe;
         Some(SharedPicture {
-            session: Arc::as_ptr(session) as usize,
+            session: session.id,
             weights: self.weights(),
             tone: r.curve.clone(),
             place: r.place,
@@ -2279,7 +2295,7 @@ impl App {
              deepens the shadows and the mid tones with them, the highlights stay: the shadows' \
              exposure.",
         );
-        if split != *self.edit.recipe.curve.as_paper().unwrap() {
+        if self.edit.recipe.curve.as_paper() != Some(&split) {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }
         let curve = split.curve();
@@ -2370,7 +2386,6 @@ impl App {
     /// sharpening mode stays off. Peak, below the tile, is the desktop
     /// high-pass. The 1:1 box is the print pixels.
     fn print_section(&mut self, ui: &mut egui::Ui) {
-        self.clear_desktop_sharpen();
         let mut mode = self.size_mode;
         ui.horizontal(|ui| {
             print_field_label(ui, "size");
@@ -2406,6 +2421,7 @@ impl App {
                             .add(
                                 egui::DragValue::new(&mut self.paper_cm[0])
                                     .range(0.1..=2000.0)
+                                    .clamp_existing_to_range(false)
                                     .speed(0.1)
                                     .fixed_decimals(1)
                                     .suffix(" cm"),
@@ -2418,6 +2434,7 @@ impl App {
                             .add(
                                 egui::DragValue::new(&mut self.paper_cm[1])
                                     .range(0.1..=2000.0)
+                                    .clamp_existing_to_range(false)
                                     .speed(0.1)
                                     .fixed_decimals(1)
                                     .suffix(" cm"),
@@ -2458,6 +2475,7 @@ impl App {
                 let response = ui.add(
                     egui::DragValue::new(&mut self.edit.recipe.dpi)
                         .range(36.0..=1200.0)
+                        .clamp_existing_to_range(false)
                         .speed(1.0)
                         .suffix(" dpi"),
                 );
@@ -2484,9 +2502,6 @@ impl App {
         self.print_sheet_line(ui);
         let border_before = self.edit.recipe.border_mm;
         let black_before = self.edit.recipe.black_mm;
-        if self.edit.recipe.black_mm > self.edit.recipe.border_mm {
-            self.edit.recipe.black_mm = self.edit.recipe.border_mm.max(0.0);
-        }
         // border and black share the row. Wrapped, so a long value breaks
         // inside the column instead of widening the dock.
         ui.horizontal_wrapped(|ui| {
@@ -2494,6 +2509,7 @@ impl App {
             ui.add(
                 egui::DragValue::new(&mut self.edit.recipe.border_mm)
                     .range(0.0..=100.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.2)
                     .suffix(" mm"),
             )
@@ -2506,6 +2522,7 @@ impl App {
             ui.add(
                 egui::DragValue::new(&mut self.edit.recipe.black_mm)
                     .range(0.0..=white_mm)
+                    .clamp_existing_to_range(false)
                     .speed(0.2)
                     .suffix(" mm"),
             )
@@ -2530,6 +2547,9 @@ impl App {
                         }
                         ResampleKernel::CatmullRom => "Interpolating cubic; rings like a short Lanczos",
                         ResampleKernel::BSpline => "Default. No overshoot, visibly soft",
+                        ResampleKernel::Area => {
+                            "Box area. Down: the mean of the covered pixels. Up: the pixel, held"
+                        }
                     });
                 }
             });
@@ -2622,7 +2642,7 @@ impl App {
         let Some([nx, ny]) = self.sharpen_at else { return };
         let Some(session) = self.session.clone() else { return };
         let key = (
-            Arc::as_ptr(&session) as usize,
+            session.id,
             self.weights(),
             self.loupe_recipe(),
             self.export_orientation(),
@@ -2655,7 +2675,7 @@ impl App {
         }
     }
 
-    /// What one export writes, for the toolbar button.
+    /// What one export writes, for the Export button in the Print window.
     fn export_hover_text(&self) -> String {
         if self.session.is_none() {
             return "Open a RAW file first.".into();
@@ -2686,13 +2706,10 @@ impl App {
         )
     }
 
-    /// Long-side enlargement of the print. Native size and a reduction are 1,
-    /// so the radius field shows the negative's radius until the picture grows.
+    /// Long-side scale of the print, destination / source. The radius field
+    /// shows print pixels: the stored negative radius times this scale.
     fn peak_scale(&self) -> f64 {
-        match self.print_layout() {
-            Some(l) if l.enlargement > 1.0 => l.enlargement,
-            _ => 1.0,
-        }
+        self.print_layout().map(|l| l.enlargement).unwrap_or(1.0)
     }
 
     /// A new file, or a recipe just loaded. A saved peak stays in the fields.
@@ -2794,7 +2811,7 @@ impl App {
                         .suffix(" px"),
                 )
                 .on_hover_text(
-                    "Radius of the Gaussian blur, in print pixels. An enlargement multiplies it; the amount stays.",
+                    "Radius of the Gaussian blur, in print pixels. The print's scale multiplies the radius measured on the negative; the amount stays.",
                 );
             if response.changed() {
                 let stored = (shown / scale)
@@ -2810,11 +2827,12 @@ impl App {
                     has,
                     egui::DragValue::new(&mut self.edit.recipe.peak.amount)
                         .range(0.0..=mimizan_core::recipe::PEAK_AMOUNT_MAX)
+                        .clamp_existing_to_range(false)
                         .speed(0.02)
                         .fixed_decimals(2),
                 )
                 .on_hover_text(
-                    "How much of the high-pass is added back. An enlargement does not change it. Zero leaves the picture as it was.",
+                    "How much of the high-pass is added back. The print's scale does not change it. Zero leaves the picture as it was.",
                 );
             if response.changed() {
                 self.peak_held = true;
@@ -3024,7 +3042,7 @@ impl App {
         let clicked_on_picture = response.clicked()
             && response.interact_pointer_pos().is_some_and(|p| rect.contains(p) && !on_dock(p));
         if self.pending_leave.is_none()
-            && strip_closes(self.show_strip, true, clicked_on_picture, crosshair_released)
+            && strip_closes(self.show_strip, clicked_on_picture, crosshair_released)
         {
             self.show_strip = false;
         }
@@ -3348,6 +3366,10 @@ const STRIP_HEIGHT: f32 = 214.0;
 /// with it (perforation and edge print keep their size, the picture grows).
 const STRIP_MIN_H: f32 = 120.0;
 const STRIP_MAX_H: f32 = 640.0;
+/// Thumbnails further than this many strip widths from the viewport drop
+/// their pixels (~150 KB each); the disk cache brings them back. The
+/// priority list wants 2.5 widths, so the two never fight.
+const THUMB_KEEP_SCREENS: f32 = 4.0;
 /// Frame proportions at the default height: 150 x 108 pt picture area.
 const TILE_W: f32 = 150.0;
 const TILE_IMG_H: f32 = 108.0;
@@ -3378,14 +3400,15 @@ impl App {
     /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
     /// keyboard is not in a text field, whether or not the strip is up.
     fn strip_keys(&mut self, ctx: &egui::Context) {
-        if self.pending_leave.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.pending_leave.is_some() || text_edit_focused(ctx) {
             return;
         }
         let (b, left, right) = ctx.input(|i| {
+            let plain = i.modifiers.is_none();
             (
-                i.key_pressed(egui::Key::B) && i.modifiers.is_none(),
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::B) && plain,
+                i.key_pressed(egui::Key::ArrowLeft) && plain,
+                i.key_pressed(egui::Key::ArrowRight) && plain,
             )
         });
         if b {
@@ -3613,6 +3636,12 @@ impl App {
                     }
                     if !visible {
                         e.texture = None;
+                        // Far off screen the pixels go too; they come back
+                        // from the disk cache when the tile scrolls near.
+                        if e.state == ThumbState::Ready && dist > clip.width() * THUMB_KEEP_SCREENS {
+                            e.thumb = None;
+                            e.state = ThumbState::Pending;
+                        }
                         continue;
                     }
                     if e.texture.is_none() {
@@ -3750,8 +3779,10 @@ impl App {
             });
         });
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let paths: Vec<PathBuf> = wanted.iter().map(|(_, i)| folder.entries[*i].path.clone()).collect();
-        if paths != self.last_wanted {
+        // Compared without allocating; the list is rebuilt only when it changed.
+        let same = wanted.len() == self.last_wanted.len()
+            && wanted.iter().zip(&self.last_wanted).all(|((_, i), p)| folder.entries[*i].path == *p);
+        if !same {
             let jobs: Vec<ThumbJob> = wanted
                 .iter()
                 .map(|(_, i)| {
@@ -3759,8 +3790,8 @@ impl App {
                     ThumbJob { generation, path: e.path.clone(), size: e.size, modified: e.modified }
                 })
                 .collect();
+            self.last_wanted = jobs.iter().map(|j| j.path.clone()).collect();
             self.thumbs.want(jobs);
-            self.last_wanted = paths;
         }
         if !bad_thumbs.is_empty() {
             self.log(format!("thumbnail was the wrong size: {}", bad_thumbs.join(", ")));
@@ -3990,6 +4021,7 @@ fn exposure_slider(ui: &mut egui::Ui, rail: f32, mark: &str, v: &mut f64, hint: 
         ui.add(
             egui::DragValue::new(v)
                 .range(-SLIDER_STOPS..=SLIDER_STOPS)
+                .clamp_existing_to_range(false)
                 .speed(speed)
                 .fixed_decimals(2)
                 .suffix(" stops"),
@@ -4059,9 +4091,12 @@ const ENLARGER_MIN_W: f32 = 64.0;
 /// Grab radius of the crosshair, points. Covers its arms.
 const CROSS_GRAB: f32 = 14.0;
 
-/// One line where the window title bar was: the name, and × to hide the dock.
-fn dock_title(ui: &mut egui::Ui, title: &str) -> bool {
-    panel_heading(ui, title)
+/// A text field has the keyboard. egui's own `wants_keyboard_input` is
+/// also true while a button holds focus (after Tab), which would mute every
+/// shortcut; only a text edit should.
+fn text_edit_focused(ctx: &egui::Context) -> bool {
+    let Some(id) = ctx.memory(|m| m.focused()) else { return false };
+    egui::TextEdit::load_state(ctx, id).is_some()
 }
 
 /// Name and ×.
@@ -4197,7 +4232,7 @@ fn show_dock(
                 egui::UiBuilder::new().max_rect(inner).layout(egui::Layout::top_down(egui::Align::Min)),
             );
             child.set_clip_rect(inner);
-            hide = dock_title(&mut child, title);
+            hide = panel_heading(&mut child, title);
             add(&mut child);
             content_h = child.min_rect().height();
         },
@@ -4251,8 +4286,9 @@ fn sheet_rect(opening: Rect, pan: Vec2, size: Vec2) -> Rect {
 
 /// The strip closes on the release of a click on the picture, or on the
 /// release of a drag that started on the crosshair. It is not written down.
-fn strip_closes(show: bool, picture_up: bool, clicked_on_picture: bool, crosshair_released: bool) -> bool {
-    show && picture_up && (clicked_on_picture || crosshair_released)
+/// Called only while a picture is up.
+fn strip_closes(show: bool, clicked_on_picture: bool, crosshair_released: bool) -> bool {
+    show && (clicked_on_picture || crosshair_released)
 }
 
 /// True when the rectangles share an interior. A shared edge is room, not a stack.
@@ -4363,7 +4399,7 @@ impl App {
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
     /// every panel. Enter keeps the crop. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
-        if self.pending_leave.is_some() || ctx.egui_wants_keyboard_input() {
+        if self.pending_leave.is_some() || text_edit_focused(ctx) {
             return;
         }
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -4373,6 +4409,14 @@ impl App {
             let any = self.panels.iter().any(|&p| p);
             self.panels = [!any; 3];
             self.persist();
+            // egui also hands Tab to the first focusable widget drawn this
+            // frame. Keyboard focus on a button would mute ←/→, B and the
+            // next Tab, so it is given back at once.
+            if let Some(id) = ctx.memory(|m| m.focused()) {
+                if egui::TextEdit::load_state(ctx, id).is_none() {
+                    ctx.memory_mut(|m| m.surrender_focus(id));
+                }
+            }
         }
         let (undo, redo) = ctx.input_mut(|i| {
             let undo =
@@ -4619,11 +4663,10 @@ mod dock_tests {
 
     #[test]
     fn the_strip_closes_only_for_a_picture_click_or_the_crosshair() {
-        assert!(strip_closes(true, true, true, false));
-        assert!(strip_closes(true, true, false, true));
-        assert!(!strip_closes(true, true, false, false));
-        assert!(!strip_closes(true, false, true, true));
-        assert!(!strip_closes(false, true, true, true));
+        assert!(strip_closes(true, true, false));
+        assert!(strip_closes(true, false, true));
+        assert!(!strip_closes(true, false, false));
+        assert!(!strip_closes(false, true, true));
     }
 
     #[test]

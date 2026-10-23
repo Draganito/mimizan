@@ -1,5 +1,4 @@
-//! Unsharp mask with Gaussian σ = r_px, applied only where the mask allows
-//! (SPEC section 9, "USM").
+//! Unsharp mask with Gaussian σ = r_px, applied only where the mask allows.
 
 use crate::plane::Plane;
 use rayon::prelude::*;
@@ -15,28 +14,14 @@ pub fn radius_px(usm_k: f64, viewing_distance_mm: f64, dpi: f64) -> f64 {
 }
 
 /// Half-width of the Gaussian, in pixels: the blur reads `±kernel_radius`.
+/// The same radius `filter::gaussian_kernel` uses.
 pub fn kernel_radius(sigma: f64) -> usize {
     (3.0 * sigma).ceil().max(1.0) as usize
 }
 
-fn gauss_kernel(sigma: f64) -> Vec<f64> {
-    let r = kernel_radius(sigma);
-    let mut k: Vec<f64> = (0..=2 * r)
-        .map(|i| {
-            let t = i as f64 - r as f64;
-            (-0.5 * t * t / (sigma * sigma)).exp()
-        })
-        .collect();
-    let s: f64 = k.iter().sum();
-    for v in &mut k {
-        *v /= s;
-    }
-    k
-}
-
 /// Separable Gaussian blur with reflect-101 borders (reuses the FIR engine).
 pub fn gaussian_blur(p: &Plane, sigma: f64) -> Plane {
-    let k = gauss_kernel(sigma);
+    let k = crate::filter::gaussian_kernel(sigma);
     crate::filter::lowpass(p, &k)
 }
 
@@ -44,7 +29,8 @@ pub fn gaussian_blur(p: &Plane, sigma: f64) -> Plane {
 /// pixel is not flagged saturated (mask == 1.0 exactly, sidecar 255); else `x`.
 /// `mask == None` applies USM everywhere.
 pub fn unsharp(p: &Plane, sigma: f64, amount: f64, mask: Option<&Plane>) -> Plane {
-    if amount <= 0.0 || sigma <= 0.0 {
+    let mask_fits = mask.is_none_or(|m| (m.width, m.height) == (p.width, p.height));
+    if !(amount > 0.0 && sigma > 0.0) || p.width == 0 || p.height == 0 || !mask_fits {
         return p.clone();
     }
     let blur = gaussian_blur(p, sigma);
@@ -69,7 +55,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn radius_example_from_spec() {
+    fn radius_example() {
         // 400 mm viewing distance at 300 DPI -> 1.4 px
         let r = radius_px(USM_K, 400.0, 300.0);
         assert!((r - 1.38).abs() < 0.01, "{r}");

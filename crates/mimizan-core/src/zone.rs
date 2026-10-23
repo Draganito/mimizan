@@ -10,7 +10,7 @@
 pub const ZONES: usize = 11;
 /// Zone V, the grey card, linear.
 pub const GRAY_CARD: f64 = 0.18;
-/// Encoding exponent of print values (SPEC section 9).
+/// Encoding exponent of print values.
 pub const GAMMA: f64 = 2.2;
 
 /// Roman numeral of zone `k` (0 … X).
@@ -25,18 +25,10 @@ pub fn linear(k: usize) -> f64 {
     GRAY_CARD * 2f64.powi(k as i32 - 5)
 }
 
-/// Encoded value `x^(1/2.2)` of a linear value.
-pub fn encode(x: f64) -> f64 {
-    x.clamp(0.0, 1.0).powf(1.0 / GAMMA)
-}
-
-/// Linear value of an encoded one.
-pub fn decode(v: f64) -> f64 {
-    v.clamp(0.0, 1.0).powf(GAMMA)
-}
-
 /// Stops around the grey card, `e = log2(max(L, ε)) − log2(0.18)` (paper,
-/// equation 3).
+/// equation 3). The pipeline works in linear values; this is the reading
+/// the tests check the zone table against.
+#[cfg(test)]
 pub fn stops(l: f64) -> f64 {
     (l.max(1e-6)).log2() - GRAY_CARD.log2()
 }
@@ -80,6 +72,5 @@ mod tests {
         assert!((stops(0.18)).abs() < 1e-12);
         assert!((stops(0.36) - 1.0).abs() < 1e-12);
         assert!((stops(0.045) + 2.0).abs() < 1e-12);
-        assert!((decode(encode(0.3)) - 0.3).abs() < 1e-12);
     }
 }

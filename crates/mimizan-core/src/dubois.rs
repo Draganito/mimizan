@@ -18,13 +18,16 @@
 //! defeats.
 
 use crate::cfa::BayerPhase;
-use crate::filter::{convolve_cols_signed, convolve_cols_signed_into, convolve_rows_mod_into, LowpassSpec};
+use crate::filter::{
+    convolve_cols_signed, convolve_cols_signed_into, convolve_rows_mod_into, gaussian_kernel, LowpassSpec,
+};
 use crate::ingest::Mosaic;
 use crate::plane::Plane;
 use crate::separate::{luminance, sign_x, Separation, FIXED_MASK_VALUE};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// Bands and weights of the pixel-adaptive separation.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DuboisParams {
     /// `C1` pass band across the local structure direction, c/px.
@@ -36,7 +39,9 @@ pub struct DuboisParams {
     pub c2_narrow: f64,
     /// `C2` pass band along the carrier, c/px.
     pub c2_wide: f64,
+    /// Transition width of every band, c/px.
     pub transition: f64,
+    /// Stop-band attenuation of every band, dB.
     pub attenuation_db: f64,
     /// Gaussian σ (px) of the local energy estimate that weights the copies.
     pub energy_sigma: f64,
@@ -66,24 +71,17 @@ impl Default for DuboisParams {
     }
 }
 
-fn gaussian_kernel(sigma: f64) -> Vec<f64> {
-    let r = (3.0 * sigma).ceil().max(1.0) as usize;
-    let k: Vec<f64> = (0..=2 * r)
-        .map(|i| {
-            let d = i as f64 - r as f64;
-            (-d * d / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let s: f64 = k.iter().sum();
-    k.into_iter().map(|v| v / s).collect()
-}
-
+/// The low-passes of one separation, built once.
 struct Kernels {
+    /// C1 narrow and wide bands.
     k1n: Vec<f64>,
     k1w: Vec<f64>,
+    /// C2 narrow and wide bands.
     kn: Vec<f64>,
     kw: Vec<f64>,
-    kr: Vec<f64>,
+    /// Outer edge of the coherence ring; `None` without the coherence step.
+    kr: Option<Vec<f64>>,
+    /// Gaussian of the local energy.
     g: Vec<f64>,
 }
 
@@ -99,7 +97,7 @@ fn local_energy_in_place(p: &mut Plane, g: &[f64], scratch: &mut Plane) {
     lowpass_in_place(p, g, scratch);
 }
 
-/// `a := a - b` in place (`a` holds the wide copy, `b` the narrow one).
+/// `narrow := wide − narrow` in place: the ring between the two bands.
 fn ring_in_place(wide: &Plane, narrow: &mut Plane) {
     narrow.data.par_iter_mut().zip(&wide.data).for_each(|(n, w)| *n = w - *n);
 }
@@ -129,7 +127,7 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
     // edge of the coherence ring.
     convolve_rows_mod_into(m, &k.kn, |x, _| sign_x(x), &mut row);
     let mut c2 = convolve_cols_signed(&row, &k.kw, |_| c.a);
-    let mut ra = (p.ring_wide > 0.0).then(|| convolve_cols_signed(&row, &k.kn, |_| c.a));
+    let ra = k.kr.as_ref().map(|kr| (kr, convolve_cols_signed(&row, &k.kn, |_| c.a)));
     convolve_rows_mod_into(m, &k.kw, |_, _| 1.0, &mut row);
     let mut c2b = convolve_cols_signed(&row, &k.kn, |y| c.b * sign_x(y));
 
@@ -148,14 +146,14 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
     // Coherence of the band ring between the two copies: chroma is in both,
     // luminance leak in one. kappa in [0, 1] says how far to open each band
     // from the elongated to the square wide shape.
-    let kappa = ra.take().map(|mut ra| {
-        convolve_rows_mod_into(m, &k.kr, |x, _| sign_x(x), &mut row);
-        let a_w = convolve_cols_signed(&row, &k.kr, |_| c.a);
+    let kappa = ra.map(|(kr, mut ra)| {
+        convolve_rows_mod_into(m, kr, |x, _| sign_x(x), &mut row);
+        let a_w = convolve_cols_signed(&row, kr, |_| c.a);
         ring_in_place(&a_w, &mut ra);
         convolve_rows_mod_into(m, &k.kn, |_, _| 1.0, &mut row);
         let mut rb = convolve_cols_signed(&row, &k.kn, |y| c.b * sign_x(y));
-        convolve_rows_mod_into(m, &k.kr, |_, _| 1.0, &mut row);
-        let b_w = convolve_cols_signed(&row, &k.kr, |y| c.b * sign_x(y));
+        convolve_rows_mod_into(m, kr, |_, _| 1.0, &mut row);
+        let b_w = convolve_cols_signed(&row, kr, |y| c.b * sign_x(y));
         ring_in_place(&b_w, &mut rb);
 
         let mut kappa = Plane::from_vec(w, h, ra.data.par_iter().zip(&rb.data).map(|(a, b)| a * b).collect());
@@ -183,16 +181,18 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
         blend_in_place(&mut c1, &c1v, &wa);
     }
     drop(wa);
-    if let Some(kappa) = &kappa {
+    if let (Some(kappa), Some(kr)) = (&kappa, &k.kr) {
         if p.ring_c1 {
-            convolve_rows_mod_into(m, &k.kr, |x, _| sign_x(x), &mut row);
-            let c1w = convolve_cols_signed(&row, &k.kr, |y| c.eps * sign_x(y));
+            convolve_rows_mod_into(m, kr, |x, _| sign_x(x), &mut row);
+            let c1w = convolve_cols_signed(&row, kr, |y| c.eps * sign_x(y));
             open_in_place(&mut c1, &c1w, kappa);
         }
     }
     (c1, c2)
 }
 
+/// The pixel-adaptive separation: two hypotheses about the local structure,
+/// weighted per pixel by the energy in the two C2 copies.
 pub fn separate_dubois(mosaic: &Mosaic, phase: BayerPhase, p: &DuboisParams) -> Separation {
     let m = &mosaic.plane;
     let spec =
@@ -202,7 +202,7 @@ pub fn separate_dubois(mosaic: &Mosaic, phase: BayerPhase, p: &DuboisParams) -> 
         k1w: spec(p.c1_wide).kernel(),
         kn: spec(p.c2_narrow).kernel(),
         kw: spec(p.c2_wide).kernel(),
-        kr: spec(if p.ring_wide > 0.0 { p.ring_wide } else { p.c2_wide }).kernel(),
+        kr: (p.ring_wide > 0.0).then(|| spec(p.ring_wide).kernel()),
         g: gaussian_kernel(p.energy_sigma),
     };
 

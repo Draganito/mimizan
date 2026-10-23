@@ -1,9 +1,11 @@
+//! `mimizan`: the command-line front end of Mimizan Lab.
+
 mod calibrate;
 mod cmd;
 mod kodak;
 mod measure;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -37,12 +39,13 @@ enum Cmd {
         raw: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
-        /// Skip the defect repair (SPEC section 2): every photosite stays as measured
+        /// Skip the defect repair: every photosite stays as measured
         #[arg(long)]
         no_defects: bool,
         /// Also write a gamma-encoded PNG quick look, downscaled by --preview-scale
         #[arg(long)]
         preview: Option<PathBuf>,
+        /// Reduction factor of the quick look
         #[arg(long, default_value_t = 8)]
         preview_scale: usize,
     },
@@ -72,9 +75,10 @@ enum Cmd {
         /// Channel balance before separation: as-shot | gray | none | "r,g,b"
         #[arg(long, default_value = "as-shot")]
         wb: String,
+        /// Chrominance cut-off, c/px (adaptive and off only; dubois has its own bands)
         #[arg(long, default_value_t = 0.15)]
         cutoff: f64,
-        /// Cross-term refinement rounds (1 = single pass)
+        /// Cross-term refinement rounds, 1 = single pass (adaptive only)
         #[arg(long, default_value_t = 1)]
         rounds: usize,
         /// Nonlinear reconstruction of the last octave: where luminance and
@@ -83,11 +87,13 @@ enum Cmd {
         /// not measured; the sidecar records where.
         #[arg(long)]
         reconstruct: bool,
-        /// Skip the defect repair (SPEC section 2): every photosite stays as measured
+        /// Skip the defect repair: every photosite stays as measured
         #[arg(long)]
         no_defects: bool,
+        /// Also write a gamma-encoded PNG quick look, downscaled by --preview-scale
         #[arg(long)]
         preview: Option<PathBuf>,
+        /// Reduction factor of the quick look
         #[arg(long, default_value_t = 8)]
         preview_scale: usize,
         /// Write a 1:1 crop PNG "x,y,w,h" next to the preview (name + .crop.png)
@@ -121,8 +127,8 @@ enum Cmd {
         /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it)
         #[arg(long)]
         size: Option<String>,
-        /// Resampling kernel: b-spline (default, no overshoot) | lanczos3 |
-        /// catmull-rom | mitchell
+        /// Resampling kernel: b-spline (default, no overshoot) | area (alias
+        /// box: mean of the covered pixels) | lanczos3 | catmull-rom | mitchell
         #[arg(long, value_name = "KERNEL")]
         resample: Option<String>,
         /// Paper border around the picture, mm, filled with paper white
@@ -132,6 +138,7 @@ enum Cmd {
         /// Never wider than the white border; zero white turns it off.
         #[arg(long, value_name = "MM")]
         black_mm: Option<f64>,
+        /// Output resolution, dots per inch (default from the recipe, 360)
         #[arg(long)]
         dpi: Option<f64>,
         /// Scale compensation: USM amount of the enlargement blur (0 = off).
@@ -182,11 +189,9 @@ enum BenchCmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cli.log).unwrap_or_default())
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_new(&cli.log)
+        .with_context(|| format!("--log '{}' is not a valid filter", cli.log))?;
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr).init();
     match cli.cmd {
         Cmd::Info { raw, json } => cmd::info(&raw, json),
         Cmd::Dump { raw, out, no_defects, preview, preview_scale } => {

@@ -1,8 +1,6 @@
-//! Tone curve: monotone PCHIP through the look points (SPEC section 9, "Kurve").
+//! Tone curve: monotone PCHIP through the look points.
 
 use crate::calib::{LookEncoding, LookFile};
-use crate::plane::Plane;
-use rayon::prelude::*;
 
 /// Fritsch–Carlson monotone cubic Hermite interpolant on strictly increasing x.
 #[derive(Clone, Debug)]
@@ -13,6 +11,8 @@ pub struct Pchip {
 }
 
 impl Pchip {
+    /// Interpolant through `points` (`[x, y]`, x strictly increasing).
+    /// Panics with fewer than two points; callers validate first.
     pub fn new(points: &[[f64; 2]]) -> Self {
         let n = points.len();
         assert!(n >= 2, "PCHIP needs at least two points");
@@ -94,16 +94,19 @@ pub struct Curve {
 }
 
 impl Curve {
+    /// Compile a look. A look with fewer than two points (which
+    /// `LookFile::validate` refuses) is treated as the plain encoding.
     pub fn from_look(look: &LookFile) -> Self {
         // Any node set on the diagonal is the identity, however many nodes:
         // the PCHIP through collinear points is the line up to rounding, and
         // rounding could flip a 16-bit value, so the shortcut makes the
         // untouched zone bar bit-identical to `neutral` (zone paper, table 4).
-        let n = look.points.len();
-        let identity_points = look.points[0] == [0.0, 0.0]
-            && look.points[n - 1] == [1.0, 1.0]
-            && look.points.iter().all(|p| p[0] == p[1]);
-        Self { encoding: look.encoding, pchip: Pchip::new(&look.points), identity_points }
+        let diagonal: [[f64; 2]; 2] = [[0.0, 0.0], [1.0, 1.0]];
+        let points: &[[f64; 2]] = if look.points.len() >= 2 { &look.points } else { &diagonal };
+        let n = points.len();
+        let identity_points =
+            points[0] == [0.0, 0.0] && points[n - 1] == [1.0, 1.0] && points.iter().all(|p| p[0] == p[1]);
+        Self { encoding: look.encoding, pchip: Pchip::new(points), identity_points }
     }
 
     /// Is this curve the plain encoding (no tone change)?
@@ -129,12 +132,6 @@ impl Curve {
         } else {
             self.pchip.eval(e).clamp(0.0, 1.0)
         }
-    }
-
-    pub fn apply(&self, p: &Plane) -> Plane {
-        let mut out = Plane::zeros(p.width, p.height);
-        out.data.par_iter_mut().zip(&p.data).for_each(|(o, &v)| *o = self.eval(v));
-        out
     }
 }
 

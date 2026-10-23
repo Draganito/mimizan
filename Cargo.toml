@@ -5,6 +5,7 @@ members = ["crates/mimizan-core", "crates/mimizan-cli", "crates/mimizan-gui"]
 [workspace.package]
 version = "0.11.26"
 edition = "2021"
+rust-version = "1.88"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Draganito/mimizan"
 authors = ["Dragan Bojovic"]

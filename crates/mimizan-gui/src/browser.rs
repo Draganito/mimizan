@@ -1,6 +1,6 @@
 //! Folder browser: the RAW files of one folder as a strip of grey
 //! thumbnails. Scanning is synchronous (a directory listing); the
-//! thumbnails come from a third worker thread that always works on the
+//! thumbnails come from their own worker thread that always works on the
 //! newest priority list the strip sent, so the visible tiles fill first
 //! and scrolling re-orders the queue instead of growing it.
 //!
@@ -21,7 +21,7 @@ use std::time::{Instant, SystemTime};
 
 /// Long edge of a thumbnail in pixels: enough for a 160-point tile on a
 /// HiDPI screen.
-pub const THUMB_LONG_EDGE: usize = 480;
+const THUMB_LONG_EDGE: usize = 480;
 
 /// Extensions rawler reads (lower case).
 const RAW_EXTENSIONS: &[&str] = &[
@@ -29,7 +29,8 @@ const RAW_EXTENSIONS: &[&str] = &[
     "mos", "iiq", "3fr", "fff", "kdc", "dcr", "dcs", "mrw", "x3f", "tfr", "ari", "srw", "raw",
 ];
 
-pub fn is_raw(path: &Path) -> bool {
+/// Does the extension name a RAW format (case-insensitive)?
+fn is_raw(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
@@ -53,8 +54,9 @@ impl Sort {
     }
 }
 
-/// What the thumbnail step learnt about the file.
-#[derive(Clone, Debug)]
+/// What the thumbnail step learnt about the file; also the JSON next to
+/// the cached PNG.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Meta {
     pub make: String,
     pub model: String,
@@ -71,6 +73,7 @@ pub enum ThumbState {
     Failed,
 }
 
+/// One RAW file of the folder.
 pub struct Entry {
     pub path: PathBuf,
     pub name: String,
@@ -83,6 +86,8 @@ pub struct Entry {
     pub texture: Option<egui::TextureHandle>,
 }
 
+/// One folder's listing: its RAW files in the chosen order and its
+/// visible subfolders.
 pub struct Folder {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
@@ -102,23 +107,28 @@ pub struct SubDir {
 }
 
 impl Folder {
+    /// List `path`: one `stat` per entry, and an entry that vanishes while
+    /// the listing runs is skipped, not an error. Fails only if the folder
+    /// itself cannot be read.
     pub fn scan(path: &Path, sort: Sort, generation: u64) -> std::io::Result<Self> {
         let mut entries = Vec::new();
         let mut subdirs = Vec::new();
         for e in std::fs::read_dir(path)? {
-            let e = e?;
+            let Ok(e) = e else { continue };
             let p = e.path();
-            if p.is_dir() {
+            // Symlinks are resolved by `metadata`, so a linked folder or
+            // file is taken for what it points to.
+            let Ok(md) = std::fs::metadata(&p) else { continue };
+            if md.is_dir() {
                 let hidden = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
                 if !hidden {
                     subdirs.push(p);
                 }
                 continue;
             }
-            if !p.is_file() || !is_raw(&p) {
+            if !md.is_file() || !is_raw(&p) {
                 continue;
             }
-            let md = e.metadata()?;
             entries.push(Entry {
                 name: p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
                 size: md.len(),
@@ -138,6 +148,7 @@ impl Folder {
         Ok(f)
     }
 
+    /// Reorder the entries; the thumbnails stay with their files.
     pub fn resort(&mut self, sort: Sort) {
         self.sort = sort;
         match sort {
@@ -148,6 +159,7 @@ impl Folder {
         }
     }
 
+    /// Position of the file in the current order.
     pub fn index_of(&self, path: &Path) -> Option<usize> {
         self.entries.iter().position(|e| e.path == path)
     }
@@ -175,40 +187,46 @@ pub fn count_raws(generation: u64, dirs: Vec<PathBuf>) -> std::sync::mpsc::Recei
 }
 
 /// Last path component as text (`/` for the root).
-pub fn dir_name(p: &Path) -> String {
+fn dir_name(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "/".to_string())
 }
 
-/// `DSC_9.NEF` before `DSC_10.NEF`: digit runs compare by value.
+/// `DSC_9.NEF` before `DSC_10.NEF`: digit runs compare by value. The runs
+/// are compared as strings (leading zeros stripped, then by length, then
+/// lexically), so a run of any length is fine.
 fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let (mut ia, mut ib) = (a.chars().peekable(), b.chars().peekable());
+    use std::cmp::Ordering;
+    fn digits(s: &[u8], from: usize) -> usize {
+        from + s[from..].iter().take_while(|c| c.is_ascii_digit()).count()
+    }
+    fn trim(s: &[u8]) -> &[u8] {
+        let z = s.iter().take_while(|&&c| c == b'0').count();
+        &s[z.min(s.len().saturating_sub(1))..]
+    }
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
     loop {
-        match (ia.peek().copied(), ib.peek().copied()) {
-            (None, None) => return std::cmp::Ordering::Equal,
-            (None, Some(_)) => return std::cmp::Ordering::Less,
-            (Some(_), None) => return std::cmp::Ordering::Greater,
+        match (a.get(i), b.get(j)) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
             (Some(ca), Some(cb)) if ca.is_ascii_digit() && cb.is_ascii_digit() => {
-                let mut na = 0u128;
-                while let Some(c) = ia.peek().filter(|c| c.is_ascii_digit()) {
-                    na = na * 10 + c.to_digit(10).unwrap() as u128;
-                    ia.next();
+                let (ea, eb) = (digits(a, i), digits(b, j));
+                let (ra, rb) = (trim(&a[i..ea]), trim(&b[j..eb]));
+                let ord = ra.len().cmp(&rb.len()).then_with(|| ra.cmp(rb));
+                if ord != Ordering::Equal {
+                    return ord;
                 }
-                let mut nb = 0u128;
-                while let Some(c) = ib.peek().filter(|c| c.is_ascii_digit()) {
-                    nb = nb * 10 + c.to_digit(10).unwrap() as u128;
-                    ib.next();
-                }
-                if na != nb {
-                    return na.cmp(&nb);
-                }
+                i = ea;
+                j = eb;
             }
             (Some(ca), Some(cb)) => {
                 let (la, lb) = (ca.to_ascii_lowercase(), cb.to_ascii_lowercase());
                 if la != lb {
                     return la.cmp(&lb);
                 }
-                ia.next();
-                ib.next();
+                i += 1;
+                j += 1;
             }
         }
     }
@@ -242,7 +260,7 @@ fn xdg_or_home(xdg: &str, windows: &str, fallback: &str) -> Option<PathBuf> {
 
 /// `$XDG_CACHE_HOME/mimizan/thumbs`, `%LOCALAPPDATA%/mimizan/thumbs`, or
 /// `~/.cache/mimizan/thumbs`.
-pub fn cache_dir() -> Option<PathBuf> {
+fn cache_dir() -> Option<PathBuf> {
     Some(xdg_or_home("XDG_CACHE_HOME", "LOCALAPPDATA", ".cache")?.join("mimizan").join("thumbs"))
 }
 
@@ -265,67 +283,53 @@ fn cache_key(path: &Path, size: u64, modified: SystemTime) -> String {
     format!("{h:016x}")
 }
 
-#[derive(Serialize, Deserialize)]
-struct CachedMeta {
-    make: String,
-    model: String,
-    exposure: Exposure,
-    width: usize,
-    height: usize,
-}
-
+/// The cached PNG and its JSON, if both are there and readable.
 fn cache_load(dir: &Path, key: &str) -> Option<(Thumb, Meta)> {
     let png = image::open(dir.join(format!("{key}.png"))).ok()?.into_luma8();
-    let meta: CachedMeta =
-        serde_json::from_slice(&std::fs::read(dir.join(format!("{key}.json"))).ok()?).ok()?;
+    let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join(format!("{key}.json"))).ok()?).ok()?;
     let (w, h) = (png.width() as usize, png.height() as usize);
-    Some((
-        Thumb { width: w, height: h, gray: png.into_raw() },
-        Meta {
-            make: meta.make,
-            model: meta.model,
-            exposure: meta.exposure,
-            width: meta.width,
-            height: meta.height,
-        },
-    ))
+    Some((Thumb { width: w, height: h, gray: png.into_raw() }, meta))
 }
 
+/// Write `name` under `dir` through a temporary file and a rename, so a
+/// reader never sees a half-written file.
+fn write_atomic(dir: &Path, name: &str, write: impl FnOnce(&Path) -> bool) -> bool {
+    let tmp = dir.join(format!("{name}.tmp"));
+    let ok = write(&tmp) && std::fs::rename(&tmp, dir.join(name)).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
+
+/// Cache a thumbnail; failures are silent, the cache is only a shortcut.
 fn cache_store(dir: &Path, key: &str, thumb: &Thumb, meta: &Meta) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let tmp = dir.join(format!("{key}.png.tmp"));
-    let ok = image::save_buffer_with_format(
-        &tmp,
-        &thumb.gray,
-        thumb.width as u32,
-        thumb.height as u32,
-        image::ColorType::L8,
-        image::ImageFormat::Png,
-    )
-    .is_ok()
-        && std::fs::rename(&tmp, dir.join(format!("{key}.png"))).is_ok();
-    if !ok {
-        let _ = std::fs::remove_file(&tmp);
+    let png_ok = write_atomic(dir, &format!("{key}.png"), |tmp| {
+        image::save_buffer_with_format(
+            tmp,
+            &thumb.gray,
+            thumb.width as u32,
+            thumb.height as u32,
+            image::ColorType::L8,
+            image::ImageFormat::Png,
+        )
+        .is_ok()
+    });
+    if !png_ok {
         return;
     }
-    let cm = CachedMeta {
-        make: meta.make.clone(),
-        model: meta.model.clone(),
-        exposure: meta.exposure.clone(),
-        width: meta.width,
-        height: meta.height,
-    };
-    if let Ok(s) = serde_json::to_vec(&cm) {
-        let _ = std::fs::write(dir.join(format!("{key}.json")), s);
+    if let Ok(s) = serde_json::to_vec(meta) {
+        write_atomic(dir, &format!("{key}.json"), |tmp| std::fs::write(tmp, &s).is_ok());
     }
 }
 
 // ---------------------------------------------------------------------------
 // Worker
 
-#[derive(Clone)]
+/// One thumbnail to make; `size` and `modified` key the disk cache.
 pub struct ThumbJob {
     pub generation: u64,
     pub path: PathBuf,
@@ -333,6 +337,7 @@ pub struct ThumbJob {
     pub modified: SystemTime,
 }
 
+/// One finished thumbnail (or the reason it failed).
 pub struct ThumbResult {
     pub generation: u64,
     pub path: PathBuf,
@@ -340,6 +345,8 @@ pub struct ThumbResult {
     pub ms: u128,
 }
 
+/// Handle to the thumbnail thread. The thread is restarted if it ever
+/// dies, so the strip never stays blank.
 pub struct Thumbs {
     tx: Sender<Vec<ThumbJob>>,
     rx: Receiver<ThumbResult>,
@@ -348,6 +355,7 @@ pub struct Thumbs {
 }
 
 impl Thumbs {
+    /// Start the thread.
     pub fn spawn(ctx: egui::Context, cameras_dir: PathBuf) -> Self {
         let (tx, rx) = start_thumbs(&ctx, &cameras_dir);
         Self { tx, rx, ctx, cameras_dir }
@@ -361,6 +369,7 @@ impl Thumbs {
         }
     }
 
+    /// Every result that arrived since the last poll.
     pub fn poll(&mut self) -> Vec<ThumbResult> {
         let mut all = Vec::new();
         loop {
@@ -426,7 +435,7 @@ fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob
                 }));
                 let result = match result {
                     Ok(r) => r,
-                    Err(payload) => Err(format!("stopped: {}", panic_message(&payload))),
+                    Err(payload) => Err(format!("stopped: {}", crate::worker::panic_message(&payload))),
                 };
                 let r = ThumbResult {
                     generation: job.generation,
@@ -444,16 +453,7 @@ fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob
     (tx, rx)
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".into()
-    }
-}
-
+/// Cache hit, or decode and bin the file and cache the result.
 fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Result<(Thumb, Meta), String> {
     let key = cache_key(&job.path, job.size, job.modified);
     if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
@@ -482,30 +482,31 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
 // ---------------------------------------------------------------------------
 // Settings that survive a restart
 
+/// `gui.json`. Every field has a default, so a file from an older or newer
+/// version still loads.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
+#[serde(default)]
 pub struct Persisted {
     pub folder: Option<PathBuf>,
     pub sort: Sort,
     /// Strip shown; `None` on a fresh install means "yes".
     pub strip: Option<bool>,
     /// Strip tiles shown as negatives (the film), not as the print.
-    #[serde(default)]
     pub strip_negative: Option<bool>,
-    /// Floating panels shown: analysis, enlarger, print. `None` means all.
-    #[serde(default)]
+    /// Docked windows open: 0 Negative, 1 Print, 2 Enlarger. `None` means all.
     pub panels: Option<[bool; 3]>,
     /// Height of the strip panel in points (the user drags its top edge).
-    #[serde(default)]
     pub strip_height: Option<f32>,
 }
 
 /// `$XDG_CONFIG_HOME/mimizan/gui.json`, `%APPDATA%/mimizan/gui.json`, or
 /// `~/.config/mimizan/gui.json`.
-pub fn config_path() -> Option<PathBuf> {
+fn config_path() -> Option<PathBuf> {
     Some(xdg_or_home("XDG_CONFIG_HOME", "APPDATA", ".config")?.join("mimizan").join("gui.json"))
 }
 
 impl Persisted {
+    /// The saved settings, or the defaults when there is no readable file.
     pub fn load() -> Self {
         config_path()
             .and_then(|p| std::fs::read(p).ok())
@@ -513,6 +514,7 @@ impl Persisted {
             .unwrap_or_default()
     }
 
+    /// Write the settings; a failure is silent (read-only home, no config dir).
     pub fn save(&self) {
         let Some(p) = config_path() else { return };
         if let Some(dir) = p.parent() {
@@ -530,9 +532,15 @@ mod tests {
 
     #[test]
     fn natural_order_counts_digits() {
-        let mut v = vec!["DSC_10.NEF", "DSC_9.NEF", "dsc_100.nef", "a.dng"];
+        let mut v = vec!["DSC_10.NEF", "DSC_9.NEF", "dsc_100.nef", "a.dng", "DSC_009.NEF"];
         v.sort_by(|a, b| natural_cmp(a, b));
-        assert_eq!(v, ["a.dng", "DSC_9.NEF", "DSC_10.NEF", "dsc_100.nef"]);
+        assert_eq!(v, ["a.dng", "DSC_9.NEF", "DSC_009.NEF", "DSC_10.NEF", "dsc_100.nef"]);
+        // Digit runs longer than any machine integer still order by value.
+        let long_a = format!("x{}.nef", "9".repeat(60));
+        let long_b = format!("x1{}.nef", "0".repeat(60));
+        assert_eq!(natural_cmp(&long_a, &long_b), std::cmp::Ordering::Less);
+        assert_eq!(natural_cmp(&long_b, &long_a), std::cmp::Ordering::Greater);
+        assert_eq!(natural_cmp("a0", "a00"), std::cmp::Ordering::Equal);
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub const PREVIEW_MAX: usize = 1800;
 pub struct DevelopParams {
     pub wb: WhiteBalance,
     pub mask: MaskMode,
+    /// Defect repair. The desktop starts with it off (every photosite stays
+    /// as measured, the Negative window has the switch); the command keeps
+    /// it on until `--no-defects`, because a batch has nobody looking.
     pub fix_defects: bool,
     /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). The
     /// desktop program starts with it on. The library and the command stay
@@ -73,7 +76,13 @@ pub struct PreviewPlanes {
     pub scale: f64,
 }
 
+/// One developed file, shared read-only (`Arc`) between the UI and the
+/// workers. Owns the decoded frame (a re-development skips the decoder),
+/// the full-resolution negative with its separation (a new mix skips the
+/// separation) and the upright preview planes the interactive view draws.
 pub struct Session {
+    /// Unique per development; the caches key on it, never on the address.
+    pub id: u64,
     pub path: PathBuf,
     pub frame: Arc<RawFrame>,
     pub negative: Negative,
@@ -83,6 +92,12 @@ pub struct Session {
     pub preview: PreviewPlanes,
     /// The four CFA channels of the frame as shot; fixed for the session.
     pub raw_hist: RawHistogram,
+}
+
+/// The next session id. Starts at 1 so 0 can mean "none" in a cache.
+pub fn next_session_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Histogram of the four sensor channels (one per 2x2 tile position) over
@@ -103,10 +118,11 @@ pub struct RawHistogram {
 }
 
 impl RawHistogram {
-    pub fn empty() -> Self {
+    fn empty() -> Self {
         Self { bins: [[0; 256]; 4], colors: [Color::G; 4], clipped: [0; 4], total: [0; 4], mono: false }
     }
 
+    /// Count the active area of the frame.
     pub fn of_frame(frame: &RawFrame) -> Self {
         let crop = frame.crop;
         let (x0, y0) = (crop.x, crop.y);
@@ -114,8 +130,7 @@ impl RawHistogram {
         if x1 <= x0 || y1 <= y0 {
             return Self::empty();
         }
-        let lut: Vec<u8> =
-            (0..65536).map(|i| ((i as f64 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
+        let lut = neg_lut();
         type RowCounts = ([[u32; 256]; 4], [usize; 4], [usize; 4]);
         let parts: Vec<RowCounts> = (y0..y1)
             .into_par_iter()
@@ -184,12 +199,7 @@ impl Session {
 
     /// Full-resolution sharpening mask (the sidecar bytes as a plane).
     pub fn mask_plane(&self) -> mimizan_core::Result<Plane> {
-        let n = &self.negative;
-        Plane::try_from_vec(
-            n.plane.width,
-            n.plane.height,
-            n.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect(),
-        )
+        mask_plane_of(&self.negative)
     }
 
     /// Upright size of the full negative.
@@ -213,71 +223,83 @@ impl Session {
     }
 }
 
+/// Shrinks full-resolution planes to the preview size and turns them
+/// upright. The resize runs on the sensor frame (to the swapped size when
+/// the orientation transposes) and the small result is oriented, so no
+/// full-resolution copy is ever made.
+struct PreviewShrink {
+    orientation: u16,
+    /// Upright preview size.
+    pw: usize,
+    ph: usize,
+    /// Upright full size.
+    w: usize,
+}
+
+impl PreviewShrink {
+    fn new(neg: &Negative) -> Self {
+        let (fw, fh) = (neg.plane.width, neg.plane.height);
+        let swap = matches!(neg.orientation, 5..=8);
+        let (w, h) = if swap { (fh, fw) } else { (fw, fh) };
+        let (pw, ph) = fit_dims(w, h, PREVIEW_MAX, PREVIEW_MAX);
+        Self { orientation: neg.orientation, pw: pw.min(w), ph: ph.min(h), w }
+    }
+
+    fn small(&self, p: &Plane) -> Plane {
+        let swap = matches!(self.orientation, 5..=8);
+        let (tw, th) = if swap { (self.ph, self.pw) } else { (self.pw, self.ph) };
+        let shrunk = if (p.width, p.height) == (tw, th) { p.clone() } else { resize(p, tw, th) };
+        orient(&shrunk, self.orientation)
+    }
+
+    /// The sidecar as a plane at preview size.
+    fn mask(&self, neg: &Negative) -> mimizan_core::Result<Plane> {
+        Ok(self.small(&mask_plane_of(neg)?))
+    }
+
+    fn scale(&self) -> f64 {
+        self.pw as f64 / self.w as f64
+    }
+}
+
 /// Build the preview planes. A Bayer negative keeps its separation. A
 /// monochrome negative previews the measured plane and stores no colour.
+/// `mask_max` is not previewed: the mix ignores it and nothing draws it.
 pub fn preview_planes(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
     let Some(sep) = neg.separation.as_ref() else {
         return preview_measured(neg);
     };
-    let o = neg.orientation;
-    let lum = orient(&sep.lum, o);
-    let (w, h) = (lum.width, lum.height);
-    let (pw, ph) = fit_dims(w, h, PREVIEW_MAX, PREVIEW_MAX);
-    let (pw, ph) = (pw.min(w), ph.min(h));
-    let small = |p: &Plane| {
-        let up = orient(p, o);
-        if (up.width, up.height) == (pw, ph) {
-            up
-        } else {
-            resize(&up, pw, ph)
-        }
-    };
-    let mask_full = Plane::try_from_vec(
-        neg.plane.width,
-        neg.plane.height,
-        neg.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect(),
-    )?;
-    let mask = small(&mask_full);
-    drop(mask_full);
+    let sh = PreviewShrink::new(neg);
+    let mask = sh.mask(neg)?;
     let sep_small = Separation {
-        lum: if (w, h) == (pw, ph) { lum } else { resize(&lum, pw, ph) },
-        c1: small(&sep.c1),
-        c2: small(&sep.c2),
-        mask_max: small(&sep.mask_max),
+        lum: sh.small(&sep.lum),
+        c1: sh.small(&sep.c1),
+        c2: sh.small(&sep.c2),
+        mask_max: Plane::zeros(1, 1),
         rounds: sep.rounds,
         phase: sep.phase,
         computed: sep.computed,
     };
-    Ok(PreviewPlanes { sep: sep_small, mask, scale: pw as f64 / w as f64 })
+    Ok(PreviewPlanes { sep: sep_small, mask, scale: sh.scale() })
 }
 
 /// Preview of a measured plane. Chrominance stays empty at preview size so
 /// the existing mix draws the measurement and nothing else.
 fn preview_measured(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
-    let o = neg.orientation;
-    let lum = orient(&neg.plane, o);
-    let (w, h) = (lum.width, lum.height);
-    let (pw, ph) = fit_dims(w, h, PREVIEW_MAX, PREVIEW_MAX);
-    let (pw, ph) = (pw.min(w), ph.min(h));
-    let lum = if (w, h) == (pw, ph) { lum } else { resize(&lum, pw, ph) };
-    let mask_full = Plane::try_from_vec(
-        neg.plane.width,
-        neg.plane.height,
-        neg.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect(),
-    )?;
-    let mask_up = orient(&mask_full, o);
-    let mask = if (mask_up.width, mask_up.height) == (pw, ph) { mask_up } else { resize(&mask_up, pw, ph) };
-    let zero = Plane::zeros(pw, ph);
+    let sh = PreviewShrink::new(neg);
+    let lum = sh.small(&neg.plane);
+    let mask = sh.mask(neg)?;
+    let zero = Plane::zeros(sh.pw, sh.ph);
     let sep = Separation {
         lum,
         c1: zero.clone(),
-        c2: zero.clone(),
-        mask_max: zero,
+        c2: zero,
+        mask_max: Plane::zeros(1, 1),
         rounds: 0,
         phase: mimizan_core::cfa::BayerPhase::RGGB,
         computed: 0.0,
     };
-    Ok(PreviewPlanes { sep, mask, scale: pw as f64 / w as f64 })
+    Ok(PreviewPlanes { sep, mask, scale: sh.scale() })
 }
 
 /// Everything the preview depends on besides the session. The preview is the
@@ -318,8 +340,9 @@ pub struct DetailRect {
     pub h: usize,
 }
 
-/// Samples kept ready around the visible window, in screen pixels, so a
-/// short pan is already on screen.
+/// Samples kept ready around the visible window, in samples of the ask's
+/// grid (one screen pixel below 1:1, one file pixel at 1:1), so a short
+/// pan is already on screen.
 pub const DETAIL_MARGIN: usize = 64;
 
 /// The zoomed window the view asks for.
@@ -338,10 +361,12 @@ pub struct DetailAsk {
 }
 
 impl DetailAsk {
+    /// Every pixel of `rect`: the 1:1 ask.
     pub fn pixels(rect: DetailRect) -> Self {
         Self { x: rect.x, y: rect.y, w: rect.w, h: rect.h, step: 1 }
     }
 
+    /// The grid step, never 0.
     pub fn step(&self) -> usize {
         self.step.max(1)
     }
@@ -420,19 +445,15 @@ pub struct DetailTile {
 
 /// Map a rectangle of the upright image (after `orientation`) back to the
 /// sensor frame of a `w`×`h` source, using the same table as `orient`.
+/// An empty rectangle maps to an empty one at its origin.
 pub(crate) fn source_rect(orientation: u16, w: usize, h: usize, r: DetailRect) -> DetailRect {
-    let map = |ox: usize, oy: usize| -> (usize, usize) {
-        match orientation {
-            2 => (w - 1 - ox, oy),
-            3 => (w - 1 - ox, h - 1 - oy),
-            4 => (ox, h - 1 - oy),
-            5 => (oy, ox),
-            6 => (oy, h - 1 - ox),
-            7 => (w - 1 - oy, h - 1 - ox),
-            8 => (w - 1 - oy, ox),
-            _ => (ox, oy),
-        }
-    };
+    if r.w == 0 || r.h == 0 || w == 0 || h == 0 {
+        return DetailRect { x: 0, y: 0, w: 0, h: 0 };
+    }
+    // Clamped to the upright size, so a rectangle that overhangs the
+    // picture maps to its edge instead of underflowing the table.
+    let (uw, uh) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
+    let map = |ox: usize, oy: usize| sensor_xy(orientation, w, h, ox.min(uw - 1), oy.min(uh - 1));
     let corners =
         [map(r.x, r.y), map(r.x + r.w - 1, r.y), map(r.x, r.y + r.h - 1), map(r.x + r.w - 1, r.y + r.h - 1)];
     let x0 = corners.iter().map(|c| c.0).min().unwrap_or(0);
@@ -535,20 +556,12 @@ struct DetailSource<'a> {
 }
 
 impl DetailSource<'_> {
-    /// Every file pixel of `rect`. The path 1:1 has always used.
+    /// Every file pixel of `rect`; the 1:1 path.
     fn dense(&self, rect: DetailRect) -> Option<Vec<u8>> {
         let Self { s, v, sep, sw, sh, orientation, table, codes } = *self;
         if v.show_mask {
             let src = source_rect(orientation, sw, sh, rect);
-            let n = &s.negative;
-            let mut m = Plane::zeros(src.w, src.h);
-            m.data.par_chunks_mut(src.w).enumerate().for_each(|(y, row)| {
-                let base = (src.y + y) * n.plane.width + src.x;
-                for (x, o) in row.iter_mut().enumerate() {
-                    *o = f64::from(n.mask8[base + x]) / 255.0;
-                }
-            });
-            let upright = orient(&m, orientation);
+            let upright = orient(&mask_window(&s.negative, src)?, orientation);
             debug_assert_eq!((upright.width, upright.height), (rect.w, rect.h));
             Some(upright.data.par_iter().map(|&x| (x.clamp(0.0, 1.0) * 255.0).round() as u8).collect())
         } else if v.place == 0.0 {
@@ -676,14 +689,7 @@ fn measured_gray(
     if step == 1 {
         if v.show_mask {
             let src = source_rect(orientation, sw, sh, rect);
-            let mut m = Plane::zeros(src.w, src.h);
-            m.data.par_chunks_mut(src.w).enumerate().for_each(|(yy, row)| {
-                let base = (src.y + yy) * n.plane.width + src.x;
-                for (xx, o) in row.iter_mut().enumerate() {
-                    *o = f64::from(n.mask8[base + xx]) / 255.0;
-                }
-            });
-            let upright = orient(&m, orientation);
+            let upright = orient(&mask_window(n, src)?, orientation);
             return Some(
                 upright.data.par_iter().map(|&p| (p.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
             );
@@ -916,7 +922,8 @@ pub fn render_sharpen_loupe(
         let Some(mixed) = measured_window(s, weights, sensor, orientation) else {
             return SharpenLoupe { gray: Vec::new(), width: 0, height: 0 };
         };
-        let mask = want_mask.then(|| crop_mask(s, sensor)).flatten().map(|m| orient(&m, orientation));
+        let mask =
+            want_mask.then(|| mask_window(&s.negative, sensor)).flatten().map(|m| orient(&m, orientation));
         (mixed, mask)
     } else {
         (Plane::zeros(1, 1), None)
@@ -940,12 +947,23 @@ pub fn render_sharpen_loupe(
             return SharpenLoupe { gray: Vec::new(), width: 0, height: 0 };
         }
     };
-    let gray = plane.data.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
+    let gray = plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
     SharpenLoupe { gray, width: plane.width, height: plane.height }
 }
 
-fn crop_mask(s: &Session, r: DetailRect) -> Option<Plane> {
-    let n = &s.negative;
+/// The whole sidecar as a plane in [0, 1]; an error when its length does
+/// not match the negative.
+fn mask_plane_of(n: &Negative) -> mimizan_core::Result<Plane> {
+    Plane::try_from_vec(
+        n.plane.width,
+        n.plane.height,
+        n.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect(),
+    )
+}
+
+/// A window of the sidecar (sensor frame) as a plane in [0, 1]. `None`
+/// when the sidecar does not fit the negative or the window lies outside.
+fn mask_window(n: &Negative, r: DetailRect) -> Option<Plane> {
     let samples = n.plane.width.checked_mul(n.plane.height)?;
     if n.mask8.len() != samples || r.w == 0 || r.h == 0 {
         return None;
@@ -954,13 +972,12 @@ fn crop_mask(s: &Session, r: DetailRect) -> Option<Plane> {
         return None;
     }
     let mut out = Plane::zeros(r.w, r.h);
-    for y in 0..r.h {
+    out.data.par_chunks_mut(r.w).enumerate().for_each(|(y, row)| {
         let base = (r.y + y) * n.plane.width + r.x;
-        let row = out.row_mut(y);
         for (x, o) in row.iter_mut().enumerate() {
             *o = f64::from(n.mask8[base + x]) / 255.0;
         }
-    }
+    });
     Some(out)
 }
 
@@ -1181,122 +1198,38 @@ impl Histogram {
 
     /// Histograms of the full-resolution negative in one pass: the linear mix
     /// on a gamma-2.2 axis (the scan, before any placing), and the mix after
-    /// `place` stops and `tone` (what the TIFF gets). Values are quantised
-    /// to 16 bits first, so the clipping counts are the TIFF's own 0 and
-    /// 65535 pixels. Nothing is downscaled: a resampled copy rings at edges
-    /// (false black and white) and averages isolated clipped pixels away, so
-    /// its histogram ends are wrong by an order of magnitude.
+    /// `place` stops and the tone `table` (what the TIFF gets). Values are
+    /// quantised to 16 bits first, so the clipping counts are the TIFF's own
+    /// 0 and 65535 pixels. Nothing is downscaled: a resampled copy rings at
+    /// edges (false black and white) and averages isolated clipped pixels
+    /// away, so its histogram ends are wrong by an order of magnitude.
     pub fn of_separation(
         sep: &Separation,
         w: &Weights,
-        tone: &ToneMap,
+        table: &ToneTable,
         place: f64,
         window: Option<(usize, usize, usize, usize)>,
     ) -> (Self, Self) {
-        // 16-bit input -> 8-bit bin, for both encodings. One evaluation per
-        // code: the clip flag is that same value at 0 or 65535.
-        let table = ToneTable::build(tone);
-        let lut_neg = neg_lut();
         let k1 = w.g - w.r - w.b;
         let k2 = 2.0 * (w.r - w.b);
-        let width = sep.lum.width;
-        let height = sep.lum.height;
-        let (x0, y0, x1, y1) = match window {
-            Some((x, y, w, h)) => {
-                let x0 = x.min(width);
-                let y0 = y.min(height);
-                (x0, y0, (x + w).min(width).max(x0), (y + h).min(height).max(y0))
-            }
-            None => (0, 0, width, height),
-        };
-        let global = 2f64.powf(place);
-        // Row-ordered partial counts, merged deterministically.
-        let parts: Vec<Counts> = (y0..y1)
-            .into_par_iter()
-            .map(|y| {
-                let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
-                let mut c = Counts::default();
-                for x in x0..x1 {
-                    let m = l[x] + k1 * c1[x] + k2 * c2[x];
-                    let q = q16(m);
-                    c.neg[lut_neg[q] as usize] += 1;
-                    c.neg_low += (q == 0) as usize;
-                    c.neg_high += (q == 65535) as usize;
-                    let qv = q16(m * global);
-                    let bin = table.view[qv];
-                    c.view[bin as usize] += 1;
-                    match table.clip[qv] {
-                        1 => c.view_low += 1,
-                        2 => c.view_high += 1,
-                        _ => {}
-                    }
-                }
-                c
-            })
-            .collect();
-        let mut all = Counts::default();
-        for c in parts {
-            all.add(&c);
-        }
-        let total = (x1 - x0) * (y1 - y0);
-        (
-            Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
-            Self::from_bins(all.view, total, all.view_low, all.view_high),
-        )
+        Self::count(sep.lum.width, sep.lum.height, window, table, place, |y| {
+            let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
+            move |x| l[x] + k1 * c1[x] + k2 * c2[x]
+        })
     }
 
     /// The same counts as [`of_separation`] on a plane that has no colour.
     /// A monochrome negative is that plane. Weights do not enter.
     pub fn of_plane(
         plane: &Plane,
-        tone: &ToneMap,
+        table: &ToneTable,
         place: f64,
         window: Option<(usize, usize, usize, usize)>,
     ) -> (Self, Self) {
-        let table = ToneTable::build(tone);
-        let lut_neg = neg_lut();
-        let width = plane.width;
-        let height = plane.height;
-        let (x0, y0, x1, y1) = match window {
-            Some((x, y, w, h)) => {
-                let x0 = x.min(width);
-                let y0 = y.min(height);
-                (x0, y0, (x + w).min(width).max(x0), (y + h).min(height).max(y0))
-            }
-            None => (0, 0, width, height),
-        };
-        let global = 2f64.powf(place);
-        let parts: Vec<Counts> = (y0..y1)
-            .into_par_iter()
-            .map(|y| {
-                let row = plane.row(y);
-                let mut c = Counts::default();
-                for &m in row.iter().take(x1).skip(x0) {
-                    let q = q16(m);
-                    c.neg[lut_neg[q] as usize] += 1;
-                    c.neg_low += (q == 0) as usize;
-                    c.neg_high += (q == 65535) as usize;
-                    let qv = q16(m * global);
-                    let bin = table.view[qv];
-                    c.view[bin as usize] += 1;
-                    match table.clip[qv] {
-                        1 => c.view_low += 1,
-                        2 => c.view_high += 1,
-                        _ => {}
-                    }
-                }
-                c
-            })
-            .collect();
-        let mut all = Counts::default();
-        for c in parts {
-            all.add(&c);
-        }
-        let total = (x1 - x0) * (y1 - y0);
-        (
-            Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
-            Self::from_bins(all.view, total, all.view_low, all.view_high),
-        )
+        Self::count(plane.width, plane.height, window, table, place, |y| {
+            let row = plane.row(y);
+            move |x| row[x]
+        })
     }
 
     /// The same counts as [`of_separation`] from cached `q16(mix)` codes.
@@ -1311,11 +1244,30 @@ impl Histogram {
         window: Option<(usize, usize, usize, usize)>,
     ) -> (Self, Self) {
         let height = codes.len().checked_div(width).unwrap_or(0);
+        Self::count(width, height, window, table, place, |y| {
+            let row = &codes[y * width..(y + 1) * width];
+            move |x| row[x] as f64 / 65535.0
+        })
+    }
+
+    /// The shared walk. `row(y)` gives a sampler of the linear value `m` at
+    /// `x`; the negative code is `q16(m)` and the view code `q16(m · 2^place)`
+    /// on the float (what `tone::place` does to the pixels), or the negative
+    /// code itself when `place == 0`. Row-ordered partial counts are merged
+    /// deterministically.
+    fn count<R: Fn(usize) -> f64>(
+        width: usize,
+        height: usize,
+        window: Option<(usize, usize, usize, usize)>,
+        table: &ToneTable,
+        place: f64,
+        row: impl Fn(usize) -> R + Sync,
+    ) -> (Self, Self) {
         let (x0, y0, x1, y1) = match window {
             Some((x, y, w, h)) => {
                 let x0 = x.min(width);
                 let y0 = y.min(height);
-                (x0, y0, (x + w).min(width).max(x0), (y + h).min(height).max(y0))
+                (x0, y0, x.saturating_add(w).min(width).max(x0), y.saturating_add(h).min(height).max(y0))
             }
             None => (0, 0, width, height),
         };
@@ -1324,14 +1276,15 @@ impl Histogram {
         let parts: Vec<Counts> = (y0..y1)
             .into_par_iter()
             .map(|y| {
-                let row = &codes[y * width + x0..y * width + x1];
+                let code_at = row(y);
                 let mut c = Counts::default();
-                for &code in row {
-                    let q = code as usize;
+                for x in x0..x1 {
+                    let m = code_at(x);
+                    let q = q16(m);
                     c.neg[lut_neg[q] as usize] += 1;
                     c.neg_low += (q == 0) as usize;
                     c.neg_high += (q == 65535) as usize;
-                    let qv = if place == 0.0 { q } else { q16((q as f64 / 65535.0) * global) };
+                    let qv = if place == 0.0 { q } else { q16(m * global) };
                     let bin = table.view[qv];
                     c.view[bin as usize] += 1;
                     match table.clip[qv] {
@@ -1423,7 +1376,7 @@ pub struct PreviewImage {
 /// on the tone, the placing and the crop. A drag of the exposures rebins
 /// the codes; it does not mix the negative again.
 pub struct HistCache {
-    session: Option<*const Session>,
+    session: Option<u64>,
     weights: Option<Weights>,
     codes: Vec<u16>,
     width: usize,
@@ -1461,13 +1414,13 @@ fn hist_window(s: &Session, v: &ViewParams) -> Option<(usize, usize, usize, usiz
 
 impl HistCache {
     fn ensure(&mut self, s: &Session, w: &Weights) {
-        let ptr = s as *const Session;
+        let ptr = s.id;
         if s.is_mono() {
             if self.session == Some(ptr) && self.width == s.negative.plane.width && !self.codes.is_empty() {
                 return;
             }
             self.width = s.negative.plane.width;
-            self.codes = s.negative.plane.data.iter().map(|&v| q16(v) as u16).collect();
+            self.codes = s.negative.plane.data.par_iter().map(|&v| q16(v) as u16).collect();
             self.session = Some(ptr);
             self.weights = None;
             self.hist_key = None;
@@ -1497,14 +1450,8 @@ impl HistCache {
         &self.codes
     }
 
-    fn histograms(
-        &mut self,
-        s: &Session,
-        v: &ViewParams,
-        tone: &ToneMap,
-        table: &ToneTable,
-    ) -> (Histogram, Histogram) {
-        let ptr = s as *const Session;
+    fn histograms(&mut self, s: &Session, v: &ViewParams, table: &ToneTable) -> (Histogram, Histogram) {
+        let ptr = s.id;
         let key = v.hist_key();
         if self.session != Some(ptr) || self.hist_key.as_ref() != Some(&key) {
             let window = hist_window(s, v);
@@ -1516,10 +1463,10 @@ impl HistCache {
                 Histogram::of_codes(&self.codes, self.width, table, 0.0, window)
             } else if s.is_mono() {
                 self.session = Some(ptr);
-                Histogram::of_plane(&s.negative.plane, tone, v.place, window)
+                Histogram::of_plane(&s.negative.plane, table, v.place, window)
             } else if let Some(sep) = s.separation() {
                 self.session = Some(ptr);
-                Histogram::of_separation(sep, &v.weights, tone, v.place, window)
+                Histogram::of_separation(sep, &v.weights, table, v.place, window)
             } else {
                 self.session = Some(ptr);
                 (Histogram::empty(), Histogram::empty())
@@ -1563,9 +1510,8 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
             hist_negative: Histogram::empty(),
         };
     }
-    let tone_map = v.tone.compile();
     // Histograms from the full-resolution separation, not the preview copy.
-    let (hist_negative, hist_view) = cache.histograms(s, v, &tone_map, table);
+    let (hist_negative, hist_view) = cache.histograms(s, v, table);
     let mut mixed = orient(&mix(&pp.sep, &v.weights), rotated(1, v.rotation));
     if let Some(c) = v.crop {
         let (fw, fh) = s.upright_size();
@@ -1798,7 +1744,7 @@ mod histogram_tests {
         )))
         .unwrap();
         let curve = Tone::Look(look).compile();
-        let (neg, view) = Histogram::of_separation(&sep, &wts, &curve, 0.0, None);
+        let (neg, view) = Histogram::of_separation(&sep, &wts, &ToneTable::build(&curve), 0.0, None);
 
         let mixed = mix(&sep, &wts);
         let mut en = [0u32; 256];
@@ -1848,7 +1794,7 @@ mod histogram_tests {
         for (tone, place) in
             [(Tone::Look(LookFile::neutral()).compile(), -0.4), (Tone::paper().compile(), 0.2)]
         {
-            let (_, view) = Histogram::of_separation(&sep, &wts, &tone, place, None);
+            let (_, view) = Histogram::of_separation(&sep, &wts, &ToneTable::build(&tone), place, None);
             let mut pic = mix(&sep, &wts);
             mimizan_core::tone::place(&mut pic, place);
             let mut ev = [0u32; 256];
@@ -1866,9 +1812,9 @@ mod histogram_tests {
         let sep = sweep(40, 24);
         let wts = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let tone = Tone::paper().compile();
-        let (n1, v1) = Histogram::of_separation(&sep, &wts, &tone, 0.0, None);
-        let codes = mix_codes(&sep, &wts);
         let table = ToneTable::build(&tone);
+        let (n1, v1) = Histogram::of_separation(&sep, &wts, &table, 0.0, None);
+        let codes = mix_codes(&sep, &wts);
         let (n2, v2) = Histogram::of_codes(&codes, sep.lum.width, &table, 0.0, None);
         assert_eq!(n1, n2);
         assert_eq!(v1, v2);
@@ -1911,8 +1857,9 @@ mod histogram_tests {
         };
         let w = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let tone = Tone::paper().compile();
-        let (n1, v1) = Histogram::of_separation(&sep, &w, &tone, 0.4, None);
-        let (n2, v2) = Histogram::of_plane(&lum, &tone, 0.4, None);
+        let table = ToneTable::build(&tone);
+        let (n1, v1) = Histogram::of_separation(&sep, &w, &table, 0.4, None);
+        let (n2, v2) = Histogram::of_plane(&lum, &table, 0.4, None);
         assert_eq!(n1, n2);
         assert_eq!(v1, v2);
     }
@@ -1954,6 +1901,7 @@ mod histogram_tests {
         assert!(preview.sep.c2.data.iter().all(|&v| v == 0.0));
         let raw_hist = RawHistogram::of_frame(&frame);
         let session = Session {
+            id: next_session_id(),
             path: "mono.dng".into(),
             frame: Arc::new(frame),
             negative: neg,

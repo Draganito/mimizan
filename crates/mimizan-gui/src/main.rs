@@ -55,7 +55,9 @@ fn main() -> eframe::Result {
         .ok()
         .and_then(|s| {
             let (w, h) = s.split_once('x')?;
-            Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])
+            let size = [w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?];
+            // The window manager rejects NaN, zero or absurd sizes.
+            size.iter().all(|v| v.is_finite() && (320.0..=16384.0).contains(v)).then_some(size)
         })
         .unwrap_or([1360.0, 860.0]);
     // `mut` is only used on Windows, where the renderer is switched to DirectX 12.

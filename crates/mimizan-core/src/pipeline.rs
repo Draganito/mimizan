@@ -16,6 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 use tracing::info;
 
+/// Everything that decides how a frame becomes a negative.
 #[derive(Clone, Debug, Default)]
 pub struct NegativeParams {
     pub ingest: IngestParams,
@@ -33,7 +34,8 @@ pub struct NegativeParams {
 }
 
 impl NegativeParams {
-    /// Apply a camera file: noise, weights (unless overridden later), USM is for print.
+    /// Apply a camera file: its noise model and its weights. `with_weights`
+    /// afterwards still overrides the weights.
     pub fn with_camera_file(mut self, cam: CameraFile) -> Self {
         self.ingest.noise = cam.noise();
         self.weights = cam.weights();
@@ -50,6 +52,7 @@ impl NegativeParams {
     }
 }
 
+/// Wall-clock time of each stage, for the description and the log.
 #[derive(Clone, Debug, Serialize)]
 pub struct Timing {
     pub decode_ms: u128,
@@ -58,6 +61,8 @@ pub struct Timing {
     pub mix_ms: u128,
 }
 
+/// The negative's description: what was done to the file, written as JSON
+/// into the TIFF.
 #[derive(Clone, Debug, Serialize)]
 pub struct NegativeInfo {
     pub mimizan: &'static str,
@@ -75,7 +80,10 @@ pub struct NegativeInfo {
     /// the illuminant-independent form.
     pub weights_raw: Weights,
     pub mask: MaskMode,
+    /// Refinement rounds the separation ran.
     pub rounds: usize,
+    /// Chroma cutoff of the Kaiser low-pass. The `dubois` mask has its own
+    /// bands and does not read it; the value is recorded as configured.
     pub cutoff: f64,
     /// Nonlinear reconstruction was enabled (`reconstruct.rs`).
     pub reconstruct: bool,
@@ -86,6 +94,8 @@ pub struct NegativeInfo {
     pub timing: Timing,
 }
 
+/// The developed negative: the linear plane, its sharpening mask, and the
+/// description.
 pub struct Negative {
     pub plane: Plane,
     /// 8-bit sidecar: `round(255*mask_max)`, 255 where saturated.
@@ -98,11 +108,14 @@ pub struct Negative {
     pub separation: Option<crate::separate::Separation>,
 }
 
+/// Read a RAW file with `rawler`.
 #[cfg(feature = "decode-rawler")]
 pub fn decode(path: &Path) -> Result<RawFrame> {
     RawlerDecoder.decode(path)
 }
 
+/// Develop a decoded frame: ingest, separate (Bayer only), mix. `decode_ms`
+/// is recorded in the timing.
 pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128) -> Result<Negative> {
     if let (Some(cam), crate::decode::SensorKind::Bayer(ph)) = (&p.camera_file, frame.kind) {
         if cam.phase() != ph {
@@ -129,6 +142,12 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     }
     let weights = weights.filtered(p.filter);
     if p.filter != ColorFilter::None {
+        weights.validate().map_err(|e| {
+            crate::Error::Invalid(format!(
+                "filter {} passes none of the weighted channels: {e}",
+                p.filter.name()
+            ))
+        })?;
         info!("filter {}: weights R {:.3} G {:.3} B {:.3}", p.filter.name(), weights.r, weights.g, weights.b);
     }
 
@@ -191,6 +210,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     Ok(Negative { plane, mask8, orientation, info, saturated, separation })
 }
 
+/// Decode and develop one file.
 #[cfg(feature = "decode-rawler")]
 pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
     let t = Instant::now();
@@ -200,6 +220,7 @@ pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
     negative_from_frame(&frame, p, decode_ms)
 }
 
+/// The 8-bit sidecar: `round(255 · mask_max)`, 255 where saturated.
 pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
     if mask_max.data.len() != saturated.len() {
         return Err(crate::Error::Invalid(format!(
