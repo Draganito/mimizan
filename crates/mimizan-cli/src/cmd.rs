@@ -315,7 +315,14 @@ pub fn print(a: &PrintArgs) -> Result<()> {
         info!("recipe {}", p.display());
     }
     let p = PrintParams { recipe, usm_k: a.usm_k, viewing_distance_mm: a.distance_mm, use_mask: a.use_mask };
-    let out = pr::render(&a.negative, &p).with_context(|| format!("rendering {}", a.negative.display()))?;
+    // The render is refused above the machine's whole memory: past that it
+    // ends in the OOM killer or a frozen machine, not in an error. Below
+    // it, a print larger than what is free is only slow.
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    let budget = (sys.total_memory() > 0).then_some(sys.total_memory());
+    let out = pr::render_within(&a.negative, &p, budget)
+        .with_context(|| format!("rendering {}", a.negative.display()))?;
     let t = Instant::now();
     pr::write(&out, &a.out, &p)?;
     if out.info.deconvolution_iterations > 0 {

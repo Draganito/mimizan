@@ -1914,6 +1914,7 @@ dependencies = [
  "mimizan-core",
  "serde",
  "serde_json",
+ "sysinfo",
  "tracing",
  "tracing-subscriber",
 ]

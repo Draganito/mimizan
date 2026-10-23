@@ -20,7 +20,9 @@ use egui_file_dialog::{FileDialog, OpeningMode};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
-use mimizan_core::print::{box_for_picture_height, box_for_picture_width, peak_print_radius, PrintSize};
+use mimizan_core::print::{
+    box_for_picture_height, box_for_picture_width, memory_estimate, memory_text, peak_print_radius, PrintSize,
+};
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
@@ -330,6 +332,11 @@ pub struct App {
     // Export section
     size_mode: SizeMode,
     paper_cm: [f64; 2],
+    /// The export estimate the user was warned about. A second click with
+    /// the same estimate goes ahead; a different one warns again.
+    export_warned: Option<u64>,
+    /// Memory in the machine, bytes, read once. Zero when unknown.
+    ram_total: u64,
     /// Where the loupe looks, as a fraction of the upright picture.
     sharpen_at: Option<[f64; 2]>,
     /// The user edited radius or amount on this file. A measurement will not
@@ -490,6 +497,12 @@ impl App {
             edit: Edit::new(Weights::default()),
             history: History::new(Edit::new(Weights::default())),
             size_mode: SizeMode::Native,
+            export_warned: None,
+            ram_total: {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_memory();
+                sys.total_memory()
+            },
             paper_cm: [30.0, 40.0],
             sharpen_at: None,
             peak_held: false,
@@ -1085,6 +1098,7 @@ impl App {
     /// Controls back to the session's defaults; the negative stays. A new
     /// file starts a new history; on the same file the reset is one step.
     fn reset(&mut self, fresh: bool) {
+        self.export_warned = None;
         let weights = self.session.as_ref().map(|s| s.default_weights()).unwrap_or_default();
         let e = Edit::new(weights);
         if fresh {
@@ -2368,8 +2382,19 @@ impl App {
             .on_disabled_hover_text(hover.clone())
             .on_hover_text(hover)
             .clicked()
+            && self.export_memory_allows()
         {
             self.start_export();
+        }
+        // The note stays while the estimate it was about is the current one.
+        if let Some(need) = self.export_warned.filter(|n| Some(*n) == self.export_memory()) {
+            ui.label(
+                RichText::new(format!(
+                    "About {} at once, more than is free. Export again to go ahead.",
+                    memory_text(need)
+                ))
+                .color(ui.visuals().warn_fg_color),
+            );
         }
     }
 
@@ -2565,16 +2590,81 @@ impl App {
             return;
         }
         let cm = |px: usize| px as f64 / dpi * 2.54;
-        ui.label(
-            RichText::new(format!(
-                "{} × {} px · {:.1} × {:.1} cm",
-                l.out_w,
-                l.out_h,
-                cm(l.out_w),
-                cm(l.out_h)
-            ))
-            .weak(),
-        );
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            ui.label(
+                RichText::new(format!(
+                    "{} × {} px · {:.1} × {:.1} cm · ",
+                    l.out_w,
+                    l.out_h,
+                    cm(l.out_w),
+                    cm(l.out_h)
+                ))
+                .weak(),
+            );
+            // What the export holds at once, red once the machine cannot.
+            if let Some(need) = self.export_memory() {
+                let text = RichText::new(memory_text(need));
+                let text = if self.ram_total > 0 && need > self.ram_total {
+                    text.color(ui.visuals().error_fg_color)
+                } else {
+                    text.weak()
+                };
+                ui.label(text).on_hover_text(
+                    "Memory the export holds at its widest point. \
+                     Above what the machine has, the export is refused; \
+                     above what is free, it asks twice.",
+                );
+            }
+        });
+    }
+
+    /// Bytes the export holds at its widest, from the same layout the
+    /// panel shows. Absent until a file is open.
+    fn export_memory(&self) -> Option<u64> {
+        let (w, h) = self.export_size();
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let params = mimizan_core::print::PrintParams { recipe: self.print_recipe(), ..Default::default() };
+        Some(memory_estimate(w, h, 1, &params))
+    }
+
+    /// Whether the export may start. A print that fits in free memory
+    /// goes; one above everything the machine has is refused with the two
+    /// figures; in between, the first click warns and the second goes.
+    fn export_memory_allows(&mut self) -> bool {
+        let Some(need) = self.export_memory() else { return true };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let (total, available) = (sys.total_memory(), sys.available_memory());
+        if total == 0 {
+            return true;
+        }
+        if need as f64 <= available as f64 / 1.3 {
+            self.export_warned = None;
+            return true;
+        }
+        if need > total {
+            self.export_warned = None;
+            self.log(format!(
+                "export not started: it would hold about {} at once, this machine has {} in all",
+                memory_text(need),
+                memory_text(total)
+            ));
+            return false;
+        }
+        if self.export_warned == Some(need) {
+            self.export_warned = None;
+            return true;
+        }
+        self.export_warned = Some(need);
+        self.log(format!(
+            "export would hold about {} at once; {} is free. Export again to go ahead",
+            memory_text(need),
+            memory_text(available)
+        ));
+        false
     }
 
     /// The 1:1 box, as wide as this panel. Print pixels after the size

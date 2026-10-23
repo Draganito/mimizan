@@ -273,6 +273,13 @@ pub struct PrintOutput {
 
 /// Full print rendering in memory.
 pub fn render(neg_path: &Path, p: &PrintParams) -> Result<PrintOutput> {
+    render_within(neg_path, p, None)
+}
+
+/// `render`, refused before any print plane is allocated when
+/// `memory_estimate` exceeds `budget` bytes. The caller knows the machine;
+/// this crate does not.
+pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> Result<PrintOutput> {
     let t = Instant::now();
     let neg = read_gray(neg_path)?;
     let src_desc = neg.description.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
@@ -280,6 +287,17 @@ pub fn render(neg_path: &Path, p: &PrintParams) -> Result<PrintOutput> {
         "negative {}x{} {} bit, orientation {}",
         neg.plane.width, neg.plane.height, neg.bits, neg.orientation
     );
+    let need = memory_estimate(neg.plane.width, neg.plane.height, neg.orientation, p);
+    info!("print holds about {} at its widest", memory_text(need));
+    if let Some(limit) = budget {
+        if need > limit {
+            return Err(Error::Invalid(format!(
+                "the print would hold about {} at once and the machine has {}; a smaller size or dpi",
+                memory_text(need),
+                memory_text(limit)
+            )));
+        }
+    }
 
     let mut mask: Option<Plane> = None;
     if p.use_mask && p.sharpens() {
@@ -444,6 +462,56 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
         enlargement,
         resample_sigma_px: enlargement_px,
         usm_radius_px: radius_px(p.usm_k, viewing_mm, r.dpi),
+    }
+}
+
+/// Bytes `render_planes` holds at its widest point for a negative of `w×h`
+/// (before orientation): the live f64 planes of the stage that keeps the
+/// most, plus the 16-bit copy the writer makes. The source plane the
+/// caller already owns is not counted. A guide for refusing an export the
+/// machine cannot hold, good to about a fifth; the allocator and the order
+/// in which planes drop are what it does not see.
+pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
+    let r = &p.recipe;
+    let lay = layout(w, h, orientation, p);
+    let (fw, fh) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
+    let (_, _, cw, ch) = source_window(fw, fh, r.crop);
+    let full = fw as f64 * fh as f64;
+    let n = cw as f64 * ch as f64;
+    let picture = lay.image_w as f64 * lay.image_h as f64;
+    let sheet = lay.out_w as f64 * lay.out_h as f64;
+    // The mask walks beside the picture through orient, crop, resize and
+    // the frame, doubling those stages.
+    let m = if p.sharpens() { 2.0 } else { 1.0 };
+    // Orientation copy, then the crop window beside it.
+    let orient = m * (full + n);
+    // Separable resize: source, the smaller intermediate, destination.
+    let mid = (ch as f64 * lay.image_w as f64).min(cw as f64 * lay.image_h as f64);
+    let resize =
+        if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
+    // The picture and the sheet it is copied into; no rings, no copy.
+    let frame = if lay.border_px + lay.black_px > 0 { m * picture + sheet } else { 0.0 };
+    // Picture cut out, blur scratch, blur, result; Richardson–Lucy keeps
+    // estimate, blurred, ratio and correction as well.
+    let peak = if r.peak.applies() { sheet + 4.0 * picture } else { 0.0 };
+    let sharpen = if p.sharpens() && lay.resample_sigma_px > 0.0 {
+        let planes = if r.sharpen.deconv_passes() > 0 { 7.0 } else { 5.0 };
+        sheet + planes * picture
+    } else {
+        0.0
+    };
+    let widest = [orient, resize, frame, peak, sharpen].into_iter().fold(0.0, f64::max);
+    let bytes = 8.0 * widest + 2.0 * sheet;
+    bytes.min(u64::MAX as f64) as u64
+}
+
+/// Bytes as a short figure: `640 MB`, `27.3 GB`.
+pub fn memory_text(bytes: u64) -> String {
+    let gb = bytes as f64 / 1e9;
+    if gb >= 1.0 {
+        format!("{gb:.1} GB")
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
     }
 }
 
@@ -981,6 +1049,30 @@ mod tests {
         assert!(PrintSize::parse("1000x10in").is_err());
         assert!(PrintSize::parse("2048px").is_err());
         assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
+    }
+
+    #[test]
+    fn memory_estimate_follows_the_sheet() {
+        // 3 x 2 m at 300 dpi from a 24 MP negative, peak on: the sheet is
+        // 837 MP, and the widest stage holds it beside four picture planes.
+        let mut recipe = Recipe::on_paper();
+        recipe.size = Some(PrintSize::parse("300x200cm").unwrap());
+        recipe.dpi = 300.0;
+        recipe.peak.on = true;
+        recipe.peak.amount = 1.15;
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(6000, 4000, 1, &p);
+        let sheet = (lay.out_w * lay.out_h) as f64;
+        let need = memory_estimate(6000, 4000, 1, &p) as f64;
+        assert!(need >= 8.0 * 5.0 * sheet * 0.9, "{need} vs sheet {sheet}");
+        assert!(need <= 8.0 * 5.0 * sheet * 1.2 + 2.0 * sheet, "{need} vs sheet {sheet}");
+        assert!(need > 25e9 && need < 40e9, "{}", memory_text(need as u64));
+        // Native size without peak: a few copies of the negative itself.
+        let native = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let small = memory_estimate(6000, 4000, 1, &native);
+        assert!(small < 24_000_000 * 8 * 4, "{small}");
+        assert_eq!(memory_text(640_000_000), "640 MB");
+        assert_eq!(memory_text(27_300_000_000), "27.3 GB");
     }
 
     #[test]

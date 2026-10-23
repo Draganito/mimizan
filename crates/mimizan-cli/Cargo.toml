@@ -21,6 +21,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc = "0.1.52"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [lints.clippy]
 all = "warn"
