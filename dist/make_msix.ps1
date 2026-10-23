@@ -112,8 +112,11 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') {
 $PackageVersion = "$Version.0"
 Write-Host "==> version $PackageVersion"
 
-& $Cli measure synth --scene wedge --size 256 | Out-Null
+# Smoke test: the synthetic bench must run without any input files and
+# report finite numbers (512 is the smallest size the wedge insets allow).
+$Smoke = & $Cli measure synth --scene wedge --size 512 --json | Out-String
 if ($LASTEXITCODE -ne 0) { throw "ERROR: measure synth failed" }
+if ($Smoke -match '"rmse[a-z_]*":\s*(null|"?NaN"?)') { throw "ERROR: measure synth reported NaN" }
 
 $MakeAppx = Find-SdkTool "makeappx.exe"
 $SignTool = Find-SdkTool "signtool.exe"

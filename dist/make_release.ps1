@@ -46,8 +46,11 @@ $Version = ($versionLine -split "\s+", 2)[1]
 if (-not $Version) { throw "ERROR: could not read version from: $versionLine" }
 Write-Host "==> version $Version"
 
-& $Cli measure synth --scene wedge --size 256 | Out-Null
+# Smoke test: the synthetic bench must run without any input files and
+# report finite numbers (512 is the smallest size the wedge insets allow).
+$Smoke = & $Cli measure synth --scene wedge --size 512 --json | Out-String
 if ($LASTEXITCODE -ne 0) { throw "ERROR: measure synth failed" }
+if ($Smoke -match '"rmse[a-z_]*":\s*(null|"?NaN"?)') { throw "ERROR: measure synth reported NaN" }
 
 $Name = "mimizan-$Version-x86_64-windows"
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("mimizan-" + [guid]::NewGuid().ToString("n"))

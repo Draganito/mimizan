@@ -38,7 +38,12 @@ VERSION=$("$CLI" --version | awk '{print $2}')
 [[ -n "$VERSION" ]] || { echo "ERROR: could not read version"; exit 1; }
 echo "==> version $VERSION"
 
-"$CLI" measure synth --scene wedge --size 256 >/dev/null || { echo "ERROR: measure synth failed"; exit 1; }
+# Smoke test: the synthetic bench must run without any input files and
+# report finite numbers (512 is the smallest size the wedge insets allow).
+SMOKE=$("$CLI" measure synth --scene wedge --size 512 --json) || { echo "ERROR: measure synth failed"; exit 1; }
+if grep -qiE '"rmse[a-z_]*":\s*(null|"?NaN"?)' <<<"$SMOKE"; then
+    echo "ERROR: measure synth reported NaN"; exit 1
+fi
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
