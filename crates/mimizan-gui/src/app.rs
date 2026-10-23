@@ -2380,22 +2380,28 @@ impl App {
                 .on_hover_text("Fit into a paper size at the dpi");
         });
         self.size_mode = mode;
-        match mode {
-            SizeMode::Paper => {
-                // Entering paper with no size yet. The struct default 30×40 is a
-                // loose box, so the first time takes 40 cm on the long side;
-                // coming back keeps the picture the fields already show.
-                if self.edit.recipe.size.is_none() && self.export_size().0 > 0 {
-                    if self.paper_cm == [30.0, 40.0] {
-                        self.set_long_edge_cm(40.0);
-                    } else {
-                        self.apply_picture(PictureSide::Width);
-                    }
+        // The centimetre row stays in both modes, so the lines under it do not
+        // jump when native and paper trade places.
+        if mode == SizeMode::Paper {
+            // Entering paper with no size yet. The struct default 30×40 is a
+            // loose box, so the first time takes 40 cm on the long side;
+            // coming back keeps the picture the fields already show.
+            if self.edit.recipe.size.is_none() && self.export_size().0 > 0 {
+                if self.paper_cm == [30.0, 40.0] {
+                    self.set_long_edge_cm(40.0);
+                } else {
+                    self.apply_picture(PictureSide::Width);
                 }
-                let dpi_before = self.edit.recipe.dpi;
-                let (width_changed, height_changed) = ui
-                    .horizontal(|ui| {
-                        print_field_label(ui, "");
+            }
+        } else {
+            self.edit.recipe.size = None;
+        }
+        let dpi_before = self.edit.recipe.dpi;
+        let (width_changed, height_changed) = ui
+            .horizontal(|ui| {
+                print_field_label(ui, "");
+                match self.size_mode {
+                    SizeMode::Paper => {
                         let width = ui
                             .add(
                                 egui::DragValue::new(&mut self.paper_cm[0])
@@ -2420,42 +2426,59 @@ impl App {
                                 "Height of the picture. The width follows the negative, one scale for both sides. The black edge and the white border are added around this.",
                             );
                         (width.changed(), height.changed())
-                    })
-                    .inner;
-                let dpi_changed = ui
-                    .horizontal(|ui| {
-                        print_field_label(ui, "dpi");
-                        ui.add(
-                            egui::DragValue::new(&mut self.edit.recipe.dpi)
-                                .range(36.0..=1200.0)
-                                .speed(1.0)
-                                .suffix(" dpi"),
+                    }
+                    SizeMode::Native => {
+                        let mut cm = self.picture_cm().unwrap_or([0.0, 0.0]);
+                        let hover = "The picture at this dpi, in centimetres. Paper is where the size is set.";
+                        ui.add_enabled(
+                            false,
+                            egui::DragValue::new(&mut cm[0])
+                                .range(0.0..=2000.0)
+                                .fixed_decimals(1)
+                                .suffix(" cm"),
                         )
-                        .changed()
-                    })
-                    .inner;
-                if width_changed {
-                    self.apply_picture(PictureSide::Width);
-                } else if height_changed {
-                    self.apply_picture(PictureSide::Height);
-                } else if dpi_changed && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
-                    self.apply_picture(PictureSide::Width);
-                } else if let Some(cm) = self.picture_cm() {
-                    self.paper_cm = cm;
+                        .on_disabled_hover_text(hover);
+                        ui.label("×");
+                        ui.add_enabled(
+                            false,
+                            egui::DragValue::new(&mut cm[1])
+                                .range(0.0..=2000.0)
+                                .fixed_decimals(1)
+                                .suffix(" cm"),
+                        )
+                        .on_disabled_hover_text(hover);
+                        (false, false)
+                    }
                 }
-            }
-            SizeMode::Native => {
-                self.edit.recipe.size = None;
-                ui.horizontal(|ui| {
-                    print_field_label(ui, "dpi");
-                    ui.add(
-                        egui::DragValue::new(&mut self.edit.recipe.dpi)
-                            .range(36.0..=1200.0)
-                            .speed(1.0)
-                            .suffix(" dpi"),
-                    )
-                    .on_hover_text("Written into the TIFF. These pixels print at this size.");
-                });
+            })
+            .inner;
+        let dpi_changed = ui
+            .horizontal(|ui| {
+                print_field_label(ui, "dpi");
+                let response = ui.add(
+                    egui::DragValue::new(&mut self.edit.recipe.dpi)
+                        .range(36.0..=1200.0)
+                        .speed(1.0)
+                        .suffix(" dpi"),
+                );
+                if self.size_mode == SizeMode::Native {
+                    response
+                        .on_hover_text("Written into the TIFF. These pixels print at this size.")
+                        .changed()
+                } else {
+                    response.changed()
+                }
+            })
+            .inner;
+        if self.size_mode == SizeMode::Paper {
+            if width_changed {
+                self.apply_picture(PictureSide::Width);
+            } else if height_changed {
+                self.apply_picture(PictureSide::Height);
+            } else if dpi_changed && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
+                self.apply_picture(PictureSide::Width);
+            } else if let Some(cm) = self.picture_cm() {
+                self.paper_cm = cm;
             }
         }
         self.print_sheet_line(ui);
@@ -2733,26 +2756,29 @@ impl App {
         }
     }
 
-    /// Radius, amount and the checkbox, directly above Export. The fields
-    /// stay editable while the checkbox is off. The tile and the TIFF
-    /// sharpen only while it is on.
+    /// High-pass controls, directly above Export. The method and the
+    /// automatic measurement are on the panel, not only in a hover. Radius
+    /// and amount share a row. The fields stay editable while the checkbox
+    /// is off. The tile and the TIFF sharpen only while it is on.
     fn peak_controls(&mut self, ui: &mut egui::Ui) {
         let has = self.session.is_some();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "sharpen");
             let mut on = self.edit.recipe.peak.on;
             let response = ui
                 .add_enabled(has, egui::Checkbox::new(&mut on, ""))
-                .on_hover_text("Sharpen this print. The tile and the TIFF use the radius and the amount. Off leaves both as they were.");
+                .on_hover_text(
+                    "Sharpen this print. The tile and the TIFF use the radius and the amount. Off leaves both as they were.",
+                );
             if response.changed() {
                 self.edit.recipe.peak.on = on;
             }
-            if self.peak_measure.is_some() {
-                ui.label(RichText::new("measuring").weak());
-            }
+            ui.label("high-pass").on_hover_text(
+                "High-pass sharpening: the print plus an amount of itself minus a Gaussian blur. The radius is that blur.",
+            );
         });
         let scale = self.peak_scale();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "radius");
             let mut shown = self.edit.recipe.peak.radius * scale;
             let response = ui
@@ -2768,7 +2794,7 @@ impl App {
                         .suffix(" px"),
                 )
                 .on_hover_text(
-                    "Gaussian radius in print pixels. Peak measures it on the negative. An enlargement multiplies it; the amount stays.",
+                    "Radius of the Gaussian blur, in print pixels. An enlargement multiplies it; the amount stays.",
                 );
             if response.changed() {
                 let stored = (shown / scale)
@@ -2778,9 +2804,7 @@ impl App {
                     self.peak_held = true;
                 }
             }
-        });
-        ui.horizontal(|ui| {
-            print_field_label(ui, "amount");
+            ui.label(RichText::new("amount").weak());
             let response = ui
                 .add_enabled(
                     has,
@@ -2819,14 +2843,19 @@ impl App {
         }
     }
 
-    /// Put the measured radius and amount back. The checkbox stays.
+    /// The measurement is named on the row, and reset returns to it.
+    /// The checkbox stays.
     fn peak_reset_row(&mut self, ui: &mut egui::Ui, has: bool) {
-        ui.horizontal(|ui| {
+        let status = if self.peak_measure.is_some() { "measuring" } else { "measured automatically" };
+        ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "");
+            ui.label(RichText::new(status).weak()).on_hover_text(
+                "An algorithm measured the radius and the amount on this negative. Reset returns to those values.",
+            );
             let ready = has && self.peak_measured.is_some() && !self.peak_at_measured();
             let response = ui
                 .add_enabled(ready, egui::Button::new("reset"))
-                .on_hover_text("Back to the radius and amount Peak measured. The checkbox stays as it is.")
+                .on_hover_text("Back to the radius and amount the algorithm measured. The checkbox stays as it is.")
                 .on_disabled_hover_text(self.peak_reset_hint(has));
             if response.clicked() {
                 if let Some((radius, amount)) = self.peak_measured {
