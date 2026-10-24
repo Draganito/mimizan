@@ -287,6 +287,7 @@ Two kernel sets are used:
 | fixed estimator (4.2) | 0.15 | 0.05 | 60 dB | 5.65 | 73 |
 | chroma core (Appendix A) | 0.05 | 0.05 | 60 dB | 5.65 | 37 |
 | directional estimator (4.3–4.4) | 0.15 / 0.30 / 0.25 | 0.15 | 40 dB | 3.40 | 15 |
+| base band of the tensor (4.3) | 0.30 | 0.15 | 40 dB | 3.40 | 15 |
 
 The separable product has a *square* pass band ($|f_x| < f_c$ and
 $|f_y| < f_c$). For $f_c = 0.15$ the corners lie at 0.21 c/px, inside the
@@ -344,10 +345,11 @@ chrominance is in both, the excess is luminance.
 **Base-band orientation.** The energy ratio fails where the chrominance
 itself is strong: both copies carry it, $w_H \to 0.5$, and the contaminated
 copy gets half the weight exactly at a coloured edge, where the leak is
-largest. Measured on the lens-like set (§8.2): a neutral copy of each
-picture separates at 57.3 dB, a flat-luminance copy with the picture's
-chrominance at 57.6 dB, the picture itself at 51.7 dB — 2.7 dB below the
-sum of the two error powers; the interaction, not either part, is the gap.
+largest. Measured with the 0.11 estimator on the lens-like set (§8.5): a
+neutral copy of each picture separates at 57.3 dB, a flat-luminance copy
+with the picture's chrominance at 61.2 dB, the picture itself at 50.2 dB —
+5.6 dB below what the sum of the two error powers would give (55.8 dB);
+the interaction, not either part, is the gap.
 The base band of the mosaic is free of chrominance below the transition
 band and carries the orientation of the luminance whatever the colour. With
 $b = \mathrm{LP}_{t,x}\mathrm{LP}_{t,y}\, m$ the square low-pass of the
@@ -366,8 +368,9 @@ $$ w_H = \frac{e_b\, t^{\beta}}{e_a\, (1-t)^{\beta} + e_b\, t^{\beta}}, \qquad \
 
 (0.5 where the denominator is $\le 10^{-18}$). Where the base band is flat
 the factor is 1 on both sides and Dubois' weight is unchanged; on a neutral
-picture and on a flat-luminance picture the figures of §8.2 move by less
-than 0.05 dB, the gain is the interaction case only. Second differences
+picture and on a flat-luminance picture the figures of §8.5 move by less
+than 0.1 dB (57.30 → 57.33, 61.19 → 61.13), the gain is the interaction
+case only. Second differences
 were chosen over first (+0.1 dB) because they weight the upper half of the
 base band, where the leak originates; `tensor_power` = 0 reproduces the
 0.11 estimator. The same weight picks the
@@ -387,10 +390,15 @@ at $(0, 0.5)$ both want to be wide along the same line $v = 0.5$ and meet at
 $u = 0.25$; with the 0.15 transition they overlap from 0.35 on (measured
 dip at 0.40). Hence `wide` = 0.30 and not more.
 
-Properties verified by unit tests: a flat colour field separates exactly
-(`flat_colour_is_exact`); a neutral vertical line pattern at 0.42 c/px
-survives with under 10 % of the error of the fixed estimator
-(`neutral_vertical_lines_survive`).
+Properties verified by unit tests, each with and without the tensor: a
+flat colour field separates exactly (`flat_colour_is_exact`); a neutral
+vertical line pattern at 0.42 c/px survives with under 10 % of the error
+of the fixed estimator (`neutral_vertical_lines_survive`); a sharp colour
+edge under flat luminance separates the same with and without the tensor
+to within 2·10⁻³ (`flat_luminance_ignores_the_tensor`); a coloured
+horizontal line pattern at 0.38 c/px, where both copies carry strong
+chrominance and the leak sits in copy b, separates with under 70 % of the
+0.11 error (`oriented_colour_edges_gain_from_the_tensor`).
 
 ### 4.4 The coherence ring
 
@@ -424,7 +432,8 @@ $$ \hat C_1 := \hat C_1 + \kappa\,\big(\mathrm{LP}_{r,x}\mathrm{LP}_{r,y}(\varep
 `ring_wide` = 0.25 is the only working value: 0.30 loses in every
 condition (same overlap argument as above), 0.20 lies inside the transition
 band of the narrow filter and measures nothing. `ring_wide` = 0 switches the
-step off and reproduces the 0.2.0 result.
+step off, together with the clean copy's ring below; with `tensor_power` =
+0 as well it reproduces the 0.2.0 result.
 
 **The clean copy's ring.** At an oriented coloured edge the contaminated
 copy's ring carries leak, $\kappa$ drops, and the clean copy loses chroma
@@ -465,11 +474,12 @@ lens-like peaks at 0.5, the band-limited and real conditions keep rising to
 | `tensor_power` | 0.5 | exponent $\beta$ of the orientation in $w_H$; 0 = the 0.11 weight |
 | `ring_tensor` | 0.5 | $\gamma$ of the clean copy's ring opening; 0 = off |
 
-Cost on a 24.4-MP file (Ryzen 7 5700U, 16 threads, f64): separation 2.17 s
-without the tensor (1.12 s without the ring, 0.75 s for the fixed
-estimator), 3.3 s from file to TIFF; the tensor adds one separable low-pass
-of the mosaic and two Gaussian passes. Peak eleven full f64 planes
-including the mosaic (2.2 GB), ten without the tensor.
+Cost on a 24.4-MP file (Ryzen 7 5700U, 16 threads, f64): separation 2.7 s
+with the default path, 3.7 s from file to TIFF; 2.17 s without the tensor
+(1.12 s without the ring, 0.75 s for the fixed estimator). The tensor is
+one separable low-pass of the mosaic, the two squared second differences
+and two Gaussian passes. Peak eleven full f64 planes including the mosaic
+(2.2 GB), ten without the tensor.
 
 ### 4.6 What the linear path guarantees
 
@@ -497,10 +507,13 @@ measured estimates, and where the base band is flat it is silent. Hence:
 
 The library, the command and, since 0.12, the desktop program leave this
 step off until it is asked for (`--reconstruct`, the checkbox under
-Negative). With the base-band tensor of §4.3 the linear path is within
-0.35 dB of this step on every realistic condition of §8.3 and 2 dB above it
-at the camera's own band limit; what remains for it is pixel-sharp
-synthetic material.
+Negative). The criterion for turning it off was set before the work of
+0.12 began: the linear path had to come within 0.5 dB of what 0.11
+delivered with this step on. It came within 0.35 dB on lens-like, 0.13 dB
+at 2× and 0.31 dB on the binned Z f files, and 2 dB above it at the
+camera's own band limit (§8.3). On the new estimator the step is still
+worth 0.5–1.0 dB on the realistic conditions and costs 0.3 dB at the band
+limit; what it is decisive for is pixel-sharp synthetic material.
 
 Where luminance lies near the carriers, no linear filter can separate it
 from chrominance. Demosaicers resolve this with an assumption — colour
@@ -776,19 +789,22 @@ weights: no effect in any condition.
 
 ### 8.3 With reconstruction
 
-| Condition | linear default | **+ reconstruct** | computed share | best of 16 | at or above the best |
-|---|---|---|---|---|---|
-| pixel-sharp (24) | 37.29 | **42.13** | 50 % | LMMSE (RT) 43.09 | 0 → 2 of 24 |
-| lens-like σ 0.75 (24) | 51.59 | **52.55** | 12 % | DCB (RT) 51.47 | 9 → 23 of 24 |
-| band-limited 2× (24) | 51.83 | **52.36** | 5 % | DCB (RT) 49.13 | 24 → 24 of 24 |
-| Z f binned (4) | 41.36 | **41.98** | 11 % | RCD 42.81 | 0 → 0 of 4 |
-| Z f binned, ×2 (4) | 53.94 | 53.62 | 0.7 % | RCD 50.66 | 4 → 4 of 4 |
+| Condition | 0.11 + reconstruct (the old default) | **linear default** | + reconstruct | computed share | best of 16 | at or above the best |
+|---|---|---|---|---|---|---|
+| pixel-sharp (24) | 42.04 | **37.29** | 42.13 | 50 % | LMMSE (RT) 43.09 | 0 → 2 of 24 |
+| lens-like σ 0.75 (24) | 51.93 | **51.59** | 52.55 | 12 % | DCB (RT) 51.47 | 9 → 23 of 24 |
+| band-limited 2× (24) | 51.96 | **51.83** | 52.36 | 5 % | DCB (RT) 49.13 | 24 → 24 of 24 |
+| Z f binned (4) | 41.67 | **41.36** | 41.98 | 11 % | RCD 42.81 | 0 → 0 of 4 |
+| Z f binned, ×2 (4) | 51.91 | **53.94** | 53.62 | 0.7 % | RCD 50.66 | 4 → 4 of 4 |
 
-$\beta = 0$ reproduces the linear default bit for bit. With the 0.11
-estimator the step was worth 1.3–5.5 dB; with the tensor it is worth
-0.5–1.0 dB on the realistic conditions and costs 0.3 dB at the camera's own
-band limit, where it is nearly inactive (0.7 %) and its estimator only adds
-error — the reason it is off by default since 0.12. On the real files at
+$\beta = 0$ reproduces the linear default bit for bit. The first column
+is what the desktop program of 0.11 wrote: its estimator with the step on.
+The linear path of 0.12 is within 0.35 dB of it on every realistic
+condition and 2 dB above it at the camera's own band limit, which is why
+the step is off by default since 0.12. With the 0.11 estimator the step
+was worth 1.3–5.5 dB; with the tensor it is worth 0.5–1.0 dB on the
+realistic conditions and costs 0.3 dB at the band limit, where it is
+nearly inactive (0.7 %) and its estimator only adds error. On the real files at
 twice the camera's sharpness the method stays below RCD even with
 $\beta = 1$ everywhere (0.11 subset: 38.52 vs 39.49): on real noise the
 estimator, not the detector, is the limit. Pixel-sharp is the one condition
@@ -873,9 +889,12 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
   relative to the chart's own low-frequency contrast, not absolute MTF.
 - Weighting does not change resolution or pixel-to-pixel noise; a filter
   adds band-limited chroma noise only (red filter 19–21 % σ on smooth areas).
-- Synthetic bench (`measure synth --size 1024`, RMSE/σ): star 3.77 (MTF10
-  0.447), zone plate 10.05, edge 0.90, patches 2.87, wedge 0.96, colour
-  fabric 0.86 (2.76 before the coherence ring).
+- Synthetic bench (`measure synth --size 1024`, RMSE/σ, 0.12 default):
+  star 3.96 (MTF10 0.447), zone plate 10.53, edge 0.91, patches 2.62,
+  wedge 0.94, colour fabric 0.82 (2.76 before the coherence ring). Against
+  0.11 (3.77, 10.05, 0.90, 2.87, 0.96, 0.86) the two neutral Nyquist
+  targets pay for the clean copy's ring, as §4.4 says, and the coloured
+  targets gain.
 - Determinism: results are bit-identical between 16 and 3 threads
   (`separation_is_deterministic_across_thread_counts`).
 
@@ -893,6 +912,9 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
   bit-identical to the plain reference (`fused_demodulation_matches_reference`).
 - Parallel reductions (grey world, convergence tests) are formed per row
   and added in row order.
+- The second differences of the tensor (§4.3) clamp their neighbours at
+  the frame edge ($x \pm 1$ held at 0 and $w - 1$) instead of mirroring;
+  the Gaussian passes that follow mirror as every other convolution does.
 - The defect test forms the median only for pixels outside the neighbour
   range (identical result, no per-pixel sort).
 - Allocator: mimalloc (glibc returns 200-MB blocks to the kernel at once and
@@ -906,9 +928,9 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
   pass bands; it shows as a faint periodic residue on achromatic Nyquist
   texture. The directional estimator, the coherence ring and the base-band
   tensor shrink that region; §5 fills it with an assumption and says so per
-  pixel. On neutral pictures §5 is still 2–3 dB ahead of the linear path:
-  that is the luminance inside the chroma bands, which no linear filter
-  returns.
+  pixel. On neutral copies of the lens-like set §5 is still 2.3 dB ahead
+  of the linear path (58.4 against 56.1 dB): that is the luminance inside
+  the chroma bands, which no linear filter returns.
 - On real sensor noise at the sensor's pixel count the method is 0.5–1.9 dB
   behind the best demosaicer (RCD) in luminance PSNR. The gap closes at the
   camera's own band limit (lens plus AA/pixel aperture), which is the
