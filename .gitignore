@@ -8,5 +8,7 @@
 # build artefacts of dist/make_release.sh
 dist/*.deb
 dist/*.tar.gz
+# downloaded Store packages (gh run download)
+dist/store/
 # typst binary fetched by docs/make_handbook_pdf.py
 docs/.cache/
