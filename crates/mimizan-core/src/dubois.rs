@@ -13,6 +13,16 @@
 //! Where the ring between the narrow and a wider square band is coherent
 //! between the two copies, that ring is chroma (a leak is in one copy only)
 //! and the band is opened to the square wide shape (`ring_*` parameters).
+//!
+//! The energy ratio alone fails where the chroma itself is strong: both
+//! copies carry it, the ratio tends to one half, and the contaminated copy
+//! gets half the weight exactly at a coloured edge, where the leak is
+//! largest. The baseband of the mosaic (square low-pass below the carriers,
+//! chroma-free) has the orientation of the luminance independent of the
+//! chroma, so a structure tensor of it is a second factor of the weight
+//! (`tensor_*` parameters), and where it is confidently oriented the clean
+//! copy's ring is opened whatever the other ring says (`ring_tensor`).
+//!
 //! The block mask of `mask.rs` cannot do any of this: it decides per 64 px
 //! block from band/ring energy ratios, which a line pattern inside the band
 //! defeats.
@@ -52,6 +62,45 @@ pub struct DuboisParams {
     pub ring_power: f64,
     /// Also open the C1 band with the coherence.
     pub ring_c1: bool,
+    /// Exponent β of the baseband orientation in the hypothesis weight:
+    /// `w_H ∝ e_b · t^β`, `w_V ∝ e_a · (1 − t)^β` with
+    /// `t = J_yy / (J_xx + J_yy)` the share of vertical second differences
+    /// in the structure tensor of the baseband. 0 leaves Dubois' weight
+    /// (the 0.11 behaviour).
+    #[serde(default = "DuboisParams::default_tensor_power")]
+    pub tensor_power: f64,
+    /// Square band (c/px) of the baseband the tensor is taken from.
+    #[serde(default = "DuboisParams::default_tensor_band")]
+    pub tensor_band: f64,
+    /// Gaussian σ (px) of the tensor window.
+    #[serde(default = "DuboisParams::default_tensor_sigma")]
+    pub tensor_sigma: f64,
+    /// Where the baseband is oriented, the clean copy's ring is chroma
+    /// whatever the other copy's ring says: its gain is raised by
+    /// `min(1, γ |2t − 1|)` times that copy's weight. 0 = off.
+    #[serde(default = "DuboisParams::default_ring_tensor")]
+    pub ring_tensor: f64,
+}
+
+impl DuboisParams {
+    fn default_tensor_power() -> f64 {
+        0.5
+    }
+    fn default_tensor_band() -> f64 {
+        0.30
+    }
+    fn default_tensor_sigma() -> f64 {
+        2.0
+    }
+    fn default_ring_tensor() -> f64 {
+        0.5
+    }
+
+    /// The 0.11 estimator: Dubois' energy weight and the coherence ring,
+    /// without the baseband tensor.
+    pub fn without_tensor() -> Self {
+        Self { tensor_power: 0.0, ring_tensor: 0.0, ..Self::default() }
+    }
 }
 
 impl Default for DuboisParams {
@@ -67,6 +116,10 @@ impl Default for DuboisParams {
             ring_wide: 0.25,
             ring_power: 2.0,
             ring_c1: true,
+            tensor_power: Self::default_tensor_power(),
+            tensor_band: Self::default_tensor_band(),
+            tensor_sigma: Self::default_tensor_sigma(),
+            ring_tensor: Self::default_ring_tensor(),
         }
     }
 }
@@ -83,6 +136,9 @@ struct Kernels {
     kr: Option<Vec<f64>>,
     /// Gaussian of the local energy.
     g: Vec<f64>,
+    /// Baseband low-pass and Gaussian window of the structure tensor;
+    /// `None` when neither tensor term is used.
+    tensor: Option<(Vec<f64>, Vec<f64>)>,
 }
 
 /// Separable low-pass of `p` in place; `scratch` holds the row pass.
@@ -112,13 +168,50 @@ fn open_in_place(base: &mut Plane, wide: &Plane, kappa: &Plane) {
     base.data.par_iter_mut().zip(&wide.data).zip(&kappa.data).for_each(|((b, w), k)| *b += k * (w - *b));
 }
 
+/// Orientation of the baseband: `t = J_yy / (J_xx + J_yy)` per pixel, the
+/// share of vertical second differences in the Gaussian-windowed structure
+/// tensor of the square low-passed mosaic. 0.5 where the baseband is flat
+/// or isotropic, 1 for horizontal structure (hypothesis H), 0 for vertical.
+/// Four planes at its own peak (mosaic, scratch, J_xx, J_yy); returns one.
+fn orientation(m: &Plane, kb: &[f64], g: &[f64], scratch: &mut Plane) -> Plane {
+    let (w, h) = (m.width, m.height);
+    let mut base = m.clone();
+    lowpass_in_place(&mut base, kb, scratch);
+    let mut jxx = Plane::zeros(w, h);
+    let mut jyy = Plane::zeros(w, h);
+    jxx.data.par_chunks_mut(w).zip(jyy.data.par_chunks_mut(w)).enumerate().for_each(|(y, (rx, ry))| {
+        let (ym, yp) = (y.saturating_sub(1), (y + 1).min(h - 1));
+        let (rm, r0, rp) = (base.row(ym), base.row(y), base.row(yp));
+        for x in 0..w {
+            let (xm, xp) = (x.saturating_sub(1), (x + 1).min(w - 1));
+            let gx = r0[xp] - 2.0 * r0[x] + r0[xm];
+            let gy = rp[x] - 2.0 * r0[x] + rm[x];
+            rx[x] = gx * gx;
+            ry[x] = gy * gy;
+        }
+    });
+    drop(base);
+    lowpass_in_place(&mut jxx, g, scratch);
+    lowpass_in_place(&mut jyy, g, scratch);
+    jyy.data.par_iter_mut().zip(&jxx.data).for_each(|(yy, xx)| {
+        let t = *yy + xx;
+        *yy = if t > 1e-18 { *yy / t } else { 0.5 };
+    });
+    jyy
+}
+
 /// The estimation: returns `(c1, c2)`. Planes are dropped as early as the
-/// data flow allows and the low-passes run in place; the peak is ten full
-/// planes (mosaic included) with the coherence step, seven without.
+/// data flow allows and the low-passes run in place; the peak is eleven
+/// full planes (mosaic included) with the coherence step and the tensor,
+/// ten without the tensor, seven without either.
 fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Plane, Plane) {
     let c = phase.carriers();
     let (w, h) = (m.width, m.height);
     let mut row = Plane::zeros(w, h);
+
+    // Orientation of the chroma-free baseband, before the copies: its own
+    // peak lies below the later one.
+    let orient = k.tensor.as_ref().map(|(kb, g)| orientation(m, kb, g, &mut row));
 
     // Hypothesis H (horizontal structure, spectrum along v): copy a at
     // (0.5, 0) is clean; bands narrow in u, wide in v. Hypothesis V
@@ -131,21 +224,35 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
     convolve_rows_mod_into(m, &k.kw, |_, _| 1.0, &mut row);
     let mut c2b = convolve_cols_signed(&row, &k.kn, |y| c.b * sign_x(y));
 
-    // Weight of hypothesis H (copy a) is the share of energy in copy b.
+    // Weight of hypothesis H (copy a) is the share of energy in copy b,
+    // times the share of horizontal structure in the baseband.
     let mut wa = c2.clone();
     local_energy_in_place(&mut wa, &k.g, &mut row);
     {
         let mut eb = c2b.clone();
         local_energy_in_place(&mut eb, &k.g, &mut row);
-        wa.data.par_iter_mut().zip(&eb.data).for_each(|(a, b)| {
-            let sum = *a + b;
-            *a = if sum > 1e-18 { b / sum } else { 0.5 };
-        });
+        match (&orient, p.tensor_power > 0.0) {
+            (Some(t), true) => {
+                let beta = p.tensor_power;
+                wa.data.par_iter_mut().zip(&eb.data).zip(&t.data).for_each(|((a, b), t)| {
+                    let (a_, b_) = (*a * (1.0 - t).powf(beta), b * t.powf(beta));
+                    let sum = a_ + b_;
+                    *a = if sum > 1e-18 { b_ / sum } else { 0.5 };
+                });
+            }
+            _ => wa.data.par_iter_mut().zip(&eb.data).for_each(|(a, b)| {
+                let sum = *a + b;
+                *a = if sum > 1e-18 { b / sum } else { 0.5 };
+            }),
+        }
     }
 
     // Coherence of the band ring between the two copies: chroma is in both,
     // luminance leak in one. kappa in [0, 1] says how far to open each band
-    // from the elongated to the square wide shape.
+    // from the elongated to the square wide shape. With the tensor, the
+    // copy the orientation declares clean is opened further, by the
+    // anisotropy scaled with that copy's weight; kappa then becomes the
+    // weighted mean of the two gains, for C1.
     let kappa = ra.map(|(kr, mut ra)| {
         convolve_rows_mod_into(m, kr, |x, _| sign_x(x), &mut row);
         let a_w = convolve_cols_signed(&row, kr, |_| c.a);
@@ -165,11 +272,39 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
             *x = if d > 1e-18 { (*x / d).clamp(0.0, 1.0).powf(p.ring_power) } else { 0.0 };
         });
         drop((ra, rb));
-        open_in_place(&mut c2, &a_w, &kappa);
-        drop(a_w);
-        open_in_place(&mut c2b, &b_w, &kappa);
+        match (&orient, p.ring_tensor > 0.0) {
+            (Some(t), true) => {
+                let gamma = p.ring_tensor;
+                // Copy a is clean under H: scale by w_H. Copy b under V: by 1 − w_H.
+                c2.data.par_iter_mut().zip(&a_w.data).zip(&kappa.data).zip(&t.data).zip(&wa.data).for_each(
+                    |((((b, w), k), t), wa)| {
+                        let c = (gamma * (2.0 * t - 1.0).abs()).min(1.0);
+                        *b += (k + (1.0 - k) * c * wa) * (w - *b);
+                    },
+                );
+                drop(a_w);
+                c2b.data.par_iter_mut().zip(&b_w.data).zip(&kappa.data).zip(&t.data).zip(&wa.data).for_each(
+                    |((((b, w), k), t), wa)| {
+                        let c = (gamma * (2.0 * t - 1.0).abs()).min(1.0);
+                        *b += (k + (1.0 - k) * c * (1.0 - wa)) * (w - *b);
+                    },
+                );
+                // kappa := w_H g_a + (1 − w_H) g_b, the gain C1 is opened with.
+                kappa.data.par_iter_mut().zip(&t.data).zip(&wa.data).for_each(|((k, t), wa)| {
+                    let c = (gamma * (2.0 * t - 1.0).abs()).min(1.0);
+                    let (ga, gb) = (*k + (1.0 - *k) * c * wa, *k + (1.0 - *k) * c * (1.0 - wa));
+                    *k = wa * ga + (1.0 - wa) * gb;
+                });
+            }
+            _ => {
+                open_in_place(&mut c2, &a_w, &kappa);
+                drop(a_w);
+                open_in_place(&mut c2b, &b_w, &kappa);
+            }
+        }
         kappa
     });
+    drop(orient);
     blend_in_place(&mut c2, &c2b, &wa);
     drop(c2b);
 
@@ -204,6 +339,8 @@ pub fn separate_dubois(mosaic: &Mosaic, phase: BayerPhase, p: &DuboisParams) -> 
         kw: spec(p.c2_wide).kernel(),
         kr: (p.ring_wide > 0.0).then(|| spec(p.ring_wide).kernel()),
         g: gaussian_kernel(p.energy_sigma),
+        tensor: (p.tensor_power > 0.0 || (p.ring_tensor > 0.0 && p.ring_wide > 0.0))
+            .then(|| (spec(p.tensor_band).kernel(), gaussian_kernel(p.tensor_sigma))),
     };
 
     let (c1, c2) = estimate(m, phase, p, &k);
@@ -270,13 +407,58 @@ mod tests {
     fn flat_colour_is_exact() {
         let (r, g, b) = (0.6, 0.3, 0.1);
         let m = mosaic_of(192, 160, |_, _| (r, g, b));
-        let s = separate_dubois(&m, BayerPhase::RGGB, &DuboisParams::default());
-        let l = (r + 2.0 * g + b) / 4.0;
-        for y in 40..120 {
-            for x in 40..150 {
-                assert!((s.lum.at(x, y) - l).abs() < 1e-9, "{}", s.lum.at(x, y));
+        for p in [DuboisParams::default(), DuboisParams::without_tensor()] {
+            let s = separate_dubois(&m, BayerPhase::RGGB, &p);
+            let l = (r + 2.0 * g + b) / 4.0;
+            for y in 40..120 {
+                for x in 40..150 {
+                    assert!((s.lum.at(x, y) - l).abs() < 1e-9, "{}", s.lum.at(x, y));
+                }
             }
         }
+    }
+
+    /// A sharp vertical colour edge under flat luminance: the baseband is
+    /// flat (`t = 0.5` everywhere, no orientation), so the tensor terms
+    /// must leave the estimate as Dubois' weight alone gives it.
+    #[test]
+    fn flat_luminance_ignores_the_tensor() {
+        let m = mosaic_of(192, 160, |x, _| if x < 96 { (0.6, 0.3, 0.1) } else { (0.1, 0.3, 0.6) });
+        let with = separate_dubois(&m, BayerPhase::RGGB, &DuboisParams::default());
+        let without = separate_dubois(&m, BayerPhase::RGGB, &DuboisParams::without_tensor());
+        let mut worst = 0.0f64;
+        for y in 20..140 {
+            for x in 20..172 {
+                worst = worst.max((with.lum.at(x, y) - without.lum.at(x, y)).abs());
+            }
+        }
+        // The edge itself is a baseband step in R and B (the mosaic is not
+        // flat there), so a small difference near x = 96 is allowed.
+        assert!(worst < 2e-3, "{worst}");
+    }
+
+    /// A coloured horizontal line pattern near the carrier: the leak sits in
+    /// copy b, the chroma is strong in both copies, and Dubois' energy ratio
+    /// cannot tell the clean copy. The baseband orientation can; the tensor
+    /// estimate must be closer to the truth than the 0.11 one.
+    #[test]
+    fn oriented_colour_edges_gain_from_the_tensor() {
+        let (w, h) = (256, 192);
+        let f = |y: usize| 0.5 + 0.25 * (2.0 * std::f64::consts::PI * 0.38 * y as f64).cos();
+        let m = mosaic_of(w, h, |_, y| (0.8 * f(y), 0.5 * f(y), 0.2 * f(y)));
+        let truth = |y: usize| (0.8 + 1.0 + 0.2) / 4.0 * f(y);
+        let err = |p: &DuboisParams| {
+            let s = separate_dubois(&m, BayerPhase::RGGB, p);
+            let mut e = 0.0;
+            for y in 32..h - 32 {
+                for x in 32..w - 32 {
+                    e += (s.lum.at(x, y) - truth(y)).powi(2);
+                }
+            }
+            (e / ((h - 64) * (w - 64)) as f64).sqrt()
+        };
+        let (e_t, e_0) = (err(&DuboisParams::default()), err(&DuboisParams::without_tensor()));
+        assert!(e_t < 0.7 * e_0, "tensor {e_t} without {e_0}");
     }
 
     /// A neutral vertical line pattern near Nyquist is luminance; the fixed
@@ -286,7 +468,6 @@ mod tests {
         let (w, h) = (256, 128);
         let f = |x: usize| 0.5 + 0.3 * (2.0 * std::f64::consts::PI * 0.42 * x as f64).cos();
         let m = mosaic_of(w, h, |x, _| (f(x), f(x), f(x)));
-        let s = separate_dubois(&m, BayerPhase::RGGB, &DuboisParams::default());
         let fixed = crate::separate::separate(
             &m,
             &crate::separate::SeparateParams { mask: crate::separate::MaskMode::Off, ..Default::default() },
@@ -301,7 +482,11 @@ mod tests {
             }
             (e / ((h - 64) * (w - 64)) as f64).sqrt()
         };
-        let (e_d, e_f) = (err(&s.lum), err(&fixed.lum));
-        assert!(e_d < 0.1 * e_f, "dubois {e_d} fixed {e_f}");
+        let e_f = err(&fixed.lum);
+        for p in [DuboisParams::default(), DuboisParams::without_tensor()] {
+            let s = separate_dubois(&m, BayerPhase::RGGB, &p);
+            let e_d = err(&s.lum);
+            assert!(e_d < 0.1 * e_f, "dubois {e_d} fixed {e_f}");
+        }
     }
 }

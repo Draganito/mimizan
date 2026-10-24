@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.10.8
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.12.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
@@ -20,8 +20,11 @@ weighted sum of measured sensor values with weights that do not depend on
 the picture content at that pixel, so there is no interpolation, no
 directional guess and no zipper. The chrominance estimate is made directional
 by a two-hypothesis scheme after Dubois (2005), extended here to both
-chrominance components and to a coherence test between the two carrier copies
-that opens the chroma band wherever it demonstrably carries no luminance.
+chrominance components, to a coherence test between the two carrier copies
+that opens the chroma band wherever it demonstrably carries no luminance,
+and to a structure tensor of the chroma-free base band that decides the
+orientation where the chrominance itself is too strong for the energy ratio
+to decide it.
 The weighting of the three colour responses (the "mix" — panchromatic,
 filter emulation, or a fitted copy of a monochrome sensor) is applied after
 separation and is band-limited, so resolution and grain are those of the
@@ -29,9 +32,11 @@ luminance estimate for every mix. An optional nonlinear step reconstructs
 the last octave where luminance provably overlaps the carriers, and records
 per pixel how much of the result was computed rather than measured. On a
 24-picture Kodak benchmark re-mosaicked at lens-like sharpness the linear
-default reaches 50.2 dB luminance PSNR against 50.6 dB for the best
-demosaicer (RCD); band-limited at 2× it reaches 50.8 dB against 48.9 dB; with
-the nonlinear step 51.9 dB and 52.0 dB. The whole method, including every
+default reaches 51.6 dB luminance PSNR against 51.5 dB for the best of
+sixteen demosaicers (DCB, RawTherapee); band-limited at 2× it reaches
+51.8 dB against 49.1 dB; on four Nikon Z f files at the camera's own band
+limit 53.9 dB against 50.7 dB (RCD); with the nonlinear step 52.6, 52.4 and
+53.6 dB. The whole method, including every
 constant, is given here so that it can be re-implemented without access to
 the source.
 
@@ -57,7 +62,7 @@ $$ m(x,y) = L(x,y) + \text{(chrominance)} \times \text{(carriers at Nyquist)} , 
 so luminance is base band and the only thing that stands between the mosaic
 and a monochrome picture is the chrominance on its carriers. Estimating the
 chrominance well is a problem of two-dimensional low-pass filter design, not
-of interpolation. Mimizan implements exactly that, with three additions that
+of interpolation. Mimizan implements exactly that, with four additions that
 the measurements of §8 forced:
 
 1. the separation runs on *white-balanced* photosites, so that neutral
@@ -68,9 +73,13 @@ the measurements of §8 forced:
    orientation of structure and the two are combined by local energy;
 3. a *coherence test* between the two carrier copies of the red-blue
    chrominance opens the chroma pass band wherever both copies agree, since
-   luminance leakage can only ever reach one of them.
+   luminance leakage can only ever reach one of them;
+4. a *structure tensor* of the base band, which is free of chrominance,
+   supplies the orientation where the energy ratio of (2) cannot: at a
+   coloured edge both copies carry the chrominance and the ratio tends to
+   one half exactly where the leak is largest.
 
-An optional fourth step (§5) leaves the linear world: where the linear
+An optional fifth step (§5) leaves the linear world: where the linear
 luminance still carries energy near the carriers, a directional LMMSE
 estimator of the Zhang–Wu family computes the missing samples, and the
 result is blended in with a per-pixel weight that is written to the output.
@@ -330,7 +339,38 @@ $$ e_a = G_\sigma * \hat C_{2a}^2, \qquad e_b = G_\sigma * \hat C_{2b}^2, \qquad
    w_H = \begin{cases} e_b / (e_a + e_b) & e_a + e_b > 10^{-18} \\ 0.5 & \text{otherwise} \end{cases} $$
 
 The copy with the *smaller* local energy is the trustworthy one: the
-chrominance is in both, the excess is luminance. The same weight picks the
+chrominance is in both, the excess is luminance.
+
+**Base-band orientation.** The energy ratio fails where the chrominance
+itself is strong: both copies carry it, $w_H \to 0.5$, and the contaminated
+copy gets half the weight exactly at a coloured edge, where the leak is
+largest. Measured on the lens-like set (§8.2): a neutral copy of each
+picture separates at 57.3 dB, a flat-luminance copy with the picture's
+chrominance at 57.6 dB, the picture itself at 51.7 dB — 2.7 dB below the
+sum of the two error powers; the interaction, not either part, is the gap.
+The base band of the mosaic is free of chrominance below the transition
+band and carries the orientation of the luminance whatever the colour. With
+$b = \mathrm{LP}_{t,x}\mathrm{LP}_{t,y}\, m$ the square low-pass of the
+mosaic at `tensor_band` = 0.30 c/px, second differences
+$\partial^2_x b = b(x+1) - 2b(x) + b(x-1)$ (likewise $\partial^2_y$), and
+$G_{\sigma_t}$ a Gaussian of $\sigma_t$ = 2 px:
+
+$$ J_{xx} = G_{\sigma_t} * (\partial^2_x b)^2, \qquad J_{yy} = G_{\sigma_t} * (\partial^2_y b)^2, \qquad
+   t = \begin{cases} J_{yy} / (J_{xx} + J_{yy}) & J_{xx} + J_{yy} > 10^{-18} \\ 0.5 & \text{otherwise} \end{cases} $$
+
+$t$ is the share of vertical second differences: 1 for horizontal
+structure (hypothesis H), 0 for vertical, 0.5 where the base band is flat
+or isotropic. It enters the weight as a second factor,
+
+$$ w_H = \frac{e_b\, t^{\beta}}{e_a\, (1-t)^{\beta} + e_b\, t^{\beta}}, \qquad \beta = 0.5 $$
+
+(0.5 where the denominator is $\le 10^{-18}$). Where the base band is flat
+the factor is 1 on both sides and Dubois' weight is unchanged; on a neutral
+picture and on a flat-luminance picture the figures of §8.2 move by less
+than 0.05 dB, the gain is the interaction case only. Second differences
+were chosen over first (+0.1 dB) because they weight the upper half of the
+base band, where the leak originates; `tensor_power` = 0 reproduces the
+0.11 estimator. The same weight picks the
 orientation of the $C_1$ band:
 
 $$ \hat C_2 = w_H\, \hat C_{2a} + (1 - w_H)\, \hat C_{2b}, \qquad
@@ -386,6 +426,26 @@ condition (same overlap argument as above), 0.20 lies inside the transition
 band of the narrow filter and measures nothing. `ring_wide` = 0 switches the
 step off and reproduces the 0.2.0 result.
 
+**The clean copy's ring.** At an oriented coloured edge the contaminated
+copy's ring carries leak, $\kappa$ drops, and the clean copy loses chroma
+bandwidth exactly where the edge needs it. Under a confident hypothesis the
+clean copy's ring is chrominance whatever the other ring says — a
+horizontal structure has no horizontal frequencies at 0.25–0.35 c/px, which
+is all copy a's ring could pick up. With the anisotropy
+$c = \min(1,\ \gamma\, |2t - 1|)$ of the tensor, $\gamma$ = `ring_tensor` = 0.5,
+each copy gets its own gain, scaled by its own weight:
+
+$$ \kappa_a = \kappa + (1 - \kappa)\, c\, w_H, \qquad \kappa_b = \kappa + (1 - \kappa)\, c\, (1 - w_H), $$
+
+$\hat C_{2a}$ is opened with $\kappa_a$, $\hat C_{2b}$ with $\kappa_b$, and
+$\hat C_1$ with $w_H \kappa_a + (1 - w_H) \kappa_b$. This step is a trade:
+on flat-luminance pictures it changes nothing, on neutral pictures it costs
+1.2 dB (a neutral oriented edge is never perfectly one-dimensional, and the
+opened ring takes some luminance with it); on the pictures the coloured
+edges outweigh that in every condition of §8.2. $\gamma$ swept 0.3–2:
+lens-like peaks at 0.5, the band-limited and real conditions keep rising to
+0.7 by 0.05–0.1 dB, 1 and 2 lose on lens-like (−0.3, −1.0).
+
 ### 4.5 Parameters of the default path
 
 | Parameter | Default | Meaning |
@@ -400,16 +460,26 @@ step off and reproduces the 0.2.0 result.
 | `ring_wide` | 0.25 c/px | square wide band of the coherence ring; 0 = off |
 | `ring_power` | 2 | exponent on $\kappa$ |
 | `ring_c1` | true | open $C_1$ with $\kappa$ too |
+| `tensor_band` | 0.30 c/px | square band of the base band the tensor reads |
+| `tensor_sigma` | 2 px | Gaussian window of the tensor |
+| `tensor_power` | 0.5 | exponent $\beta$ of the orientation in $w_H$; 0 = the 0.11 weight |
+| `ring_tensor` | 0.5 | $\gamma$ of the clean copy's ring opening; 0 = off |
 
 Cost on a 24.4-MP file (Ryzen 7 5700U, 16 threads, f64): separation 2.17 s
-(1.12 s without the ring, 0.75 s for the fixed estimator), 3.3 s from file
-to TIFF; peak ten full f64 planes including the mosaic (2.0 GB).
+without the tensor (1.12 s without the ring, 0.75 s for the fixed
+estimator), 3.3 s from file to TIFF; the tensor adds one separable low-pass
+of the mosaic and two Gaussian passes. Peak eleven full f64 planes
+including the mosaic (2.2 GB), ten without the tensor.
 
 ### 4.6 What the linear path guarantees
 
 Every operation in §4 is a convolution with a fixed kernel, a per-pixel
 product, or a per-pixel convex combination of two such results with weights
-that depend on *local energy*, never on the value being estimated. Hence:
+that depend on *local energy* and on the *orientation of the base band*,
+never on the value being estimated. The orientation term is a model of the
+picture (structure is locally one-dimensional) and in that sense a step
+towards a prior; but it never produces a value, it only chooses between two
+measured estimates, and where the base band is flat it is silent. Hence:
 
 - a flat field of any colour gives a flat $\hat L$ (exact, to rounding);
 - a neutral subject gives $\hat L = m$ up to the noise the chroma filters
@@ -425,8 +495,12 @@ that depend on *local energy*, never on the value being estimated. Hence:
 
 ## 5. Nonlinear reconstruction of the last octave (`--reconstruct`)
 
-The library and the command leave this step off until `--reconstruct` is
-set. The desktop program starts with the checkbox on.
+The library, the command and, since 0.12, the desktop program leave this
+step off until it is asked for (`--reconstruct`, the checkbox under
+Negative). With the base-band tensor of §4.3 the linear path is within
+0.35 dB of this step on every realistic condition of §8.3 and 2 dB above it
+at the camera's own band limit; what remains for it is pixel-sharp
+synthetic material.
 
 Where luminance lies near the carriers, no linear filter can separate it
 from chrominance. Demosaicers resolve this with an assumption — colour
@@ -648,7 +722,12 @@ same samples go to Mimizan (`separate`, native mix) and, as a minimal CFA
 DNG (ColorMatrix1 = XYZ→sRGB, AsShotNeutral 1,1,1), to libraw 0.21 (VNG,
 PPG, AHD, DCB, DHT, AAHD) and RawTherapee 5.11 (fast, VNG4, AHD, EAHD, HPHD,
 DCB, LMMSE, IGV, AMaZE, RCD); bilinear is computed in-house. The tables
-below name the best of these per condition. Their RGB is reduced
+below name the best of these sixteen per condition. (The tables of the
+0.10 and 0.11 versions of this text compared against five of them —
+bilinear, AHD, DHT, AMaZE and RCD — and named RCD or AMaZE as the best;
+against all sixteen the best is DCB (RawTherapee) in the lens-like and 2×
+conditions and LMMSE (RawTherapee) on pixel-sharp material, 0.9, 0.25 and
+2.4 dB above the earlier figures.) Their RGB is reduced
 with $(R + 2G + B)/4$. Ground truth is the same luminance of the linear
 source. PSNR on sRGB-encoded 0..255 values, 16-px border excluded. Converter
 chains were verified on a smooth synthetic picture (every method ≥ 59 dB:
@@ -666,21 +745,22 @@ upscaled 2× ("soft", the camera's own band limit).
 
 Mean luminance PSNR (dB):
 
-| Condition | fixed (4.2) | Dubois 0.2.0 (4.3) | **+ ring (4.4), default** | best demosaicer |
-|---|---|---|---|---|
-| pixel-sharp (24) | 34.60 | 36.45 | **36.55** | AMaZE 40.72, AHD 38.71 |
-| lens-like σ 0.75 (24) | 43.95 | – | **50.21** | RCD 50.59, AMaZE 50.50 |
-| band-limited 2× (24) | 44.02 | 49.32 | **50.80** | RCD 48.88 |
-| Z f binned (4) | 37.22 | 40.29 | **40.38** | RCD 42.81, AMaZE 42.10 |
-| Z f binned, ×2 (4) | 42.61 | 48.16 | **51.92** | RCD 50.66, AMaZE 48.58 |
+| Condition | fixed (4.2) | Dubois 0.2.0 (4.3) | + ring (4.4), 0.11 | **+ tensor (4.3–4.4), default** | best of 16 demosaicers |
+|---|---|---|---|---|---|
+| pixel-sharp (24) | 34.60 | 36.45 | 36.55 | **37.29** | LMMSE (RT) 43.09, AMaZE 40.72 |
+| lens-like σ 0.75 (24) | 43.95 | – | 50.21 | **51.59** | DCB (RT) 51.47, RCD 50.59 |
+| band-limited 2× (24) | 44.02 | 49.32 | 50.80 | **51.83** | DCB (RT) 49.13, RCD 48.88 |
+| Z f binned (4) | 37.22 | 40.29 | 40.38 | **41.36** | RCD 42.81, DCB (RT) 42.64 |
+| Z f binned, ×2 (4) | 42.61 | 48.16 | 51.92 | **53.94** | RCD 50.66, DCB (libraw) 50.51 |
 
-Per picture: at 2× every picture gains over 0.2.0 (0.26 to 4.87 dB) and 23
-of 24 are above every demosaicer (kodim19, the fence, 0.5 dB below RCD);
-lens-like, 6 of 24 beat every demosaicer, the largest gap is kodim19
-(−4.4 dB to AMaZE); on the real files at the camera's own band limit three of
-four are above RCD (+0.85, +3.35, +1.00 dB), NikonZF 0.13 below. The binned
-real files at twice the camera's sharpness behave like the pixel-sharp set,
-2.4 dB behind RCD.
+Per picture: lens-like, every picture gains over 0.11 (0.5 to 2.9 dB) and
+9 of 24 are at or above the best of the sixteen demosaicers (0.11: 5),
+the largest gaps are kodim19, the fence (−2.4 dB), and kodim08 (−2.1); at
+2× all 24 are above every demosaicer (0.11: 21), the smallest margin
+0.5 dB; on the real files at the camera's own band limit all four are
+above RCD (+2.4, +3.0, +4.3, +3.3 dB; 0.11: three of four). The binned real
+files at twice the camera's sharpness behave like the pixel-sharp set,
+0.5–1.9 dB behind RCD.
 
 Why the fixed estimator trailed by 4–6 dB — three defects, all in the
 separation: (1) the two $C_2$ copies were averaged although luminance leaks
@@ -696,19 +776,24 @@ weights: no effect in any condition.
 
 ### 8.3 With reconstruction
 
-| Condition | linear default | **+ reconstruct** | computed share | best demosaicer | at or above the best |
+| Condition | linear default | **+ reconstruct** | computed share | best of 16 | at or above the best |
 |---|---|---|---|---|---|
-| pixel-sharp (24) | 36.55 | **42.04** | 49 % | AMaZE 40.72 | 0 → 22 of 24 |
-| lens-like σ 0.75 (24) | 50.21 | **51.93** | 12 % | RCD 50.59 | 6 → 21 of 24 |
-| band-limited 2× (24) | 50.80 | **51.96** | 5 % | RCD 48.88 | 23 → 24 of 24 |
-| Z f binned (4) | 40.38 | **41.67** | 10 % | RCD 42.81 | 0 → 0 of 4 |
-| Z f binned, ×2 (4) | 51.92 | 51.91 | 0.5 % | RCD 50.66 | 3 → 3 of 4 |
+| pixel-sharp (24) | 37.29 | **42.13** | 50 % | LMMSE (RT) 43.09 | 0 → 2 of 24 |
+| lens-like σ 0.75 (24) | 51.59 | **52.55** | 12 % | DCB (RT) 51.47 | 9 → 23 of 24 |
+| band-limited 2× (24) | 51.83 | **52.36** | 5 % | DCB (RT) 49.13 | 24 → 24 of 24 |
+| Z f binned (4) | 41.36 | **41.98** | 11 % | RCD 42.81 | 0 → 0 of 4 |
+| Z f binned, ×2 (4) | 53.94 | 53.62 | 0.7 % | RCD 50.66 | 4 → 4 of 4 |
 
-$\beta = 0$ reproduces the linear default bit for bit. On the real files at
-twice the camera's sharpness the method stays 0.7–1.8 dB below RCD even with
-$\beta = 1$ everywhere (38.52 vs 39.49): on real noise the estimator, not
-the detector, is the limit. At the camera's own band limit the step is
-inactive (0.5 %).
+$\beta = 0$ reproduces the linear default bit for bit. With the 0.11
+estimator the step was worth 1.3–5.5 dB; with the tensor it is worth
+0.5–1.0 dB on the realistic conditions and costs 0.3 dB at the camera's own
+band limit, where it is nearly inactive (0.7 %) and its estimator only adds
+error — the reason it is off by default since 0.12. On the real files at
+twice the camera's sharpness the method stays below RCD even with
+$\beta = 1$ everywhere (0.11 subset: 38.52 vs 39.49): on real noise the
+estimator, not the detector, is the limit. Pixel-sharp is the one condition
+where the step is decisive, and even there LMMSE (RawTherapee), which is
+built from the same Zhang–Wu estimator, stays 1 dB ahead.
 
 ### 8.4 Design sweep for the nonlinear step (subset)
 
@@ -727,7 +812,60 @@ inactive (0.5 %).
 20/80 was chosen over 10/40 for the soft condition, the only one where the
 nonlinear step can only lose.
 
-### 8.5 Other measurements
+### 8.5 Design sweep for the base-band tensor (0.12)
+
+Mean luminance PSNR of the linear path, lens-like / band-limited 2×,
+against the 0.11 estimator at 50.21 / 50.80. The two decompositions used
+above: *neutral* replaces every picture by its luminance (every error is
+leak), *flat* sets the luminance to 0.5 and keeps the picture's
+chrominance (every error is chrominance the estimate missed).
+
+| Variant | lens | 2× | neutral (lens) | flat (lens) |
+|---|---|---|---|---|
+| 0.11 (energy weight, coherence ring) | 50.21 | 50.80 | 57.30 | 61.19 |
+| tensor in $w_H$, $\beta$ 0.5, band 0.30, $\sigma_t$ 2, second differences | 51.40 | 51.43 | 57.33 | 61.13 |
+| — $\beta$ 0.3 / 0.7 / 1.0 / 2.0 | 50.91 / 51.04 / 50.92 / 50.46 | 51.33 / 51.31 / 51.16 / 50.74 | | |
+| — band 0.10 / 0.15 / 0.25 / 0.35 | 50.88 / 51.04 / 51.17 / 51.19 | 51.31 / 51.37 / 51.41 / 51.41 | | |
+| — $\sigma_t$ 1.5 / 3 / 5 / 8 | 51.44 / 50.96 / 50.96 / 50.86 | 51.43 / 51.34 / 51.34 / 51.29 | | |
+| — first differences; band-pass 0.15–0.30 | 51.19; 51.24 | 51.41; 51.42 | | |
+| **+ clean copy's ring, $\gamma$ 0.5 (default)** | **51.59** | **51.83** | 56.10 | 61.19 |
+| — $\gamma$ 0.3 / 0.7 / 1.0 / 2.0 | 51.58 / 51.52 / 51.27 / 50.63 | 51.71 / 51.90 / 51.88 / 51.73 | | |
+
+Rejected, all measured against the same baseline:
+
+- *Leak-power weights.* The shared part $S = G_\sigma * (\hat C_{2a,n}
+  \hat C_{2b,n})$ of the square narrow copies as the chrominance, $n = e -
+  S$ as the leak, $w_H = n_B / (n_A + n_B)$: 47.7 / 48.3. Regularised with
+  $n + \lambda S$: $\lambda$ 0.1 49.8, 0.3 50.1, never above 0.11. The
+  shared-part estimate is too noisy in a 3-px window; Dubois' dilution by
+  the common chrominance is a regulariser, not a defect. The same with the
+  energies of the elongated extensions only ($\hat C_{2a} - \hat C_{2a,n}$):
+  47.4 / 48.5.
+- *Per-copy ring gains* $G_\sigma*(r_A r_B) / G_\sigma * r_A^2$ instead of
+  the common normalised correlation: 50.12 on lens-like.
+- *Two-observation MMSE ring.* Weights by leak power, Wiener gain
+  $S / (S + n_A n_B / (n_A + n_B))$, one wide estimate for both copies:
+  50.42 / 51.23 alone, but 52.80 against 53.63 for the tensor alone at the
+  camera's band limit and no gain on the real files at 1×.
+- *Inner core ring.* Shrink towards a 0.08 or 0.10 c/px square band where
+  the ring between core and narrow band is incoherent: 47.8–49.0. The inner
+  ring carries most of the chrominance edge energy.
+- *Bands.* Narrow 0.12 / 0.13 (−0.4 to −0.8); narrow 0.18 with transition
+  0.10 / 0.075 / 0.05 (lens −1.0, 2× +1.1, the trade already described
+  under 4.3); attenuation 60 dB (−0.2); elongated bands 0.33 / 0.35 with
+  the tensor weight (−0.5 / −1.4), $C_2$ alone at 0.35 (−1.0). The 0.25
+  c/px overlap of $C_1$ and $C_2$ along the carrier holds.
+- *Plateau.* Weight exponent on the energies 1.5 / 2 (±0.02), $\sigma$ of
+  the energy window 2 / 2.5 (+0.01 / +0.07 at 2×), ring power 1.5 (+0.03 /
+  +0.16), 3 (−0.1 / −0.3).
+
+Upper bound of any linear estimator with a square chroma band (true
+chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
+50.2 at 0.20, 54.8 at 0.25, 59.5 at 0.30. The directional estimator at
+51.6 sits between the 0.20 and 0.25 square bands while keeping its
+0.15 c/px width towards the luminance.
+
+### 8.6 Other measurements
 
 - Siemens star on the Z f: MTF10 0.405 c/px separating on raw levels,
   0.451 on balanced levels (= the true value of the chart). The star
@@ -766,9 +904,12 @@ nonlinear step can only lose.
 
 - The information loss of the linear path is the luminance inside the chroma
   pass bands; it shows as a faint periodic residue on achromatic Nyquist
-  texture. The directional estimator and the coherence ring shrink that
-  region; §5 fills it with an assumption and says so per pixel.
-- On real sensor noise at the sensor's pixel count the method is 1–2 dB
+  texture. The directional estimator, the coherence ring and the base-band
+  tensor shrink that region; §5 fills it with an assumption and says so per
+  pixel. On neutral pictures §5 is still 2–3 dB ahead of the linear path:
+  that is the luminance inside the chroma bands, which no linear filter
+  returns.
+- On real sensor noise at the sensor's pixel count the method is 0.5–1.9 dB
   behind the best demosaicer (RCD) in luminance PSNR. The gap closes at the
   camera's own band limit (lens plus AA/pixel aperture), which is the
   condition real pictures are in.
@@ -860,15 +1001,18 @@ input:  raw CFA array, black/white levels, CFA phase (ε, a, b), as-shot WB
 3.  defect rule on same-phase 8-neighbourhood, σ(s) of §3.3    §3.4
 4.  m := m · k_c  (k_G = 1, as-shot normalised to G)           §3.5
 5.  kernels: Kaiser-sinc, Δf 0.15, A 40 dB, 15 taps, DC/Nyquist-corrected,
-    fc = 0.15 (n), 0.30 (w), 0.25 (r); G_σ: Gaussian σ 3 px   §4.1
+    fc = 0.15 (n), 0.30 (w), 0.25 (r), 0.30 (t); G_σ: Gaussian σ 3 px   §4.1
 6.  C2a := LPn,x LPw,y (a·sx·m);  C2b := LPw,x LPn,y (b·sy·m)
     C1H := LPn,x LPw,y (ε·sx·sy·m);  C1V := LPw,x LPn,y (ε·sx·sy·m)
-    wH := G*C2b² / (G*C2a² + G*C2b²)                           §4.3
+    b := LPt,x LPt,y m  (fc 0.30);  Jxx := Gt*(∂²x b)², Jyy := Gt*(∂²y b)²  (Gt: σ 2 px)
+    t := Jyy / (Jxx + Jyy)  (0.5 where the sum is ~0)
+    wH := G*C2b²·t^0.5 / (G*C2a²·(1−t)^0.5 + G*C2b²·t^0.5)      §4.3
 7.  rA := LPr,x LPr,y(a·sx·m) − LPn,x LPn,y(a·sx·m);  rB likewise with b·sy
     κ := clamp(G*(rA·rB) / sqrt(G*rA² · G*rB²), 0, 1)²
-    C2a += κ·(LPr²(a·sx·m) − C2a);  C2b += κ·(LPr²(b·sy·m) − C2b)   §4.4
+    c := min(1, 0.5·|2t − 1|);  κa := κ + (1−κ)·c·wH;  κb := κ + (1−κ)·c·(1−wH)
+    C2a += κa·(LPr²(a·sx·m) − C2a);  C2b += κb·(LPr²(b·sy·m) − C2b)   §4.4
 8.  C2 := wH·C2a + (1−wH)·C2b;  C1 := wH·C1H + (1−wH)·C1V
-    C1 += κ·(LPr²(ε·sx·sy·m) − C1)
+    C1 += (wH·κa + (1−wH)·κb)·(LPr²(ε·sx·sy·m) − C1)
 9.  L := m − ε·sx·sy·C1 − (a·sx + b·sy)·C2                    §4.3
 10. [optional] β from the carrier residue of L (σ 2 px, 20/80);
     Zhang–Wu LMMSE in m^(1/2.2); L, C1, C2 += β·(nonlinear − linear)   §5

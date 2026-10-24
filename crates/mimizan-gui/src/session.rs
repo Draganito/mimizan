@@ -36,10 +36,12 @@ pub struct DevelopParams {
     /// as measured, the Negative window has the switch); the command keeps
     /// it on until `--no-defects`, because a batch has nobody looking.
     pub fix_defects: bool,
-    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). The
-    /// desktop program starts with it on. The library and the command stay
-    /// off until `--reconstruct` is passed, because a pixel that passes
-    /// through it is computed, not measured.
+    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). Off
+    /// everywhere until asked for: a pixel that passes through it is
+    /// computed, not measured. Since the baseband tensor in the separation
+    /// the linear path is within 0.3 dB of it on real pictures and above it
+    /// at the camera's own band limit; it still pays on pixel-sharp
+    /// synthetic material, so the switch stays.
     pub reconstruct: bool,
 }
 
@@ -47,7 +49,7 @@ impl Default for DevelopParams {
     fn default() -> Self {
         // Pixel-adaptive Dubois separation is the default; the fixed estimator
         // and the block mask stay available under Development.
-        Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois, fix_defects: false, reconstruct: true }
+        Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois, fix_defects: false, reconstruct: false }
     }
 }
 
@@ -1696,13 +1698,15 @@ mod tests {
         assert!(next.ask.y + next.ask.h <= 30);
     }
 
-    /// The desktop program starts with the last octave reconstructed. The
-    /// library default stays off; this is the GUI's own switch.
+    /// The desktop program starts with every pixel measured: the last
+    /// octave is reconstructed only when the switch is set.
     #[test]
-    fn reconstruct_starts_on() {
+    fn reconstruct_starts_off() {
         let p = DevelopParams::default();
-        assert!(p.reconstruct);
-        assert!(p.negative_params(None).separate.reconstruct.is_some());
+        assert!(!p.reconstruct);
+        assert!(p.negative_params(None).separate.reconstruct.is_none());
+        let on = DevelopParams { reconstruct: true, ..p };
+        assert!(on.negative_params(None).separate.reconstruct.is_some());
     }
 }
 

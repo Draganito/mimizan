@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/mimizan-core", "crates/mimizan-cli", "crates/mimizan-gui"]
 
 [workspace.package]
-version = "0.11.28"
+version = "0.12.0"
 edition = "2021"
 rust-version = "1.88"
 license = "GPL-3.0-or-later"
