@@ -1,9 +1,10 @@
-//! Bayer phase and the carrier sign table from SPEC section 4.
+//! Bayer phase and the carrier sign table.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Colour of one photosite under the Bayer filter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Color {
     R,
@@ -22,17 +23,25 @@ pub enum BayerPhase {
     GBRG,
 }
 
+/// Signs of the two chrominance carriers for one phase, with
+/// `sx = (−1)^x`, `sy = (−1)^y`:
 /// `m = L + eps*sx*sy*C1 + C2*(a*sx + b*sy)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Carriers {
+    /// Sign of the diagonal `C1` carrier.
     pub eps: f64,
+    /// Sign of the horizontal `C2` carrier.
     pub a: f64,
+    /// Sign of the vertical `C2` carrier.
     pub b: f64,
 }
 
 impl BayerPhase {
+    /// The four phases, in the order of their names.
     pub const ALL: [BayerPhase; 4] = [Self::RGGB, Self::BGGR, Self::GRBG, Self::GBRG];
 
+    /// Phase from its name, case-insensitive; anything that is not one of
+    /// the four 2x2 Bayer patterns is `Error::Unsupported`.
     pub fn from_name(name: &str) -> Result<Self> {
         match name.trim().to_ascii_uppercase().as_str() {
             "RGGB" => Ok(Self::RGGB),
@@ -45,6 +54,7 @@ impl BayerPhase {
         }
     }
 
+    /// The four-letter name, as `from_name` reads it.
     pub fn name(self) -> &'static str {
         match self {
             Self::RGGB => "RGGB",
@@ -65,12 +75,13 @@ impl BayerPhase {
         }
     }
 
+    /// Colour of the photosite at `(x, y)` in a frame that starts on this phase.
     #[inline]
     pub fn color_at(self, x: usize, y: usize) -> Color {
         self.tile()[(y & 1) * 2 + (x & 1)]
     }
 
-    /// Sign table from SPEC section 4.
+    /// Carrier signs of this phase.
     pub fn carriers(self) -> Carriers {
         match self {
             Self::RGGB => Carriers { eps: -1.0, a: 1.0, b: 1.0 },

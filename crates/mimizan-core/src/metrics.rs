@@ -1,4 +1,4 @@
-//! Measurements (SPEC section 8). No number leaves this module without a definition.
+//! Measurements. No number leaves this module without a definition.
 
 use crate::blockfft::{BlockFft, CARRIERS};
 use crate::decode::Rect;
@@ -12,11 +12,16 @@ pub struct ErrorStats {
     pub rmse: f64,
     pub p99: f64,
     pub max: f64,
+    /// Samples compared.
     pub n: usize,
 }
 
+/// Error of `a` against `b` over the pixels more than `border` from the
+/// edge. Planes of different sizes compare nothing (`n == 0`, NaNs).
 pub fn error_stats(a: &Plane, b: &Plane, border: usize) -> ErrorStats {
-    assert_eq!((a.width, a.height), (b.width, b.height));
+    if (a.width, a.height) != (b.width, b.height) {
+        return ErrorStats { rmse: f64::NAN, p99: f64::NAN, max: f64::NAN, n: 0 };
+    }
     let mut errs: Vec<f64> = Vec::new();
     let mut s2 = 0.0;
     for y in border..a.height.saturating_sub(border) {
@@ -30,7 +35,7 @@ pub fn error_stats(a: &Plane, b: &Plane, border: usize) -> ErrorStats {
     if n == 0 {
         return ErrorStats { rmse: f64::NAN, p99: f64::NAN, max: f64::NAN, n: 0 };
     }
-    errs.sort_by(|p, q| p.partial_cmp(q).unwrap());
+    errs.sort_by(f64::total_cmp);
     ErrorStats {
         rmse: (s2 / n as f64).sqrt(),
         p99: errs[(0.99 * (n - 1) as f64) as usize],
@@ -45,15 +50,19 @@ pub fn error_stats(a: &Plane, b: &Plane, border: usize) -> ErrorStats {
 pub struct CarrierReport {
     /// [C1 (½,½), C2a (½,0), C2b (0,½)]
     pub ratio: [f64; 3],
+    /// Blocks averaged; 0 (and NaN ratios) when the region is too small.
     pub blocks: usize,
+    /// Chebyshev radius around each carrier, cycles per pixel.
     pub radius: f64,
 }
 
+/// Carrier-to-noise ratio of `plane` inside `region` (the whole plane when
+/// `None`). The noise energy per bin comes from `noise` at the block mean.
 pub fn carrier_energy(plane: &Plane, noise: &NoiseModel, region: Option<Rect>, radius: f64) -> CarrierReport {
     let n = 64usize;
     let bf = BlockFft::new(n);
     let reg = region.unwrap_or(Rect { x: 0, y: 0, w: plane.width, h: plane.height });
-    let mut scratch = Vec::new();
+    let mut scratch = crate::blockfft::FftScratch::default();
     let mut acc = [0.0f64; 3];
     let mut blocks = 0usize;
     let mut sel: Vec<Vec<usize>> = vec![Vec::new(); 3];
@@ -106,12 +115,16 @@ pub fn region_stats(plane: &Plane, r: Rect) -> (f64, f64) {
     (mean, var.sqrt())
 }
 
+/// Log-log fit of a grey wedge: `ln(mean) = intercept + slope · ln(exposure)`.
 #[derive(Clone, Debug, Serialize)]
 pub struct WedgeFit {
     pub slope: f64,
     pub intercept: f64,
+    /// Largest `|mean / fit − 1|` over the steps.
     pub max_rel_residual: f64,
+    /// Steps used (positive exposure and mean).
     pub n: usize,
+    /// Slope 1.00 ± 0.02 and residual at most 2 %.
     pub pass: bool,
 }
 
@@ -136,18 +149,25 @@ pub fn wedge_fit(samples: &[(f64, f64)]) -> WedgeFit {
     WedgeFit { slope, intercept, max_rel_residual, n, pass }
 }
 
+/// Modulation of the star on one ring, relative to the outermost ring.
 #[derive(Clone, Debug, Serialize)]
 pub struct StarSample {
     pub radius: f64,
     /// Spoke frequency at this radius in c/px.
     pub freq: f64,
+    /// Within ±10° of the axes.
     pub axis: f64,
+    /// Within ±10° of the diagonals.
     pub diag: f64,
+    /// All angles.
     pub all: f64,
 }
 
+/// The star measurement. Every MTF figure is relative to the outermost
+/// ring's modulation, not to the chart's true contrast (see [`star_mtf`]).
 #[derive(Clone, Debug, Serialize)]
 pub struct StarReport {
+    /// Rings from the outside in.
     pub samples: Vec<StarSample>,
     pub mtf50_axis: Option<f64>,
     pub mtf50_diag: Option<f64>,
@@ -158,31 +178,36 @@ pub struct StarReport {
     pub ring_diag: bool,
 }
 
+/// Bilinear sample, clamped to the plane; the plane must not be empty.
 #[inline]
 fn bilinear(p: &Plane, x: f64, y: f64) -> f64 {
-    let x0 = x.floor().max(0.0) as usize;
-    let y0 = y.floor().max(0.0) as usize;
+    let x0 = (x.floor().max(0.0) as usize).min(p.width - 1);
+    let y0 = (y.floor().max(0.0) as usize).min(p.height - 1);
     let x1 = (x0 + 1).min(p.width - 1);
     let y1 = (y0 + 1).min(p.height - 1);
-    let fx = x - x0 as f64;
-    let fy = y - y0 as f64;
-    let a = p.at(x0.min(p.width - 1), y0.min(p.height - 1));
-    let b = p.at(x1, y0.min(p.height - 1));
-    let c = p.at(x0.min(p.width - 1), y1);
+    let fx = (x - x0 as f64).clamp(0.0, 1.0);
+    let fy = (y - y0 as f64).clamp(0.0, 1.0);
+    let a = p.at(x0, y0);
+    let b = p.at(x1, y0);
+    let c = p.at(x0, y1);
     let d = p.at(x1, y1);
     (a * (1.0 - fx) + b * fx) * (1.0 - fy) + (c * (1.0 - fx) + d * fx) * fy
 }
 
 /// Modulation of the `spokes`-th angular harmonic on circles of growing radius,
 /// split into sectors within ±10° of the axes and of the diagonals. Contrast is
-/// normalised to the outermost (lowest-frequency) ring of the same sector.
+/// normalised to the outermost (lowest-frequency) ring of the same sector, so
+/// an MTF50 here is the frequency where the modulation is half that of the
+/// outermost ring, not half the chart's true contrast. Radii that do not
+/// make a range (`r_min >= r_max`, or not finite) give an empty report.
 pub fn star_mtf(plane: &Plane, cx: f64, cy: f64, spokes: usize, r_min: f64, r_max: f64) -> StarReport {
     let k = (spokes * 16).max(720);
     let mut samples = Vec::new();
     let mut r = r_max;
     let step = (r_max - r_min) / 60.0;
     let sector = 10f64.to_radians();
-    while r >= r_min {
+    let valid = step.is_finite() && step > 0.0 && r_max.is_finite() && plane.width > 0 && plane.height > 0;
+    while valid && r >= r_min {
         let (mut ca, mut sa, mut na) = (0.0, 0.0, 0usize);
         let (mut cd, mut sd, mut nd) = (0.0, 0.0, 0usize);
         let (mut cl, mut sl, mut nl) = (0.0, 0.0, 0usize);
@@ -285,7 +310,7 @@ mod tests {
         let l = rgb.luminance();
         let rep = star_mtf(&l, n as f64 / 2.0, n as f64 / 2.0, STAR_SPOKES, 20.0, 230.0);
         // The pixel aperture (4x4 supersampling) plus the contrast sampling of
-        // the star limit the truth itself to about 0.27 c/px (RESULTS.md).
+        // the star limit the truth itself to about 0.27 c/px.
         assert!(rep.mtf50_axis.unwrap() > 0.25, "{:?}", rep.mtf50_axis);
         assert!(rep.mtf50_diag.unwrap() > 0.25, "{:?}", rep.mtf50_diag);
     }

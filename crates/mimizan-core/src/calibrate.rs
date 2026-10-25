@@ -1,4 +1,4 @@
-//! Calibration fits (SPEC sections 10 and 11): a look from a grey wedge, mix
+//! Calibration fits: a look from a grey wedge, mix
 //! weights from colour patches, star MTF into the camera file.
 
 use crate::calib::{LookEncoding, LookFile};
@@ -79,12 +79,14 @@ pub struct LookFit {
     /// Largest |curve(neg) − reference| over the samples, in 8-bit steps.
     pub max_err_255: f64,
     pub rms_err_255: f64,
+    /// At least two measured points and at most 3/255 of error on them.
     pub pass: bool,
 }
 
 /// Fit a look from `(negative linear, reference encoded)` pairs. Points are
 /// sorted, near-duplicates merged, forced monotone (pool adjacent violators)
-/// and anchored at (0,0) and (1,1). Pass: ≤ 3/255 on the fitted samples.
+/// and anchored at (0,0) and (1,1). Pass: ≤ 3/255 on the fitted samples,
+/// and at least two measured points, so an empty wedge is not a perfect fit.
 pub fn fit_look(
     name: &str,
     pairs: &[(f64, f64)],
@@ -141,7 +143,8 @@ pub fn fit_look(
     } else {
         (errs.iter().map(|e| e * e).sum::<f64>() / errs.len() as f64).sqrt()
     };
-    LookFit { look, samples: pts, dropped, max_err_255, rms_err_255, pass: max_err_255 <= 3.0 }
+    let pass = merged.len() >= 2 && max_err_255 <= 3.0;
+    LookFit { look, samples: pts, dropped, max_err_255, rms_err_255, pass }
 }
 
 /// Weighted isotonic regression (non-decreasing), pool adjacent violators.
@@ -285,13 +288,7 @@ impl RefEncoding {
     pub fn to_linear(self, v: f64) -> f64 {
         let v = v.clamp(0.0, 1.0);
         match self {
-            Self::Srgb => {
-                if v <= 0.04045 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            }
+            Self::Srgb => crate::kodak::srgb_decode(v),
             Self::Gamma22 => v.powf(2.2),
             Self::Linear => v,
         }
@@ -328,7 +325,7 @@ pub fn wedge_self_test(size: usize, with_noise: bool) -> WedgeSelfTest {
     let sp =
         SynthParams { noise: if with_noise { Some(Default::default()) } else { None }, ..Default::default() };
     let s = synth::mosaic(Scene::Wedge, size, size, &sp);
-    let sep = separate(&s.mosaic, &SeparateParams::default());
+    let sep = separate(&s.mosaic, &SeparateParams::default()).expect("synthetic mosaic has a phase");
     let steps = 16;
     let rects = grid_rects(Rect { x: 0, y: 0, w: size - size % steps, h: size }, steps, 1, 0.3);
     let pairs: Vec<(f64, f64)> = rects

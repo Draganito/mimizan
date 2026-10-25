@@ -1,4 +1,4 @@
-//! Optional nonlinear reconstruction of the last octave (SPEC 5.6).
+//! Optional nonlinear reconstruction of the last octave.
 //!
 //! The linear separation cannot tell luminance from chrominance at the
 //! carriers: an achromatic line pattern near Nyquist and a sharp colour edge
@@ -22,12 +22,14 @@
 //! near the carriers above the noise.
 
 use crate::cfa::{BayerPhase, Color};
+use crate::filter::gaussian_kernel;
 use crate::ingest::NoiseModel;
 use crate::plane::Plane;
 use crate::separate::{sign_x, Separation, FIXED_MASK_VALUE};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// What decides, per pixel, how much of the nonlinear estimate is used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Detector {
     /// Every pixel from the nonlinear estimate (β = 1).
@@ -39,10 +41,14 @@ pub enum Detector {
     Residue,
 }
 
+/// Settings of the reconstruction.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReconstructParams {
     pub detector: Detector,
-    /// β rises from 0 at `lo` to 1 at `hi` (detector units: energy / noise variance).
+    /// β rises from 0 at `lo` to 1 at `hi`. Detector units: carrier-band
+    /// energy over the noise variance of the balanced luminance at that
+    /// level, so the scale is approximate and the thresholds were tuned on
+    /// balanced pictures.
     pub lo: f64,
     pub hi: f64,
     /// Gaussian σ (px) of the detector window.
@@ -179,7 +185,7 @@ fn lmmse_line(d: &[f64], out: &mut [f64], err: &mut [f64], scratch: &mut Vec<f64
 }
 
 /// Full-resolution `(L, C1, C2)` of the nonlinear estimate.
-pub fn estimate_lcc(m: &Plane, phase: BayerPhase, mu: f64, gamma: f64) -> (Plane, Plane, Plane) {
+pub(crate) fn estimate_lcc(m: &Plane, phase: BayerPhase, mu: f64, gamma: f64) -> (Plane, Plane, Plane) {
     let (w, h) = (m.width, m.height);
     let enc;
     let m = if gamma != 1.0 {
@@ -226,18 +232,21 @@ fn estimate_grb(m: &Plane, phase: BayerPhase, mu: f64) -> (Plane, Plane, Plane) 
         },
     );
     drop(dh);
-    // Column-wise LMMSE on dv: transpose, process rows, transpose back.
+    // Column-wise LMMSE on dv: each thread gathers one column into its
+    // scratch, filters it as a line, and writes the transposed result; the
+    // two outputs are transposed back.
     let (ev, vev) = {
-        let dvt = transpose(&dv);
-        drop(dv);
         let mut evt = Plane::zeros(h, w);
         let mut vevt = Plane::zeros(h, w);
         evt.data.par_chunks_mut(h).zip(vevt.data.par_chunks_mut(h)).enumerate().for_each_init(
-            Vec::new,
-            |scratch, (x, (o, e))| {
-                lmmse_line(dvt.row(x), o, e, scratch);
+            || (Vec::new(), Vec::new()),
+            |(col, scratch), (x, (o, e))| {
+                col.clear();
+                col.extend((0..h).map(|y| dv.at(x, y)));
+                lmmse_line(col, o, e, scratch);
             },
         );
+        drop(dv);
         (transpose(&evt), transpose(&vevt))
     };
     // Fused G − X at the X sites, and the green plane.
@@ -252,9 +261,8 @@ fn estimate_grb(m: &Plane, phase: BayerPhase, mu: f64) -> (Plane, Plane, Plane) 
             }
         }
     });
-    drop((veh, vev));
-    // eh / ev are reused as the R − G and B − G planes.
-    // First at the measured sites: X − G.
+    drop((eh, ev, veh, vev));
+    // X − G at the measured sites of each colour; zero elsewhere.
     let (mut rg, mut bg) = (Plane::zeros(w, h), Plane::zeros(w, h));
     rg.data.par_chunks_mut(w).zip(bg.data.par_chunks_mut(w)).enumerate().for_each(|(y, (rr, br))| {
         let (mr, gr) = (m.row(y), g.row(y));
@@ -266,47 +274,44 @@ fn estimate_grb(m: &Plane, phase: BayerPhase, mu: f64) -> (Plane, Plane, Plane) 
             }
         }
     });
-    // At the opposite chroma site: mean of the four diagonal neighbours.
-    let fill_diag = |p: &mut Plane, own: Color| {
-        let src = p.clone();
-        p.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+    // Fill the other sites from the measured ones, in one pass per colour.
+    // At the opposite chroma site: mean of the four diagonal neighbours,
+    // which are all measured sites. At a G site: mean of the two neighbours
+    // along the line that carries the channel, measured sites as well. The
+    // output never reads a filled value, so it is written into a new plane
+    // from the measured plane alone.
+    let fill = |meas: &Plane, own: Color| -> Plane {
+        let mut out = Plane::zeros(w, h);
+        out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            let (up, down) = (refl(y as isize - 1, h), refl(y as isize + 1, h));
             for (x, o) in row.iter_mut().enumerate() {
+                let xi = x as isize;
                 let c = phase.color_at(x, y);
-                if c != Color::G && c != own {
-                    let (xi, yi) = (x as isize, y as isize);
-                    let s = src.at(refl(xi - 1, w), refl(yi - 1, h))
-                        + src.at(refl(xi + 1, w), refl(yi - 1, h))
-                        + src.at(refl(xi - 1, w), refl(yi + 1, h))
-                        + src.at(refl(xi + 1, w), refl(yi + 1, h));
-                    *o = 0.25 * s;
-                }
-            }
-        });
-    };
-    fill_diag(&mut rg, Color::R);
-    fill_diag(&mut bg, Color::B);
-    // At G sites: mean of the two neighbours that carry the channel (row or column).
-    let fill_g = |p: &mut Plane, own: Color| {
-        let src = p.clone();
-        p.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-            for (x, o) in row.iter_mut().enumerate() {
-                if phase.color_at(x, y) == Color::G {
-                    let (xi, yi) = (x as isize, y as isize);
+                *o = if c == own {
+                    meas.at(x, y)
+                } else if c != Color::G {
+                    0.25 * (meas.at(refl(xi - 1, w), up)
+                        + meas.at(refl(xi + 1, w), up)
+                        + meas.at(refl(xi - 1, w), down)
+                        + meas.at(refl(xi + 1, w), down))
+                } else {
                     let horizontal = phase.color_at(refl(xi + 1, w), y) == own
                         || phase.color_at(refl(xi - 1, w), y) == own;
-                    *o = if horizontal {
-                        0.5 * (src.at(refl(xi - 1, w), y) + src.at(refl(xi + 1, w), y))
+                    if horizontal {
+                        0.5 * (meas.at(refl(xi - 1, w), y) + meas.at(refl(xi + 1, w), y))
                     } else {
-                        0.5 * (src.at(x, refl(yi - 1, h)) + src.at(x, refl(yi + 1, h)))
-                    };
+                        0.5 * (meas.at(x, up) + meas.at(x, down))
+                    }
                 }
             }
         });
+        out
     };
-    fill_g(&mut rg, Color::R);
-    fill_g(&mut bg, Color::B);
-    drop((eh, ev));
-    (g, rg, bg)
+    let rg_full = fill(&rg, Color::R);
+    drop(rg);
+    let bg_full = fill(&bg, Color::B);
+    drop(bg);
+    (g, rg_full, bg_full)
 }
 
 fn transpose(p: &Plane) -> Plane {
@@ -330,18 +335,6 @@ fn transpose(p: &Plane) -> Plane {
     t
 }
 
-fn gaussian_kernel(sigma: f64) -> Vec<f64> {
-    let r = (3.0 * sigma).ceil().max(1.0) as usize;
-    let k: Vec<f64> = (0..=2 * r)
-        .map(|i| {
-            let d = i as f64 - r as f64;
-            (-d * d / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let s: f64 = k.iter().sum();
-    k.into_iter().map(|v| v / s).collect()
-}
-
 /// Demodulate the linear luminance by the three carriers and low-pass each:
 /// summed squared amplitude of what is left near the carriers. Same pass
 /// sharing as `separate::chroma_estimates`: two row passes serve three
@@ -362,7 +355,7 @@ fn carrier_residue(lum: &Plane, c: &crate::cfa::Carriers, g: &[f64]) -> Plane {
 }
 
 /// Detector statistic per pixel, before the ramp (energy / noise variance).
-pub fn detector_plane(
+pub(crate) fn detector_plane(
     phase: BayerPhase,
     noise: &NoiseModel,
     lum_linear: &Plane,
@@ -389,7 +382,7 @@ pub fn detector_plane(
 }
 
 /// β per pixel from the detector statistic: 0 below `lo`, 1 above `hi`.
-pub fn beta_from(stat: &Plane, p: &ReconstructParams) -> Plane {
+pub(crate) fn beta_from(stat: &Plane, p: &ReconstructParams) -> Plane {
     let (lo, hi) = (p.lo, p.hi.max(p.lo + 1e-9));
     Plane::from_vec(
         stat.width,
@@ -415,7 +408,10 @@ pub fn apply(sep: &mut Separation, m: &Plane, noise: &NoiseModel, p: &Reconstruc
     blend(&mut sep.c2, &c2);
     let span = 0.99 - FIXED_MASK_VALUE;
     sep.mask_max.data.par_iter_mut().zip(&beta.data).for_each(|(mk, b)| *mk = FIXED_MASK_VALUE + span * b);
-    beta.data.par_iter().sum::<f64>() / beta.data.len() as f64
+    // Per-row sums combined in row order: the figure goes into the
+    // description and must not depend on how rayon split the work.
+    let rows: Vec<f64> = beta.data.par_chunks(beta.width.max(1)).map(|r| r.iter().sum::<f64>()).collect();
+    rows.iter().sum::<f64>() / beta.data.len().max(1) as f64
 }
 
 #[cfg(test)]

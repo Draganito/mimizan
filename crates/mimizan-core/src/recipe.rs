@@ -19,6 +19,77 @@ use std::path::Path;
 /// Largest USM amount a recipe accepts (the GUI slider ends here too).
 pub const USM_MAX: f64 = 1.5;
 
+/// Gaussian σ of the peak high-pass, in pixels of the negative. The search in
+/// [`crate::peak`] starts at the same radius.
+pub const PEAK_RADIUS_DEFAULT: f64 = 0.7;
+/// Finest and widest radius the print panel will store.
+pub const PEAK_RADIUS_MIN: f64 = 0.3;
+pub const PEAK_RADIUS_MAX: f64 = 8.0;
+/// Largest peak amount. The search itself stops near 1.5; the field goes
+/// further so a measured value can be pushed by hand.
+pub const PEAK_AMOUNT_MAX: f64 = 4.0;
+
+fn default_peak_radius() -> f64 {
+    PEAK_RADIUS_DEFAULT
+}
+
+/// Peak high-pass on the picture. The paper border is not part of it.
+/// `on` is the checkbox: radius and amount stay when it is off, and neither
+/// the tile nor the TIFF is sharpened.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Peak {
+    #[serde(default)]
+    pub on: bool,
+    /// Gaussian σ in pixels of the negative. The print multiplies it by the
+    /// long-side scale, above 1 and below.
+    #[serde(default = "default_peak_radius")]
+    pub radius: f64,
+    /// `x + amount · (x − blur(radius))`.
+    #[serde(default)]
+    pub amount: f64,
+}
+
+impl Default for Peak {
+    fn default() -> Self {
+        Self { on: false, radius: default_peak_radius(), amount: 0.0 }
+    }
+}
+
+impl Peak {
+    /// The high-pass runs. Off, or a zero amount, leaves every pixel as it was.
+    pub fn applies(&self) -> bool {
+        self.on && self.radius > 0.0 && self.amount > 0.0
+    }
+
+    /// Omitted from a recipe file. A saved radius or a ticked checkbox is kept.
+    pub fn is_unset(&self) -> bool {
+        !self.on && self.amount == 0.0 && self.radius == PEAK_RADIUS_DEFAULT
+    }
+
+    /// A measured pair, pulled into the range [`Self::validate`] accepts.
+    pub fn clamp_measured(radius: f64, amount: f64) -> (f64, f64) {
+        let radius = if radius.is_finite() { radius } else { PEAK_RADIUS_DEFAULT };
+        let amount = if amount.is_finite() { amount } else { 0.0 };
+        (radius.clamp(PEAK_RADIUS_MIN, PEAK_RADIUS_MAX), amount.clamp(0.0, PEAK_AMOUNT_MAX))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.radius.is_finite() || !(PEAK_RADIUS_MIN..=PEAK_RADIUS_MAX).contains(&self.radius) {
+            return Err(Error::Invalid(format!(
+                "peak radius {} not within {PEAK_RADIUS_MIN}..{PEAK_RADIUS_MAX}",
+                self.radius
+            )));
+        }
+        if !self.amount.is_finite() || !(0.0..=PEAK_AMOUNT_MAX).contains(&self.amount) {
+            return Err(Error::Invalid(format!(
+                "peak amount {} not within 0..{PEAK_AMOUNT_MAX}",
+                self.amount
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Scale compensation after the curve: the enlargement blur, if any.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
@@ -89,6 +160,15 @@ impl Sharpen {
 /// Current recipe schema.
 pub const SCHEMA: u32 = 1;
 
+/// Highest dpi a recipe accepts.
+pub const DPI_MAX: f64 = 10_000.0;
+/// Widest white border or black edge, mm (one metre).
+pub const BORDER_MAX_MM: f64 = 1_000.0;
+/// Most samples a sheet may have: 2^30, eight gigabytes of f64. A recipe
+/// that asks for more is a typo, and the allocation would abort the process
+/// instead of failing.
+pub const SHEET_MAX_PX: usize = 1 << 30;
+
 fn default_dpi() -> f64 {
     300.0
 }
@@ -101,8 +181,10 @@ fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
 
+/// Every decision of the print pass. See the module doc.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
+    /// [`SCHEMA`]; anything else fails validation.
     #[serde(default = "default_schema")]
     pub schema: u32,
     /// Placing, in stops, before the curve (paper, equation 1).
@@ -118,14 +200,25 @@ pub struct Recipe {
     /// Output size; `None` keeps the negative's pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<PrintSize>,
+    /// Pixels per inch: converts `size`, `border_mm` and `black_mm`, and is
+    /// written into the file.
     #[serde(default = "default_dpi")]
     pub dpi: f64,
-    /// Paper border around the fitted picture, mm (converted with `dpi`),
+    /// White paper around the fitted picture, mm (converted with `dpi`),
     /// filled with paper white, the curve's value at linear 1.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub border_mm: f64,
+    /// Black film edge between the picture and the white border, mm.
+    /// Never wider than `border_mm`: a wider value is printed as the white
+    /// width, and zero white turns the edge off. Old recipes omit it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub black_mm: f64,
+    /// Scale compensation after the curve.
     #[serde(default)]
     pub sharpen: Sharpen,
+    /// Peak high-pass. Absent in older recipes, which stay unsharpened.
+    #[serde(default, skip_serializing_if = "Peak::is_unset")]
+    pub peak: Peak,
     /// Window on the upright negative, whole pixels, before the size step.
     /// `None` is the full frame. Old recipes omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,7 +235,9 @@ impl Default for Recipe {
             size: None,
             dpi: default_dpi(),
             border_mm: 0.0,
+            black_mm: 0.0,
             sharpen: Sharpen::Off,
+            peak: Peak::default(),
             crop: None,
         }
     }
@@ -151,9 +246,13 @@ impl Default for Recipe {
 /// Which corner of a crop window is being dragged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CropCorner {
+    /// Top left.
     Nw,
+    /// Top right.
     Ne,
+    /// Bottom right.
     Se,
+    /// Bottom left.
     Sw,
 }
 
@@ -161,9 +260,13 @@ pub enum CropCorner {
 /// top-left. Nothing here resamples: the size step is the only resize.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CropRect {
+    /// Left edge, pixels from the left of the upright negative.
     pub x: u32,
+    /// Top edge, pixels from the top.
     pub y: u32,
+    /// Width, pixels, at least 1 once sanitized.
     pub w: u32,
+    /// Height, pixels, at least 1 once sanitized.
     pub h: u32,
 }
 
@@ -214,11 +317,15 @@ impl CropRect {
         Self { x: (img_w - cw) / 2, y: (img_h - ch) / 2, w: cw, h: ch }
     }
 
-    /// Move, keeping the size, staying inside the image.
+    /// Move, keeping the size, staying inside the image. A window larger
+    /// than the image is first pulled back inside it.
     pub fn shift(self, dx: i32, dy: i32, img_w: u32, img_h: u32) -> Self {
-        let x = (self.x as i32 + dx).clamp(0, img_w as i32 - self.w as i32);
-        let y = (self.y as i32 + dy).clamp(0, img_h as i32 - self.h as i32);
-        Self { x: x as u32, y: y as u32, ..self }
+        let s = self.sanitized(img_w, img_h);
+        let max_x = i64::from(img_w).saturating_sub(i64::from(s.w)).max(0);
+        let max_y = i64::from(img_h).saturating_sub(i64::from(s.h)).max(0);
+        let x = (i64::from(s.x) + i64::from(dx)).clamp(0, max_x);
+        let y = (i64::from(s.y) + i64::from(dy)).clamp(0, max_y);
+        Self { x: x as u32, y: y as u32, ..s }
     }
 
     /// Drag `corner` to `pointer` in image pixels. The opposite corner stays.
@@ -292,6 +399,9 @@ impl Recipe {
         Self { curve: Tone::paper(), ..Self::default() }
     }
 
+    /// Every field within its range, and the sheet the recipe asks for
+    /// within [`SHEET_MAX_PX`]. A recipe that fails here is refused before
+    /// a pixel is touched.
     pub fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA {
             return Err(Error::Invalid(format!("recipe schema {} not supported", self.schema)));
@@ -304,20 +414,49 @@ impl Recipe {
             )));
         }
         self.curve.validate()?;
-        if !(self.dpi.is_finite() && self.dpi > 0.0) {
-            return Err(Error::Invalid("dpi must be positive".into()));
+        if !(self.dpi.is_finite() && self.dpi > 0.0 && self.dpi <= DPI_MAX) {
+            return Err(Error::Invalid(format!("dpi {} not within 0..{DPI_MAX}", self.dpi)));
         }
-        if !(self.border_mm.is_finite() && self.border_mm >= 0.0) {
-            return Err(Error::Invalid("border must be zero or positive".into()));
+        let mm = |v: f64| v.is_finite() && (0.0..=BORDER_MAX_MM).contains(&v);
+        if !mm(self.border_mm) {
+            return Err(Error::Invalid(format!(
+                "border {} mm not within 0..{BORDER_MAX_MM}",
+                self.border_mm
+            )));
+        }
+        if !mm(self.black_mm) {
+            return Err(Error::Invalid(format!(
+                "black edge {} mm not within 0..{BORDER_MAX_MM}",
+                self.black_mm
+            )));
+        }
+        let frame2 = self.frame_px().saturating_mul(2);
+        if frame2.saturating_mul(frame2) > SHEET_MAX_PX {
+            return Err(Error::Invalid(format!(
+                "border and black edge at {} dpi exceed the sheet limit",
+                self.dpi
+            )));
+        }
+        if let Some(size) = self.size {
+            size.validate()?;
+            let (w, h) = size.pixels(self.dpi);
+            if w.checked_mul(h).is_none_or(|n| n > SHEET_MAX_PX) {
+                return Err(Error::Invalid(format!(
+                    "size {w}x{h} px at {} dpi exceeds the sheet limit of {SHEET_MAX_PX} samples",
+                    self.dpi
+                )));
+            }
         }
         if let Some(c) = self.crop {
             if c.w == 0 || c.h == 0 {
                 return Err(Error::Invalid("crop must cover at least one pixel".into()));
             }
         }
-        self.sharpen.validate()
+        self.sharpen.validate()?;
+        self.peak.validate()
     }
 
+    /// Read and validate a recipe file.
     pub fn load(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)?;
         let r: Recipe = serde_json::from_str(&s)?;
@@ -325,18 +464,38 @@ impl Recipe {
         Ok(r)
     }
 
+    /// Write the recipe as pretty JSON.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
+        let mut json = serde_json::to_string_pretty(self)?;
+        json.push('\n');
+        std::fs::write(path, json)?;
         Ok(())
     }
 
-    /// Border in pixels at this recipe's dpi.
-    pub fn border_px(&self) -> usize {
-        if self.border_mm <= 0.0 {
+    /// Millimetres at this recipe's dpi, rounded to whole pixels.
+    fn mm_px(&self, mm: f64) -> usize {
+        if mm <= 0.0 || !mm.is_finite() || !(self.dpi.is_finite() && self.dpi > 0.0) {
             0
         } else {
-            (self.border_mm / 25.4 * self.dpi).round() as usize
+            (mm / 25.4 * self.dpi).round() as usize
         }
+    }
+
+    /// White border in pixels on each side.
+    pub fn border_px(&self) -> usize {
+        self.mm_px(self.border_mm)
+    }
+
+    /// Black edge in pixels on each side. Clamped to the white border, so
+    /// rounding cannot put black outside white, and a zero white border
+    /// turns the edge off.
+    pub fn black_px(&self) -> usize {
+        self.mm_px(self.black_mm.min(self.border_mm)).min(self.border_px())
+    }
+
+    /// Both rings, pixels on each side. The picture sits inside this.
+    pub fn frame_px(&self) -> usize {
+        self.black_px() + self.border_px()
     }
 }
 
@@ -349,10 +508,11 @@ mod tests {
         let r = Recipe::default();
         r.validate().unwrap();
         let json = serde_json::to_string(&r).unwrap();
-        // Zero place, no size, no border are omitted.
-        assert!(!json.contains("place") && !json.contains("border"));
+        // Zero place, no size, no border, no black edge are omitted.
+        assert!(!json.contains("place") && !json.contains("border") && !json.contains("black"));
         assert!(json.contains(r#""resample":"b-spline""#), "{json}");
         assert!(json.contains(r#""sharpen":{"mode":"off"}"#), "{json}");
+        assert!(!json.contains("peak"), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
     }
@@ -366,6 +526,7 @@ mod tests {
             size: Some(PrintSize::Physical { width_in: 11.811, height_in: 15.748 }),
             dpi: 360.0,
             border_mm: 20.0,
+            black_mm: 8.0,
             sharpen: Sharpen::Deconv { passes: 5, usm_amount: 0.5 },
             ..Recipe::default()
         };
@@ -375,6 +536,10 @@ mod tests {
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
         assert_eq!(r.border_px(), 283);
+        assert_eq!(r.black_px(), 113);
+        assert_eq!(r.frame_px(), 396);
+        let wider = Recipe { black_mm: 40.0, ..r.clone() };
+        assert_eq!(wider.black_px(), wider.border_px());
         // Older fields missing: defaults fill in.
         let minimal: Recipe =
             serde_json::from_str(r#"{"curve":{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}}"#)
@@ -392,11 +557,47 @@ mod tests {
         assert!(bad.validate().is_err());
         let bad = Recipe { border_mm: -1.0, ..Recipe::default() };
         assert!(bad.validate().is_err());
+        let bad = Recipe { black_mm: -1.0, ..Recipe::default() };
+        assert!(bad.validate().is_err());
         let bad = Recipe { schema: 2, ..Recipe::default() };
         assert!(bad.validate().is_err());
+        let bad = Recipe { dpi: 1e7, ..Recipe::default() };
+        assert!(bad.validate().is_err());
+        let bad = Recipe { border_mm: 1e6, ..Recipe::default() };
+        assert!(bad.validate().is_err());
+        let bad = Recipe { border_mm: 1000.0, dpi: 10_000.0, ..Recipe::default() };
+        assert!(bad.validate().is_err(), "a metre of border at 10 000 dpi is 400 000 px a side");
+        let bad = Recipe {
+            size: Some(PrintSize::Physical { width_in: f64::NAN, height_in: 1.0 }),
+            ..Recipe::default()
+        };
+        assert!(bad.validate().is_err());
+        let bad = Recipe {
+            size: Some(PrintSize::Physical { width_in: 300.0, height_in: 300.0 }),
+            dpi: 1000.0,
+            ..Recipe::default()
+        };
+        assert!(bad.validate().is_err(), "90 gigapixels");
+        let big_but_fine = Recipe {
+            size: Some(PrintSize::Physical { width_in: 80.0, height_in: 60.0 }),
+            dpi: 360.0,
+            ..Recipe::default()
+        };
+        big_but_fine.validate().unwrap();
         let bad = Recipe { curve: Tone::Paper(crate::paper::SplitGrade::new(0.0, 9.0)), ..Recipe::default() };
         assert!(bad.validate().is_err());
         Recipe::on_paper().validate().unwrap();
+        let peak_on = Recipe { peak: Peak { on: true, radius: 1.4, amount: 0.35 }, ..Recipe::default() };
+        peak_on.validate().unwrap();
+        let json = serde_json::to_string(&peak_on).unwrap();
+        let back: Recipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.peak, peak_on.peak, "{json}");
+        let off = Recipe { peak: Peak { on: false, radius: 1.4, amount: 0.35 }, ..Recipe::default() };
+        let kept: Recipe = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!kept.peak.on);
+        assert!((kept.peak.radius - 1.4).abs() < 1e-12);
+        let bad = Recipe { peak: Peak { on: true, radius: 0.1, amount: 0.2 }, ..Recipe::default() };
+        assert!(bad.validate().is_err());
         assert!(Sharpen::Usm { amount: 1.5 }.validate().is_ok());
         assert!(Sharpen::Usm { amount: 1.6 }.validate().is_err());
         assert!(!Sharpen::Deconv { passes: 3, usm_amount: 0.0 }.uses_mask());
@@ -429,6 +630,9 @@ mod tests {
         let moved = fit.shift(5, -3, 100, 80);
         assert_eq!(moved.y, 0);
         assert!(moved.x <= 100 - moved.w);
+        // A stale window larger than the image is pulled inside, not a panic.
+        let stale = CropRect { x: 0, y: 0, w: 300, h: 300 }.shift(1, 1, 100, 80);
+        assert_eq!(stale, CropRect { x: 0, y: 0, w: 100, h: 80 });
 
         let shrunk = sq.scale_corner(CropCorner::Se, (sq.x as i32 + 50, sq.y as i32 + 80), 100, 100, (10, 8));
         assert_eq!(shrunk.x, sq.x);

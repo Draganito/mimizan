@@ -3,8 +3,15 @@
 //! separation lives in `mimizan-core`. AMaZE, RCD, DCB and LMMSE are an
 //! optional extra path in `mimizan-demosaic` (librtprocess); choosing one
 //! does not run the separation.
+//!
+//! This is the comparison line. The binary is `mimizan-demosaic-gui`, the
+//! window class, config and cache carry the same suffix, so it installs and
+//! runs beside the daily `mimizan-gui`.
 
 #![forbid(unsafe_code)]
+
+/// Window title; the suffix tells the two darkrooms apart on the screen.
+pub const WINDOW_TITLE: &str = "Mimizan Lab (demosaic)";
 
 mod app;
 mod browser;
@@ -44,8 +51,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(size)
             .with_min_inner_size([820.0, 560.0])
-            .with_title("Mimizan Lab"),
+            .with_title(WINDOW_TITLE)
+            // Matches StartupWMClass in dist/mimizan-demosaic-gui.desktop,
+            // so GNOME groups this window apart from mimizan-gui.
+            .with_app_id("mimizan-demosaic-gui"),
         ..Default::default()
     };
-    eframe::run_native("Mimizan Lab", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))))
+    eframe::run_native(WINDOW_TITLE, options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, initial)))))
 }

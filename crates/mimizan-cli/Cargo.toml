@@ -7,8 +7,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# `mimizan-demosaic`: the demosaic-comparison line of mimizan. Binaries,
+# package and data paths carry the suffix so it installs beside the daily
+# `mimizan` package and both can run at once.
 [[bin]]
-name = "mimizan"
+name = "mimizan-demosaic"
 path = "src/main.rs"
 
 [dependencies]
@@ -21,6 +24,7 @@ serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc = "0.1.52"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
 [lints.clippy]
 all = "warn"
@@ -28,7 +32,7 @@ all = "warn"
 # `cargo deb -p mimizan-cli` builds the one Debian package for both binaries
 # (dist/make_release.sh). Paths are relative to this manifest.
 [package.metadata.deb]
-name = "mimizan"
+name = "mimizan-demosaic"
 maintainer = "Dragan Bojovic"
 copyright = "2026, Dragan Bojovic"
 license-file = ["../../LICENSE", "0"]
@@ -39,19 +43,22 @@ extended-description = """\
 Bayer RAW to linear monochrome negative without demosaicing: luminance is
 estimated directly from the mosaic (pixel-adaptive frequency separation),
 written as 16-bit linear TIFF with a mask sidecar, and
-printed through a split-grade paper model, USM optional. Includes the mimizan CLI
-and the mimizan-gui desktop app."""
+printed through a split-grade paper model, USM optional. This is the
+comparison line: the same separation core as mimizan, plus AMaZE, RCD, DCB
+and LMMSE (librtprocess) and the Compare window, installable beside the
+mimizan package. Includes the mimizan-demosaic CLI and the
+mimizan-demosaic-gui desktop app."""
 assets = [
-    ["target/release/mimizan", "usr/bin/", "755"],
-    ["target/release/mimizan-gui", "usr/bin/", "755"],
-    ["../../cameras/*.json", "usr/share/mimizan/cameras/", "644"],
-    ["../../look/*.json", "usr/share/mimizan/look/", "644"],
-    ["../../dist/mimizan-gui.desktop", "usr/share/applications/", "644"],
-    ["../../README.md", "usr/share/doc/mimizan/", "644"],
-    ["../../DETAILED.md", "usr/share/doc/mimizan/", "644"],
-    ["../../LICENSE", "usr/share/doc/mimizan/LICENSE.txt", "644"],
-    ["../../third_party/librtprocess/LICENSE.txt", "usr/share/doc/mimizan/LICENSE-librtprocess.txt", "644"],
-    ["../../docs/SPEC.md", "usr/share/doc/mimizan/docs/", "644"],
-    ["../../docs/RESULTS.md", "usr/share/doc/mimizan/docs/", "644"],
-    ["../../docs/gui.png", "usr/share/doc/mimizan/docs/", "644"],
+    ["target/release/mimizan-demosaic", "usr/bin/", "755"],
+    ["target/release/mimizan-demosaic-gui", "usr/bin/", "755"],
+    ["../../cameras/*.json", "usr/share/mimizan-demosaic/cameras/", "644"],
+    ["../../look/*.json", "usr/share/mimizan-demosaic/look/", "644"],
+    ["../../dist/mimizan-demosaic-gui.desktop", "usr/share/applications/", "644"],
+    ["../../README.md", "usr/share/doc/mimizan-demosaic/", "644"],
+    ["../../DETAILED.md", "usr/share/doc/mimizan-demosaic/", "644"],
+    ["../../LICENSE", "usr/share/doc/mimizan-demosaic/LICENSE.txt", "644"],
+    ["../../third_party/librtprocess/LICENSE.txt", "usr/share/doc/mimizan-demosaic/LICENSE-librtprocess.txt", "644"],
+    ["../../docs/SPEC.md", "usr/share/doc/mimizan-demosaic/docs/", "644"],
+    ["../../docs/RESULTS.md", "usr/share/doc/mimizan-demosaic/docs/", "644"],
+    ["../../docs/gui.png", "usr/share/doc/mimizan-demosaic/docs/", "644"],
 ]

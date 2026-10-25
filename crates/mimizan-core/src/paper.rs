@@ -1,5 +1,5 @@
 //! The paper: a variable-contrast printing paper exposed in two passes, the
-//! split-grade print (Zonensystem paper, section 9 of the SPEC).
+//! split-grade print.
 //!
 //! There is no curve to draw. The print tone of a scene value is what a
 //! sheet of multigrade paper gives after a *soft* exposure (filter 00) and

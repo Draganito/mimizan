@@ -118,6 +118,7 @@ impl ToneMap {
     }
 
     /// Apply to a plane that is already placed.
+    #[cfg(test)]
     pub fn apply(&self, p: &Plane) -> Plane {
         let mut out = Plane::zeros(p.width, p.height);
         out.data.par_iter_mut().zip(&p.data).for_each(|(o, &v)| *o = self.eval(v));
@@ -137,10 +138,16 @@ pub fn place(plane: &mut Plane, place: f64) {
 }
 
 /// Placing and tone in one pass, in place: `plane` holds linear values on
-/// entry and print values on return.
+/// entry and print values on return. Zero placing evaluates the tone on
+/// the untouched value, so the result is bit-identical to [`place`]
+/// followed by the tone.
 pub fn render(plane: &mut Plane, place_stops: f64, tone: &ToneMap) {
-    place(plane, place_stops);
-    plane.data.par_iter_mut().for_each(|v| *v = tone.eval(*v));
+    if place_stops == 0.0 {
+        plane.data.par_iter_mut().for_each(|v| *v = tone.eval(*v));
+    } else {
+        let global = 2f64.powf(place_stops);
+        plane.data.par_iter_mut().for_each(|v| *v = tone.eval(*v * global));
+    }
 }
 
 #[cfg(test)]

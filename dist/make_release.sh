@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Builds the release artefacts for mimizan.
+# Builds the release artefacts for mimizan-demosaic, the comparison line.
+# Package, binaries and data paths carry the suffix, so the .deb installs
+# beside the daily mimizan package and both darkrooms run at once.
 #
 # Result (always under dist/, not committed):
-#   dist/mimizan_<version>_amd64.deb                 both binaries, cameras/, look/,
-#                                                     desktop file, docs
-#   dist/mimizan-<version>-x86_64-linux.tar.gz       the same as a plain tarball
+#   dist/mimizan-demosaic_<version>_amd64.deb            both binaries, cameras/, look/,
+#                                                         desktop file, docs
+#   dist/mimizan-demosaic-<version>-x86_64-linux.tar.gz  the same as a plain tarball
 #
 # Usage:  dist/make_release.sh [--skip-build]
 #
@@ -14,8 +16,8 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
-CLI="$TARGET_DIR/dist/mimizan"
-GUI="$TARGET_DIR/dist/mimizan-gui"
+CLI="$TARGET_DIR/dist/mimizan-demosaic"
+GUI="$TARGET_DIR/dist/mimizan-demosaic-gui"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
     echo "==> cargo build --profile dist"
@@ -31,41 +33,42 @@ VERSION=$("$CLI" --version | awk '{print $2}')
 echo "==> version $VERSION"
 
 # Smoke test: the synthetic bench must run without any input files.
-"$CLI" measure synth --scene wedge --size 256 >/dev/null || { echo "ERROR: measure synth failed"; exit 1; }
+"$CLI" measure synth --scene wedge --size 512 >/dev/null || { echo "ERROR: measure synth failed"; exit 1; }
 
 # --- tarball -----------------------------------------------------------------
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-NAME="mimizan-$VERSION-x86_64-linux"
+NAME="mimizan-demosaic-$VERSION-x86_64-linux"
 mkdir -p "$STAGE/$NAME/docs"
 cp "$CLI" "$GUI" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/DETAILED.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/third_party/librtprocess/LICENSE.txt" "$STAGE/$NAME/LICENSE-librtprocess.txt"
 cp "$PROJECT_DIR/docs/SPEC.md" "$PROJECT_DIR/docs/RESULTS.md" "$PROJECT_DIR/docs/gui.png" "$STAGE/$NAME/docs/"
-cp "$PROJECT_DIR/dist/mimizan-gui.desktop" "$STAGE/$NAME/"
+cp "$PROJECT_DIR/dist/mimizan-demosaic-gui.desktop" "$STAGE/$NAME/"
 TARBALL="$PROJECT_DIR/dist/$NAME.tar.gz"
-rm -f "$PROJECT_DIR"/dist/mimizan-*-x86_64-linux.tar.gz
+rm -f "$PROJECT_DIR"/dist/mimizan-demosaic-*-x86_64-linux.tar.gz
 tar -C "$STAGE" -czf "$TARBALL" "$NAME"
 echo "==> $TARBALL ($(du -h "$TARBALL" | cut -f1))"
 
 # --- .deb --------------------------------------------------------------------
 if command -v cargo-deb >/dev/null; then
-    rm -f "$PROJECT_DIR"/dist/mimizan_*.deb
+    rm -f "$PROJECT_DIR"/dist/mimizan-demosaic_*.deb
     DEB=$(cd "$PROJECT_DIR" && cargo deb -p mimizan-cli --profile dist --no-build -o "$PROJECT_DIR/dist/" | tail -1)
     [[ -f "$DEB" ]] || { echo "ERROR: cargo deb produced no package"; exit 1; }
     LISTING=$(dpkg-deb -c "$DEB")
     for f in \
-        ./usr/bin/mimizan \
-        ./usr/bin/mimizan-gui \
-        ./usr/share/mimizan/cameras/nikon_z_f.json \
-        ./usr/share/mimizan/look/neutral.json \
-        ./usr/share/applications/mimizan-gui.desktop \
-        ./usr/share/doc/mimizan/README.md \
-        ./usr/share/doc/mimizan/DETAILED.md \
-        ./usr/share/doc/mimizan/LICENSE.txt \
-        ./usr/share/doc/mimizan/docs/SPEC.md \
-        ./usr/share/doc/mimizan/docs/RESULTS.md
+        ./usr/bin/mimizan-demosaic \
+        ./usr/bin/mimizan-demosaic-gui \
+        ./usr/share/mimizan-demosaic/cameras/nikon_z_f.json \
+        ./usr/share/mimizan-demosaic/look/neutral.json \
+        ./usr/share/applications/mimizan-demosaic-gui.desktop \
+        ./usr/share/doc/mimizan-demosaic/README.md \
+        ./usr/share/doc/mimizan-demosaic/DETAILED.md \
+        ./usr/share/doc/mimizan-demosaic/LICENSE.txt \
+        ./usr/share/doc/mimizan-demosaic/LICENSE-librtprocess.txt \
+        ./usr/share/doc/mimizan-demosaic/docs/SPEC.md \
+        ./usr/share/doc/mimizan-demosaic/docs/RESULTS.md
     do
         grep -q " $f\$" <<<"$LISTING" || { echo "ERROR: $f missing in deb"; exit 1; }
     done
@@ -79,4 +82,4 @@ fi
 
 echo
 echo "Release assets (do not commit):"
-ls -lh "$PROJECT_DIR"/dist/mimizan_*.deb "$PROJECT_DIR"/dist/mimizan-*.tar.gz 2>/dev/null || true
+ls -lh "$PROJECT_DIR"/dist/mimizan-demosaic_*.deb "$PROJECT_DIR"/dist/mimizan-demosaic-*.tar.gz 2>/dev/null || true

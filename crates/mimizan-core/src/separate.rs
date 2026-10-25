@@ -1,4 +1,4 @@
-//! Luminance / chrominance separation (SPEC section 5).
+//! Luminance / chrominance separation of a Bayer mosaic.
 
 use crate::cfa::BayerPhase;
 use crate::filter::{convolve_cols_signed, convolve_rows_mod, convolve_rows_mod_into, LowpassSpec};
@@ -7,6 +7,8 @@ use crate::plane::Plane;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// How the ambiguous band around each carrier is divided between luminance
+/// and colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MaskMode {
     /// Fixed separation, g1 = g2 = 1 (Phase 2 estimator).
@@ -19,12 +21,19 @@ pub enum MaskMode {
     Dubois,
 }
 
+/// Parameters of the separation. `cutoff`, `transition` and `attenuation_db`
+/// describe the Kaiser low-pass of the `Off` and `Adaptive` modes; the
+/// `Dubois` mode has its own bands in `dubois` and does not read them.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SeparateParams {
+    /// Chroma cutoff, cycles per pixel (`Off`, `Adaptive`).
     pub cutoff: f64,
+    /// Transition width of that low-pass, cycles per pixel.
     pub transition: f64,
+    /// Stop-band attenuation of that low-pass, dB.
     pub attenuation_db: f64,
     pub mask: MaskMode,
+    /// Rounds of the cross-term refinement in the `Adaptive` mode.
     pub rounds_max: usize,
     /// Parameters of the `Dubois` mode (ignored otherwise).
     #[serde(default)]
@@ -40,7 +49,7 @@ pub struct SeparateParams {
 impl Default for SeparateParams {
     fn default() -> Self {
         // rounds_max = 1: the cross-term refinement changed no bench figure
-        // beyond the fourth digit while doubling the run time (RESULTS.md).
+        // beyond the fourth digit while doubling the run time.
         Self {
             cutoff: 0.15,
             transition: 0.05,
@@ -54,6 +63,7 @@ impl Default for SeparateParams {
 }
 
 impl SeparateParams {
+    /// The Kaiser low-pass of the `Off` and `Adaptive` modes.
     pub fn lowpass_spec(&self) -> LowpassSpec {
         LowpassSpec { cutoff: self.cutoff, transition: self.transition, attenuation_db: self.attenuation_db }
     }
@@ -68,16 +78,21 @@ pub struct Separation {
     pub c1: Plane,
     /// Combined low-pass chrominance `Ĉ2'`, mask gain already folded in.
     pub c2: Plane,
-    /// `max(M_1, M_2a, M_2b)` per pixel in [0,1]; `FIXED_MASK_VALUE` everywhere
-    /// in the `Off` and `Dubois` modes.
+    /// Where output sharpening is allowed, per pixel in [0,1]. `Adaptive`:
+    /// `max(M_1, M_2a, M_2b)` of the block mask. `Off` and `Dubois`:
+    /// `FIXED_MASK_VALUE` everywhere. With `reconstruct`, `reconstruct::apply`
+    /// replaces it by `FIXED_MASK_VALUE + (0.99 − FIXED_MASK_VALUE)·β`.
     pub mask_max: Plane,
+    /// Refinement rounds that ran.
     pub rounds: usize,
+    /// Bayer phase of the mosaic the separation was made from.
     pub phase: BayerPhase,
     /// Mean β of the nonlinear reconstruction: the fraction of the picture
     /// that was computed rather than filtered. 0 without `reconstruct`.
     pub computed: f64,
 }
 
+/// The Nyquist carrier `(−1)^x`: +1 on even, −1 on odd indices.
 #[inline]
 pub fn sign_x(x: usize) -> f64 {
     if x & 1 == 0 {
@@ -85,20 +100,6 @@ pub fn sign_x(x: usize) -> f64 {
     } else {
         -1.0
     }
-}
-
-/// `out[y][x] = f(x, y) * src[y][x]` with f one of the three carriers.
-pub fn modulate(src: &Plane, carrier: impl Fn(f64, f64) -> f64 + Sync) -> Plane {
-    let w = src.width;
-    let mut out = Plane::zeros(w, src.height);
-    out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        let sy = sign_x(y);
-        let s = src.row(y);
-        for (x, (o, &v)) in row.iter_mut().zip(s).enumerate() {
-            *o = carrier(sign_x(x), sy) * v;
-        }
-    });
-    out
 }
 
 /// Fixed-filter estimate of the three chrominance planes from a mosaic `m`:
@@ -154,18 +155,20 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
     Separation { lum, c1, c2: c2a, mask_max, rounds: 1, phase, computed: 0.0 }
 }
 
-pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> Separation {
-    let mut sep = separate_linear(mosaic, p);
+/// Separate a Bayer mosaic in the mode `p.mask` names, then run the optional
+/// nonlinear reconstruction. A monochrome mosaic is an error.
+pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
+    let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
+    let mut sep = separate_linear(mosaic, phase, p);
     if let Some(r) = &p.reconstruct {
         let t = std::time::Instant::now();
         sep.computed = crate::reconstruct::apply(&mut sep, &mosaic.plane, &mosaic.noise, r);
         tracing::debug!("reconstruct {} ms, computed {:.3}", t.elapsed().as_millis(), sep.computed);
     }
-    sep
+    Ok(sep)
 }
 
-fn separate_linear(mosaic: &Mosaic, p: &SeparateParams) -> Separation {
-    let phase = mosaic.phase.expect("separate() needs a Bayer mosaic");
+fn separate_linear(mosaic: &Mosaic, phase: BayerPhase, p: &SeparateParams) -> Separation {
     let m = &mosaic.plane;
     if p.mask == MaskMode::Dubois {
         return crate::dubois::separate_dubois(mosaic, phase, &p.dubois);
@@ -175,16 +178,13 @@ fn separate_linear(mosaic: &Mosaic, p: &SeparateParams) -> Separation {
     let (c1, c2a, c2b) = chroma_estimates(m, phase, &k);
     tracing::debug!("chroma estimates ({} taps) {} ms", k.len(), t.elapsed().as_millis());
 
-    match p.mask {
-        MaskMode::Off => fixed(m, phase, c1, c2a, c2b),
-        MaskMode::Dubois => unreachable!(),
-        MaskMode::Adaptive => {
-            if crate::mask::grid_dims(m.width, m.height) == (0, 0) {
-                // Too small for a block grid: fall back to the fixed estimator.
-                return fixed(m, phase, c1, c2a, c2b);
-            }
-            crate::mask::separate_adaptive(mosaic, phase, &k, c1, c2a, c2b, p)
-        }
+    // Too small for a block grid: the adaptive mode falls back to the fixed
+    // estimator.
+    let adaptive = p.mask == MaskMode::Adaptive && crate::mask::grid_dims(m.width, m.height) != (0, 0);
+    if adaptive {
+        crate::mask::separate_adaptive(mosaic, phase, &k, c1, c2a, c2b, p)
+    } else {
+        fixed(m, phase, c1, c2a, c2b)
     }
 }
 

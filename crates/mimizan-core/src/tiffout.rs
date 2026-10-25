@@ -1,4 +1,4 @@
-//! 16-bit grey TIFF output with embedded ICC and JSON description (SPEC section 7).
+//! 16-bit grey TIFF output with embedded ICC and JSON description.
 
 use crate::error::Result;
 use crate::icc::{gray_profile, GrayTrc};
@@ -10,20 +10,28 @@ use std::path::Path;
 use tiff::encoder::{colortype, Rational, TiffEncoder};
 use tiff::tags::{ResolutionUnit, Tag};
 
+/// Tags written next to the pixels.
 pub struct TiffMeta<'a> {
+    /// `ImageDescription`: the JSON the GUI and `print` read back.
     pub description: &'a str,
+    /// Which grey ICC profile to embed.
     pub trc: GrayTrc,
+    /// EXIF orientation 1–8; anything else writes no tag.
     pub orientation: u16,
+    /// `XResolution`/`YResolution` in dots per inch, when known.
     pub dpi: Option<f64>,
 }
 
-/// Quantise `clamp(v,0,1)*65535` and write a single-strip-set grey TIFF.
+/// Quantise `clamp(v,0,1)*65535` and write a 16-bit grey TIFF in strips of
+/// 64 rows.
 pub fn write_gray16(path: &Path, plane: &Plane, meta: &TiffMeta<'_>) -> Result<()> {
     let data: Vec<u16> =
         plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
     write_gray16_u16(path, plane.width, plane.height, &data, meta)
 }
 
+/// Write already quantised 16-bit samples; `data.len()` must be
+/// `width * height` (the encoder checks and errors otherwise).
 pub fn write_gray16_u16(
     path: &Path,
     width: usize,

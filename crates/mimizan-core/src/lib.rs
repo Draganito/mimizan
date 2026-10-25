@@ -1,6 +1,6 @@
 //! mimizan-core: Bayer RAW to linear monochrome negative.
 //!
-//! The contract for every number in this crate is `docs/SPEC.md`.
+//! The method is written up in `docs/PAPER.md`. The code and its tests are the contract.
 
 pub mod baseline;
 pub mod bench;
@@ -21,6 +21,7 @@ pub mod mask;
 pub mod metrics;
 pub mod mix;
 pub mod paper;
+pub mod peak;
 pub mod pipeline;
 pub mod plane;
 pub mod preview;
@@ -38,6 +39,3 @@ pub mod usm;
 pub mod zone;
 
 pub use error::{Error, Result};
-
-/// Crate version, the `mimizan` field every negative and print records.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");

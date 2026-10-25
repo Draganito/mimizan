@@ -1,4 +1,4 @@
-//! Kaiser-windowed sinc low-pass and separable convolution (SPEC section 5.1).
+//! Kaiser-windowed sinc low-pass and separable convolution.
 
 use crate::plane::Plane;
 use rayon::prelude::*;
@@ -19,6 +19,7 @@ pub fn bessel_i0(x: f64) -> f64 {
     sum
 }
 
+/// Design of one Kaiser-windowed sinc low-pass.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LowpassSpec {
     /// Half-amplitude cutoff in cycles per pixel.
@@ -36,6 +37,8 @@ impl Default for LowpassSpec {
 }
 
 impl LowpassSpec {
+    /// Kaiser window shape for the stop-band attenuation; 0 (rectangular)
+    /// below 21 dB.
     pub fn kaiser_beta(&self) -> f64 {
         let a = self.attenuation_db;
         if a > 50.0 {
@@ -47,12 +50,13 @@ impl LowpassSpec {
         }
     }
 
-    /// Odd tap count from the Kaiser length formula.
+    /// Odd tap count from the Kaiser length formula, at least 3. A transition
+    /// at or below zero is read as 0.001 c/px, so the length stays finite.
     pub fn taps(&self) -> usize {
-        let dw = 2.0 * PI * self.transition;
+        let dw = 2.0 * PI * self.transition.max(1e-3);
         // Kaiser estimate N ≈ (A − 8) / (2.285·Δω); rounded up to an odd length
-        // (73 for the SPEC defaults).
-        let n = ((self.attenuation_db - 8.0) / (2.285 * dw)).ceil() as usize;
+        // (73 for the defaults).
+        let n = ((self.attenuation_db - 8.0) / (2.285 * dw)).ceil().max(3.0) as usize;
         if n.is_multiple_of(2) {
             n + 1
         } else {
@@ -93,11 +97,30 @@ impl LowpassSpec {
     }
 }
 
+/// Normalised Gaussian of standard deviation `sigma` pixels, radius
+/// `ceil(3σ)`, at least 1. A sigma that is not a positive finite number
+/// gives the identity tap.
+pub fn gaussian_kernel(sigma: f64) -> Vec<f64> {
+    if sigma.is_nan() || sigma <= 0.0 || sigma.is_infinite() {
+        return vec![1.0];
+    }
+    let r = (3.0 * sigma).ceil().max(1.0) as usize;
+    let k: Vec<f64> = (0..=2 * r)
+        .map(|i| {
+            let d = i as f64 - r as f64;
+            (-d * d / (2.0 * sigma * sigma)).exp()
+        })
+        .collect();
+    let s: f64 = k.iter().sum();
+    k.into_iter().map(|v| v / s).collect()
+}
+
 /// reflect-101 index: ... 2 1 | 0 1 2 ... n-2 n-1 | n-2 n-3 ...
+/// A length of one (or zero) always gives 0.
 #[inline]
-fn reflect(i: isize, n: usize) -> usize {
+pub(crate) fn reflect(i: isize, n: usize) -> usize {
     let n = n as isize;
-    if n == 1 {
+    if n <= 1 {
         return 0;
     }
     let period = 2 * (n - 1);
@@ -161,12 +184,14 @@ pub fn convolve_rows_mod_into(
     );
 }
 
+/// [`convolve_rows_mod_into`] into a new plane.
 pub fn convolve_rows_mod(src: &Plane, k: &[f64], carrier: impl Fn(usize, usize) -> f64 + Sync) -> Plane {
     let mut out = Plane::zeros(src.width, src.height);
     convolve_rows_mod_into(src, k, carrier, &mut out);
     out
 }
 
+/// Row convolution without a carrier.
 pub fn convolve_rows(src: &Plane, k: &[f64]) -> Plane {
     convolve_rows_mod(src, k, |_, _| 1.0)
 }
@@ -232,32 +257,21 @@ pub fn convolve_cols_signed_into(
     );
 }
 
+/// [`convolve_cols_signed_into`] into a new plane.
 pub fn convolve_cols_signed(src: &Plane, k: &[f64], row_sign: impl Fn(usize) -> f64 + Sync) -> Plane {
     let mut out = Plane::zeros(src.width, src.height);
     convolve_cols_signed_into(src, k, row_sign, &mut out);
     out
 }
 
+/// Column convolution without a row sign.
 pub fn convolve_cols(src: &Plane, k: &[f64]) -> Plane {
     convolve_cols_signed(src, k, |_| 1.0)
 }
 
 /// Separable low-pass: rows then columns.
 pub fn lowpass(src: &Plane, k: &[f64]) -> Plane {
-    let t = std::time::Instant::now();
-    let tmp = convolve_rows(src, k);
-    let t_rows = t.elapsed().as_millis();
-    let t = std::time::Instant::now();
-    let out = convolve_cols(&tmp, k);
-    tracing::trace!(
-        "lowpass {}x{} {} taps: rows {} ms, cols {} ms",
-        src.width,
-        src.height,
-        k.len(),
-        t_rows,
-        t.elapsed().as_millis()
-    );
-    out
+    convolve_cols(&convolve_rows(src, k), k)
 }
 
 /// Naive 2-D reference for tests (same kernel both axes, reflect-101).
@@ -295,6 +309,17 @@ mod tests {
         let nyq: f64 = k.iter().enumerate().map(|(i, v)| if i % 2 == 0 { *v } else { -*v }).sum();
         assert!(nyq.abs() < 1e-12, "{nyq}");
         assert!((s.kaiser_beta() - 5.653).abs() < 1e-3);
+        // Degenerate designs still give a finite, odd, usable kernel.
+        for s in [
+            LowpassSpec { cutoff: 0.15, transition: 0.0, attenuation_db: 60.0 },
+            LowpassSpec { cutoff: 0.15, transition: -1.0, attenuation_db: 60.0 },
+            LowpassSpec { cutoff: 0.15, transition: 0.05, attenuation_db: 0.0 },
+        ] {
+            let k = s.kernel();
+            assert!(k.len() >= 3 && k.len() % 2 == 1, "{}", k.len());
+            assert!(k.iter().all(|v| v.is_finite()), "{s:?}");
+            assert!((k.iter().sum::<f64>() - 1.0).abs() < 1e-9, "{s:?}");
+        }
     }
 
     /// Frequency response: pass at 0.1, half at cutoff, stop at 0.2.

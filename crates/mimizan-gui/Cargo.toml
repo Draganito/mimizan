@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+# The comparison line installs beside the daily `mimizan-gui`; the suffix
+# keeps binary, window class, config and cache apart (see mimizan-cli).
 [[bin]]
-name = "mimizan-gui"
+name = "mimizan-demosaic-gui"
 path = "src/main.rs"
 
 [dependencies]

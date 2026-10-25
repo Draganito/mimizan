@@ -44,7 +44,7 @@ pub fn develop(
     p.weights.validate()?;
 
     let t = Instant::now();
-    let mosaic = ingest(frame, &p.ingest);
+    let mosaic = ingest(frame, &p.ingest)?;
     let ingest_ms = t.elapsed().as_millis();
 
     let weights = p.weights.to_balanced(p.weights_space, mosaic.wb);
@@ -175,7 +175,7 @@ mod tests {
         let mut params = mimizan_core::pipeline::NegativeParams::default();
         params.ingest.fix_defects = false;
         params.ingest.wb = mimizan_core::ingest::WhiteBalance::None;
-        let truth = mimizan_core::kodak::luminance(&mimizan_core::kodak::load_srgb8(&png).unwrap());
+        let truth = mimizan_core::kodak::load_srgb8(&png).unwrap().luminance();
         // Published RawTherapee luminance PSNR. The bench reads RT's 16-bit
         // sRGB file and inverts the curve, so a direct linear result can sit
         // a little higher.

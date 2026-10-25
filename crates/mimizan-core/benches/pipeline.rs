@@ -1,5 +1,5 @@
-//! Criterion benches for the hot stages (SPEC section 12). Run with
-//! `cargo bench -p mimizan-core`; the figures in docs/RESULTS.md come from here
+//! Criterion benches for the hot stages. Run with
+//! `cargo bench -p mimizan-core`. The numbers come from here
 //! and from `mimizan negative` on the real samples.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -52,12 +52,16 @@ fn bench_separate(c: &mut Criterion) {
         let s = mosaic(Scene::Patches, size, size, &SynthParams::default());
         g.throughput(Throughput::Elements((size * size) as u64));
         let fixed = SeparateParams { mask: MaskMode::Off, ..Default::default() };
-        let adaptive = SeparateParams::default();
+        let adaptive = SeparateParams { mask: MaskMode::Adaptive, ..Default::default() };
+        let dubois = SeparateParams { mask: MaskMode::Dubois, ..Default::default() };
         g.bench_with_input(BenchmarkId::new("fixed", size), &s.mosaic, |b, m| {
             b.iter(|| separate(black_box(m), &fixed))
         });
         g.bench_with_input(BenchmarkId::new("adaptive", size), &s.mosaic, |b, m| {
             b.iter(|| separate(black_box(m), &adaptive))
+        });
+        g.bench_with_input(BenchmarkId::new("dubois", size), &s.mosaic, |b, m| {
+            b.iter(|| separate(black_box(m), &dubois))
         });
         g.bench_with_input(BenchmarkId::new("mask_only", size), &s.mosaic, |b, m| {
             b.iter(|| compute_mask(black_box(m)))
@@ -69,8 +73,13 @@ fn bench_separate(c: &mut Criterion) {
 fn bench_blockfft(c: &mut Criterion) {
     let bf = BlockFft::new(64);
     let p = plane(256, 256);
-    let mut scratch = Vec::new();
-    c.bench_function("blockfft/power_64", |b| b.iter(|| bf.power(black_box(&p), 64, 64, &mut scratch)));
+    let mut scratch = mimizan_core::blockfft::FftScratch::default();
+    c.bench_function("blockfft/power_64", |b| {
+        b.iter(|| {
+            let (power, total) = bf.power(black_box(&p), 64, 64, &mut scratch);
+            black_box((power[0], total))
+        })
+    });
 }
 
 fn bench_resize(c: &mut Criterion) {

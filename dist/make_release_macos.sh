@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Apple silicon release archive for mimizan.
+# Apple silicon release archive for mimizan-demosaic, the comparison line.
 #
 # Result (always under dist/, not committed):
-#   dist/mimizan-<version>-aarch64-macos.zip
-#     mimizan, mimizan-gui, cameras/, look/, docs
+#   dist/mimizan-demosaic-<version>-aarch64-macos.zip
+#     mimizan-demosaic, mimizan-demosaic-gui, cameras/, look/, docs
 #
 # The two programs link only the frameworks that ship with macOS.
 #
@@ -13,8 +13,8 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
-CLI="$TARGET_DIR/dist/mimizan"
-GUI="$TARGET_DIR/dist/mimizan-gui"
+CLI="$TARGET_DIR/dist/mimizan-demosaic"
+GUI="$TARGET_DIR/dist/mimizan-demosaic-gui"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "ERROR: this archive is the Apple silicon build (uname -m is $(uname -m))"
@@ -36,11 +36,11 @@ VERSION=$("$CLI" --version | awk '{print $2}')
 [[ -n "$VERSION" ]] || { echo "ERROR: could not read version"; exit 1; }
 echo "==> version $VERSION"
 
-"$CLI" measure synth --scene wedge --size 256 >/dev/null || { echo "ERROR: measure synth failed"; exit 1; }
+"$CLI" measure synth --scene wedge --size 512 >/dev/null || { echo "ERROR: measure synth failed"; exit 1; }
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-NAME="mimizan-$VERSION-aarch64-macos"
+NAME="mimizan-demosaic-$VERSION-aarch64-macos"
 mkdir -p "$STAGE/$NAME/docs"
 cp "$CLI" "$GUI" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
@@ -50,7 +50,7 @@ cp "$PROJECT_DIR/docs/SPEC.md" "$PROJECT_DIR/docs/RESULTS.md" "$PROJECT_DIR/docs
 
 DIST="$PROJECT_DIR/dist"
 mkdir -p "$DIST"
-rm -f "$DIST"/mimizan-*-aarch64-macos.zip
+rm -f "$DIST"/mimizan-demosaic-*-aarch64-macos.zip
 ZIP="$DIST/$NAME.zip"
 ditto -c -k --keepParent "$STAGE/$NAME" "$ZIP"
 echo "==> $ZIP ($(du -h "$ZIP" | cut -f1))"

@@ -1,12 +1,14 @@
-//! Synthetic scenes with ground truth (SPEC section 8, "RMSE gegen Wahrheit").
+//! Synthetic scenes with ground truth: RMSE against the truth.
 
 use crate::cfa::{BayerPhase, Color};
 use crate::decode::Rect;
 use crate::ingest::{CameraInfo, IngestReport, Mosaic, NoiseModel};
 use crate::plane::Plane;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
 
+/// Three linear planes of the same size: a demosaiced or synthetic picture.
 #[derive(Clone, Debug)]
 pub struct Rgb {
     pub r: Plane,
@@ -15,6 +17,7 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    /// Black picture of `w × h`.
     pub fn new(w: usize, h: usize) -> Self {
         Self { r: Plane::zeros(w, h), g: Plane::zeros(w, h), b: Plane::zeros(w, h) }
     }
@@ -24,6 +27,7 @@ impl Rgb {
     pub fn height(&self) -> usize {
         self.r.height
     }
+    /// Store one pixel.
     pub fn set(&mut self, x: usize, y: usize, r: f64, g: f64, b: f64) {
         self.r.set(x, y, r);
         self.g.set(x, y, g);
@@ -32,16 +36,18 @@ impl Rgb {
     /// `L_true = (R + 2G + B)/4`.
     pub fn luminance(&self) -> Plane {
         let mut l = Plane::zeros(self.width(), self.height());
-        for ((o, r), (g, b)) in l.data.iter_mut().zip(&self.r.data).zip(self.g.data.iter().zip(&self.b.data))
-        {
-            *o = (r + 2.0 * g + b) / 4.0;
-        }
+        l.data
+            .par_iter_mut()
+            .zip(&self.r.data)
+            .zip(self.g.data.par_iter().zip(&self.b.data))
+            .for_each(|((o, r), (g, b))| *o = (r + 2.0 * g + b) / 4.0);
         l
     }
+    /// Multiply each channel by its gain.
     pub fn scale(&mut self, gr: f64, gg: f64, gb: f64) {
-        self.r.data.iter_mut().for_each(|v| *v *= gr);
-        self.g.data.iter_mut().for_each(|v| *v *= gg);
-        self.b.data.iter_mut().for_each(|v| *v *= gb);
+        self.r.data.par_iter_mut().for_each(|v| *v *= gr);
+        self.g.data.par_iter_mut().for_each(|v| *v *= gg);
+        self.b.data.par_iter_mut().for_each(|v| *v *= gb);
     }
 }
 
@@ -67,6 +73,7 @@ pub enum Scene {
 }
 
 impl Scene {
+    /// Scene from its lowercase name.
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "star" => Some(Self::Star),
@@ -79,35 +86,63 @@ impl Scene {
             _ => None,
         }
     }
+    /// Every scene, in the order of the bench table.
     pub const ALL: [Scene; 7] =
         [Self::Star, Self::Zoneplate, Self::Edge, Self::Patches, Self::Wedge, Self::Fabric, Self::Alias];
+
+    /// Name as `parse` reads it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Star => "star",
+            Self::Zoneplate => "zoneplate",
+            Self::Edge => "edge",
+            Self::Patches => "patches",
+            Self::Wedge => "wedge",
+            Self::Fabric => "fabric",
+            Self::Alias => "alias",
+        }
+    }
 }
 
 /// Area-averaged sampling of a function over the pixel (4x4 supersampling)
-/// so synthetic edges carry a physical pixel aperture.
-fn supersample(w: usize, h: usize, f: impl Fn(f64, f64) -> (f64, f64, f64)) -> Rgb {
+/// so synthetic edges carry a physical pixel aperture. Rows in parallel;
+/// every pixel sums its 16 samples in the same order, so the result does
+/// not depend on the thread count.
+fn supersample(w: usize, h: usize, f: impl Fn(f64, f64) -> (f64, f64, f64) + Sync) -> Rgb {
     let mut rgb = Rgb::new(w, h);
     let s = 4usize;
     let inv = 1.0 / (s * s) as f64;
-    for y in 0..h {
-        for x in 0..w {
-            let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
-            for sy in 0..s {
-                for sx in 0..s {
-                    let px = x as f64 + (sx as f64 + 0.5) / s as f64;
-                    let py = y as f64 + (sy as f64 + 0.5) / s as f64;
-                    let (a, c, d) = f(px, py);
-                    r += a;
-                    g += c;
-                    b += d;
-                }
-            }
-            rgb.set(x, y, r * inv, g * inv, b * inv);
-        }
+    if w == 0 {
+        return rgb;
     }
+    rgb.r
+        .data
+        .par_chunks_mut(w)
+        .zip(rgb.g.data.par_chunks_mut(w))
+        .zip(rgb.b.data.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, ((rr, gr), br))| {
+            for x in 0..w {
+                let (mut r, mut g, mut b) = (0.0, 0.0, 0.0);
+                for sy in 0..s {
+                    for sx in 0..s {
+                        let px = x as f64 + (sx as f64 + 0.5) / s as f64;
+                        let py = y as f64 + (sy as f64 + 0.5) / s as f64;
+                        let (a, c, d) = f(px, py);
+                        r += a;
+                        g += c;
+                        b += d;
+                    }
+                }
+                rr[x] = r * inv;
+                gr[x] = g * inv;
+                br[x] = b * inv;
+            }
+        });
     rgb
 }
 
+/// Spokes of the Siemens star.
 pub const STAR_SPOKES: usize = 72;
 
 /// 24 ColorChecker-like reflectances in linear camera RGB (no white balance):
@@ -139,6 +174,8 @@ pub const PATCH_RGB: [[f64; 3]; 24] = [
     [0.04, 0.04, 0.04],
 ];
 
+/// The scene in linear RGB, before gains and noise. Any size works; the
+/// patch and wedge scenes just get patches of at least one pixel.
 pub fn render(scene: Scene, w: usize, h: usize) -> Rgb {
     let cx = w as f64 / 2.0;
     let cy = h as f64 / 2.0;
@@ -176,8 +213,8 @@ pub fn render(scene: Scene, w: usize, h: usize) -> Rgb {
             let mut rgb = Rgb::new(w, h);
             let cols = 6;
             let rows = 4;
-            let pw = w / cols;
-            let ph = h / rows;
+            let pw = (w / cols).max(1);
+            let ph = (h / rows).max(1);
             for y in 0..h {
                 for x in 0..w {
                     let i = ((y / ph).min(rows - 1)) * cols + (x / pw).min(cols - 1);
@@ -190,7 +227,7 @@ pub fn render(scene: Scene, w: usize, h: usize) -> Rgb {
         Scene::Wedge => {
             let mut rgb = Rgb::new(w, h);
             let steps = 16usize;
-            let pw = w / steps;
+            let pw = (w / steps).max(1);
             for y in 0..h {
                 for x in 0..w {
                     let i = (x / pw).min(steps - 1);
@@ -222,7 +259,7 @@ pub fn render(scene: Scene, w: usize, h: usize) -> Rgb {
 /// 6 stops in `steps` log-spaced levels, top level 0.9.
 pub fn wedge_level(i: usize, steps: usize) -> f64 {
     let stops = 6.0;
-    0.9 * 2f64.powf(-stops * i as f64 / (steps - 1) as f64)
+    0.9 * 2f64.powf(-stops * i as f64 / steps.saturating_sub(1).max(1) as f64)
 }
 
 /// Deterministic Gaussian generator (xorshift64* + Box-Muller).
@@ -231,9 +268,12 @@ pub struct Rng {
 }
 
 impl Rng {
+    /// Seeded generator; a zero seed is replaced by one (xorshift has no
+    /// zero state).
     pub fn new(seed: u64) -> Self {
         Self { state: seed.max(1) }
     }
+    /// Next raw 64-bit value.
     pub fn next_u64(&mut self) -> u64 {
         let mut x = self.state;
         x ^= x >> 12;
@@ -242,6 +282,7 @@ impl Rng {
         self.state = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
+    /// Uniform in `[0, 1)` with 53 random bits.
     pub fn uniform(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
@@ -257,13 +298,17 @@ impl Rng {
     }
 }
 
+/// How a scene is turned into a mosaic.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynthParams {
     pub phase: BayerPhase,
     /// Raw channel gains applied before mosaicing: a neutral scene is not
-    /// neutral in raw DN (no white balance in this pipeline).
+    /// neutral in raw DN (no white balance in this pipeline). Must be
+    /// positive and finite; the balance divides by them.
     pub gains: [f64; 3],
+    /// Shot and read noise added to the mosaic; `None` is a noiseless sensor.
     pub noise: Option<NoiseModel>,
+    /// Seed of the noise generator.
     pub seed: u64,
 }
 
@@ -273,9 +318,13 @@ impl Default for SynthParams {
     }
 }
 
+/// A mosaiced scene with its truth.
 pub struct Synthetic {
+    /// What the pipeline sees.
     pub mosaic: Mosaic,
+    /// The balanced scene.
     pub rgb: Rgb,
+    /// Luminance of the balanced scene.
     pub l_true: Plane,
 }
 

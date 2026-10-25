@@ -2184,6 +2184,9 @@ impl App {
                         }
                         ResampleKernel::CatmullRom => "Interpolating cubic; rings like a short Lanczos",
                         ResampleKernel::BSpline => "Default. No overshoot, visibly soft",
+                        ResampleKernel::Area => {
+                            "Box area. Down: the mean of the covered pixels. Up: the pixel, held"
+                        }
                     });
                 }
             });
@@ -2533,7 +2536,7 @@ impl App {
                 painter.text(
                     avail.center(),
                     egui::Align2::CENTER_CENTER,
-                    "Mimizan Lab",
+                    crate::WINDOW_TITLE,
                     egui::FontId::proportional(28.0),
                     Color32::from_gray(90),
                 );

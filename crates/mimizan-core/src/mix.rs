@@ -1,4 +1,4 @@
-//! Three-weight mix via the low-pass chrominance (SPEC section 6).
+//! Three-weight mix via the low-pass chrominance.
 
 use crate::error::{Error, Result};
 use crate::plane::Plane;
@@ -59,7 +59,12 @@ impl Weights {
         }
     }
 
+    /// Finite, non-negative, and summing to one. A filter that passes none
+    /// of the weighted channels normalises to NaN and fails here.
     pub fn validate(&self) -> Result<()> {
+        if ![self.r, self.g, self.b].iter().all(|v| v.is_finite()) {
+            return Err(Error::Invalid("weights must be finite".into()));
+        }
         if self.r < 0.0 || self.g < 0.0 || self.b < 0.0 {
             return Err(Error::Invalid("weights must be non-negative".into()));
         }

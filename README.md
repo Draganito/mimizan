@@ -10,6 +10,8 @@ The name is the beach at Mimizan, where the idea came up watching the surf: sepa
 
 ![A session in Mimizan Lab: the print in the middle, the enlarger below, the sheet on the right, the folder as a film strip](docs/gui.png)
 
+**This branch is the comparison line.** It carries the same separation core as the current `main` (0.12), plus the demosaicers AMaZE, RCD, DCB and LMMSE (librtprocess) and the Compare window that `main` left behind. Package, programs and data folders are called `mimizan-demosaic` and `mimizan-demosaic-gui`, so it installs beside the daily `mimizan` and both darkrooms run at once. Build it with `cargo build --release` or `dist/make_release.sh`; the window is `target/release/mimizan-demosaic-gui`.
+
 ## A session
 
 The folder lies along the bottom as a strip of negatives. The picture in the middle is the print, paper-white border included, so a 20 mm border is judged as it will go on the wall.

@@ -1,15 +1,17 @@
-use crate::measure::{parse_pair, parse_rect};
+//! `mimizan calibrate`: look curve from a grey wedge, mix weights from a
+//! colour chart, star MTF into the camera file.
+
+use crate::measure::{parse_list, parse_rect, print_star, read_gray_image, star_report};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use mimizan_core::calib::{CameraFile, LookEncoding, StarCalib};
 use mimizan_core::calibrate::{self, fit_look, fit_weights, grid_rects, patch_mean, patch_rgb, RefEncoding};
 use mimizan_core::decode::{Rect, SensorKind};
 use mimizan_core::ingest::{ingest, IngestParams};
-use mimizan_core::metrics::{star_mtf, wedge_fit};
+use mimizan_core::metrics::wedge_fit;
 use mimizan_core::mix::WeightSpace;
-use mimizan_core::plane::Plane;
 use mimizan_core::tiffin::read_gray;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{info, warn};
 
 #[derive(Subcommand)]
@@ -139,17 +141,16 @@ fn rects_from(patches: Option<&str>, grid: Option<&str>, inset: f64) -> Result<O
     }
 }
 
-fn parse_list(s: &str) -> Result<Vec<f64>> {
-    Ok(s.split(',').map(|t| t.trim().parse::<f64>()).collect::<std::result::Result<_, _>>()?)
-}
-
-/// Reference image as a grey plane in [0,1] (encoded as stored).
-fn read_reference(path: &Path) -> Result<Plane> {
-    let img = image::open(path).with_context(|| format!("reference {}", path.display()))?;
-    let g = img.to_luma16();
-    let (w, h) = (g.width() as usize, g.height() as usize);
-    let data: Vec<f64> = g.as_raw().iter().map(|&v| f64::from(v) / 65535.0).collect();
-    Ok(Plane::from_vec(w, h, data))
+/// Share of a patch the saturation sidecar marks as clipped (255). Pixels
+/// outside the sidecar count as clean.
+fn saturated_fraction(sidecar: &(usize, usize, Vec<u8>), r: Rect) -> f64 {
+    let (mw, mh, data) = sidecar;
+    let hits = (r.y..r.y + r.h)
+        .filter(|y| y < mh)
+        .flat_map(|y| (r.x..r.x + r.w).filter(|x| x < mw).map(move |x| (x, y)))
+        .filter(|(x, y)| data.get(y * mw + x).is_some_and(|&v| v == 255))
+        .count();
+    hits as f64 / (r.w * r.h).max(1) as f64
 }
 
 pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
@@ -204,22 +205,18 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
             }
             let neg = read_gray(neg_path)?;
             let mask_path = mimizan_core::print::sidecar_path(neg_path);
-            let sat = mimizan_core::tiffin::read_mask8(&mask_path).ok();
-            let refp = read_reference(ref_path)?;
+            // A sidecar of another size belongs to another negative.
+            let sat = mimizan_core::tiffin::read_mask8(&mask_path)
+                .ok()
+                .filter(|(mw, mh, _)| (*mw, *mh) == (neg.plane.width, neg.plane.height));
+            let refp = read_gray_image(ref_path).context("reference")?;
             let mut pairs = Vec::with_capacity(rects.len());
             let mut n_sat = 0;
             for (r, q) in rects.iter().zip(&ref_rects) {
                 let mut m = patch_mean(&neg.plane, *r) * gain;
-                if let Some((mw, _, data)) = &sat {
-                    let frac = (r.y..r.y + r.h)
-                        .flat_map(|y| (r.x..r.x + r.w).map(move |x| (x, y)))
-                        .filter(|(x, y)| data.get(y * mw + x).is_some_and(|&v| v == 255))
-                        .count() as f64
-                        / (r.w * r.h).max(1) as f64;
-                    if frac > 0.01 {
-                        n_sat += 1;
-                        m = f64::NAN;
-                    }
+                if sat.as_ref().is_some_and(|s| saturated_fraction(s, *r) > 0.01) {
+                    n_sat += 1;
+                    m = f64::NAN;
                 }
                 pairs.push((m, patch_mean(&refp, *q)));
             }
@@ -323,7 +320,7 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                 (None, Some(rp)) => {
                     let ref_rects = rects_from(ref_patches.as_deref(), ref_grid.as_deref(), *inset)?
                         .unwrap_or_else(|| rects.clone());
-                    let p = read_reference(rp)?;
+                    let p = read_gray_image(rp).context("reference")?;
                     ref_rects.iter().map(|q| renc.to_linear(patch_mean(&p, *q))).collect()
                 }
                 (None, None) => bail!("--reference or --ref-values required"),
@@ -336,7 +333,7 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                 bail!("weights need a Bayer sensor");
             };
             let params = IngestParams { wb: crate::cmd::parse_wb(wb)?, ..IngestParams::default() };
-            let mosaic = ingest(&frame, &params);
+            let mosaic = ingest(&frame, &params)?;
             info!("balance {} R {:.4} B {:.4}", mosaic.report.wb_source, mosaic.wb[0], mosaic.wb[2]);
             let mut samples = Vec::with_capacity(rects.len());
             let mut dropped = 0;
@@ -387,11 +384,13 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                 );
             }
             if *write {
-                let path = cameras.join(CameraFile::file_name(&frame.clean_make, &frame.clean_model));
+                let path = CameraFile::path_in(cameras, &frame.clean_make, &frame.clean_model);
                 let mut cam = if path.is_file() {
                     CameraFile::load(&path)?
                 } else {
-                    std::fs::create_dir_all(cameras)?;
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir)?;
+                    }
                     CameraFile::defaults(frame.clean_make.trim(), frame.clean_model.trim(), phase)
                 };
                 cam.weights_rgb = [raw_w.r, raw_w.g, raw_w.b];
@@ -412,15 +411,11 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
         }
         CalibrateCmd::Star { negative, center, radius, spokes, camera, cameras, usm_amount, write, json } => {
             let g = read_gray(negative)?;
-            let (cx, cy) = parse_pair(center)?;
-            let (rmin, rmax) = parse_pair(radius)?;
-            let rep = star_mtf(&g.plane, cx, cy, *spokes, rmin, rmax);
+            let rep = star_report(&g.plane, center, radius, *spokes)?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&rep)?);
             } else {
-                println!("MTF50 axis {:?}  diag {:?}", rep.mtf50_axis, rep.mtf50_diag);
-                println!("MTF10 axis {:?}  diag {:?}", rep.mtf10_axis, rep.mtf10_diag);
-                println!("ring axis {}  diag {}", rep.ring_axis, rep.ring_diag);
+                print_star(&rep);
             }
             if *write {
                 let path = match camera {
@@ -431,7 +426,10 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                         let cam = v.get("camera").context("negative description has no camera")?;
                         let make = cam.get("clean_make").and_then(|m| m.as_str()).unwrap_or_default();
                         let model = cam.get("clean_model").and_then(|m| m.as_str()).unwrap_or_default();
-                        cameras.join(CameraFile::file_name(make, model))
+                        if make.is_empty() && model.is_empty() {
+                            bail!("negative description names no camera; give --camera");
+                        }
+                        CameraFile::path_in(cameras, make, model)
                     }
                 };
                 let mut cam =

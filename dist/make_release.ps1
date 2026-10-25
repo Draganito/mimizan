@@ -1,8 +1,8 @@
-# Builds the Windows release archive for mimizan.
+# Builds the Windows release archive for mimizan-demosaic, the comparison line.
 #
 # Result (always under dist/, not committed):
-#   dist/mimizan-<version>-x86_64-windows.zip
-#     mimizan.exe, mimizan-gui.exe, cameras/, look/, docs
+#   dist/mimizan-demosaic-<version>-x86_64-windows.zip
+#     mimizan-demosaic.exe, mimizan-demosaic-gui.exe, cameras/, look/, docs
 #
 # Usage:  dist/make_release.ps1 [-SkipBuild]
 
@@ -14,8 +14,8 @@ $ErrorActionPreference = "Stop"
 
 $ProjectDir = Split-Path -Parent $PSScriptRoot
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $ProjectDir "target" }
-$Cli = Join-Path $TargetDir "dist\mimizan.exe"
-$Gui = Join-Path $TargetDir "dist\mimizan-gui.exe"
+$Cli = Join-Path $TargetDir "dist\mimizan-demosaic.exe"
+$Gui = Join-Path $TargetDir "dist\mimizan-demosaic-gui.exe"
 
 if (-not $SkipBuild) {
     Write-Host "==> cargo build --profile dist"
@@ -41,10 +41,10 @@ $Version = ($versionLine -split "\s+", 2)[1]
 if (-not $Version) { throw "ERROR: could not read version from: $versionLine" }
 Write-Host "==> version $Version"
 
-& $Cli measure synth --scene wedge --size 256 | Out-Null
+& $Cli measure synth --scene wedge --size 512 | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "ERROR: measure synth failed" }
 
-$Name = "mimizan-$Version-x86_64-windows"
+$Name = "mimizan-demosaic-$Version-x86_64-windows"
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("mimizan-" + [guid]::NewGuid().ToString("n"))
 $Root = Join-Path $Stage $Name
 New-Item -ItemType Directory -Path (Join-Path $Root "docs") -Force | Out-Null
@@ -61,7 +61,7 @@ foreach ($doc in @("SPEC.md", "RESULTS.md", "gui.png")) {
 
 $Dist = Join-Path $ProjectDir "dist"
 New-Item -ItemType Directory -Path $Dist -Force | Out-Null
-Get-ChildItem -LiteralPath $Dist -Filter "mimizan-*-x86_64-windows.zip" -ErrorAction SilentlyContinue |
+Get-ChildItem -LiteralPath $Dist -Filter "mimizan-demosaic-*-x86_64-windows.zip" -ErrorAction SilentlyContinue |
     Remove-Item -Force
 $Zip = Join-Path $Dist "$Name.zip"
 tar.exe -C $Stage -a -c -f $Zip $Name

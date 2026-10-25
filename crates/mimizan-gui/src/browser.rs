@@ -23,6 +23,10 @@ use std::time::{Instant, SystemTime};
 /// HiDPI screen.
 pub const THUMB_LONG_EDGE: usize = 480;
 
+/// Folder name under the config and cache roots. The comparison line keeps
+/// its own, beside the daily `mimizan`.
+const APP_DIR: &str = "mimizan-demosaic";
+
 /// Extensions rawler reads (lower case).
 const RAW_EXTENSIONS: &[&str] = &[
     "nef", "nrw", "dng", "cr2", "cr3", "crw", "arw", "srf", "sr2", "raf", "rw2", "pef", "orf", "erf", "mef",
@@ -240,10 +244,13 @@ fn xdg_or_home(xdg: &str, windows: &str, fallback: &str) -> Option<PathBuf> {
     Some(home_dir()?.join(fallback))
 }
 
-/// `$XDG_CACHE_HOME/mimizan/thumbs`, `%LOCALAPPDATA%/mimizan/thumbs`, or
-/// `~/.cache/mimizan/thumbs`.
+/// `$XDG_CACHE_HOME/mimizan-demosaic/thumbs`,
+/// `%LOCALAPPDATA%/mimizan-demosaic/thumbs`, or
+/// `~/.cache/mimizan-demosaic/thumbs`. Its own folder: the daily
+/// `mimizan-gui` keeps `mimizan/thumbs`, and the two must not overwrite
+/// each other's pictures.
 pub fn cache_dir() -> Option<PathBuf> {
-    Some(xdg_or_home("XDG_CACHE_HOME", "LOCALAPPDATA", ".cache")?.join("mimizan").join("thumbs"))
+    Some(xdg_or_home("XDG_CACHE_HOME", "LOCALAPPDATA", ".cache")?.join(APP_DIR).join("thumbs"))
 }
 
 /// FNV-1a over path, size and modification time: a renamed or re-saved
@@ -457,10 +464,12 @@ pub struct Persisted {
     pub strip_height: Option<f32>,
 }
 
-/// `$XDG_CONFIG_HOME/mimizan/gui.json`, `%APPDATA%/mimizan/gui.json`, or
-/// `~/.config/mimizan/gui.json`.
+/// `$XDG_CONFIG_HOME/mimizan-demosaic/gui.json`,
+/// `%APPDATA%/mimizan-demosaic/gui.json`, or
+/// `~/.config/mimizan-demosaic/gui.json`. Separate from `mimizan/gui.json`,
+/// which the daily `mimizan-gui` writes with its own set of fields.
 pub fn config_path() -> Option<PathBuf> {
-    Some(xdg_or_home("XDG_CONFIG_HOME", "APPDATA", ".config")?.join("mimizan").join("gui.json"))
+    Some(xdg_or_home("XDG_CONFIG_HOME", "APPDATA", ".config")?.join(APP_DIR).join("gui.json"))
 }
 
 impl Persisted {

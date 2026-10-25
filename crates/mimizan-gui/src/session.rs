@@ -31,11 +31,12 @@ pub struct DevelopParams {
     pub wb: WhiteBalance,
     pub mask: MaskMode,
     pub fix_defects: bool,
-    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). The
-    /// desktop program starts with it on. The library and the command stay
-    /// off until `--reconstruct` is passed, because a pixel that passes
-    /// through it is computed, not measured. Ignored unless `converter` is
-    /// [`Converter::Mimizan`].
+    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). Off
+    /// everywhere until asked for, as in the daily line since 0.12.0: a
+    /// pixel that passes through it is computed, not measured, and with the
+    /// baseband tensor in the separation the linear path is within 0.3 dB of
+    /// it on real pictures. The switch stays under Development. Ignored
+    /// unless `converter` is [`Converter::Mimizan`].
     pub reconstruct: bool,
     pub converter: Converter,
 }
@@ -73,7 +74,7 @@ impl Default for DevelopParams {
             wb: WhiteBalance::AsShot,
             mask: MaskMode::Dubois,
             fix_defects: false,
-            reconstruct: true,
+            reconstruct: false,
             converter: Converter::Mimizan,
         }
     }
@@ -513,7 +514,13 @@ pub fn render_sharpen_loupe(
         full_w,
         full_h,
     });
-    let plane = sharpen_window(window, mask_window, &params, nx, ny, view);
+    let plane = match sharpen_window(window, mask_window, &params, nx, ny, view) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("{e}");
+            return SharpenLoupe { gray: Vec::new(), width: 0, height: 0 };
+        }
+    };
     let gray = plane.data.iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
     SharpenLoupe { gray, width: plane.width, height: plane.height }
 }
@@ -822,7 +829,9 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache) -> Pre
             .data
             .par_iter()
             .map(|&l| {
-                let st = zone::stops(l * 2f64.powf(v.place));
+                // Stops around the grey card (paper, equation 3); the core
+                // keeps this reading for its tests only.
+                let st = (l * 2f64.powf(v.place)).max(1e-6).log2() - zone::GRAY_CARD.log2();
                 // The outer zones take everything beyond them.
                 let inside = (st >= lo || k == 0) && (st < hi || k as usize == zone::ZONES - 1);
                 if inside {
@@ -872,13 +881,16 @@ mod tests {
         }
     }
 
-    /// The desktop program starts with the last octave reconstructed. The
-    /// library default stays off; this is the GUI's own switch.
+    /// The desktop starts without the reconstruction, like the daily line
+    /// and the library; the last octave is reconstructed only when the
+    /// switch is set.
     #[test]
-    fn reconstruct_starts_on() {
+    fn reconstruct_starts_off() {
         let p = DevelopParams::default();
-        assert!(p.reconstruct);
-        assert!(p.negative_params(None).separate.reconstruct.is_some());
+        assert!(!p.reconstruct);
+        assert!(p.negative_params(None).separate.reconstruct.is_none());
+        let on = DevelopParams { reconstruct: true, ..p };
+        assert!(on.negative_params(None).separate.reconstruct.is_some());
     }
 }
 

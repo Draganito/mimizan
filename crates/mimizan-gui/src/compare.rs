@@ -489,7 +489,7 @@ fn ensure_mosaic(req: &CompareRequest, cache: &mut Cache) -> Result<(), String> 
         }
     }
     let params = req.session.develop.negative_params(req.session.camera_file.clone());
-    let mosaic = ingest::ingest(&req.session.frame, &params.ingest);
+    let mosaic = ingest::ingest(&req.session.frame, &params.ingest).map_err(|e| e.to_string())?;
     let phase = mosaic.phase.ok_or("no colour mosaic")?;
     cache.mosaic = Some(MosaicHold { frame, wb, plane: mosaic.plane, phase });
     Ok(())

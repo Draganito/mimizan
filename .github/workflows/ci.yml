@@ -65,4 +65,4 @@ jobs:
       - name: Window
         run: cargo build --release -p mimizan-gui
       - name: No libraries beyond macOS
-        run: bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui
+        run: bash dist/check_macos_links.sh target/release/mimizan-demosaic target/release/mimizan-demosaic-gui

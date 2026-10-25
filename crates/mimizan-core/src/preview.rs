@@ -11,6 +11,12 @@ pub fn write_png(plane: &Plane, path: &Path, factor: usize, gamma_encode: bool) 
     let f = factor.max(1);
     let w = plane.width / f;
     let h = plane.height / f;
+    if w == 0 || h == 0 {
+        return Err(crate::Error::Invalid(format!(
+            "preview of {}x{} at 1/{f} has no pixels",
+            plane.width, plane.height
+        )));
+    }
     let inv = 1.0 / (f * f) as f64;
     let mut buf = vec![0u8; w * h];
     buf.par_chunks_mut(w).enumerate().for_each(|(oy, row)| {

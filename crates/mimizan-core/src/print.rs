@@ -1,6 +1,7 @@
-//! Negative -> print file (SPEC section 9, Zonensystem paper section 7): the
-//! one pass. Upright -> crop window -> size -> place -> curve -> border ->
-//! [Richardson–Lucy ->] USM -> one quantisation ->
+//! Negative -> print file: the one pass.
+//! Upright -> crop window -> size -> place -> curve -> black edge ->
+//! white border -> [Richardson–Lucy ->] USM -> peak on the picture ->
+//! one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
 //! print decision (viewing model constant, sidecar use).
@@ -52,10 +53,21 @@ impl PrintSize {
         let p =
             |v: &str| v.trim().parse::<f64>().map_err(|_| Error::Invalid(format!("size '{s}': bad number")));
         let (w, h) = (p(parts[0])? / unit, p(parts[1])? / unit);
-        if w <= 0.0 || h <= 0.0 {
-            return Err(Error::Invalid("size must be positive".into()));
+        let size = Self::Physical { width_in: w, height_in: h };
+        size.validate()?;
+        Ok(size)
+    }
+
+    /// Both sides finite, positive and at most [`SIZE_MAX_IN`] inches.
+    pub fn validate(&self) -> Result<()> {
+        let Self::Physical { width_in, height_in } = *self;
+        let ok = |v: f64| v.is_finite() && v > 0.0 && v <= SIZE_MAX_IN;
+        if !(ok(width_in) && ok(height_in)) {
+            return Err(Error::Invalid(format!(
+                "size {width_in}x{height_in} in must be positive and at most {SIZE_MAX_IN} in a side"
+            )));
         }
-        Ok(Self::Physical { width_in: w, height_in: h })
+        Ok(())
     }
 
     /// Bounding box in pixels.
@@ -65,13 +77,20 @@ impl PrintSize {
     }
 }
 
+/// Longest side a print size may have, inches (10 m).
+pub const SIZE_MAX_IN: f64 = 400.0;
+
+/// What the print pass needs besides the recipe: the viewing model's
+/// constant and distance (recorded in the description, not applied to a
+/// pixel) and whether the mask sidecar may restrict the USM.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrintParams {
     /// Every print decision.
     pub recipe: Recipe,
-    /// USM radius constant of the viewing model (`usm.rs`).
+    /// Arc-minute constant of the viewing model (`usm.rs`). Only
+    /// `usm_radius_px` in the description comes from it.
     pub usm_k: f64,
-    /// Viewing distance for the USM radius, mm. `None` = print diagonal.
+    /// Viewing distance for that radius, mm. `None` = print diagonal.
     pub viewing_distance_mm: Option<f64>,
     /// Use the `.mask.tif` sidecar to restrict USM.
     pub use_mask: bool,
@@ -84,11 +103,6 @@ impl Default for PrintParams {
 }
 
 impl PrintParams {
-    /// Just a look, everything else default (the GUI's TIFF export).
-    pub fn with_look(look: crate::calib::LookFile) -> Self {
-        Self { recipe: Recipe::with_look(look), ..Self::default() }
-    }
-
     /// USM consults the mask. Deconvolution does not: it runs on the whole
     /// picture, and USM may follow it.
     pub fn sharpens(&self) -> bool {
@@ -96,35 +110,51 @@ impl PrintParams {
     }
 }
 
+/// The print's `ImageDescription`: what was printed, from what, and how.
 #[derive(Clone, Debug, Serialize)]
 pub struct PrintInfo {
+    /// Crate version that wrote the file.
     pub mimizan: &'static str,
+    /// Always `"print"`.
     pub stage: &'static str,
+    /// The negative's file name.
     pub source: String,
+    /// The negative's own description, when it parsed as JSON.
     pub source_description: Option<serde_json::Value>,
+    /// Name of the tone (paper or look).
     pub look: String,
+    /// `"gamma22"` or `"none"`: the TRC of the embedded ICC profile.
     pub look_encoding: String,
+    /// Output file size, pixels.
     pub width: usize,
     pub height: usize,
     pub dpi: f64,
+    /// TIFF orientation of the negative that was applied; the file is upright.
     pub orientation_applied: u16,
     /// The recipe this pass ran (Zonensystem paper, section 11): place,
     /// curve, kernel, size, border, sharpening mode.
     pub recipe: Recipe,
-    /// Border in pixels on each side, when there is one.
+    /// White border in pixels on each side, when there is one.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub border_px: usize,
+    /// Black edge in pixels on each side, inside the white border.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub black_px: usize,
+    /// USM amount of the sharpening mode, 0 when none.
     pub usm_amount: f64,
     /// One arc minute at the viewing distance, in print pixels. Recorded
     /// only: sharpening uses [`Self::resample_sigma_px`].
     pub usm_radius_px: f64,
-    /// Gaussian σ of the enlargement, in print pixels. Zero at native size
-    /// and when shrinking. USM and Richardson–Lucy use this.
+    /// Gaussian σ of the enlargement, in print pixels. Zero at native size,
+    /// when shrinking, and for the Area kernel, which adds no blur of its
+    /// own. USM and Richardson–Lucy use this.
     pub resample_sigma_px: f64,
+    /// A mask sidecar restricted the USM.
     pub usm_masked: bool,
     /// Richardson–Lucy iterations when that path ran; omitted when it did not.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub deconvolution_iterations: u32,
+    /// Wall time of the pass, milliseconds.
     pub ms: u128,
 }
 
@@ -136,9 +166,13 @@ fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
 
-/// Apply a TIFF orientation (1..8) to the pixels so the result is upright.
+/// Apply a TIFF orientation (1..=8) to the pixels so the result is upright.
+/// Upright (1) and unknown values copy the plane.
 pub fn orient(p: &Plane, orientation: u16) -> Plane {
     let (w, h) = (p.width, p.height);
+    if !(2..=8).contains(&orientation) || w == 0 || h == 0 {
+        return p.clone();
+    }
     let swap = matches!(orientation, 5..=8);
     let (ow, oh) = if swap { (h, w) } else { (w, h) };
     let mut out = Plane::zeros(ow, oh);
@@ -201,15 +235,17 @@ pub fn rotated(orientation: u16, quarter_turns: u8) -> u16 {
 }
 
 /// Rotate an 8-bit image 90° clockwise `quarter_turns` times; returns the
-/// new (width, height, pixels).
-pub fn rotate_gray8_cw(w: usize, h: usize, g: &[u8], quarter_turns: u8) -> (usize, usize, Vec<u8>) {
+/// new (width, height, pixels). Kept to test `rotate_cw` against `orient`.
+#[cfg(test)]
+fn rotate_gray8_cw(w: usize, h: usize, g: &[u8], quarter_turns: u8) -> (usize, usize, Vec<u8>) {
+    assert_eq!(g.len(), w * h);
     let k = quarter_turns % 4;
     if k == 0 {
         return (w, h, g.to_vec());
     }
     let (ow, oh) = if k % 2 == 1 { (h, w) } else { (w, h) };
     let mut out = vec![0u8; ow * oh];
-    out.par_chunks_mut(ow).enumerate().for_each(|(oy, row)| {
+    for (oy, row) in out.chunks_mut(ow.max(1)).enumerate() {
         for (ox, o) in row.iter_mut().enumerate() {
             let (sx, sy) = match k {
                 1 => (oy, h - 1 - ox),
@@ -218,22 +254,32 @@ pub fn rotate_gray8_cw(w: usize, h: usize, g: &[u8], quarter_turns: u8) -> (usiz
             };
             *o = g[sy * w + sx];
         }
-    });
+    }
     (ow, oh, out)
 }
 
+/// `<negative stem>.mask.tif` next to the negative.
 pub fn sidecar_path(neg: &Path) -> PathBuf {
     let stem = neg.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     neg.with_file_name(format!("{stem}.mask.tif"))
 }
 
+/// The rendered sheet and its description.
 pub struct PrintOutput {
+    /// Print values in [0, 1], not yet quantised.
     pub plane: Plane,
     pub info: PrintInfo,
 }
 
 /// Full print rendering in memory.
 pub fn render(neg_path: &Path, p: &PrintParams) -> Result<PrintOutput> {
+    render_within(neg_path, p, None)
+}
+
+/// `render`, refused before any print plane is allocated when
+/// `memory_estimate` exceeds `budget` bytes. The caller knows the machine;
+/// this crate does not.
+pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> Result<PrintOutput> {
     let t = Instant::now();
     let neg = read_gray(neg_path)?;
     let src_desc = neg.description.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
@@ -241,16 +287,31 @@ pub fn render(neg_path: &Path, p: &PrintParams) -> Result<PrintOutput> {
         "negative {}x{} {} bit, orientation {}",
         neg.plane.width, neg.plane.height, neg.bits, neg.orientation
     );
+    let need = memory_estimate(neg.plane.width, neg.plane.height, neg.orientation, p);
+    info!("print holds about {} at its widest", memory_text(need));
+    if let Some(limit) = budget {
+        if need > limit {
+            return Err(Error::Invalid(format!(
+                "the print would hold about {} at once and the machine has {}; a smaller size or dpi",
+                memory_text(need),
+                memory_text(limit)
+            )));
+        }
+    }
 
     let mut mask: Option<Plane> = None;
     if p.use_mask && p.sharpens() {
         let sp = sidecar_path(neg_path);
         match read_mask8(&sp) {
             Ok((mw, mh, data)) if mw == neg.plane.width && mh == neg.plane.height => {
-                mask = Some(Plane::from_vec(mw, mh, data.iter().map(|&v| f64::from(v) / 255.0).collect()));
+                let values: Vec<f64> = data.par_iter().map(|&v| f64::from(v) / 255.0).collect();
+                match Plane::try_from_vec(mw, mh, values) {
+                    Ok(m) => mask = Some(m),
+                    Err(e) => warn!("mask sidecar {}: {e}; USM everywhere", sp.display()),
+                }
             }
             Ok(_) => warn!("mask sidecar {} has the wrong size; USM everywhere", sp.display()),
-            Err(_) => warn!("no mask sidecar {}; USM everywhere", sp.display()),
+            Err(e) => warn!("no mask sidecar {} ({e}); USM everywhere", sp.display()),
         }
     }
 
@@ -268,31 +329,38 @@ pub fn render(neg_path: &Path, p: &PrintParams) -> Result<PrintOutput> {
 
 /// A negative already in memory (GUI session, or the file just read).
 pub struct PrintSource<'a> {
+    /// Linear luminance as stored in the negative, sensor orientation.
     pub plane: &'a Plane,
     /// Mask in [0,1], same size as `plane`; `None` = USM everywhere.
     pub mask: Option<&'a Plane>,
+    /// TIFF orientation of `plane`, 1..=8.
     pub orientation: u16,
+    /// File name for the description.
     pub name: String,
+    /// The negative's own description, when it parsed as JSON.
     pub description: Option<serde_json::Value>,
 }
 
-/// Where the picture lands: its pixel size, the border around it, the sheet
-/// (picture plus border), and the viewing model's numbers.
+/// Where the picture lands: its pixel size, the two rings around it, the sheet
+/// (picture plus black plus white), and the viewing model's numbers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     /// Picture size after the fit, pixels.
     pub image_w: usize,
     pub image_h: usize,
-    /// Border on each side, pixels.
+    /// White border on each side, pixels.
     pub border_px: usize,
-    /// Output file size: picture plus twice the border.
+    /// Black edge on each side, inside the white, pixels.
+    pub black_px: usize,
+    /// Output file size: picture plus twice the black edge plus twice the white.
     pub out_w: usize,
     pub out_h: usize,
     /// Viewing distance, mm (given, or the sheet diagonal).
     pub viewing_mm: f64,
     /// Long-side scale, destination / source. Above 1 when the picture is enlarged.
     pub enlargement: f64,
-    /// Blur the resampler added, print pixels. Zero unless `enlargement > 1`.
+    /// Blur the resampler added, print pixels. Zero unless `enlargement > 1`
+    /// with a kernel that blurs (the Area kernel holds pixels and adds none).
     pub resample_sigma_px: f64,
     /// One arc minute at `viewing_mm`, print pixels. Recorded, not applied.
     pub usm_radius_px: f64,
@@ -330,8 +398,10 @@ pub fn source_window(full_w: usize, full_h: usize, crop: Option<CropRect>) -> (u
     }
 }
 
-/// Shift a full-image window into crop coordinates. The plane itself is unchanged.
+/// Shift a full-image window into crop coordinates. The plane itself is
+/// unchanged. The window's origin must not lie before the crop.
 fn window_frame<'a>(src: PlaneWindow<'a>, ox: usize, oy: usize, sw: usize, sh: usize) -> PlaneWindow<'a> {
+    debug_assert!(src.origin_x >= ox && src.origin_y >= oy, "window starts before the crop");
     PlaneWindow {
         plane: src.plane,
         origin_x: src.origin_x.saturating_sub(ox),
@@ -352,24 +422,29 @@ pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
     out
 }
 
-/// Layout for a negative of `w×h` (before orientation). The border is taken
-/// from the paper box before the fit, so picture plus border never exceeds
-/// the size asked for.
+/// Layout for a negative of `w×h` (before orientation). Both rings are taken
+/// from the paper box before the fit, so picture plus black plus white never
+/// exceeds the size asked for, unless the frame alone is wider than the
+/// sheet, which leaves one pixel of picture. With no size, the rings are
+/// added outside the crop window and the picture pixels stay as they are.
 pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let r = &p.recipe;
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
     // The fit and the enlargement are measured from the crop window.
     let (_, _, w, h) = source_window(w, h, r.crop);
-    let b = r.border_px();
+    let white = r.border_px();
+    let black = r.black_px();
+    let frame = white.saturating_add(black);
+    let frame2 = frame.saturating_mul(2);
     let (image_w, image_h) = match r.size {
         Some(sz) => {
             let (bw, bh) = sz.pixels(r.dpi);
-            // A border wider than the paper leaves one pixel of picture.
-            fit_dims(w, h, bw.saturating_sub(2 * b).max(1), bh.saturating_sub(2 * b).max(1))
+            // A frame wider than the paper leaves one pixel of picture.
+            fit_dims(w, h, bw.saturating_sub(frame2).max(1), bh.saturating_sub(frame2).max(1))
         }
         None => (w, h),
     };
-    let (out_w, out_h) = (image_w + 2 * b, image_h + 2 * b);
+    let (out_w, out_h) = (image_w.saturating_add(frame2), image_h.saturating_add(frame2));
     let viewing_mm = p.viewing_distance_mm.unwrap_or_else(|| {
         let diag_in = ((out_w as f64 / r.dpi).powi(2) + (out_h as f64 / r.dpi).powi(2)).sqrt();
         diag_in * 25.4
@@ -379,7 +454,8 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     Layout {
         image_w,
         image_h,
-        border_px: b,
+        border_px: white,
+        black_px: black,
         out_w,
         out_h,
         viewing_mm,
@@ -389,11 +465,54 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     }
 }
 
-/// Print geometry for a negative of `w×h` (before orientation): picture
-/// pixel size, viewing distance (mm) and USM radius (px).
-pub fn geometry(w: usize, h: usize, orientation: u16, p: &PrintParams) -> (usize, usize, f64, f64) {
-    let l = layout(w, h, orientation, p);
-    (l.image_w, l.image_h, l.viewing_mm, l.usm_radius_px)
+/// Bytes `render_planes` holds at its widest point for a negative of `w×h`
+/// (before orientation): the live f64 planes of the stage that keeps the
+/// most, plus the 16-bit copy the writer makes. The source plane the
+/// caller already owns is not counted. A guide for refusing an export the
+/// machine cannot hold, good to about a fifth; the allocator and the order
+/// in which planes drop are what it does not see.
+pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
+    let r = &p.recipe;
+    let lay = layout(w, h, orientation, p);
+    let (fw, fh) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
+    let (_, _, cw, ch) = source_window(fw, fh, r.crop);
+    let full = fw as f64 * fh as f64;
+    let n = cw as f64 * ch as f64;
+    let picture = lay.image_w as f64 * lay.image_h as f64;
+    let sheet = lay.out_w as f64 * lay.out_h as f64;
+    // The mask walks beside the picture through orient, crop, resize and
+    // the frame, doubling those stages.
+    let m = if p.sharpens() { 2.0 } else { 1.0 };
+    // Orientation copy, then the crop window beside it.
+    let orient = m * (full + n);
+    // Separable resize: source, the smaller intermediate, destination.
+    let mid = (ch as f64 * lay.image_w as f64).min(cw as f64 * lay.image_h as f64);
+    let resize =
+        if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
+    // The picture and the sheet it is copied into; no rings, no copy.
+    let frame = if lay.border_px + lay.black_px > 0 { m * picture + sheet } else { 0.0 };
+    // Picture cut out, blur scratch, blur, result; Richardson–Lucy keeps
+    // estimate, blurred, ratio and correction as well.
+    let peak = if r.peak.applies() { sheet + 4.0 * picture } else { 0.0 };
+    let sharpen = if p.sharpens() && lay.resample_sigma_px > 0.0 {
+        let planes = if r.sharpen.deconv_passes() > 0 { 7.0 } else { 5.0 };
+        sheet + planes * picture
+    } else {
+        0.0
+    };
+    let widest = [orient, resize, frame, peak, sharpen].into_iter().fold(0.0, f64::max);
+    let bytes = 8.0 * widest + 2.0 * sheet;
+    bytes.min(u64::MAX as f64) as u64
+}
+
+/// Bytes as a short figure: `640 MB`, `27.3 GB`.
+pub fn memory_text(bytes: u64) -> String {
+    let gb = bytes as f64 / 1e9;
+    if gb >= 1.0 {
+        format!("{gb:.1} GB")
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
+    }
 }
 
 /// How far, in print pixels, a sharpened sample can see.
@@ -420,7 +539,7 @@ pub fn sharpen_halo(sigma: f64, passes: usize, usm: bool) -> usize {
 /// Where the loupe sits on the sheet, and which picture pixels have to be
 /// resampled so the sharpening around that box sees real neighbours.
 struct LoupeGeom {
-    /// Box origin on the sheet (picture plus border).
+    /// Box origin on the sheet (picture plus black edge plus white border).
     view_x: usize,
     view_y: usize,
     view_w: usize,
@@ -441,8 +560,25 @@ struct LoupeGeom {
     image_h: usize,
 }
 
-fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> LoupeGeom {
-    let (image_w, image_h, border) = (lay.image_w, lay.image_h, lay.border_px);
+/// Radius in print pixels. The stored radius is in negative pixels, and the
+/// print multiplies it by the long-side scale `destination / source`, above
+/// 1 and below. At native size the factor is 1. The amount is never scaled.
+pub fn peak_print_radius(radius: f64, scale: f64) -> f64 {
+    radius * scale
+}
+
+fn peak_halo_px(recipe: &Recipe, enlargement: f64) -> usize {
+    if recipe.peak.applies() {
+        kernel_radius(peak_print_radius(recipe.peak.radius, enlargement))
+    } else {
+        0
+    }
+}
+
+fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize, peak_halo: usize) -> LoupeGeom {
+    let (image_w, image_h) = (lay.image_w, lay.image_h);
+    // Picture inset: white on the outside, black between that and the picture.
+    let border = lay.border_px + lay.black_px;
     let (sheet_w, sheet_h) = (lay.out_w, lay.out_h);
     let vw = view.min(sheet_w).max(1);
     let vh = view.min(sheet_h).max(1);
@@ -454,11 +590,12 @@ fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> 
     top = top.clamp(0, sheet_h as isize - vh as isize);
     let passes = sharpen.deconv_passes() as usize;
     let usm = sharpen.usm_amount() > 0.0;
-    let halo = if lay.resample_sigma_px > 0.0 && (passes > 0 || usm) {
+    let from_sharpen = if lay.resample_sigma_px > 0.0 && (passes > 0 || usm) {
         sharpen_halo(lay.resample_sigma_px, passes, usm)
     } else {
         0
-    } as isize;
+    };
+    let halo = from_sharpen.saturating_add(peak_halo) as isize;
     let tile_x = (left - halo).max(0) as usize;
     let tile_y = (top - halo).max(0) as usize;
     let tile_r = (left + vw as isize + halo).min(sheet_w as isize) as usize;
@@ -496,9 +633,9 @@ fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize) -> 
 }
 
 /// Upright source pixels the loupe resamples. When USM is on, the mask is
-/// resampled with Lanczos-3 (wider than the other kernels) and that span is
-/// united with the picture kernel, so one crop feeds both. `(0, 0, 0, 0)`
-/// when the box lies entirely on the border.
+/// resampled with [`MASK_KERNEL`] and that span is united with the picture
+/// kernel's, so one crop feeds both. `(0, 0, 0, 0)` when the box lies
+/// entirely on the border.
 pub fn loupe_source_rect(
     full_w: usize,
     full_h: usize,
@@ -509,7 +646,7 @@ pub fn loupe_source_rect(
 ) -> (usize, usize, usize, usize) {
     let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
     let lay = layout(full_w, full_h, 1, p);
-    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe, lay.enlargement));
     if g.pic_w == 0 || g.pic_h == 0 {
         return (0, 0, 0, 0);
     }
@@ -519,13 +656,20 @@ pub fn loupe_source_rect(
     };
     let (x0, y0, x1, y1) = span(p.recipe.resample);
     let (x0, y0, x1, y1) = if p.recipe.sharpen.usm_amount() > 0.0 {
-        let (mx0, my0, mx1, my1) = span(ResampleKernel::Lanczos3);
+        let (mx0, my0, mx1, my1) = span(MASK_KERNEL);
         (x0.min(mx0), y0.min(my0), x1.max(mx1), y1.max(my1))
     } else {
         (x0, y0, x1, y1)
     };
     (x0 + ox, y0 + oy, x1 + ox, y1 + oy)
 }
+
+/// Kernel the mask sidecar is resampled with. Its weights are positive and
+/// sum to one, so a saturated flag (exactly 1.0) stays exactly 1.0 when the
+/// picture is enlarged, and nothing overshoots into or out of the flag when
+/// it is reduced. A sharper kernel would ring the flags and sharpen pixels
+/// the sidecar had excluded.
+pub const MASK_KERNEL: ResampleKernel = ResampleKernel::Area;
 
 /// The print pixels of one box: resize, place, tone, then the same
 /// Richardson–Lucy and USM as [`render_planes`], on a tile padded by
@@ -538,13 +682,29 @@ pub fn sharpen_window(
     nx: f64,
     ny: f64,
     view: usize,
-) -> Plane {
+) -> crate::Result<Plane> {
     let (ox, oy, sw, sh) = source_window(linear.full_w, linear.full_h, p.recipe.crop);
     let lay = layout(linear.full_w, linear.full_h, 1, p);
-    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view);
+    let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe, lay.enlargement));
     let tone = p.recipe.curve.compile();
     let white = tone.white();
     let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
+    if lay.black_px > 0 {
+        let x0 = lay.border_px;
+        let y0 = lay.border_px;
+        paint_sheet_rect(
+            &mut tile,
+            g.tile_x,
+            g.tile_y,
+            (
+                x0,
+                y0,
+                x0 + lay.black_px + lay.image_w + lay.black_px,
+                y0 + lay.black_px + lay.image_h + lay.black_px,
+            ),
+            tone.eval(0.0),
+        );
+    }
     let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
     // The plane window is in full-image coordinates. The resize maps the
     // crop, so its coordinate system is the window.
@@ -552,65 +712,164 @@ pub fn sharpen_window(
     let mask = mask.map(|m| window_frame(m, ox, oy, sw, sh));
     if g.pic_w > 0 && g.pic_h > 0 {
         let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
-        let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic);
+        let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic)?;
         crate::tone::render(&mut picture, p.recipe.place, &tone);
         let ox = g.pic_x + g.border - g.tile_x;
         let oy = g.pic_y + g.border - g.tile_y;
         for y in 0..g.pic_h {
             tile.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(picture.row(y));
         }
-        // The print resamples the mask with Lanczos-3, which is wider than
-        // Mitchell, Catmull–Rom and the B-spline. Only do it when a USM will
-        // read the mask: the crop from `loupe_source_rect` includes those
-        // taps only then. Resampling it anyway reads off the window.
+        // Only resample the mask when a USM will read it: the crop from
+        // `loupe_source_rect` includes the mask kernel's taps only then, and
+        // resampling it anyway could read off the window.
         if p.recipe.sharpen.usm_amount() > 0.0 {
             if let (Some(m), Some(dst)) = (mask, mask_tile.as_mut()) {
-                let resampled = resize_rect(m, g.image_w, g.image_h, ResampleKernel::Lanczos3, pic);
+                let resampled = resize_rect(m, g.image_w, g.image_h, MASK_KERNEL, pic)?;
                 for y in 0..g.pic_h {
                     dst.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(resampled.row(y));
                 }
             }
         }
+        // Sharpening and peak on the picture pixels of the tile only, the
+        // same rectangle `render_planes` sharpens, so the box matches the
+        // full print and the paper around the picture stays untouched.
+        let rect = (ox, oy, g.pic_w, g.pic_h);
+        apply_sharpen(&mut tile, mask_tile.as_ref(), &p.recipe, &lay, rect);
+        apply_peak_picture(
+            &mut tile,
+            &p.recipe,
+            rect,
+            peak_print_radius(p.recipe.peak.radius, lay.enlargement),
+        );
     }
-    tile = apply_sharpen(tile, mask_tile.as_ref(), &p.recipe, &lay).0;
     let mut out = Plane::zeros(g.view_w, g.view_h);
     let ox = g.view_x - g.tile_x;
     let oy = g.view_y - g.tile_y;
     for y in 0..g.view_h {
         out.row_mut(y).copy_from_slice(&tile.row(oy + y)[ox..ox + g.view_w]);
     }
-    out
+    Ok(out)
 }
 
-/// Surround `p` with `b` pixels of `value` on every side. The mask gets 0
-/// there (nothing to sharpen on paper).
+/// Paint `value` into the part of `tile` that overlaps the sheet rectangle
+/// `(x0, y0, x1, y1)`, half-open. `tile_x` and `tile_y` are the tile's origin.
+fn paint_sheet_rect(
+    tile: &mut Plane,
+    tile_x: usize,
+    tile_y: usize,
+    rect: (usize, usize, usize, usize),
+    value: f64,
+) {
+    let (x0, y0, x1, y1) = rect;
+    let left = x0.max(tile_x);
+    let top = y0.max(tile_y);
+    let right = x1.min(tile_x + tile.width);
+    let bottom = y1.min(tile_y + tile.height);
+    if left >= right || top >= bottom {
+        return;
+    }
+    for y in top..bottom {
+        tile.row_mut(y - tile_y)[left - tile_x..right - tile_x].fill(value);
+    }
+}
+
+/// Surround `p` with `b` pixels of `value` on every side.
 pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
-    if b == 0 {
+    frame_sheet(p, 0, b, value, value)
+}
+
+/// The sheet: `p` inside `black` pixels of `black_value`, inside `white`
+/// pixels of `white_value`, in one allocation.
+fn frame_sheet(p: &Plane, black: usize, white: usize, black_value: f64, white_value: f64) -> Plane {
+    let frame = black + white;
+    if frame == 0 {
         return p.clone();
     }
-    let (w, h) = (p.width + 2 * b, p.height + 2 * b);
-    let mut out = Plane::from_vec(w, h, vec![value; w * h]);
-    out.data.par_chunks_mut(w).enumerate().skip(b).take(p.height).for_each(|(y, row)| {
-        row[b..b + p.width].copy_from_slice(p.row(y - b));
+    let (w, h) = (p.width + 2 * frame, p.height + 2 * frame);
+    let mut out = Plane::from_vec(w, h, vec![white_value; w * h]);
+    out.data.par_chunks_mut(w).enumerate().skip(white).take(p.height + 2 * black).for_each(|(y, row)| {
+        let inner = &mut row[white..w - white];
+        if y < frame || y >= frame + p.height {
+            inner.fill(black_value);
+        } else {
+            inner[..black].fill(black_value);
+            inner[black..black + p.width].copy_from_slice(p.row(y - frame));
+            inner[black + p.width..].fill(black_value);
+        }
     });
     out
 }
 
-/// Richardson–Lucy and USM at the enlargement σ. A width of zero leaves
-/// the plane as it is.
-fn apply_sharpen(mut plane: Plane, mask: Option<&Plane>, recipe: &Recipe, lay: &Layout) -> (Plane, usize) {
+/// `(x0, y0, width, height)` of the picture inside a sheet or tile.
+type PictureRect = (usize, usize, usize, usize);
+
+/// Run `f` on the picture rectangle of `plane` and write the result back.
+/// The paper and the black edge stay as they were, and the filters reflect
+/// inside the picture, not into the border. A rectangle that does not fit
+/// the plane is left alone. `mask` is cut to the same rectangle.
+fn on_picture(
+    plane: &mut Plane,
+    mask: Option<&Plane>,
+    rect: PictureRect,
+    f: impl FnOnce(&Plane, Option<&Plane>) -> Plane,
+) {
+    let (x0, y0, width, height) = rect;
+    if width == 0 || height == 0 {
+        return;
+    }
+    if x0.saturating_add(width) > plane.width || y0.saturating_add(height) > plane.height {
+        return;
+    }
+    let cut = |src: &Plane| {
+        let mut out = Plane::zeros(width, height);
+        for y in 0..height {
+            out.row_mut(y).copy_from_slice(&src.row(y0 + y)[x0..x0 + width]);
+        }
+        out
+    };
+    let picture = cut(plane);
+    let mask = mask.filter(|m| (m.width, m.height) == (plane.width, plane.height)).map(cut);
+    let out = f(&picture, mask.as_ref());
+    if (out.width, out.height) != (width, height) {
+        return;
+    }
+    for y in 0..height {
+        plane.row_mut(y0 + y)[x0..x0 + width].copy_from_slice(out.row(y));
+    }
+}
+
+/// Peak on the picture rectangle only.
+fn apply_peak_picture(plane: &mut Plane, recipe: &Recipe, rect: PictureRect, print_radius: f64) {
+    if !recipe.peak.applies() {
+        return;
+    }
+    on_picture(plane, None, rect, |picture, _| unsharp(picture, print_radius, recipe.peak.amount, None));
+}
+
+/// Richardson–Lucy and USM at the enlargement σ, on the picture rectangle
+/// only. Returns the iterations run. A σ of zero leaves the plane as it is.
+fn apply_sharpen(
+    plane: &mut Plane,
+    mask: Option<&Plane>,
+    recipe: &Recipe,
+    lay: &Layout,
+    rect: PictureRect,
+) -> usize {
     let detail = lay.resample_sigma_px;
-    let mut deconv_n = 0usize;
     let passes = recipe.sharpen.deconv_passes() as usize;
-    if passes > 0 && detail > 0.0 {
-        deconv_n = passes.min(DECONV_ITERATIONS);
-        plane = richardson_lucy(&plane, detail, deconv_n);
-    }
     let amount = recipe.sharpen.usm_amount();
-    if amount > 0.0 && detail > 0.0 {
-        plane = unsharp(&plane, detail, amount, mask);
+    if detail <= 0.0 || (passes == 0 && amount <= 0.0) {
+        return 0;
     }
-    (plane, deconv_n)
+    let deconv_n = if passes > 0 { passes.min(DECONV_ITERATIONS) } else { 0 };
+    on_picture(plane, mask, rect, |picture, mask| {
+        let mut out = if deconv_n > 0 { richardson_lucy(picture, detail, deconv_n) } else { picture.clone() };
+        if amount > 0.0 {
+            out = unsharp(&out, detail, amount, mask);
+        }
+        out
+    });
+    deconv_n
 }
 
 /// The one pass on in-memory planes. `info.ms` covers this call only.
@@ -639,8 +898,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         info!("resize {}x{} -> {}x{} ({})", plane.width, plane.height, tw, th, r.resample.name());
         plane = resize_with(&plane, tw, th, r.resample);
         if let Some(m) = mask.take() {
-            // The mask is a weight field; a plain resample is enough.
-            mask = Some(resize_with(&m, tw, th, ResampleKernel::Lanczos3));
+            mask = Some(resize_with(&m, tw, th, MASK_KERNEL));
         }
     }
 
@@ -653,18 +911,46 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     info!("tone {}", r.curve.name());
     crate::tone::render(&mut plane, r.place, &tone);
 
+    let px_mm = |px: usize| px as f64 * 25.4 / r.dpi;
+    if lay.black_px > 0 {
+        info!(
+            "black edge {} px ({:.2} mm) at clear film {:.4}",
+            lay.black_px,
+            px_mm(lay.black_px),
+            tone.eval(0.0)
+        );
+    }
     if lay.border_px > 0 {
-        info!("border {} px ({} mm) in paper white {:.4}", lay.border_px, r.border_mm, tone.white());
-        plane = add_border(&plane, lay.border_px, tone.white());
+        info!(
+            "border {} px ({:.2} mm) in paper white {:.4}",
+            lay.border_px,
+            px_mm(lay.border_px),
+            tone.white()
+        );
+    }
+    let frame = lay.black_px + lay.border_px;
+    if frame > 0 {
+        // Both rings in one allocation. The mask gets 0 there: nothing to
+        // sharpen on paper.
+        plane = frame_sheet(&plane, lay.black_px, lay.border_px, tone.eval(0.0), tone.white());
         if let Some(m) = mask.take() {
-            mask = Some(add_border(&m, lay.border_px, 0.0));
+            mask = Some(add_border(&m, frame, 0.0));
         }
     }
 
-    let (plane, deconv_n) = apply_sharpen(plane, mask.as_ref(), r, &lay);
+    let picture = (frame, frame, lay.image_w, lay.image_h);
+    let deconv_n = apply_sharpen(&mut plane, mask.as_ref(), r, &lay, picture);
+    let print_radius = peak_print_radius(r.peak.radius, lay.enlargement);
+    apply_peak_picture(&mut plane, r, picture, print_radius);
+    if r.peak.applies() {
+        info!(
+            "peak radius {:.2} px, amount {:.2}, scale {:.2}, border left as it was",
+            print_radius, r.peak.amount, lay.enlargement
+        );
+    }
     if deconv_n > 0 {
         info!(
-            "richardson-lucy {deconv_n} iterations, enlargement sigma {:.2} px, no mask",
+            "richardson-lucy {deconv_n} iterations, enlargement sigma {:.2} px, no mask, picture only",
             lay.resample_sigma_px
         );
     }
@@ -690,6 +976,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         orientation_applied: src.orientation,
         recipe: r.clone(),
         border_px: lay.border_px,
+        black_px: lay.black_px,
         usm_amount: r.sharpen.usm_amount(),
         usm_radius_px: lay.usm_radius_px,
         resample_sigma_px: lay.resample_sigma_px,
@@ -722,6 +1009,7 @@ pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
     Ok(())
 }
 
+/// `.jpg` or `.jpeg`, any case.
 pub fn is_jpeg_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
@@ -756,8 +1044,35 @@ mod tests {
         assert_eq!(PrintSize::parse("8x10in").unwrap().pixels(300.0), (2400, 3000));
         assert!(PrintSize::parse("30x40").is_err());
         assert!(PrintSize::parse("0x40cm").is_err());
+        assert!(PrintSize::parse("infx10in").is_err());
+        assert!(PrintSize::parse("nanx10in").is_err());
+        assert!(PrintSize::parse("1000x10in").is_err());
         assert!(PrintSize::parse("2048px").is_err());
         assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
+    }
+
+    #[test]
+    fn memory_estimate_follows_the_sheet() {
+        // 3 x 2 m at 300 dpi from a 24 MP negative, peak on: the sheet is
+        // 837 MP, and the widest stage holds it beside four picture planes.
+        let mut recipe = Recipe::on_paper();
+        recipe.size = Some(PrintSize::parse("300x200cm").unwrap());
+        recipe.dpi = 300.0;
+        recipe.peak.on = true;
+        recipe.peak.amount = 1.15;
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(6000, 4000, 1, &p);
+        let sheet = (lay.out_w * lay.out_h) as f64;
+        let need = memory_estimate(6000, 4000, 1, &p) as f64;
+        assert!(need >= 8.0 * 5.0 * sheet * 0.9, "{need} vs sheet {sheet}");
+        assert!(need <= 8.0 * 5.0 * sheet * 1.2 + 2.0 * sheet, "{need} vs sheet {sheet}");
+        assert!(need > 25e9 && need < 40e9, "{}", memory_text(need as u64));
+        // Native size without peak: a few copies of the negative itself.
+        let native = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let small = memory_estimate(6000, 4000, 1, &native);
+        assert!(small < 24_000_000 * 8 * 4, "{small}");
+        assert_eq!(memory_text(640_000_000), "640 MB");
+        assert_eq!(memory_text(27_300_000_000), "27.3 GB");
     }
 
     #[test]
@@ -961,6 +1276,78 @@ mod tests {
         assert!(out3.plane.at(100, 100) < grey);
     }
 
+    /// Both rings are added around the crop window. A pixel inside the crop
+    /// is the same as a print of that window with no border. A pixel outside
+    /// the crop is not on the sheet. Black sits against the picture; white
+    /// is the outer edge. A black wider than the white is printed as the white.
+    #[test]
+    fn black_edge_wraps_the_crop_and_leaves_its_pixels() {
+        let (w, h) = (8, 6);
+        let mut data = vec![0.5; w * h];
+        data[0] = 0.9;
+        data[2 * w + 3] = 0.25;
+        let plane = Plane::from_vec(w, h, data);
+        let recipe = Recipe {
+            dpi: 254.0,
+            border_mm: 2.0,
+            black_mm: 1.0,
+            crop: Some(crate::recipe::CropRect { x: 2, y: 1, w: 4, h: 3 }),
+            ..Recipe::default()
+        };
+        assert_eq!((recipe.border_px(), recipe.black_px(), recipe.frame_px()), (20, 10, 30));
+        let wider = Recipe { black_mm: 9.0, ..recipe.clone() };
+        assert_eq!(wider.black_px(), wider.border_px());
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "crop".into(), description: None };
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(w, h, 1, &p);
+        assert_eq!((lay.image_w, lay.image_h, lay.black_px, lay.border_px), (4, 3, 10, 20));
+        assert_eq!((lay.out_w, lay.out_h), (64, 63));
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (64, 63));
+        assert_eq!((out.info.border_px, out.info.black_px), (20, 10));
+        assert_eq!(out.plane.at(0, 0), 1.0);
+        assert_eq!(out.plane.at(19, 31), 1.0);
+        assert_eq!(out.plane.at(20, 31), 0.0);
+        assert_eq!(out.plane.at(29, 31), 0.0);
+        let bare = Recipe { border_mm: 0.0, black_mm: 0.0, ..p.recipe.clone() };
+        let bare_out = render_planes(&src, &PrintParams { recipe: bare, ..Default::default() });
+        assert_eq!((bare_out.plane.width, bare_out.plane.height), (4, 3));
+        assert!((out.plane.at(30, 30) - bare_out.plane.at(0, 0)).abs() < 1e-12);
+        assert!((out.plane.at(31, 31) - bare_out.plane.at(1, 1)).abs() < 1e-12);
+        assert!((out.plane.at(33, 32) - bare_out.plane.at(3, 2)).abs() < 1e-12);
+        let outside = 0.9f64.powf(1.0 / 2.2);
+        assert!(out.plane.data.iter().all(|v| (*v - outside).abs() > 1e-6));
+    }
+
+    /// The centimetre picture stays the size that was asked. Black and white
+    /// grow the sheet around it.
+    #[test]
+    fn black_and_white_are_added_around_the_picture() {
+        let dpi = 300.0;
+        let (img_w, img_h) = (5504, 8256);
+        let picture = 2400usize;
+        let white = 15usize;
+        let black = 4usize;
+        let frame = white + black;
+        let (bw, bh) = box_for_picture_width(img_w, img_h, picture, frame);
+        let p = PrintParams {
+            recipe: Recipe {
+                size: Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi }),
+                dpi,
+                border_mm: white as f64 / dpi * 25.4,
+                black_mm: black as f64 / dpi * 25.4,
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(p.recipe.border_px(), white);
+        assert_eq!(p.recipe.black_px(), black);
+        let lay = layout(img_w, img_h, 1, &p);
+        assert_eq!(lay.image_w, picture);
+        assert_eq!((lay.out_w, lay.out_h), (lay.image_w + 2 * frame, lay.image_h + 2 * frame));
+    }
+
     /// Paper, table 4: place = 0 is the run that never had
     /// the step; the same recipe twice is the same picture; paper at its
     /// base exposure is a different picture from the neutral look.
@@ -1055,6 +1442,7 @@ mod tests {
         let mut recipe = Recipe::on_paper();
         recipe.dpi = 100.0;
         recipe.border_mm = 1.0;
+        recipe.black_mm = 0.5;
         recipe.size = Some(PrintSize::Physical { width_in: 0.22, height_in: 0.22 });
         recipe.resample = ResampleKernel::Lanczos3;
         recipe.sharpen = Sharpen::Deconv { passes: 2, usm_amount: 0.6 };
@@ -1089,8 +1477,16 @@ mod tests {
                 nx,
                 ny,
                 11,
+            )
+            .expect("loupe window");
+            let g = loupe_geom(
+                &lay,
+                params.recipe.sharpen,
+                nx,
+                ny,
+                11,
+                peak_halo_px(&params.recipe, lay.enlargement),
             );
-            let g = loupe_geom(&lay, params.recipe.sharpen, nx, ny, 11);
             for y in 0..got.height {
                 for x in 0..got.width {
                     let expect = full.plane.at(g.view_x + x, g.view_y + y);
@@ -1130,6 +1526,7 @@ mod tests {
                     recipe.resample = kernel;
                     recipe.sharpen = sharpen;
                     recipe.border_mm = 2.0;
+                    recipe.black_mm = 1.0;
                     recipe.size =
                         Some(PrintSize::Physical { width_in, height_in: width_in * h as f64 / w as f64 });
                     let params = PrintParams { recipe, ..PrintParams::default() };
@@ -1168,8 +1565,16 @@ mod tests {
                             nx,
                             ny,
                             16,
+                        )
+                        .expect("loupe window");
+                        let g = loupe_geom(
+                            &lay,
+                            sharpen,
+                            nx,
+                            ny,
+                            16,
+                            peak_halo_px(&params.recipe, lay.enlargement),
                         );
-                        let g = loupe_geom(&lay, sharpen, nx, ny, 16);
                         assert_eq!((got.width, got.height), (g.view_w, g.view_h));
                         for y in 0..got.height {
                             for x in 0..got.width {
@@ -1326,7 +1731,7 @@ mod tests {
         // The boost sits on the shoulder of the ramp, a few pixels off the
         // 50 % point. A viewing-distance halo of ~7 px would still be up
         // well past that.
-        assert!((peak_at as isize - edge as isize).abs() <= 6, "peak at {peak_at}, edge {edge}");
+        assert!((peak_at as isize - edge as isize).abs() <= 6, "boost at {peak_at}, edge {edge}");
         for dx in [14, 18] {
             for x in [edge - dx, edge + dx] {
                 assert!(
@@ -1336,6 +1741,154 @@ mod tests {
                     urow[x],
                     row[x]
                 );
+            }
+        }
+    }
+
+    /// A stored radius of 1 px is 2 px on a 2× print and 0.5 px on a half-size print.
+    #[test]
+    fn the_print_scale_multiplies_the_peak_radius() {
+        assert!((peak_print_radius(1.4, 1.0) - 1.4).abs() < 1e-12);
+        assert!((peak_print_radius(1.4, 0.5) - 0.7).abs() < 1e-12);
+        assert!((peak_print_radius(1.4, 2.0) - 2.8).abs() < 1e-12);
+
+        let (w, h) = (32, 24);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, if x < w / 2 { 0.2 } else { 0.8 });
+            }
+        }
+        let mut recipe = Recipe::on_paper();
+        recipe.dpi = 100.0;
+        recipe.size = Some(PrintSize::Physical { width_in: 0.64, height_in: 0.48 });
+        recipe.peak.on = true;
+        recipe.peak.radius = 1.0;
+        recipe.peak.amount = 0.8;
+        let params = PrintParams { recipe, ..PrintParams::default() };
+        let lay = layout(w, h, 1, &params);
+        assert!((lay.enlargement - 2.0).abs() < 1e-9, "{}", lay.enlargement);
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "t".into(), description: None };
+        let got = render_planes(&src, &params);
+        let mut bare = params.clone();
+        bare.recipe.peak.on = false;
+        let plain = render_planes(&src, &bare);
+        let mut picture = Plane::zeros(lay.image_w, lay.image_h);
+        for y in 0..lay.image_h {
+            picture.row_mut(y).copy_from_slice(&plain.plane.row(y)[..lay.image_w]);
+        }
+        let expect = unsharp(&picture, 2.0, 0.8, None);
+        let y = lay.image_h / 2;
+        for x in 0..lay.image_w {
+            let a = got.plane.at(x, y);
+            let b = expect.at(x, y);
+            assert!((a - b).abs() < 1e-9, "x {x}: {a} vs {b}");
+        }
+
+        let mut small = params.clone();
+        small.recipe.size = Some(PrintSize::Physical { width_in: 0.16, height_in: 0.12 });
+        let lay = layout(w, h, 1, &small);
+        assert!((lay.enlargement - 0.5).abs() < 1e-9, "{}", lay.enlargement);
+        let got = render_planes(&src, &small);
+        let mut bare = small.clone();
+        bare.recipe.peak.on = false;
+        let plain = render_planes(&src, &bare);
+        let mut picture = Plane::zeros(lay.image_w, lay.image_h);
+        for y in 0..lay.image_h {
+            picture.row_mut(y).copy_from_slice(&plain.plane.row(y)[..lay.image_w]);
+        }
+        let expect = unsharp(&picture, 0.5, 0.8, None);
+        let y = lay.image_h / 2;
+        for x in 0..lay.image_w {
+            let a = got.plane.at(x, y);
+            let b = expect.at(x, y);
+            assert!((a - b).abs() < 1e-9, "half-size x {x}: {a} vs {b}");
+        }
+    }
+
+    /// Peak lifts the picture and leaves the paper. The 1:1 box is those
+    /// same pixels, including where the box sits on the border.
+    #[test]
+    fn peak_matches_the_loupe_and_leaves_the_border() {
+        let (w, h) = (72, 48);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, if x < w / 2 { 0.15 } else { 0.75 });
+            }
+        }
+        let mut recipe = Recipe::on_paper();
+        recipe.dpi = 254.0;
+        recipe.border_mm = 1.0;
+        recipe.black_mm = 0.5;
+        recipe.peak.on = true;
+        recipe.peak.radius = 1.0;
+        recipe.peak.amount = 0.8;
+        let params = PrintParams { recipe, ..PrintParams::default() };
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "t".into(), description: None };
+        let full = render_planes(&src, &params);
+        let frame = full.info.border_px + full.info.black_px;
+        assert!(frame >= 5, "frame {frame}");
+        let mut quiet = params.clone();
+        quiet.recipe.peak.on = false;
+        let plain = render_planes(&src, &quiet);
+        assert_eq!(full.plane.at(0, 0), plain.plane.at(0, 0), "paper");
+        assert_eq!(
+            full.plane.at(full.info.border_px, 2),
+            plain.plane.at(full.info.border_px, 2),
+            "black edge"
+        );
+        let inside = frame + 4;
+        let y = frame + h / 2;
+        assert!((full.plane.at(inside, y) - plain.plane.at(inside, y)).abs() < 1e-6, "flat field");
+        let edge = frame + w / 2;
+        assert!(
+            (full.plane.at(edge, y) - plain.plane.at(edge, y)).abs() > 1e-3,
+            "edge {} vs {}",
+            full.plane.at(edge, y),
+            plain.plane.at(edge, y)
+        );
+
+        let lay = layout(w, h, 1, &params);
+        for (nx, ny) in [(0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.5, 0.0)] {
+            let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 15);
+            let (lc, origin_x, origin_y) = if ex > sx && ey > sy {
+                let mut lc = Plane::zeros(ex - sx, ey - sy);
+                for yy in 0..lc.height {
+                    for xx in 0..lc.width {
+                        lc.set(xx, yy, plane.at(sx + xx, sy + yy));
+                    }
+                }
+                (lc, sx, sy)
+            } else {
+                (plane.clone(), 0, 0)
+            };
+            let got = sharpen_window(
+                PlaneWindow { plane: &lc, origin_x, origin_y, full_w: w, full_h: h },
+                None,
+                &params,
+                nx,
+                ny,
+                15,
+            )
+            .expect("loupe");
+            let g = loupe_geom(
+                &lay,
+                params.recipe.sharpen,
+                nx,
+                ny,
+                15,
+                peak_halo_px(&params.recipe, lay.enlargement),
+            );
+            assert_eq!((got.width, got.height), (g.view_w, g.view_h));
+            for yy in 0..got.height {
+                for xx in 0..got.width {
+                    let expect = full.plane.at(g.view_x + xx, g.view_y + yy);
+                    let v = got.at(xx, yy);
+                    assert!((v - expect).abs() < 1e-9, "at {nx},{ny} +{xx},{yy}: {v} vs {expect}");
+                }
             }
         }
     }

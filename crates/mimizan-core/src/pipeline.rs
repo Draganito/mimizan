@@ -16,6 +16,7 @@ use std::path::Path;
 use std::time::Instant;
 use tracing::info;
 
+/// Everything that decides how a frame becomes a negative.
 #[derive(Clone, Debug, Default)]
 pub struct NegativeParams {
     pub ingest: IngestParams,
@@ -33,7 +34,8 @@ pub struct NegativeParams {
 }
 
 impl NegativeParams {
-    /// Apply a camera file: noise, weights (unless overridden later), USM is for print.
+    /// Apply a camera file: its noise model and its weights. `with_weights`
+    /// afterwards still overrides the weights.
     pub fn with_camera_file(mut self, cam: CameraFile) -> Self {
         self.ingest.noise = cam.noise();
         self.weights = cam.weights();
@@ -50,6 +52,7 @@ impl NegativeParams {
     }
 }
 
+/// Wall-clock time of each stage, for the description and the log.
 #[derive(Clone, Debug, Serialize)]
 pub struct Timing {
     pub decode_ms: u128,
@@ -58,6 +61,8 @@ pub struct Timing {
     pub mix_ms: u128,
 }
 
+/// The negative's description: what was done to the file, written as JSON
+/// into the TIFF.
 #[derive(Clone, Debug, Serialize)]
 pub struct NegativeInfo {
     pub mimizan: &'static str,
@@ -75,7 +80,10 @@ pub struct NegativeInfo {
     /// the illuminant-independent form.
     pub weights_raw: Weights,
     pub mask: MaskMode,
+    /// Refinement rounds the separation ran.
     pub rounds: usize,
+    /// Chroma cutoff of the Kaiser low-pass. The `dubois` mask has its own
+    /// bands and does not read it; the value is recorded as configured.
     pub cutoff: f64,
     /// Nonlinear reconstruction was enabled (`reconstruct.rs`).
     pub reconstruct: bool,
@@ -90,6 +98,8 @@ pub struct NegativeInfo {
     pub timing: Timing,
 }
 
+/// The developed negative: the linear plane, its sharpening mask, and the
+/// description.
 pub struct Negative {
     pub plane: Plane,
     /// 8-bit sidecar: `round(255*mask_max)`, 255 where saturated.
@@ -102,11 +112,14 @@ pub struct Negative {
     pub separation: Option<crate::separate::Separation>,
 }
 
+/// Read a RAW file with `rawler`.
 #[cfg(feature = "decode-rawler")]
 pub fn decode(path: &Path) -> Result<RawFrame> {
     RawlerDecoder.decode(path)
 }
 
+/// Develop a decoded frame: ingest, separate (Bayer only), mix. `decode_ms`
+/// is recorded in the timing.
 pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128) -> Result<Negative> {
     if let (Some(cam), crate::decode::SensorKind::Bayer(ph)) = (&p.camera_file, frame.kind) {
         if cam.phase() != ph {
@@ -119,7 +132,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     p.weights.validate()?;
 
     let t = Instant::now();
-    let mosaic = ingest(frame, &p.ingest);
+    let mosaic = ingest(frame, &p.ingest)?;
     let ingest_ms = t.elapsed().as_millis();
     info!("ingest {} ms: {}", ingest_ms, serde_json::to_string(&mosaic.report)?);
 
@@ -133,6 +146,12 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     }
     let weights = weights.filtered(p.filter);
     if p.filter != ColorFilter::None {
+        weights.validate().map_err(|e| {
+            crate::Error::Invalid(format!(
+                "filter {} passes none of the weighted channels: {e}",
+                p.filter.name()
+            ))
+        })?;
         info!("filter {}: weights R {:.3} G {:.3} B {:.3}", p.filter.name(), weights.r, weights.g, weights.b);
     }
 
@@ -160,7 +179,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     let (plane, mask8, saturated, separation) = match mosaic.phase {
         Some(_) => {
             let t = Instant::now();
-            let sep = separate(&mosaic, &p.separate);
+            let sep = separate(&mosaic, &p.separate)?;
             info.timing.separate_ms = t.elapsed().as_millis();
             info.rounds = sep.rounds;
             info.computed = sep.computed;
@@ -171,7 +190,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             // The mosaic plane is no longer needed: free it before mixing.
             let Mosaic { saturated, plane: mosaic_plane, .. } = mosaic;
             drop(mosaic_plane);
-            let mask8 = mask_sidecar(&sep.mask_max, &saturated);
+            let mask8 = mask_sidecar(&sep.mask_max, &saturated)?;
             let t = Instant::now();
             let (plane, separation) = if p.keep_separation {
                 (mix(&sep, &weights), Some(sep))
@@ -183,6 +202,10 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         }
         None => {
             let Mosaic { saturated, plane, .. } = mosaic;
+            // The measurement is the picture. Reconstruction and the colour
+            // mask were not run, so the record must not say they were.
+            info.reconstruct = false;
+            info.computed = 0.0;
             // No carriers on a mono sensor: sharpening allowed except at saturation.
             let allowed = (crate::separate::FIXED_MASK_VALUE * 255.0).round() as u8;
             let mask8 = saturated.iter().map(|&s| if s != 0 { 255 } else { allowed }).collect();
@@ -192,6 +215,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     Ok(Negative { plane, mask8, orientation, info, saturated, separation })
 }
 
+/// Decode and develop one file.
 #[cfg(feature = "decode-rawler")]
 pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
     let t = Instant::now();
@@ -201,11 +225,32 @@ pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
     negative_from_frame(&frame, p, decode_ms)
 }
 
-pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Vec<u8> {
-    mask_max
+/// The 8-bit sidecar: `round(255 · mask_max)`, 255 where saturated.
+pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
+    if mask_max.data.len() != saturated.len() {
+        return Err(crate::Error::Invalid(format!(
+            "mask has {} samples and saturation has {}",
+            mask_max.data.len(),
+            saturated.len()
+        )));
+    }
+    Ok(mask_max
         .data
         .par_iter()
         .zip(saturated.par_iter())
         .map(|(&m, &s)| if s != 0 { 255 } else { (m.clamp(0.0, 1.0) * 255.0).round() as u8 })
-        .collect()
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_saturation_list_is_an_error() {
+        let mask = Plane::zeros(2, 2);
+        let err = mask_sidecar(&mask, &[0, 1]).unwrap_err();
+        assert!(err.to_string().contains("4"), "{err}");
+        assert!(err.to_string().contains("2"), "{err}");
+    }
 }

@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::ingest::{CameraInfo, IngestReport, Mosaic, NoiseModel};
 use crate::plane::Plane;
 use crate::synth::Rgb;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
@@ -62,25 +63,32 @@ pub fn quantisation_noise() -> NoiseModel {
 /// to 16 bit. The 16-bit samples are what the DNG carries, the `Mosaic`
 /// is the same data as the pipeline sees it (balance 1,1,1, no saturation).
 pub struct FakeBayer {
+    /// The mosaic as the pipeline ingests it.
     pub mosaic: Mosaic,
+    /// The same samples as 16-bit DNs, row-major, for the DNG.
     pub samples: Vec<u16>,
 }
 
+/// Sample `rgb` through a Bayer CFA of `phase` and quantise to 16 bit.
+/// `noise` is the model the mosaic carries; `name` goes into the camera
+/// model string.
 pub fn mosaic_rgb(rgb: &Rgb, phase: BayerPhase, noise: NoiseModel, name: &str) -> FakeBayer {
     let (w, h) = (rgb.width(), rgb.height());
     let mut samples = vec![0u16; w * h];
     let mut plane = Plane::zeros(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            let v = match phase.color_at(x, y) {
-                Color::R => rgb.r.at(x, y),
-                Color::G => rgb.g.at(x, y),
-                Color::B => rgb.b.at(x, y),
-            };
-            let q = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
-            samples[y * w + x] = q;
-            plane.set(x, y, f64::from(q) / 65535.0);
-        }
+    if w > 0 {
+        samples.par_chunks_mut(w).zip(plane.data.par_chunks_mut(w)).enumerate().for_each(|(y, (qs, ps))| {
+            for x in 0..w {
+                let v = match phase.color_at(x, y) {
+                    Color::R => rgb.r.at(x, y),
+                    Color::G => rgb.g.at(x, y),
+                    Color::B => rgb.b.at(x, y),
+                };
+                let q = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                qs[x] = q;
+                ps[x] = f64::from(q) / 65535.0;
+            }
+        });
     }
     let wb = [1.0, 1.0, 1.0];
     let mosaic = Mosaic {
@@ -123,7 +131,7 @@ pub fn mosaic_rgb(rgb: &Rgb, phase: BayerPhase, noise: NoiseModel, name: &str) -
 #[cfg(feature = "decode-rawler")]
 pub fn binned_raw(path: &Path) -> Result<(Rgb, NoiseModel)> {
     let frame = crate::pipeline::decode(path)?;
-    let mosaic = crate::ingest::ingest(&frame, &crate::ingest::IngestParams::default());
+    let mosaic = crate::ingest::ingest(&frame, &crate::ingest::IngestParams::default())?;
     let phase = match mosaic.phase {
         Some(p) => p,
         None => return Err(Error::Invalid(format!("{}: not a Bayer file", path.display()))),
@@ -407,106 +415,71 @@ pub struct Quality {
     pub rmse_lin: f64,
 }
 
+/// sRGB-encoded values on the 0..255 scale.
 fn encoded(p: &Plane) -> Plane {
-    Plane::from_vec(p.width, p.height, p.data.iter().map(|&v| srgb_encode(v) * 255.0).collect())
+    Plane::from_vec(p.width, p.height, p.data.par_iter().map(|&v| srgb_encode(v) * 255.0).collect())
 }
 
-/// Separable Gaussian blur, reflect padding.
-fn gauss(p: &Plane, sigma: f64, radius: usize) -> Plane {
-    let k: Vec<f64> = (0..=2 * radius)
-        .map(|i| {
-            let d = i as f64 - radius as f64;
-            (-d * d / (2.0 * sigma * sigma)).exp()
-        })
-        .collect();
-    let s: f64 = k.iter().sum();
-    let k: Vec<f64> = k.iter().map(|v| v / s).collect();
-    let (w, h) = (p.width, p.height);
-    let refl = |i: isize, n: usize| -> usize {
-        let n = n as isize;
-        let mut i = i;
-        if i < 0 {
-            i = -i;
-        }
-        if i >= n {
-            i = 2 * n - 2 - i;
-        }
-        i.clamp(0, n - 1) as usize
-    };
-    let mut tmp = Plane::zeros(w, h);
-    for y in 0..h {
-        let row = p.row(y);
-        let out = tmp.row_mut(y);
-        for x in 0..w {
-            let mut acc = 0.0;
-            for (i, kv) in k.iter().enumerate() {
-                acc += kv * row[refl(x as isize + i as isize - radius as isize, w)];
-            }
-            out[x] = acc;
-        }
-    }
-    let mut out = Plane::zeros(w, h);
-    for y in 0..h {
-        for (i, kv) in k.iter().enumerate() {
-            let sy = refl(y as isize + i as isize - radius as isize, h);
-            let src = tmp.row(sy);
-            let dst = out.row_mut(y);
-            for x in 0..w {
-                dst[x] += kv * src[x];
-            }
-        }
-    }
-    out
+/// SSIM's Gaussian window: σ 1.5, radius 5 (the same `ceil(3σ)` as
+/// [`crate::filter::gaussian_kernel`]), reflect-101 borders.
+fn gauss(p: &Plane) -> Plane {
+    crate::usm::gaussian_blur(p, 1.5)
 }
 
+/// Sum of `f` over the pixels inside `border`, rows in parallel and
+/// combined in row order, so the figure does not depend on the thread count.
+fn sum_inside(w: usize, h: usize, border: usize, f: impl Fn(usize, usize) -> f64 + Sync) -> f64 {
+    let (x0, x1, y0, y1) = (border, w.saturating_sub(border), border, h.saturating_sub(border));
+    let rows: Vec<f64> = (y0..y1).into_par_iter().map(|y| (x0..x1).map(|x| f(x, y)).sum::<f64>()).collect();
+    rows.iter().sum()
+}
+
+/// PSNR, SSIM and linear RMSE of `est` against `truth`, `border` pixels of
+/// the edge excluded. Planes of different sizes, or a border that leaves
+/// nothing, give NaNs.
 pub fn quality(est: &Plane, truth: &Plane, border: usize) -> Quality {
-    assert_eq!((est.width, est.height), (truth.width, truth.height));
+    let nan = Quality { psnr_db: f64::NAN, ssim: f64::NAN, rmse_lin: f64::NAN };
+    if (est.width, est.height) != (truth.width, truth.height) {
+        return nan;
+    }
     let (w, h) = (est.width, est.height);
     let (x0, x1, y0, y1) = (border, w.saturating_sub(border), border, h.saturating_sub(border));
-    let n = ((x1 - x0) * (y1 - y0)) as f64;
-
-    let mut se_lin = 0.0;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let d = est.at(x, y) - truth.at(x, y);
-            se_lin += d * d;
-        }
+    let n = (x1.saturating_sub(x0) * y1.saturating_sub(y0)) as f64;
+    if n == 0.0 {
+        return nan;
     }
+
+    let se_lin = sum_inside(w, h, border, |x, y| {
+        let d = est.at(x, y) - truth.at(x, y);
+        d * d
+    });
     let a = encoded(est);
     let b = encoded(truth);
-    let mut se = 0.0;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let d = a.at(x, y) - b.at(x, y);
-            se += d * d;
-        }
-    }
+    let se = sum_inside(w, h, border, |x, y| {
+        let d = a.at(x, y) - b.at(x, y);
+        d * d
+    });
     let mse = se / n;
     let psnr_db = if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY };
 
     // SSIM (Wang et al. 2004) on the encoded planes.
-    let (sigma, radius) = (1.5, 5);
-    let mu_a = gauss(&a, sigma, radius);
-    let mu_b = gauss(&b, sigma, radius);
+    let mu_a = gauss(&a);
+    let mu_b = gauss(&b);
     let sq = |p: &Plane, q: &Plane| {
-        Plane::from_vec(w, h, p.data.iter().zip(&q.data).map(|(u, v)| u * v).collect())
+        Plane::from_vec(w, h, p.data.par_iter().zip(&q.data).map(|(u, v)| u * v).collect())
     };
-    let s_aa = gauss(&sq(&a, &a), sigma, radius);
-    let s_bb = gauss(&sq(&b, &b), sigma, radius);
-    let s_ab = gauss(&sq(&a, &b), sigma, radius);
+    let s_aa = gauss(&sq(&a, &a));
+    let s_bb = gauss(&sq(&b, &b));
+    let s_ab = gauss(&sq(&a, &b));
     let c1 = (0.01f64 * 255.0).powi(2);
     let c2 = (0.03f64 * 255.0).powi(2);
-    let mut ssim_sum = 0.0;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let (ma, mb) = (mu_a.at(x, y), mu_b.at(x, y));
-            let va = s_aa.at(x, y) - ma * ma;
-            let vb = s_bb.at(x, y) - mb * mb;
-            let cov = s_ab.at(x, y) - ma * mb;
-            ssim_sum +=
-                ((2.0 * ma * mb + c1) * (2.0 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2));
-        }
-    }
+    let ssim_sum = sum_inside(w, h, border, |x, y| {
+        let (ma, mb) = (mu_a.at(x, y), mu_b.at(x, y));
+        let va = s_aa.at(x, y) - ma * ma;
+        let vb = s_bb.at(x, y) - mb * mb;
+        let cov = s_ab.at(x, y) - ma * mb;
+        ((2.0 * ma * mb + c1) * (2.0 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2))
+    });
     Quality { psnr_db, ssim: ssim_sum / n, rmse_lin: (se_lin / n).sqrt() }
 }
 
@@ -515,6 +488,9 @@ pub fn quality(est: &Plane, truth: &Plane, border: usize) -> Quality {
 /// hardest for every method, used for the comparison crops.
 pub fn hardest_window(ests: &[&Plane], truth: &Plane, size: usize, border: usize) -> (usize, usize) {
     let (w, h) = (truth.width, truth.height);
+    if w < size + 2 * border || h < size + 2 * border || ests.iter().any(|e| (e.width, e.height) != (w, h)) {
+        return (0, 0);
+    }
     let enc_t = encoded(truth);
     let mut e2 = vec![0.0f64; w * h];
     for est in ests {
@@ -538,9 +514,6 @@ pub fn hardest_window(ests: &[&Plane], truth: &Plane, size: usize, border: usize
             + ii[y * (w + 1) + x]
     };
     let mut best = (border, border, -1.0);
-    if w < size + 2 * border || h < size + 2 * border {
-        return (0, 0);
-    }
     for y in border..=h - size - border {
         for x in border..=w - size - border {
             let s = sum(x, y);
@@ -584,15 +557,9 @@ pub fn write_strip(
 
 /// Write a full-size grey PNG (sRGB-encoded) of a linear plane.
 pub fn write_gray_png(path: &Path, p: &Plane) -> Result<()> {
-    let buf: Vec<u8> = p.data.iter().map(|&v| (srgb_encode(v) * 255.0).round() as u8).collect();
+    let buf: Vec<u8> = p.data.par_iter().map(|&v| (srgb_encode(v) * 255.0).round() as u8).collect();
     image::save_buffer(path, &buf, p.width as u32, p.height as u32, image::ColorType::L8)?;
     Ok(())
-}
-
-/// Luminance `(R + 2G + B)/4` of demosaiced planes: the same weights as the
-/// ground truth and as the `Native` mix.
-pub fn luminance(rgb: &Rgb) -> Plane {
-    rgb.luminance()
 }
 
 #[cfg(test)]
