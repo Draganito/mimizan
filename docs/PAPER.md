@@ -900,7 +900,7 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
 
 ---
 
-## 8.7 The three-colour plate (0.13)
+### 8.7 The three-colour plate (0.13)
 
 The mixing rule of §6 gives, for the pure weights (1,0,0), (0,1,0) and
 (0,0,1), the three colour separations themselves:
@@ -949,6 +949,42 @@ and 7 of 24 ahead; at twice the sampling 47.2 (47.5) against RCD 45.4,
   range (identical result, no per-pixel sort).
 - Allocator: mimalloc (glibc returns 200-MB blocks to the kernel at once and
   every new plane paid its page faults again).
+- The plate (§8.7) is three calls of the mixing step of §6 on one
+  separation, nothing in the separation changes. The taking filters are
+  three weight triples on the balanced channels (`plate.rs`): `camera`
+  inverts `xyz_to_cam · rgb_to_xyz` after normalising each row so every
+  camera channel sees the output white as 1 (the as-shot balance of §3.5
+  therefore stays the only white balance); `wratten` multiplies the
+  panchromatic weights by the transmissions of Wratten 25/58/47; `channels`
+  is the identity. Without a camera matrix `camera` falls back to
+  `channels`.
+- The plate file is one 16-bit linear grey TIFF with the three mixes
+  stacked, blue, green, red from the top, in sensor orientation, and a
+  `plate` object in the JSON description (frame order, frame height, filter
+  set, weight triples). Any viewer shows it as the three-frame plate; the
+  monochrome print path prints it as a contact copy. The mask sidecar is
+  one frame for all three.
+- `print` recognises the `plate` object and runs its one pass three times
+  (`render_plate`) with the same layout, crop, paper and the two exposures;
+  the lamps are added as stops to the paper exposure of the red and blue
+  pass (`recipe.place += lamp`), nothing else differs between the passes.
+  Peak (the high-pass of the print) runs on each positive with the radius
+  measured on the monochrome mix, so the three positives share one
+  sharpening and stay in register.
+- The output is a 16-bit RGB TIFF or JPEG whose primaries are the
+  projection filters, Adobe RGB (1998) by default (its transfer curve is
+  the gamma 2.2 of the paper encoding), sRGB on request; the embedded
+  profile is a matrix/TRC display profile with D50-adapted colorants
+  (`icc.rs`), built the same way as the grey profile.
+- The desktop treats the plate as a re-mix of the resident separation
+  (`ViewParams.plate`): the fitted view, the 100 % view and the print box
+  carry an RGB buffer next to the grey one and go through the same tone
+  table; histograms stay those of the monochrome mix. The lamps are two
+  sliders under the paper's exposures. Plate and lamps are part of the
+  development the history undoes and are not written to the recipe sidecar.
+- Without `--plate` nothing changes: the same file and recipe give the
+  bytes of 0.12.0 (the monochrome tests are unchanged; only the metadata
+  now carries `xyz_to_cam` where the file has one).
 
 ---
 
@@ -972,6 +1008,25 @@ and 7 of 24 ahead; at twice the sampling 47.2 (47.5) against RCD 45.4,
   with it.
 - Only 2×2 CFAs. X-Trans has carriers too, but at other positions with other
   copies; it is not implemented.
+- The plate's colour is the chrominance of the carriers and resolves to
+  their band limit, about 0.25 c/px: half as fine as the drawing. On a
+  print that is the red layer of a tripack film; on a pixel-sharp chart it
+  costs 1–6 dB CPSNR against the edge-directed demosaicers, which place
+  colour at the pixel (§8.7). The gap closes behind a lens and reverses at
+  twice the sampling.
+- The Ĉ1 leak on diagonal colour alternation at 3–4 px period, which the
+  monochrome negative showed as grey beads, is false colour on the plate.
+  Same cause; `--reconstruct` reduces it.
+- The chrominance carries low-frequency colour noise (19–21 % σ for the
+  red filter on the Z f, §6.1), colour mottle like dye clouds. No noise
+  reduction, as a matter of principle; the plate's chroma noise has not
+  been measured yet.
+- Clipped photosites clamp at 1 in every channel, so a clipped highlight
+  goes to paper white in all three; there is no highlight reconstruction.
+- The plate has two lamps and nothing else: no saturation, no hue, no
+  per-channel curve. The filter transmissions of `wratten` are the same
+  approximations as the monochrome weights; the `camera` matrix is the
+  maker's, not measured.
 
 ---
 
@@ -1070,8 +1125,27 @@ input:  raw CFA array, black/white levels, CFA phase (ε, a, b), as-shot WB
     Zhang–Wu LMMSE in m^(1/2.2); L, C1, C2 += β·(nonlinear − linear)   §5
 11. out := L + (wG − wR − wB)·C1 + 2·(wR − wB)·C2              §6
 12. TIFF 16 bit linear grey + JSON description; mask sidecar   §7
+
+plate (--plate [camera|wratten|channels]):                     §8.7
+13. W := filter rows w_R, w_G, w_B (camera: row-normalised
+    (xyz_to_cam · rgb_to_xyz)⁻¹; wratten: Wratten 25/58/47 × base weights;
+    channels: identity)
+14. plate_c := step 11 with w := W_c, for c = R, G, B
+15. TIFF 16 bit linear grey, frames stacked B, G, R from the top,
+    `plate` object in the JSON (order, frame height, filters, W)
+16. print: steps of the monochrome print ×3, same layout/crop/paper/
+    exposures; place_R += lamp_R, place_B += lamp_B; peak radius from the
+    monochrome mix; 16-bit RGB TIFF/JPEG, matrix/TRC profile (Adobe RGB
+    1998 default, sRGB on request)
 ```
 
 Every constant in this recipe is a default of the published code and can be
-checked against `crates/mimizan-core/src/{filter,dubois,reconstruct,mix}.rs`
-and their tests.
+checked against `crates/mimizan-core/src/{filter,dubois,reconstruct,mix}.rs`,
+for the plate `{plate,print,icc}.rs`, and their tests.
+
+The colour benchmark of §8.7 is `mimizan bench plate` (pixel-sharp),
+`mimizan bench plate --blur 0.75` (behind a lens) and
+`mimizan bench plate --scale 2` (twice the sampling); each run scores the
+plate with and without reconstruction against the demosaiced RGB of libraw
+and RawTherapee 5.11;
+CPSNR on sRGB-encoded values, border 16 px, report and JSON in `out/plate/`.
