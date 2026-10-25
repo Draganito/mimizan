@@ -1114,10 +1114,11 @@ pub fn render_sharpen_loupe(
         (Some(p), Some(planes)) => {
             // Each positive through the same pass, plus its lamp, as the export does.
             let mut out = Vec::with_capacity(3);
-            for (plane, lamp) in planes.iter().zip(p.lamps) {
+            for (positive, lamp) in planes.iter().zip(p.lamps) {
                 let mut q = params.clone();
                 q.recipe.place += lamp;
-                let Some(pos) = through(plane, &q) else { return SharpenLoupe::empty() };
+                let Some(pos) = through(positive, &q) else { return SharpenLoupe::empty() };
+                // Against the grey box, not the source window the positive came from.
                 if (pos.width, pos.height) != (plane.width, plane.height) {
                     return SharpenLoupe::empty();
                 }
@@ -2246,6 +2247,14 @@ mod histogram_tests {
         let lp = render_sharpen_loupe(&session, &view.weights, Some(&plate), &recipe, o, 0.5, 0.5, 16);
         assert!(lp.width > 0);
         grey_in_colour(&lp.gray, lp.rgb.as_ref().unwrap());
+        // Peak in the box runs on every positive alike: grey stays grey.
+        let mut peaked = recipe.clone();
+        peaked.peak.on = true;
+        peaked.peak.radius = 1.0;
+        peaked.peak.amount = 0.8;
+        let lp2 = render_sharpen_loupe(&session, &view.weights, Some(&plate), &peaked, o, 0.5, 0.5, 16);
+        assert_eq!((lp2.width, lp2.height), (lp.width, lp.height));
+        grey_in_colour(&lp2.gray, lp2.rgb.as_ref().unwrap());
 
         // A red lamp: red brighter, green and blue as before.
         let lit = PlateView { lamps: [0.5, 0.0, 0.0], ..plate };

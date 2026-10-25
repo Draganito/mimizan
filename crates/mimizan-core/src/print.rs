@@ -1941,6 +1941,78 @@ mod tests {
         }
     }
 
+    /// Peak on a plate: each positive is sharpened like the grey print,
+    /// so a grey edge stays grey after it, and a coloured edge is lifted
+    /// in every channel. A lamp on top shifts one channel and nothing else.
+    #[test]
+    fn peak_sharpens_every_positive_of_a_plate() {
+        use crate::plate::{PlateInfo, PlateSpace, PlateWeights};
+        let (w, h) = (72, 48);
+        let step = |lo: f64, hi: f64| {
+            let mut p = Plane::zeros(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    p.set(x, y, if x < w / 2 { lo } else { hi });
+                }
+            }
+            p
+        };
+        let grey = step(0.15, 0.75);
+        let mut recipe = Recipe::on_paper();
+        recipe.dpi = 254.0;
+        recipe.peak.on = true;
+        recipe.peak.radius = 1.0;
+        recipe.peak.amount = 0.8;
+        let params = PrintParams { recipe, ..PrintParams::default() };
+        let mut quiet = params.clone();
+        quiet.recipe.peak.on = false;
+        fn src(plane: &Plane) -> PrintSource<'_> {
+            PrintSource { plane, mask: None, orientation: 1, name: "t".into(), description: None }
+        }
+        let pi = PlateInfo::new(&PlateWeights::channels(), PlateSpace::AdobeRgb, h);
+
+        // Grey plate: three equal positives, sharpened alike.
+        let out = render_plate([src(&grey), src(&grey), src(&grey)], &pi, &params);
+        let sheet = out.plate.as_ref().unwrap();
+        assert_eq!(out.plane.data, sheet.green.data, "grey stays grey under peak");
+        assert_eq!(sheet.green.data, sheet.blue.data);
+        let mono = render_planes(&src(&grey), &params);
+        assert_eq!(out.plane.data, mono.plane.data, "a positive is the grey print");
+        let plain = render_planes(&src(&grey), &quiet);
+        let edge = w / 2;
+        assert!((out.plane.at(edge, h / 2) - plain.plane.at(edge, h / 2)).abs() > 1e-3, "peak did run");
+
+        // Coloured plate: a red edge, a flat green, a blue step the other way.
+        let red = step(0.1, 0.9);
+        let green = step(0.4, 0.4);
+        let blue = step(0.7, 0.2);
+        let out = render_plate([src(&red), src(&green), src(&blue)], &pi, &params);
+        let still = render_plate([src(&red), src(&green), src(&blue)], &pi, &quiet);
+        let sheet = out.plate.as_ref().unwrap();
+        let flat = still.plate.as_ref().unwrap();
+        assert!((out.plane.at(edge, h / 2) - still.plane.at(edge, h / 2)).abs() > 1e-3, "red edge lifted");
+        assert!((sheet.blue.at(edge, h / 2) - flat.blue.at(edge, h / 2)).abs() > 1e-3, "blue edge lifted");
+        assert!(
+            (sheet.green.at(edge, h / 2) - flat.green.at(edge, h / 2)).abs() < 1e-9,
+            "flat green untouched"
+        );
+        for ch in [&sheet.green, &flat.green] {
+            let v = ch.at(0, 0);
+            assert!(ch.data.iter().all(|&x| (x - v).abs() < 1e-9), "green is a flat field");
+        }
+
+        // A red lamp on the sharpened plate: red moves, green and blue as before.
+        let mut lit = params.clone();
+        lit.lamps = [0.3, 0.0, 0.0];
+        let warm = render_plate([src(&red), src(&green), src(&blue)], &pi, &lit);
+        let ws = warm.plate.as_ref().unwrap();
+        assert_eq!(ws.green.data, sheet.green.data);
+        assert_eq!(ws.blue.data, sheet.blue.data);
+        assert!(warm.plane.data.iter().zip(&out.plane.data).all(|(a, b)| a >= b));
+        assert!(warm.plane.data.iter().zip(&out.plane.data).any(|(a, b)| a > b));
+        assert_eq!(warm.info.plate.as_ref().unwrap().lamps, [0.3, 0.0, 0.0]);
+    }
+
     /// Peak lifts the picture and leaves the paper. The 1:1 box is those
     /// same pixels, including where the box sits on the border.
     #[test]
