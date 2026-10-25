@@ -247,13 +247,36 @@ impl RawDecoder for RawlerDecoder {
             }
         };
 
+        // The camera's XYZ → camera matrix: rawler's per-illuminant table
+        // first (D65, the daylight matrix the plate wants; else the other
+        // daylight-like entries; else whatever there is), then the older
+        // single matrix.
         let xyz_to_cam = {
-            let m = img.xyz_to_cam;
-            let nonzero = m.iter().take(3).flatten().any(|v| *v != 0.0);
-            nonzero.then(|| {
-                let r = |i: usize| [f64::from(m[i][0]), f64::from(m[i][1]), f64::from(m[i][2])];
-                [r(0), r(1), r(2)]
-            })
+            use rawler::imgop::xyz::Illuminant as I;
+            let from_flat = |m: &[f32]| -> Option<[[f64; 3]; 3]> {
+                if m.len() < 9 || m.iter().take(9).all(|v| *v == 0.0) {
+                    return None;
+                }
+                let r = |i: usize| [f64::from(m[3 * i]), f64::from(m[3 * i + 1]), f64::from(m[3 * i + 2])];
+                Some([r(0), r(1), r(2)])
+            };
+            let preferred = [I::D65, I::D55, I::Daylight, I::D50, I::D75, I::FineWeather, I::CloudyWeather];
+            preferred
+                .iter()
+                .find_map(|k| img.color_matrix.get(k).and_then(|m| from_flat(m)))
+                .or_else(|| {
+                    let mut keys: Vec<_> = img.color_matrix.keys().collect();
+                    keys.sort_by_key(|k| **k as u16);
+                    keys.into_iter().find_map(|k| from_flat(&img.color_matrix[k]))
+                })
+                .or_else(|| {
+                    let m = img.xyz_to_cam;
+                    let nonzero = m.iter().take(3).flatten().any(|v| *v != 0.0);
+                    nonzero.then(|| {
+                        let r = |i: usize| [f64::from(m[i][0]), f64::from(m[i][1]), f64::from(m[i][2])];
+                        [r(0), r(1), r(2)]
+                    })
+                })
         };
 
         let wb_as_shot = {

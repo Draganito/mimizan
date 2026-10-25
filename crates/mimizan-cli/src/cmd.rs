@@ -9,6 +9,8 @@ use mimizan_core::icc::GrayTrc;
 use mimizan_core::ingest::{ingest, IngestParams, WhiteBalance};
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::pipeline::{self, NegativeParams};
+use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace};
+use mimizan_core::print::LAMP_LIMIT;
 use mimizan_core::separate::{MaskMode, SeparateParams};
 use mimizan_core::tiffout::{write_gray16, write_gray8, TiffMeta};
 use serde_json::json;
@@ -34,6 +36,38 @@ pub struct NegativeArgs {
     pub preview: Option<PathBuf>,
     pub preview_scale: usize,
     pub crop: Option<String>,
+    /// `Some(filter set)` makes a three-colour plate.
+    pub plate: Option<String>,
+    pub plate_space: String,
+}
+
+/// `camera`, `wratten` or `channels`.
+pub fn parse_plate_filters(s: &str) -> Result<PlateFilters> {
+    PlateFilters::parse(s).ok_or_else(|| {
+        let names: Vec<&str> = PlateFilters::ALL.iter().map(|f| f.name()).collect();
+        anyhow::anyhow!("unknown plate filters '{s}' ({})", names.join("|"))
+    })
+}
+
+/// `adobe-rgb` or `srgb`.
+pub fn parse_plate_space(s: &str) -> Result<PlateSpace> {
+    PlateSpace::parse(s).ok_or_else(|| {
+        let names: Vec<&str> = PlateSpace::ALL.iter().map(|f| f.name()).collect();
+        anyhow::anyhow!("unknown plate space '{s}' ({})", names.join("|"))
+    })
+}
+
+/// `"R,B"` lamp stops for a plate print, green fixed at zero.
+pub fn parse_lamps(s: &str) -> Result<[f64; 3]> {
+    let v = parse_list(s)?;
+    if v.len() != 2 {
+        bail!("--lamp wants two values R,B (stops; green is the reference)");
+    }
+    let lamps = [v[0], 0.0, v[1]];
+    if lamps.iter().any(|l| !l.is_finite() || l.abs() > LAMP_LIMIT) {
+        bail!("lamps must be within ±{LAMP_LIMIT} stops");
+    }
+    Ok(lamps)
 }
 
 /// `"r,g,b"` mix weights, validated.
@@ -141,8 +175,24 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
             anyhow::anyhow!("unknown filter '{f}' ({})", names.join("|"))
         })?;
     }
+    if let Some(f) = &a.plate {
+        if a.filter.is_some() {
+            bail!("--filter is a contrast filter for one negative; a plate has its own three (--plate)");
+        }
+        params.plate =
+            Some(PlateParams { filters: parse_plate_filters(f)?, space: parse_plate_space(&a.plate_space)? });
+    }
 
     let neg = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
+    if let Some(pi) = &neg.info.plate {
+        info!(
+            "plate: three frames of {}x{} ({}), projected through {}",
+            neg.plane.width,
+            pi.frame_height,
+            pi.frames.join(", "),
+            pi.space.name()
+        );
+    }
     if neg.info.reconstruct {
         info!("reconstruct on: {:.1} % of the picture computed, not measured", 100.0 * neg.info.computed);
     }
@@ -154,13 +204,9 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         &TiffMeta { description: &desc, trc: GrayTrc::Linear, orientation: neg.orientation, dpi: None },
     )?;
     let side = sidecar_path(&a.out);
-    write_gray8(
-        &side,
-        neg.plane.width,
-        neg.plane.height,
-        &neg.mask8,
-        "mimizan mask: 255*max(M), 255=saturated",
-    )?;
+    // The mask is one frame: the same for the three plates of a plate.
+    let mask_h = neg.info.plate.as_ref().map_or(neg.plane.height, |pi| pi.frame_height);
+    write_gray8(&side, neg.plane.width, mask_h, &neg.mask8, "mimizan mask: 255*max(M), 255=saturated")?;
     info!("wrote {} + {} in {} ms", a.out.display(), side.display(), t.elapsed().as_millis());
 
     if let Some(p) = &a.preview {
@@ -206,6 +252,8 @@ pub struct PrintArgs {
     pub use_mask: bool,
     pub deconv: Option<u32>,
     pub cameras: PathBuf,
+    /// `"R,B"` lamp stops, plates only.
+    pub lamp: Option<String>,
 }
 
 /// USM default: the camera file of the camera named in the negative's description.
@@ -314,7 +362,17 @@ pub fn print(a: &PrintArgs) -> Result<()> {
         recipe.save(p).with_context(|| format!("writing recipe {}", p.display()))?;
         info!("recipe {}", p.display());
     }
-    let p = PrintParams { recipe, usm_k: a.usm_k, viewing_distance_mm: a.distance_mm, use_mask: a.use_mask };
+    let lamps = match &a.lamp {
+        Some(l) => parse_lamps(l)?,
+        None => [0.0; 3],
+    };
+    let p = PrintParams {
+        recipe,
+        usm_k: a.usm_k,
+        viewing_distance_mm: a.distance_mm,
+        use_mask: a.use_mask,
+        lamps,
+    };
     // The render is refused above the machine's whole memory: past that it
     // ends in the OOM killer or a frozen machine, not in an error. Below
     // it, a print larger than what is free is only slow.
@@ -323,6 +381,12 @@ pub fn print(a: &PrintArgs) -> Result<()> {
     let budget = (sys.total_memory() > 0).then_some(sys.total_memory());
     let out = pr::render_within(&a.negative, &p, budget)
         .with_context(|| format!("rendering {}", a.negative.display()))?;
+    if a.lamp.is_some() && out.plate.is_none() {
+        warn!("--lamp has no effect: {} is not a plate", a.negative.display());
+    }
+    if let Some(pp) = &out.info.plate {
+        info!("plate print: {} filters, {} primaries", pp.filters.name(), pp.space.name());
+    }
     let t = Instant::now();
     pr::write(&out, &a.out, &p)?;
     if out.info.deconvolution_iterations > 0 {

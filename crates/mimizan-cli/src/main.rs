@@ -4,6 +4,7 @@ mod calibrate;
 mod cmd;
 mod kodak;
 mod measure;
+mod plate_bench;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -16,7 +17,11 @@ use std::path::PathBuf;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(name = "mimizan", version, about = "Bayer RAW to linear monochrome negative, no demosaic")]
+#[command(
+    name = "mimizan",
+    version,
+    about = "Bayer RAW to linear monochrome negative, or a three-colour plate; no demosaic"
+)]
 struct Cli {
     /// Log level filter (e.g. info, debug, mimizan_core=trace)
     #[arg(long, global = true, default_value = "info")]
@@ -99,6 +104,16 @@ enum Cmd {
         /// Write a 1:1 crop PNG "x,y,w,h" next to the preview (name + .crop.png)
         #[arg(long)]
         crop: Option<String>,
+        /// Three-colour plate instead of one negative (Prokudin-Gorsky):
+        /// the three taking filters are camera (the file's colour matrix,
+        /// default) | wratten (25/58/47 in front of the panchromatic mix) |
+        /// channels (the balanced channels as they are). The file holds the
+        /// three frames stacked, blue, green, red; `print` makes it a colour print.
+        #[arg(long, value_name = "FILTERS", num_args = 0..=1, default_missing_value = "camera")]
+        plate: Option<String>,
+        /// Primaries the plate is projected through: adobe-rgb (default) | srgb
+        #[arg(long, value_name = "SPACE", default_value = "adobe-rgb")]
+        plate_space: String,
     },
     /// Negative TIFF -> print file in one pass: size, place, paper or look, border,
     /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC). Every print
@@ -161,6 +176,10 @@ enum Cmd {
         /// Directory with cameras/*.json for the USM default
         #[arg(long, default_value = "cameras")]
         cameras: PathBuf,
+        /// Plate only: the projector's lamps, stops added to the red and blue
+        /// positive ("R,B"; green is the reference), within ±2
+        #[arg(long, value_name = "R,B", allow_hyphen_values = true)]
+        lamp: Option<String>,
     },
     /// Generate a synthetic scene (mosaic + ground truth)
     Synth(measure::SynthArgs),
@@ -185,6 +204,8 @@ enum Cmd {
 enum BenchCmd {
     /// Kodak pictures as fake Bayer mosaics: Mimizan vs libraw / RawTherapee demosaicers
     Kodak(kodak::KodakArgs),
+    /// The same mosaics in colour: the three-colour plate vs the demosaicers' RGB (CPSNR)
+    Plate(plate_bench::PlateBenchArgs),
 }
 
 fn main() -> Result<()> {
@@ -214,6 +235,8 @@ fn main() -> Result<()> {
             preview,
             preview_scale,
             crop,
+            plate,
+            plate_space,
         } => cmd::negative(&cmd::NegativeArgs {
             raw,
             out,
@@ -231,6 +254,8 @@ fn main() -> Result<()> {
             preview,
             preview_scale,
             crop,
+            plate,
+            plate_space,
         }),
         Cmd::Print {
             negative,
@@ -251,6 +276,7 @@ fn main() -> Result<()> {
             no_mask,
             deconv,
             cameras,
+            lamp,
         } => cmd::print(&cmd::PrintArgs {
             negative,
             out,
@@ -270,10 +296,12 @@ fn main() -> Result<()> {
             use_mask: !no_mask,
             deconv,
             cameras,
+            lamp,
         }),
         Cmd::Synth(a) => measure::synth(&a),
         Cmd::Measure { cmd } => measure::measure(&cmd),
         Cmd::Bench { cmd: BenchCmd::Kodak(a) } => kodak::kodak(&a),
+        Cmd::Bench { cmd: BenchCmd::Plate(a) } => plate_bench::plate_bench(&a),
         Cmd::Calibrate { cmd } => calibrate::calibrate(&cmd),
     }
 }

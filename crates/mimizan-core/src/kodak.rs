@@ -483,6 +483,59 @@ pub fn quality(est: &Plane, truth: &Plane, border: usize) -> Quality {
     Quality { psnr_db, ssim: ssim_sum / n, rmse_lin: (se_lin / n).sqrt() }
 }
 
+/// Colour quality of a three-channel estimate: the PSNR of each channel and
+/// the CPSNR (one MSE over all three), sRGB-encoded 0..255 scale, border
+/// excluded; the convention of the demosaicing literature.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct ColourQuality {
+    pub cpsnr_db: f64,
+    pub psnr_r_db: f64,
+    pub psnr_g_db: f64,
+    pub psnr_b_db: f64,
+    /// RMSE of the linear values, all three channels.
+    pub rmse_lin: f64,
+}
+
+pub fn colour_quality(est: &Rgb, truth: &Rgb, border: usize) -> ColourQuality {
+    let nan = ColourQuality {
+        cpsnr_db: f64::NAN,
+        psnr_r_db: f64::NAN,
+        psnr_g_db: f64::NAN,
+        psnr_b_db: f64::NAN,
+        rmse_lin: f64::NAN,
+    };
+    if (est.width(), est.height()) != (truth.width(), truth.height()) {
+        return nan;
+    }
+    let (w, h) = (est.width(), est.height());
+    let (x0, x1, y0, y1) = (border, w.saturating_sub(border), border, h.saturating_sub(border));
+    let n = (x1.saturating_sub(x0) * y1.saturating_sub(y0)) as f64;
+    if n == 0.0 {
+        return nan;
+    }
+    let psnr = |mse: f64| if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY };
+    let mut mses = [0.0; 3];
+    let mut se_lin = 0.0;
+    for (k, (e, t)) in [(&est.r, &truth.r), (&est.g, &truth.g), (&est.b, &truth.b)].into_iter().enumerate() {
+        let (a, b) = (encoded(e), encoded(t));
+        mses[k] = sum_inside(w, h, border, |x, y| {
+            let d = a.at(x, y) - b.at(x, y);
+            d * d
+        }) / n;
+        se_lin += sum_inside(w, h, border, |x, y| {
+            let d = e.at(x, y) - t.at(x, y);
+            d * d
+        });
+    }
+    ColourQuality {
+        cpsnr_db: psnr((mses[0] + mses[1] + mses[2]) / 3.0),
+        psnr_r_db: psnr(mses[0]),
+        psnr_g_db: psnr(mses[1]),
+        psnr_b_db: psnr(mses[2]),
+        rmse_lin: (se_lin / (3.0 * n)).sqrt(),
+    }
+}
+
 /// Top-left corner of the `size`×`size` window (inside `border`) with the
 /// largest summed squared error of all `errs` planes combined: the region
 /// hardest for every method, used for the comparison crops.

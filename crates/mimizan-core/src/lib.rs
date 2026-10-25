@@ -24,6 +24,7 @@ pub mod paper;
 pub mod peak;
 pub mod pipeline;
 pub mod plane;
+pub mod plate;
 pub mod preview;
 pub mod print;
 pub mod recipe;

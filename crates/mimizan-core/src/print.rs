@@ -94,13 +94,26 @@ pub struct PrintParams {
     pub viewing_distance_mm: Option<f64>,
     /// Use the `.mask.tif` sidecar to restrict USM.
     pub use_mask: bool,
+    /// The three lamps of the projector, for a plate: stops of exposure
+    /// added to the red, green and blue positive on top of the recipe's
+    /// placing. The only colour control there is; zero for a negative.
+    pub lamps: [f64; 3],
 }
 
 impl Default for PrintParams {
     fn default() -> Self {
-        Self { recipe: Recipe::default(), usm_k: USM_K, viewing_distance_mm: None, use_mask: true }
+        Self {
+            recipe: Recipe::default(),
+            usm_k: USM_K,
+            viewing_distance_mm: None,
+            use_mask: true,
+            lamps: [0.0; 3],
+        }
     }
 }
+
+/// Lamps stay within this many stops of the placing.
+pub const LAMP_LIMIT: f64 = 2.0;
 
 impl PrintParams {
     /// USM consults the mask. Deconvolution does not: it runs on the whole
@@ -156,6 +169,34 @@ pub struct PrintInfo {
     pub deconvolution_iterations: u32,
     /// Wall time of the pass, milliseconds.
     pub ms: u128,
+    /// Present when the source was a three-colour plate: the filter set it
+    /// was taken with, the primaries it is projected through, the lamps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plate: Option<PlatePrintInfo>,
+}
+
+/// The plate part of a print's description.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlatePrintInfo {
+    pub filters: crate::plate::PlateFilters,
+    pub space: crate::plate::PlateSpace,
+    /// Stops added to the red, green and blue positive.
+    pub lamps: [f64; 3],
+}
+
+/// The green and blue positives of a plate print; the red one is
+/// [`PrintOutput::plane`].
+pub struct PlateSheet {
+    pub green: Plane,
+    pub blue: Plane,
+    pub space: crate::plate::PlateSpace,
+}
+
+impl PlateSheet {
+    /// The three positives as `[red, green, blue]`.
+    pub fn rgb<'a>(&'a self, red: &'a Plane) -> [&'a Plane; 3] {
+        [red, &self.green, &self.blue]
+    }
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -266,9 +307,12 @@ pub fn sidecar_path(neg: &Path) -> PathBuf {
 
 /// The rendered sheet and its description.
 pub struct PrintOutput {
-    /// Print values in [0, 1], not yet quantised.
+    /// Print values in [0, 1], not yet quantised. For a plate, the red
+    /// positive; the other two are in `plate`.
     pub plane: Plane,
     pub info: PrintInfo,
+    /// The green and blue positives when the source was a plate.
+    pub plate: Option<PlateSheet>,
 }
 
 /// Full print rendering in memory.
@@ -283,11 +327,25 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
     let t = Instant::now();
     let neg = read_gray(neg_path)?;
     let src_desc = neg.description.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
+    let plate_info = crate::plate::PlateInfo::from_description(src_desc.as_ref());
+    // A plate is three frames stacked; the print works on one frame's size.
+    let frames = match &plate_info {
+        Some(pi) => Some(crate::plate::split(&neg.plane, pi)?),
+        None => None,
+    };
+    let (fw, fh) = match &frames {
+        Some(f) => (f[0].width, f[0].height),
+        None => (neg.plane.width, neg.plane.height),
+    };
     info!(
-        "negative {}x{} {} bit, orientation {}",
-        neg.plane.width, neg.plane.height, neg.bits, neg.orientation
+        "{} {}x{} {} bit, orientation {}",
+        if plate_info.is_some() { "plate, each frame" } else { "negative" },
+        fw,
+        fh,
+        neg.bits,
+        neg.orientation
     );
-    let need = memory_estimate(neg.plane.width, neg.plane.height, neg.orientation, p);
+    let need = memory_estimate(fw, fh, neg.orientation, p) * if frames.is_some() { 3 } else { 1 };
     info!("print holds about {} at its widest", memory_text(need));
     if let Some(limit) = budget {
         if need > limit {
@@ -303,7 +361,7 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
     if p.use_mask && p.sharpens() {
         let sp = sidecar_path(neg_path);
         match read_mask8(&sp) {
-            Ok((mw, mh, data)) if mw == neg.plane.width && mh == neg.plane.height => {
+            Ok((mw, mh, data)) if mw == fw && mh == fh => {
                 let values: Vec<f64> = data.par_iter().map(|&v| f64::from(v) / 255.0).collect();
                 match Plane::try_from_vec(mw, mh, values) {
                     Ok(m) => mask = Some(m),
@@ -315,16 +373,63 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
         }
     }
 
-    let source = PrintSource {
-        plane: &neg.plane,
-        mask: mask.as_ref(),
-        orientation: neg.orientation,
-        name: neg_path.display().to_string(),
-        description: src_desc,
+    let name = neg_path.display().to_string();
+    let orientation = neg.orientation;
+    let mut out = match (frames, plate_info) {
+        (Some(frames), Some(pi)) => {
+            // The stacked plane is not needed any more.
+            drop(neg);
+            let [r, g, b] = &frames;
+            let sources = [r, g, b].map(|plane| PrintSource {
+                plane,
+                mask: mask.as_ref(),
+                orientation,
+                name: name.clone(),
+                description: src_desc.clone(),
+            });
+            render_plate(sources, &pi, p)
+        }
+        _ => {
+            let source = PrintSource {
+                plane: &neg.plane,
+                mask: mask.as_ref(),
+                orientation: neg.orientation,
+                name,
+                description: src_desc,
+            };
+            render_planes(&source, p)
+        }
     };
-    let mut out = render_planes(&source, p);
     out.info.ms = t.elapsed().as_millis();
     Ok(out)
+}
+
+/// The three positives of a plate: each frame through the same pass, the
+/// same layout, the same paper and the same two exposures, plus its lamp.
+/// `sources[i]` are red, green, blue and must agree in size and
+/// orientation; `orientation` is read from the first.
+pub fn render_plate(
+    sources: [PrintSource<'_>; 3],
+    pi: &crate::plate::PlateInfo,
+    p: &PrintParams,
+) -> PrintOutput {
+    let t = Instant::now();
+    let lamp = |c: usize| {
+        let mut q = p.clone();
+        q.recipe.place += p.lamps[c];
+        q
+    };
+    let [red, green, blue] = sources;
+    let mut r = render_planes(&red, &lamp(0));
+    let g = render_planes(&green, &lamp(1));
+    let b = render_planes(&blue, &lamp(2));
+    if p.lamps.iter().any(|&l| l != 0.0) {
+        info!("lamps R {:+.2} G {:+.2} B {:+.2} stops", p.lamps[0], p.lamps[1], p.lamps[2]);
+    }
+    r.info.plate = Some(PlatePrintInfo { filters: pi.filters, space: pi.space, lamps: p.lamps });
+    r.info.ms = t.elapsed().as_millis();
+    r.plate = Some(PlateSheet { green: g.plane, blue: b.plane, space: pi.space });
+    r
 }
 
 /// A negative already in memory (GUI session, or the file just read).
@@ -983,29 +1088,58 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         usm_masked: mask.is_some(),
         deconvolution_iterations: deconv_n as u32,
         ms: t.elapsed().as_millis(),
+        plate: None,
     };
     debug_assert_eq!((plane.width, plane.height), (lay.out_w, lay.out_h));
-    PrintOutput { plane, info }
+    PrintOutput { plane, info, plate: None }
 }
 
-/// Write the print: a 16-bit TIFF (grey ICC) unless `path` ends in
-/// `.jpg`/`.jpeg`, in which case an 8-bit JPEG is written (the mobile
-/// app's album; the desktop writes TIFF).
+/// Write the print: a 16-bit TIFF (grey ICC; RGB ICC for a plate) unless
+/// `path` ends in `.jpg`/`.jpeg`, in which case an 8-bit JPEG is written
+/// (the mobile app's album; the desktop writes TIFF).
 pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
     let desc = serde_json::to_string(&out.info)?;
     let trc = match p.recipe.curve.encoding() {
         crate::calib::LookEncoding::Gamma22 => GrayTrc::Gamma(2.2),
         crate::calib::LookEncoding::None => GrayTrc::Linear,
     };
-    if is_jpeg_path(path) {
-        write_jpeg(&out.plane, path, trc)?;
-    } else {
-        write_gray16(
-            path,
-            &out.plane,
-            &TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.recipe.dpi) },
-        )?;
+    let meta = TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.recipe.dpi) };
+    match (&out.plate, is_jpeg_path(path)) {
+        (Some(sheet), true) => write_rgb_jpeg(sheet.rgb(&out.plane), sheet.space, path, trc)?,
+        (Some(sheet), false) => crate::tiffout::write_rgb16(path, sheet.rgb(&out.plane), sheet.space, &meta)?,
+        (None, true) => write_jpeg(&out.plane, path, trc)?,
+        (None, false) => write_gray16(path, &out.plane, &meta)?,
     }
+    Ok(())
+}
+
+/// JPEG of a plate print: 8-bit RGB, quality 100, the RGB ICC embedded.
+pub fn write_rgb_jpeg(
+    rgb: [&Plane; 3],
+    space: crate::plate::PlateSpace,
+    path: &Path,
+    trc: GrayTrc,
+) -> Result<()> {
+    use image::ImageEncoder;
+    let [r, g, b] = rgb;
+    if (g.width, g.height) != (r.width, r.height) || (b.width, b.height) != (r.width, r.height) {
+        return Err(Error::Invalid("the three print planes differ in size".into()));
+    }
+    let q = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let mut buf = vec![0u8; 3 * r.data.len()];
+    buf.par_chunks_mut(3 * r.width).enumerate().for_each(|(y, row)| {
+        let (rr, gr, br) = (r.row(y), g.row(y), b.row(y));
+        for x in 0..r.width {
+            row[3 * x] = q(rr[x]);
+            row[3 * x + 1] = q(gr[x]);
+            row[3 * x + 2] = q(br[x]);
+        }
+    });
+    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
+    enc.set_icc_profile(crate::icc::rgb_profile(space, trc))
+        .map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
+    enc.write_image(&buf, r.width as u32, r.height as u32, image::ExtendedColorType::Rgb8)?;
     Ok(())
 }
 

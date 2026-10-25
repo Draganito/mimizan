@@ -74,11 +74,43 @@ pub fn gray_profile(trc: GrayTrc) -> Vec<u8> {
         (b"wtpt", xyz_tag(0.9642, 1.0, 0.8249)),
         (b"kTRC", curv_tag(trc)),
     ];
+    assemble(b"GRAY", tags)
+}
 
+/// Build an RGB/XYZ matrix-TRC display-class profile: the colorants of
+/// `space` (D50-adapted) and one `trc` for all three channels. The plate's
+/// print file carries this.
+pub fn rgb_profile(space: crate::plate::PlateSpace, trc: GrayTrc) -> Vec<u8> {
+    let name = match (space, trc) {
+        (crate::plate::PlateSpace::AdobeRgb, GrayTrc::Gamma(_)) => "mimizan plate Adobe RGB (1998) gamma 2.2",
+        (crate::plate::PlateSpace::AdobeRgb, GrayTrc::Linear) => {
+            "mimizan plate Adobe RGB (1998) primaries, linear"
+        }
+        (crate::plate::PlateSpace::Srgb, GrayTrc::Gamma(_)) => "mimizan plate sRGB primaries gamma 2.2",
+        (crate::plate::PlateSpace::Srgb, GrayTrc::Linear) => "mimizan plate sRGB primaries, linear",
+    };
+    let [r, g, b] = space.colorants_d50();
+    let curve = curv_tag(trc);
+    let tags: Vec<(&[u8; 4], Vec<u8>)> = vec![
+        (b"desc", mluc(name)),
+        (b"cprt", mluc("No copyright, use freely")),
+        (b"wtpt", xyz_tag(0.9642, 1.0, 0.8249)),
+        (b"rXYZ", xyz_tag(r[0], r[1], r[2])),
+        (b"gXYZ", xyz_tag(g[0], g[1], g[2])),
+        (b"bXYZ", xyz_tag(b[0], b[1], b[2])),
+        (b"rTRC", curve.clone()),
+        (b"gTRC", curve.clone()),
+        (b"bTRC", curve),
+    ];
+    assemble(b"RGB ", tags)
+}
+
+/// Header, tag table and tag data of a display-class profile with PCS XYZ.
+fn assemble(colour_space: &[u8; 4], tags: Vec<(&[u8; 4], Vec<u8>)>) -> Vec<u8> {
     let mut header = vec![0u8; 128];
     header[8..12].copy_from_slice(&be32(0x0420_0000));
     header[12..16].copy_from_slice(b"mntr");
-    header[16..20].copy_from_slice(b"GRAY");
+    header[16..20].copy_from_slice(colour_space);
     header[20..24].copy_from_slice(b"XYZ ");
     // date/time left zero (allowed); 'acsp' signature:
     header[36..40].copy_from_slice(b"acsp");
@@ -118,5 +150,19 @@ mod tests {
         assert_eq!(&p[16..20], b"GRAY");
         let g = gray_profile(GrayTrc::Gamma(2.2));
         assert!(g.len() > 128);
+        let rgb = rgb_profile(crate::plate::PlateSpace::AdobeRgb, GrayTrc::Gamma(2.2));
+        assert_eq!(&rgb[36..40], b"acsp");
+        assert_eq!(&rgb[16..20], b"RGB ");
+        assert_eq!(u32::from_be_bytes([rgb[0], rgb[1], rgb[2], rgb[3]]) as usize, rgb.len());
+        assert_eq!(u32::from_be_bytes([rgb[128], rgb[129], rgb[130], rgb[131]]), 9);
+        // The colorants add up to the D50 white.
+        for s in crate::plate::PlateSpace::ALL {
+            let c = s.colorants_d50();
+            for k in 0..3 {
+                let sum: f64 = c.iter().map(|v| v[k]).sum();
+                let want = [0.9642, 1.0, 0.8249][k];
+                assert!((sum - want).abs() < 1e-3, "{s:?} {k} {sum}");
+            }
+        }
     }
 }

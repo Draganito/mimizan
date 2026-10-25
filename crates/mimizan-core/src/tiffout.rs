@@ -60,6 +60,55 @@ pub fn write_gray16_u16(
     Ok(())
 }
 
+/// Interleave three planes of equal size into 16-bit RGB samples.
+pub fn interleave_rgb16(rgb: [&Plane; 3]) -> Result<Vec<u16>> {
+    let [r, g, b] = rgb;
+    if (g.width, g.height) != (r.width, r.height) || (b.width, b.height) != (r.width, r.height) {
+        return Err(crate::Error::Invalid("the three print planes differ in size".into()));
+    }
+    let q = |v: f64| (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+    let mut data = vec![0u16; 3 * r.data.len()];
+    data.par_chunks_mut(3 * r.width).enumerate().for_each(|(y, row)| {
+        let (rr, gr, br) = (r.row(y), g.row(y), b.row(y));
+        for x in 0..r.width {
+            row[3 * x] = q(rr[x]);
+            row[3 * x + 1] = q(gr[x]);
+            row[3 * x + 2] = q(br[x]);
+        }
+    });
+    Ok(data)
+}
+
+/// The plate's print: a 16-bit RGB TIFF with the profile of `space`.
+pub fn write_rgb16(
+    path: &Path,
+    rgb: [&Plane; 3],
+    space: crate::plate::PlateSpace,
+    meta: &TiffMeta<'_>,
+) -> Result<()> {
+    let data = interleave_rgb16(rgb)?;
+    let (width, height) = (rgb[0].width, rgb[0].height);
+    let file = BufWriter::new(File::create(path)?);
+    let mut enc = TiffEncoder::new(file)?;
+    let mut img = enc.new_image::<colortype::RGB16>(width as u32, height as u32)?;
+    img.rows_per_strip(64)?;
+    let icc = crate::icc::rgb_profile(space, meta.trc);
+    {
+        let d = img.encoder();
+        d.write_tag(Tag::IccProfile, icc.as_slice())?;
+        d.write_tag(Tag::ImageDescription, meta.description)?;
+        d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
+        if meta.orientation >= 1 && meta.orientation <= 8 {
+            d.write_tag(Tag::Orientation, meta.orientation)?;
+        }
+    }
+    if let Some(dpi) = meta.dpi {
+        img.resolution(ResolutionUnit::Inch, Rational { n: (dpi * 1000.0).round() as u32, d: 1000 });
+    }
+    img.write_data(&data)?;
+    Ok(())
+}
+
 /// 8-bit grey TIFF (mask sidecar).
 pub fn write_gray8(path: &Path, width: usize, height: usize, data: &[u8], description: &str) -> Result<()> {
     let file = BufWriter::new(File::create(path)?);

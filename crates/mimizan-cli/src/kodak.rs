@@ -68,22 +68,22 @@ pub struct KodakArgs {
 
 /// One demosaicing reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-enum Tool {
+pub(crate) enum Tool {
     Bilinear,
     Libraw(u8),
     RawTherapee(&'static str),
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
-struct Method {
-    name: &'static str,
-    tool: Tool,
+pub(crate) struct Method {
+    pub(crate) name: &'static str,
+    pub(crate) tool: Tool,
 }
 
 /// Every standalone demosaicer libraw and RawTherapee 5.11 implement.
 /// Dual blends (AMaZE+VNG4 and the like) are omitted: they are mixtures of
 /// two entries already in this list, not a further algorithm.
-const METHODS: &[Method] = &[
+pub(crate) const METHODS: &[Method] = &[
     Method { name: "Bilinear", tool: Tool::Bilinear },
     Method { name: "VNG (libraw)", tool: Tool::Libraw(1) },
     Method { name: "PPG (libraw)", tool: Tool::Libraw(2) },
@@ -138,7 +138,7 @@ struct Report {
     images: Vec<ImageResult>,
 }
 
-fn tool_version(cmd: &str, arg: &str) -> Option<String> {
+pub(crate) fn tool_version(cmd: &str, arg: &str) -> Option<String> {
     let mut c = Command::new(cmd);
     if !arg.is_empty() {
         c.arg(arg);
@@ -173,14 +173,18 @@ DualDemosaicAutoContrast=false\nDualDemosaicContrast=0\nPDAFLinesFilter=false\n\
 }
 
 /// File name without directory and extension; the path must name a file.
-fn stem_of(path: &Path) -> Result<String> {
+pub(crate) fn stem_of(path: &Path) -> Result<String> {
     path.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow::anyhow!("{} is not a file name", path.display()))
 }
 
 /// Run one external converter on `dng`; returns the demosaiced linear RGB.
-fn run_external(tool: Tool, dng: &Path, out_dir: &Path) -> Result<Option<mimizan_core::synth::Rgb>> {
+pub(crate) fn run_external(
+    tool: Tool,
+    dng: &Path,
+    out_dir: &Path,
+) -> Result<Option<mimizan_core::synth::Rgb>> {
     let stem = stem_of(dng)?;
     match tool {
         Tool::Bilinear => Ok(None),
@@ -225,7 +229,7 @@ fn run_external(tool: Tool, dng: &Path, out_dir: &Path) -> Result<Option<mimizan
     }
 }
 
-fn has_tool(tool: Tool, tools: &[(String, Option<String>)]) -> bool {
+pub(crate) fn has_tool(tool: Tool, tools: &[(String, Option<String>)]) -> bool {
     match tool {
         Tool::Bilinear => true,
         Tool::Libraw(_) => tools[0].1.is_some(),

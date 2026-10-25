@@ -31,6 +31,10 @@ pub struct NegativeParams {
     /// Keep `L̂, Ĉ1', Ĉ2'` (three more planes) so the weights can be re-mixed
     /// without separating again (GUI). The CLI leaves this off.
     pub keep_separation: bool,
+    /// Make a three-colour plate (`plate.rs`) instead of one negative: the
+    /// three taking filters replace the mix, and `Negative::plane` holds
+    /// the three frames stacked. `None` is the monochrome negative.
+    pub plate: Option<crate::plate::PlateParams>,
 }
 
 impl NegativeParams {
@@ -92,6 +96,10 @@ pub struct NegativeInfo {
     pub computed: f64,
     pub report: IngestReport,
     pub timing: Timing,
+    /// Present when the file is a three-colour plate (`plate.rs`): frame
+    /// order, frame height, the filter set and its weights.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plate: Option<crate::plate::PlateInfo>,
 }
 
 /// The developed negative: the linear plane, its sharpening mask, and the
@@ -168,8 +176,33 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         computed: 0.0,
         report: mosaic.report.clone(),
         timing: Timing { decode_ms, ingest_ms, separate_ms: 0, mix_ms: 0 },
+        plate: None,
     };
     let orientation = mosaic.orientation;
+
+    // The plate's taking filters, resolved before the separation so a bad
+    // matrix fails early. The Wratten set filters the base weights, before
+    // any contrast filter.
+    let plate_weights = match (&p.plate, mosaic.phase) {
+        (Some(pp), Some(_)) => {
+            let base = p.weights.to_balanced(p.weights_space, mosaic.wb);
+            let w = crate::plate::PlateWeights::resolve(pp, base, mosaic.xyz_to_cam.as_ref())?;
+            for (name, row) in ["red", "green", "blue"].iter().zip(w.rows) {
+                info!(
+                    "plate {name}: weights R {:+.3} G {:+.3} B {:+.3} ({})",
+                    row[0],
+                    row[1],
+                    row[2],
+                    w.filters.name()
+                );
+            }
+            Some((w, pp.space))
+        }
+        (Some(_), None) => {
+            return Err(crate::Error::Invalid("a three-colour plate needs a Bayer mosaic".into()));
+        }
+        (None, _) => None,
+    };
 
     let (plane, mask8, saturated, separation) = match mosaic.phase {
         Some(_) => {
@@ -187,7 +220,11 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             drop(mosaic_plane);
             let mask8 = mask_sidecar(&sep.mask_max, &saturated)?;
             let t = Instant::now();
-            let (plane, separation) = if p.keep_separation {
+            let (plane, separation) = if let Some((w, space)) = plate_weights {
+                info.plate = Some(crate::plate::PlateInfo::new(&w, space, sep.lum.height));
+                let plate = crate::plate::mix_plate_stacked(&sep, &w)?;
+                (plate, p.keep_separation.then_some(sep))
+            } else if p.keep_separation {
                 (mix(&sep, &weights), Some(sep))
             } else {
                 (mix_into(sep, &weights), None)
