@@ -900,6 +900,36 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
 
 ---
 
+## 8.7 The three-colour plate (0.13)
+
+The mixing rule of §6 gives, for the pure weights (1,0,0), (0,1,0) and
+(0,0,1), the three colour separations themselves:
+
+```
+R̂ = L̂ − Ĉ1' + 2Ĉ2'      Ĝ = L̂ + Ĉ1'      B̂ = L̂ − Ĉ1' − 2Ĉ2'
+```
+
+each the full-resolution luminance plus a band-limited chrominance, each
+pixel a weighted sum of measured photosites, the three in register by
+construction. Three such mixes through a set of taking filters (the
+camera's matrix towards the output primaries, inverted and row-normalised;
+or Wratten 25/58/47 in front of the panchromatic mix; or the bare
+channels), printed through one paper with one pair of exposures and three
+lamps, are Prokudin-Gorsky's additive process on the separation. No
+demosaicing enters; the drawing of the colour print is the drawing of the
+negative, and the colour resolves to the carriers' band limit, about
+0.25 c/px, like the red layer of a tripack film.
+
+CPSNR on sRGB-encoded values, Kodak set, `bench plate`, channels filters,
+linear separation (`--reconstruct` in brackets), against the best of the
+sixteen demosaicers of §8.1: pixel-sharp 33.5 (38.3) dB against LMMSE
+39.4, 1 (0) of 24 ahead; behind a lens (σ 0.75 px) 45.0 (46.5) against
+RCD 46.2 and LMMSE 46.2, the plate with reconstruction first by the mean
+and 7 of 24 ahead; at twice the sampling 47.2 (47.5) against RCD 45.4,
+19 of 24 ahead with reconstruction and 4 without. The green channel leads everywhere by 2–5 dB: it is
+`L̂ + Ĉ1'`, not interpolated. Method, file format and limits are in
+`docs/PLATE.md`.
+
 ## 9. Implementation notes
 
 - All arithmetic in f64; the mosaic and all estimates are full planes.

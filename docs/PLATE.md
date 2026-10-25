@@ -1,4 +1,4 @@
-# Experimental branch: the three-colour plate
+# The three-colour plate
 
 Colour pictures without demosaicing, on Prokudin-Gorsky's principle.
 
@@ -95,7 +95,7 @@ mimizan print photo_plate.tif -o photo_colour.tif --paper 0,-0.5 --lamp 0.1,-0.1
 ```
 
 Without `--plate` nothing changes: the same file and the same recipe give
-the same bytes as 0.12.0.
+the same bytes as 0.12.0. The plate came in 0.13.0.
 
 **The desktop.** The Negative window has a *Plate* section under the
 histogram: the switch, the filter set and the primaries, and the three
