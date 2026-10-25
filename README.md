@@ -6,6 +6,8 @@ You open a colour RAW. Mimizan Lab makes a monochrome negative from it and print
 
 Mimizan Lab also accepts a file from a monochrome sensor, for anyone who wants to develop it here. That sensor has no colour filter, so the file opens as the measurement.
 
+Since 0.13 it prints colour too, one way: the three-colour plate. The same negative, mixed three times through three taking filters and printed through the same paper, the way Prokudin-Gorsky made colour a century ago. Still without demosaicing.
+
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
 > Lift the colour off. Print what remains.
@@ -48,7 +50,29 @@ The print is a measured sheet of Ilford Multigrade. Soft is grade 00, ISO R 160.
 
 On the Kodak set, brought to the band limit of a photograph, the linear negative is 51.8 dB. The best of the sixteen demosaicers we ran, DCB in RawTherapee, is 49.1 dB; RCD is 48.9 dB. All twenty-four pictures are above every one of them: VNG, PPG, AHD, DCB, DHT and AAHD in libraw, and fast, VNG4, AHD, EAHD, HPHD, DCB, LMMSE, IGV, AMaZE and RCD in RawTherapee. With the switch set the mean is 52.4 dB and 5% of the pixels are computed. On four Nikon Z f files at the sharpness the camera recorded, the linear mean is 53.9 dB against 50.7 dB for RCD, and all four are above it by 2.4 to 4.3 dB; the switch costs 0.3 dB there. Where a lens-like picture still reaches the sensor, the linear mean is 51.6 dB and DCB is 51.5 dB; nine of the twenty-four lead every demosaicer. The switch puts that mean at 52.6 dB, with 12% computed, and twenty-three lead. On detail sharper than any lens delivers, LMMSE in RawTherapee leads the linear negative, 43.1 dB to 37.3 dB. The switch passes that Kodak test at 42.1 dB, with half the pixels computed, and still trails by a decibel. On the four Z f files made twice as sharp as the camera saw them, RCD leads by 0.5 to 1.9 dB, with the switch and without it. The means, and how many pictures lead, are in the paper.
 
-It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no noise reduction, no lens correction, and colour only one way, the three-colour plate: three separations through three taking filters, printed together through the same paper, the way Prokudin-Gorsky made colour in 1909, still without demosaicing. The command has `--plate`, the Negative window a *Plate* section, the Enlarger two lamps. [docs/PLATE.md](docs/PLATE.md) has the method and the measurements. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
+It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no noise reduction, no lens correction, and colour only as the plate below. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
+
+## The plate
+
+> Three plates, one paper, two lamps. The colour is a relation of exposures, not a value at a pixel.
+
+**Where it comes from.** In 1902 Adolf Miethe built a camera that exposed one long glass plate three times in a row, through a blue, a green and a red filter. Sergei Prokudin-Gorsky took it across Russia from 1909 to 1915: three to four seconds for the three exposures, the red one longer because the plates were weakest there. The ratio of those three times was the white balance. The negative was contact-copied onto one positive plate, so the three positives shared one exposure and one development, and the relation of their densities was kept. Projected through three lenses and the same three filters, the light added up on the screen; the lamps and the register of the side lenses were the only controls. The Library of Congress today scans those plates, cuts them into three frames, registers red and blue on green and puts them straight into the RGB channels. Colour film did the same thing later, in three layers at once, with dyes instead of light, each layer with its own curve, and the red layer, at the bottom of the pack, resolving least. Colour has always been softer than drawing.
+
+**How it is done here.** The separation of the negative gives three things: the luminance, and the two colour differences lifted off the carriers. The monochrome mix adds them up with one set of weights. The plate adds them up three times, with three sets of weights, the taking filters:
+
+```
+R̂ = L̂ − Ĉ1' + 2Ĉ2'      Ĝ = L̂ + Ĉ1'      B̂ = L̂ − Ĉ1' − 2Ĉ2'
+```
+
+Every plate is the same full-resolution luminance with a different band-limited colour added. Every pixel of every plate is still a weighted sum of photosites the sensor measured; no value is interpolated, no edge is guessed. The three plates are in register by construction, since they come from one separation. The taking filters are the camera's own colour matrix towards the output primaries (the default, colorimetric), Wratten 25, 58 and 47 in front of the panchromatic mix (the softer palette of the historical glass), or the bare channels, as the Library of Congress does. The white balance stays where it was, before the separation, as the camera metered it: it is the ratio of the three exposure times, and it is what makes a grey subject give three equal plates.
+
+The negative is written as one grey TIFF with the three frames stacked, blue, green, red from the top, the way the glass looked. The print runs its one pass three times over those frames, with the same crop, the same paper and the same two exposures; the three positives become the channels of a 16-bit RGB TIFF with an Adobe RGB or sRGB profile. The two lamps, red and blue, add stops to their positive; green is the reference. That is the only colour control. There is no saturation, no hue, no per-channel curve.
+
+**What it gives.** The drawing of the colour print is, pixel for pixel, the drawing of the monochrome negative: red, green and blue carry the same edges in the same places, so there are no colour fringes, no zippers, no mazes, and the detail a lens put on the mosaic stays where it was. Grey stays grey at every density, since all three channels go through one paper curve from one pair of exposures, which film never managed (crossover). Saturated colours run towards white in the shoulder and darker in the toe, the look of a slide. The colour itself is band-limited to about a quarter of the sampling, half as fine as the drawing, and lies under a sharp luminance as a soft layer: the structure of a tripack film, or of a dye-transfer print, and the reason the pictures read as prints rather than as files. The noise is film's too: fine luminance grain, and under it colour mottle, slow and soft, never a pixel-sized rainbow.
+
+Measured on the Kodak set against sixteen demosaicers of libraw and RawTherapee, CPSNR: behind a lens the plate is 45.0 dB against 46.2 for RCD and LMMSE, with the last-octave switch 46.5 dB and first by the mean; at twice the sampling 47.2 dB against 45.4, nineteen of twenty-four ahead. Only on pixel-sharp charts, which no camera produces, does the band limit cost it against the edge-directed demosaicers. The green channel leads everywhere by 2 to 5 dB: it is `L̂ + Ĉ1'`, not interpolated.
+
+In the window, *Plate* sits under the histogram of the Negative panel: the switch, the filter set and the primaries, and the three weight rows they come to. The picture turns to colour at once, fitted, at 1:1 and in the print box; it is a re-mix of the separation, not a re-development. The Enlarger gains the two lamps under the paper's exposures. Export writes the RGB TIFF. On the command line it is `--plate` on `negative` and `--lamp R,B` on `print`. [docs/PLATE.md](docs/PLATE.md) has the method, the file format and the measurements; the paper has it in §8.7.
 
 ## A session
 
@@ -68,17 +92,17 @@ The picture in the middle is the print. A white border is added around it, and a
 
 Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/releases).
 
-Debian and Ubuntu: [mimizan_0.12.0-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.12.0/mimizan_0.12.0-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.13.0-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.13.0/mimizan_0.13.0-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.12.0-1_amd64.deb
+sudo apt install ./mimizan_0.13.0-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.12.0-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.12.0/mimizan-0.12.0-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
+Windows, 64-bit Intel and AMD: [mimizan-0.13.0-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.13.0/mimizan-0.13.0-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
 
-Apple silicon: [mimizan-0.12.0-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.12.0/mimizan-0.12.0-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+Apple silicon: [mimizan-0.13.0-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.13.0/mimizan-0.13.0-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 
@@ -113,7 +137,14 @@ mimizan negative photo.nef -o photo_neg.tif
 mimizan print photo_neg.tif -o photo_print.tif --size 30x40cm --paper 0,-0.5 --border-mm 20
 ```
 
-`info` says what is in the file. `negative` writes a 16-bit linear TIFF, and a mask beside it. `print` writes the sheet: half a stop less hard light, a 20 mm paper-white border. The rest is `mimizan --help`.
+`info` says what is in the file. `negative` writes a 16-bit linear TIFF, and a mask beside it. `print` writes the sheet: half a stop less hard light, a 20 mm paper-white border.
+
+```bash
+mimizan negative photo.nef -o photo_plate.tif --plate              # camera filters; or --plate wratten
+mimizan print photo_plate.tif -o photo_colour.tif --size 30x40cm --lamp 0.1,-0.1
+```
+
+`--plate` writes the three-frame plate instead of the negative; `print` recognises it and writes the RGB sheet, here with a tenth of a stop more red lamp and less blue. The rest is `mimizan --help`.
 
 ## The method
 
