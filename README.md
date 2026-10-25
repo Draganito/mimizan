@@ -10,7 +10,7 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 > Lift the colour off. Print what remains.
 >
-> Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Only a small remainder is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
+> Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Nothing is reconstructed unless you ask for it, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
 >
 > Dragan Bojovic
 
