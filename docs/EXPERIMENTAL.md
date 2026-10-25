@@ -97,6 +97,18 @@ mimizan print photo_plate.tif -o photo_colour.tif --paper 0,-0.5 --lamp 0.1,-0.1
 Without `--plate` nothing changes: the same file and the same recipe give
 the same bytes as 0.12.0.
 
+**The desktop.** The Negative window has a *Plate* section under the
+histogram: the switch, the filter set and the primaries, and the three
+weight rows they come to. It is a re-mix, not a re-development: the
+separation stays, the picture turns to colour at once, in the fitted view,
+at 100 % and in the print box, all through the same table as the grey.
+Under the paper's two exposures the Enlarger gains the two lamps, red and
+blue, as sliders in stops. Export writes the RGB TIFF the command writes.
+The histograms stay those of the monochrome mix, the plate's luminance;
+the strip stays the film. The plate and the lamps are part of the
+development the history undoes, and like the weights they are not written
+into the recipe sidecar.
+
 ## Measured
 
 `mimizan bench plate`: the Kodak set as fake Bayer mosaics, the plate with
@@ -170,5 +182,6 @@ errors most.
 - The chrominance carries low-frequency colour noise (19–21 % σ for the
   red filter on the Z f, paper §6.1): colour mottle like dye clouds. No
   noise reduction, as a matter of principle; not yet measured for the plate.
-- The GUI does not know plates yet; the command does. The window, the
-  paper and the method are those of the monochrome darkroom.
+- The window, the paper and the method are those of the monochrome
+  darkroom; the plate adds two lamps and nothing else. There is no
+  saturation, no hue, no per-channel curve, by design.

@@ -7,7 +7,7 @@ use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbSta
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
-use crate::session::{DetailAsk, DevelopParams, Histogram, Session, ViewParams, DETAIL_MARGIN};
+use crate::session::{DetailAsk, DevelopParams, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
     Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest,
     PreviewResult,
@@ -20,8 +20,10 @@ use egui_file_dialog::{FileDialog, OpeningMode};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
+use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{
-    box_for_picture_height, box_for_picture_width, memory_estimate, memory_text, peak_print_radius, PrintSize,
+    box_for_picture_height, box_for_picture_width, memory_estimate, memory_text, peak_print_radius,
+    PrintSize, LAMP_LIMIT,
 };
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
@@ -276,7 +278,21 @@ struct SharedPicture {
     place: f64,
     rotation: u8,
     crop: Option<CropRect>,
+    plate: Option<PlateView>,
 }
+
+/// The taking filters resolved for one session, one plate choice and one
+/// base mix, so the resolution runs when those change, not every frame.
+struct PlateResolved {
+    session: u64,
+    params: PlateParams,
+    base: Weights,
+    weights: Result<PlateWeights, String>,
+}
+
+/// What one print box was asked with: session id, weights, plate, recipe,
+/// orientation, point, box side in print pixels.
+type LoupeKey = (u64, Weights, Option<PlateView>, Recipe, u16, [f64; 2], usize);
 
 /// The print box has a newer exposure than the picture on screen.
 fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
@@ -355,9 +371,9 @@ pub struct App {
     loupe: Loupe,
     loupe_sent: u64,
     loupe_shown: u64,
-    /// Last request (session id, weights, recipe, orientation, point, box
-    /// side in print pixels), so an unchanged frame does not send another.
-    loupe_key: Option<(u64, Weights, Recipe, u16, [f64; 2], usize)>,
+    /// Last request (session id, weights, plate, recipe, orientation, point,
+    /// box side in print pixels), so an unchanged frame does not send another.
+    loupe_key: Option<LoupeKey>,
     /// Box side asked for this frame, in print pixels (one screen pixel each).
     loupe_px: usize,
     /// The print window was drawn this frame, so the box is requested after the sliders.
@@ -384,6 +400,8 @@ pub struct App {
     mask_mode: MaskMode,
     fix_defects: bool,
     reconstruct: bool,
+    /// The plate's taking filters for the current edit, or why there are none.
+    plate_resolved: Option<PlateResolved>,
 
     // Preview
     show_mask: bool,
@@ -455,6 +473,17 @@ fn capitalise(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// The texture of a rendered picture: the plate in colour when its bytes
+/// are there and fit, else the grey.
+fn colour_or_gray(size: [usize; 2], gray: &[u8], rgb: Option<&[u8]>) -> ColorImage {
+    match rgb {
+        Some(c) if c.len() == size[0].saturating_mul(size[1]).saturating_mul(3) => {
+            ColorImage::from_rgb(size, c)
+        }
+        _ => ColorImage::from_gray(size, gray),
+    }
 }
 
 fn resource_dir(name: &str) -> PathBuf {
@@ -530,6 +559,7 @@ impl App {
             mask_mode: DevelopParams::default().mask,
             fix_defects: DevelopParams::default().fix_defects,
             reconstruct: DevelopParams::default().reconstruct,
+            plate_resolved: None,
             show_mask: false,
             texture: None,
             tex_size: [0, 0],
@@ -795,7 +825,49 @@ impl App {
             rotation: self.edit.rotation,
             // While the easel is up the whole negative is shown.
             crop: if self.crop_open { None } else { r.crop },
+            plate: self.plate_view(),
         }
+    }
+
+    /// Resolve the plate's taking filters for the current session, choice
+    /// and base mix, once per change. Runs at the top of every frame.
+    fn refresh_plate(&mut self) {
+        let (Some(s), Some(params)) = (self.session.clone(), self.edit.plate) else {
+            self.plate_resolved = None;
+            return;
+        };
+        if s.is_mono() {
+            self.plate_resolved = None;
+            return;
+        }
+        let base = self.weights();
+        let same = self
+            .plate_resolved
+            .as_ref()
+            .is_some_and(|r| r.session == s.id && r.params == params && r.base == base);
+        if same {
+            return;
+        }
+        // The camera set without a matrix would log a warning on every
+        // resolution; the panel says so instead, and the channels are taken.
+        let mut asked = params;
+        if asked.filters == PlateFilters::Camera && !s.has_colour_matrix() {
+            asked.filters = PlateFilters::Channels;
+        }
+        let weights = s.plate_weights(&asked, base).map_err(|e| e.to_string());
+        if let Err(e) = &weights {
+            self.log(format!("plate: {e}"));
+        }
+        self.plate_resolved = Some(PlateResolved { session: s.id, params, base, weights });
+    }
+
+    /// The plate the view, the box and the export render, when it is on
+    /// and its filters resolved.
+    fn plate_view(&self) -> Option<PlateView> {
+        let params = self.edit.plate?;
+        let r = self.plate_resolved.as_ref()?;
+        let weights = r.weights.as_ref().ok()?;
+        Some(PlateView { weights: *weights, space: params.space, lamps: self.edit.lamps_rgb() })
     }
 
     /// Orientation the export applies: the file's plus the user's turns.
@@ -1303,6 +1375,15 @@ impl App {
                             // A paper border in the unattended capture.
                             self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
                         }
+                        if let Some(filters) = self
+                            .screenshot_to
+                            .as_ref()
+                            .and_then(|_| std::env::var("MIMIZAN_SCREENSHOT_PLATE").ok())
+                            .and_then(|v| PlateFilters::parse(&v))
+                        {
+                            // The plate in the unattended capture.
+                            self.edit.plate = Some(PlateParams { filters, ..PlateParams::default() });
+                        }
                         self.recipe_baseline = self.edit.recipe.clone();
                     }
                     // A re-development has new pixels: the measured radius
@@ -1437,6 +1518,7 @@ impl App {
             place: r.place,
             rotation: self.edit.rotation,
             crop: if self.crop_open { None } else { r.crop },
+            plate: self.plate_view(),
         })
     }
 
@@ -1492,7 +1574,7 @@ impl App {
             }
             self.tex_rotation = im.rotation;
             if im.width > 0 && im.height > 0 && im.gray.len() == im.width.saturating_mul(im.height) {
-                let img = ColorImage::from_gray([im.width, im.height], &im.gray);
+                let img = colour_or_gray([im.width, im.height], &im.gray, im.rgb.as_deref());
                 let opts = TextureOptions::LINEAR;
                 match &mut self.texture {
                     Some(t) if self.tex_size == [im.width, im.height] => t.set(img, opts),
@@ -1511,7 +1593,7 @@ impl App {
                 self.log("detail window was the wrong size");
                 return;
             }
-            let img = ColorImage::from_gray([d.ask.w, d.ask.h], &d.gray);
+            let img = colour_or_gray([d.ask.w, d.ask.h], &d.gray, d.rgb.as_deref());
             // One sample is one screen pixel, or one file pixel at 1:1.
             // Nearest keeps that sample; it does not blend it with a neighbour.
             let opts = TextureOptions::NEAREST;
@@ -1530,8 +1612,7 @@ impl App {
         if r.image.width > 0 && r.image.height > 0 && r.image.gray.len() == r.image.width * r.image.height {
             let w = r.image.width;
             let h = r.image.height;
-            let pixels: Vec<Color32> = r.image.gray.iter().copied().map(Color32::from_gray).collect();
-            let image = ColorImage::new([w, h], pixels);
+            let image = colour_or_gray([w, h], &r.image.gray, r.image.rgb.as_deref());
             self.loupe_tex = Some(ctx.load_texture("sharpen-loupe", image, TextureOptions::NEAREST));
             self.loupe_size = [w, h];
         } else {
@@ -1584,6 +1665,7 @@ impl App {
             self.heavy.send(Job::Export {
                 session: Arc::clone(s),
                 weights: self.weights(),
+                plate: self.plate_view(),
                 recipe: self.print_recipe(),
                 path,
                 orientation: self.export_orientation(),
@@ -1928,6 +2010,9 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.histogram_section(ui);
+        if !s.is_mono() {
+            egui::CollapsingHeader::new("Plate").default_open(true).show(ui, |ui| self.plate_section(ui, &s));
+        }
         ui.collapsing("Development", |ui| {
             ui.label(RichText::new("Changes here recompute the picture.").weak());
             if s.is_mono() {
@@ -2002,6 +2087,110 @@ impl App {
             });
         });
         ui.collapsing("CPU", |ui| self.cpu_section(ui));
+    }
+
+    /// The three-colour plate: on or off, the taking filters, the
+    /// projection primaries, and the three weight rows they come to. A
+    /// re-mix, not a re-development: the separation stays.
+    fn plate_section(&mut self, ui: &mut egui::Ui, s: &Session) {
+        let mut on = self.edit.plate.is_some();
+        if ui
+            .checkbox(&mut on, "three-colour plate")
+            .on_hover_text(
+                "Three mixes of the one separation through three taking filters, printed together \
+                 through the same paper and the same two exposures, into one RGB file. \
+                 Prokudin-Gorsky's principle on the Bayer mosaic: every pixel of every plate is a \
+                 weighted sum of measured photosites, no demosaicing. The drawing is the \
+                 negative's; the colour is band-limited to the carriers, like the red layer of a film.",
+            )
+            .changed()
+        {
+            self.edit.plate = on.then(PlateParams::default);
+        }
+        let Some(mut params) = self.edit.plate else {
+            ui.label(RichText::new("Off: the monochrome negative.").weak().small());
+            return;
+        };
+        let has_matrix = s.has_colour_matrix();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("filters").weak());
+            egui::ComboBox::from_id_salt("plate-filters").selected_text(params.filters.name()).show_ui(
+                ui,
+                |ui| {
+                    for f in PlateFilters::ALL {
+                        let hover = match f {
+                            PlateFilters::Camera => {
+                                "The camera's colour matrix towards the primaries, inverted: the \
+                                 colorimetric set, as a RAW converter applies it. Weights go negative \
+                                 off the diagonal. Without a matrix in the file the channels are taken."
+                            }
+                            PlateFilters::Wratten => {
+                                "Wratten 25, 58 and 47 in front of the panchromatic mix, crosstalk \
+                                 included: the softer palette of the historical glass. Follows the mix \
+                                 in the enlarger."
+                            }
+                            PlateFilters::Channels => {
+                                "The balanced channels as they are, straight into R, G and B. What the \
+                                 Library of Congress does with the scanned plates."
+                            }
+                        };
+                        ui.selectable_value(&mut params.filters, f, f.name()).on_hover_text(hover);
+                    }
+                },
+            );
+            ui.label(RichText::new("primaries").weak());
+            egui::ComboBox::from_id_salt("plate-space")
+                .selected_text(match params.space {
+                    PlateSpace::AdobeRgb => "Adobe RGB",
+                    PlateSpace::Srgb => "sRGB",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB").on_hover_text(
+                        "Adobe RGB (1998): its curve is exactly the paper's gamma 2.2 and its gamut \
+                         holds the saturated primaries. The file carries the profile.",
+                    );
+                    ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
+                        "sRGB primaries with the paper's gamma 2.2 (not the sRGB curve). The file \
+                         carries the profile.",
+                    );
+                });
+        });
+        if self.edit.plate != Some(params) {
+            self.edit.plate = Some(params);
+        }
+        if params.filters == PlateFilters::Camera && !has_matrix {
+            ui.label(
+                RichText::new("No colour matrix in this file: the channels are taken as they are.")
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+            );
+        }
+        match self.plate_resolved.as_ref().map(|r| &r.weights) {
+            Some(Ok(w)) => {
+                let rows = ["red", "green", "blue"];
+                egui::Grid::new("plate-weights").num_columns(4).spacing([10.0, 1.0]).show(ui, |ui| {
+                    for (name, row) in rows.iter().zip(w.rows.iter()) {
+                        ui.label(RichText::new(*name).weak().small());
+                        for v in row {
+                            ui.label(RichText::new(format!("{v:+.3}")).monospace().small());
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.label(
+                    RichText::new(
+                        "Each row sums to one on the balanced channels R G B, so grey gives three \
+                         equal plates. The screen shows the plate; the histograms stay the mix's.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new(format!("No plate: {e}")).small().color(ui.visuals().error_fg_color));
+            }
+            None => {}
+        }
     }
 
     /// The machine's cores. The body runs only while the section is open,
@@ -2329,6 +2518,9 @@ impl App {
             "The single filter grade this pair of exposures equals (by its ISO range), the scene \
              stops between the paper's first tone and its near-black, and where Zone V lands.",
         );
+        if self.plate_view().is_some() {
+            self.lamp_sliders(ui, rail);
+        }
         if self.edit.recipe.place != 0.0 {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("place {:+.2}", self.edit.recipe.place)).weak().small())
@@ -2339,6 +2531,48 @@ impl App {
                     self.edit.recipe.place = 0.0;
                 }
             });
+        }
+    }
+
+    /// The projector's lamps, under the paper's two exposures: stops added
+    /// to the red and the blue positive. Green is the reference and has
+    /// none. The only colour control a plate has.
+    fn lamp_sliders(&mut self, ui: &mut egui::Ui, rail: f32) {
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("lamps").weak()).on_hover_text(
+                "Prokudin-Gorsky's projector had three lamps and the register of the side lenses, \
+                 nothing else. These are the red and the blue lamp, in stops of exposure added to \
+                 that positive; the green one is the reference. Grey stays grey at zero.",
+            );
+            let off = self.edit.lamps == [0.0; 2];
+            if ui
+                .add_enabled(!off, egui::Button::new(RichText::new("0")).small())
+                .on_hover_text("Both lamps back to zero")
+                .clicked()
+            {
+                self.edit.lamps = [0.0; 2];
+            }
+        });
+        let [mut red, mut blue] = self.edit.lamps;
+        exposure_slider(
+            ui,
+            rail,
+            "R",
+            &mut red,
+            "The red lamp, in stops. More red warms the whole print; less cools it. \
+             A grey card stays grey only at zero.",
+        );
+        exposure_slider(
+            ui,
+            rail,
+            "B",
+            &mut blue,
+            "The blue lamp, in stops. More blue cools the print; less turns it towards yellow.",
+        );
+        let lamps = [red.clamp(-LAMP_LIMIT, LAMP_LIMIT), blue.clamp(-LAMP_LIMIT, LAMP_LIMIT)];
+        if lamps != self.edit.lamps {
+            self.edit.lamps = lamps;
         }
     }
 
@@ -2627,7 +2861,16 @@ impl App {
             return None;
         }
         let params = mimizan_core::print::PrintParams { recipe: self.print_recipe(), ..Default::default() };
-        Some(memory_estimate(w, h, 1, &params))
+        let one = memory_estimate(w, h, 1, &params);
+        if self.plate_view().is_none() {
+            return Some(one);
+        }
+        // A plate holds its three mixed planes while one of them is
+        // printed, and the finished positives beside the third.
+        let lay = mimizan_core::print::layout(w, h, 1, &params);
+        let plane = (w as u64).saturating_mul(h as u64).saturating_mul(8);
+        let sheet = (lay.out_w as u64).saturating_mul(lay.out_h as u64).saturating_mul(8);
+        Some(one.saturating_add(plane.saturating_mul(2)).saturating_add(sheet.saturating_mul(2)))
     }
 
     /// Whether the export may start. A print that fits in free memory
@@ -2734,6 +2977,7 @@ impl App {
         let key = (
             session.id,
             self.weights(),
+            self.plate_view(),
             self.loupe_recipe(),
             self.export_orientation(),
             [nx, ny],
@@ -2748,6 +2992,7 @@ impl App {
         self.loupe.request(LoupeRequest {
             session,
             weights: self.weights(),
+            plate: self.plate_view(),
             recipe: self.loupe_recipe(),
             orientation: self.export_orientation(),
             nx,
@@ -2790,10 +3035,29 @@ impl App {
         } else {
             ", no sharpening".to_string()
         };
-        format!(
-            "Writes the print on the {look}{rot}{local}:\n\
-             <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC{sharpen}, recipe in the description"
-        )
+        match self.plate_view() {
+            Some(p) => {
+                let space = match p.space {
+                    PlateSpace::AdobeRgb => "Adobe RGB (1998)",
+                    PlateSpace::Srgb => "sRGB",
+                };
+                let lamps = if p.lamps[0] != 0.0 || p.lamps[2] != 0.0 {
+                    format!(", lamps R {:+.2} B {:+.2}", p.lamps[0], p.lamps[2])
+                } else {
+                    String::new()
+                };
+                format!(
+                    "Writes the three-colour plate on the {look}{rot}{local}{lamps}:\n\
+                     <name>.tif  {ow} x {oh} px, 16 bit RGB, {space} gamma 2.2 ICC, {} filters{sharpen}, \
+                     recipe and plate in the description",
+                    p.weights.filters.name()
+                )
+            }
+            None => format!(
+                "Writes the print on the {look}{rot}{local}:\n\
+                 <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC{sharpen}, recipe in the description"
+            ),
+        }
     }
 
     /// Long-side scale of the print, destination / source. The radius field
@@ -3943,6 +4207,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.loupe_open = false;
         self.ensure_loupe_point();
+        self.refresh_plate();
         self.handle_dialog(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
@@ -3992,6 +4257,8 @@ impl eframe::App for App {
         self.edit_keys(&ctx);
         self.clear_desktop_sharpen();
         self.commit_history(&ctx);
+        // The panels may have changed the plate this frame; resolve before asking.
+        self.refresh_plate();
         self.request_preview_if_needed();
         // After every slider. The print window is drawn before the enlarger,
         // so a request from inside it would still carry the previous exposure.

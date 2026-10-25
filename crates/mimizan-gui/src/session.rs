@@ -13,6 +13,7 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
+use mimizan_core::plate::{mix_plate, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{
     layout, loupe_source_rect, orient, rotated, sharpen_window, source_window, window_plane, PrintParams,
 };
@@ -223,6 +224,29 @@ impl Session {
     pub fn wb(&self) -> [f64; 3] {
         self.negative.info.wb
     }
+
+    /// The three taking filters `p` asks for, in front of `base` (the
+    /// Wratten set filters the panchromatic mix; the camera set needs the
+    /// file's matrix and takes the channels as they are without one).
+    pub fn plate_weights(&self, p: &PlateParams, base: Weights) -> mimizan_core::Result<PlateWeights> {
+        PlateWeights::resolve(p, base, self.frame.xyz_to_cam.as_ref())
+    }
+
+    /// The file carries a colour matrix, so the camera set is colorimetric.
+    pub fn has_colour_matrix(&self) -> bool {
+        self.frame.xyz_to_cam.is_some()
+    }
+}
+
+/// The three-colour plate as the view, the print box and the export render
+/// it: the taking filters, the projection primaries and the lamps. `None`
+/// in a view is the monochrome negative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlateView {
+    pub weights: PlateWeights,
+    pub space: PlateSpace,
+    /// Stops added to the red, green and blue positive on top of the placing.
+    pub lamps: [f64; 3],
 }
 
 /// Shrinks full-resolution planes to the preview size and turns them
@@ -319,6 +343,9 @@ pub struct ViewParams {
     /// Window on the file-upright negative. `None` is the whole frame.
     /// The preview turns it with `rotation` before cutting.
     pub crop: Option<CropRect>,
+    /// Three mixes instead of one: the picture is shown in colour. The
+    /// histograms stay those of the monochrome mix, the plate's luminance.
+    pub plate: Option<PlateView>,
 }
 
 /// The parts of a view the full-resolution histograms depend on (the
@@ -436,13 +463,22 @@ impl DetailAsk {
 /// 1:1 crop of the negative for the zoomed view, or a coarser grid of it.
 pub struct DetailImage {
     pub ask: DetailAsk,
+    /// The monochrome negative, `w * h` bytes.
     pub gray: Vec<u8>,
+    /// The plate in colour, interleaved R, G, B, `3 * w * h` bytes.
+    pub rgb: Option<Vec<u8>>,
 }
 
 /// A rendered ask, kept so the next pan can reuse the overlap.
 pub struct DetailTile {
     pub ask: DetailAsk,
     pub gray: Vec<u8>,
+    pub rgb: Option<Vec<u8>>,
+}
+
+/// `rgb`, when present, has three bytes for every one of `gray`.
+fn rgb_fits(gray: &[u8], rgb: Option<&Vec<u8>>) -> bool {
+    rgb.is_none_or(|c| c.len() == gray.len().saturating_mul(3))
 }
 
 /// Map a rectangle of the upright image (after `orientation`) back to the
@@ -537,9 +573,20 @@ pub fn render_detail(
     let src = DetailSource { s, v, sep, sw, sh, orientation, table, codes };
     let gray = if step == 1 { src.dense(rect)? } else { src.grid(x, y, w, h, step) };
     debug_assert_eq!(gray.len(), w * h);
+    let rgb = match v.plate.filter(|_| !v.show_mask) {
+        Some(plate) => Some(if step == 1 {
+            let sensor = source_rect(orientation, sw, sh, rect);
+            let planes = plate_upright(sep, &plate.weights, sensor, orientation)?;
+            display_rgb(&planes, v.place, plate.lamps, table)
+        } else {
+            src.plate_grid(&plate, x, y, w, h, step)
+        }),
+        None => None,
+    };
     Some(DetailImage {
         ask: DetailAsk { x: x.saturating_sub(origin.0), y: y.saturating_sub(origin.1), w, h, step },
         gray,
+        rgb,
     })
 }
 
@@ -606,6 +653,25 @@ impl DetailSource<'_> {
         });
         out
     }
+
+    /// The plate on the screen grid: three mixes of the same sample, each
+    /// placed by its lamp, interleaved R, G, B.
+    fn plate_grid(&self, plate: &PlateView, x: usize, y: usize, w: usize, h: usize, step: usize) -> Vec<u8> {
+        let Self { v, sep, sw, sh, orientation, table, .. } = *self;
+        let weights = plate.weights.weights();
+        let mut out = vec![0u8; w * h * 3];
+        out.par_chunks_mut(w * 3).enumerate().for_each(|(j, row)| {
+            let oy = y + j * step;
+            for (i, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let ox = x + i * step;
+                let (sx, sy) = sensor_xy(orientation, sw, sh, ox, oy);
+                for c in 0..3 {
+                    px[c] = show_sample(mix_at(sep, &weights[c], sx, sy), v.place + plate.lamps[c], table);
+                }
+            }
+        });
+        out
+    }
 }
 
 fn mix_at(sep: &Separation, w: &Weights, x: usize, y: usize) -> f64 {
@@ -664,6 +730,7 @@ fn render_measured(
     Some(DetailImage {
         ask: DetailAsk { x: x.saturating_sub(origin.0), y: y.saturating_sub(origin.1), w, h, step },
         gray,
+        rgb: None,
     })
 }
 
@@ -737,8 +804,8 @@ fn measured_window(s: &Session, weights: &Weights, src: DetailRect, orientation:
     }
 }
 
-fn mixed_upright(sep: &Separation, weights: &Weights, src: DetailRect, orientation: u16) -> Option<Plane> {
-    let small = Separation {
+fn crop_separation(sep: &Separation, src: DetailRect) -> Option<Separation> {
+    Some(Separation {
         lum: crop(&sep.lum, src)?,
         c1: crop(&sep.c1, src)?,
         c2: crop(&sep.c2, src)?,
@@ -746,8 +813,43 @@ fn mixed_upright(sep: &Separation, weights: &Weights, src: DetailRect, orientati
         rounds: sep.rounds,
         phase: sep.phase,
         computed: sep.computed,
-    };
-    Some(orient(&mix(&small, weights), orientation))
+    })
+}
+
+fn mixed_upright(sep: &Separation, weights: &Weights, src: DetailRect, orientation: u16) -> Option<Plane> {
+    Some(orient(&mix(&crop_separation(sep, src)?, weights), orientation))
+}
+
+/// The three plates of a window, upright, by output channel R, G, B.
+fn plate_upright(
+    sep: &Separation,
+    w: &PlateWeights,
+    src: DetailRect,
+    orientation: u16,
+) -> Option<[Plane; 3]> {
+    let small = crop_separation(sep, src)?;
+    Some(mix_plate(&small, w).map(|p| orient(&p, orientation)))
+}
+
+/// 8-bit face of a plate print: channel `c` placed by `place + lamps[c]`,
+/// then the same table as the grey, interleaved R, G, B. The planes must
+/// agree in size.
+fn display_rgb(planes: &[Plane; 3], place: f64, lamps: [f64; 3], table: &ToneTable) -> Vec<u8> {
+    let n = planes.iter().map(|p| p.data.len()).min().unwrap_or(0);
+    debug_assert!(planes.iter().all(|p| p.data.len() == n));
+    let gains = lamps.map(|l| 2f64.powf(place + l));
+    let mut out = vec![0u8; n * 3];
+    const ROW: usize = 4096;
+    out.par_chunks_mut(ROW * 3).enumerate().for_each(|(k, chunk)| {
+        let base = k * ROW;
+        for (i, px) in chunk.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let idx = base + i;
+            for c in 0..3 {
+                px[c] = table.show[q16(planes[c].data[idx] * gains[c])];
+            }
+        }
+    });
+    out
 }
 
 /// The visible window of a fitted print: the recipe's kernel on the negative,
@@ -788,16 +890,27 @@ pub fn render_print_detail(
     let sensor = source_rect(orientation, sensor_w, sensor_h, upright);
     let mixed = measured_window(s, &v.weights, sensor, orientation)?;
     debug_assert_eq!((mixed.width, mixed.height), (upright.w, upright.h));
-    let window = PlaneWindow { plane: &mixed, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
-    let picture = match resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("{e}");
-            return None;
+    let enlarge = |plane: &Plane| {
+        let window = PlaneWindow { plane, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
+        match resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!("{e}");
+                None
+            }
         }
     };
+    let picture = enlarge(&mixed)?;
     let gray = display_bytes(&picture, v.place, table);
-    Some(DetailImage { ask: DetailAsk::pixels(rect), gray })
+    let rgb = match v.plate.filter(|_| !s.is_mono()) {
+        Some(plate) => {
+            let planes = plate_upright(s.separation()?, &plate.weights, sensor, orientation)?;
+            let [r, g, b] = [enlarge(&planes[0])?, enlarge(&planes[1])?, enlarge(&planes[2])?];
+            Some(display_rgb(&[r, g, b], v.place, plate.lamps, table))
+        }
+        None => None,
+    };
+    Some(DetailImage { ask: DetailAsk::pixels(rect), gray, rgb })
 }
 
 /// A render that clipped the ask, or failed, still has to come back as a
@@ -805,11 +918,34 @@ pub fn render_print_detail(
 /// that gets kept: the screen asked for a corner the picture does not have.
 fn painted(ask: DetailAsk, rendered: Option<DetailImage>) -> DetailTile {
     if let Some(d) = rendered {
-        if d.ask.step() == ask.step() && d.gray.len() == d.ask.w.saturating_mul(d.ask.h) {
-            return DetailTile { ask: d.ask, gray: d.gray };
+        if d.ask.step() == ask.step()
+            && d.gray.len() == d.ask.w.saturating_mul(d.ask.h)
+            && rgb_fits(&d.gray, d.rgb.as_ref())
+        {
+            return DetailTile { ask: d.ask, gray: d.gray, rgb: d.rgb };
         }
     }
-    DetailTile { ask, gray: vec![0; ask.w.saturating_mul(ask.h)] }
+    DetailTile { ask, gray: vec![0; ask.w.saturating_mul(ask.h)], rgb: None }
+}
+
+/// Copy `h` rows of `w` samples, `ch` bytes each, from `(sx, sy)` of a
+/// `src_w`-wide buffer to `(dx, dy)` of a `dst_w`-wide one.
+#[allow(clippy::too_many_arguments)]
+fn copy_rows(
+    dst: &mut [u8],
+    dst_w: usize,
+    (dx, dy): (usize, usize),
+    src: &[u8],
+    src_w: usize,
+    (sx, sy): (usize, usize),
+    (w, h): (usize, usize),
+    ch: usize,
+) {
+    for j in 0..h {
+        let d = ((dy + j) * dst_w + dx) * ch;
+        let s = ((sy + j) * src_w + sx) * ch;
+        dst[d..d + w * ch].copy_from_slice(&src[s..s + w * ch]);
+    }
 }
 
 /// `have` supplies every sample that already sits on this grid. The rest is
@@ -830,14 +966,19 @@ pub fn cover_detail(
         && old.ask.step() == step
         && old.ask.x.is_multiple_of(step)
         && old.ask.y.is_multiple_of(step)
-        && old.gray.len() == old.ask.w.saturating_mul(old.ask.h);
+        && old.gray.len() == old.ask.w.saturating_mul(old.ask.h)
+        && rgb_fits(&old.gray, old.rgb.as_ref());
     let (Some(shift_i), Some(shift_j)) = (
         aligned.then(|| grid_shift(ask.x, old.ask.x, step)).flatten(),
         aligned.then(|| grid_shift(ask.y, old.ask.y, step)).flatten(),
     ) else {
         return painted(ask, render(ask));
     };
-    let mut gray = vec![0u8; ask.w.saturating_mul(ask.h)];
+    let n = ask.w.saturating_mul(ask.h);
+    let mut gray = vec![0u8; n];
+    // The colour comes along when the old tile had it; a gap rendered
+    // without it (the view changed under us) repaints the whole ask.
+    let mut rgb = old.rgb.as_ref().map(|_| vec![0u8; n * 3]);
     let ni0 = (-shift_i).max(0) as usize;
     let ni1 = (old.ask.w as isize - shift_i).clamp(0, ask.w as isize) as usize;
     let nj0 = (-shift_j).max(0) as usize;
@@ -845,15 +986,14 @@ pub fn cover_detail(
     if ni0 >= ni1 || nj0 >= nj1 {
         return painted(ask, render(ask));
     }
-    for nj in nj0..nj1 {
-        let oj = (nj as isize + shift_j) as usize;
-        let src = oj * old.ask.w + (ni0 as isize + shift_i) as usize;
-        let dst = nj * ask.w + ni0;
-        let n = ni1 - ni0;
-        gray[dst..dst + n].copy_from_slice(&old.gray[src..src + n]);
+    let from = ((ni0 as isize + shift_i) as usize, (nj0 as isize + shift_j) as usize);
+    let span = (ni1 - ni0, nj1 - nj0);
+    copy_rows(&mut gray, ask.w, (ni0, nj0), &old.gray, old.ask.w, from, span, 1);
+    if let (Some(dst), Some(src)) = (rgb.as_mut(), old.rgb.as_ref()) {
+        copy_rows(dst, ask.w, (ni0, nj0), src, old.ask.w, from, span, 3);
     }
     if ni0 == 0 && ni1 == ask.w && nj0 == 0 && nj1 == ask.h {
-        return DetailTile { ask, gray };
+        return DetailTile { ask, gray, rgb };
     }
     let mut gaps = Vec::with_capacity(4);
     if ni0 > 0 {
@@ -875,16 +1015,20 @@ pub fn cover_detail(
         };
         // A clip changes the rectangle. The strip no longer fits the gap,
         // so the whole ask is rendered again and keeps the clipped size.
-        if got.ask.w != gw || got.ask.h != gh || got.gray.len() != gw * gh {
+        if got.ask.w != gw
+            || got.ask.h != gh
+            || got.gray.len() != gw * gh
+            || got.rgb.is_some() != rgb.is_some()
+            || !rgb_fits(&got.gray, got.rgb.as_ref())
+        {
             return painted(ask, render(ask));
         }
-        for j in 0..gh {
-            let dst = (gy + j) * ask.w + gx;
-            let src = j * gw;
-            gray[dst..dst + gw].copy_from_slice(&got.gray[src..src + gw]);
+        copy_rows(&mut gray, ask.w, (gx, gy), &got.gray, gw, (0, 0), (gw, gh), 1);
+        if let (Some(dst), Some(src)) = (rgb.as_mut(), got.rgb.as_ref()) {
+            copy_rows(dst, ask.w, (gx, gy), src, gw, (0, 0), (gw, gh), 3);
         }
     }
-    DetailTile { ask, gray }
+    DetailTile { ask, gray, rgb }
 }
 
 fn grid_shift(new_origin: usize, old_origin: usize, step: usize) -> Option<isize> {
@@ -894,15 +1038,26 @@ fn grid_shift(new_origin: usize, old_origin: usize, step: usize) -> Option<isize
 
 pub struct SharpenLoupe {
     pub gray: Vec<u8>,
+    /// The plate's box in colour, interleaved R, G, B.
+    pub rgb: Option<Vec<u8>>,
     pub width: usize,
     pub height: usize,
 }
 
+impl SharpenLoupe {
+    fn empty() -> Self {
+        Self { gray: Vec::new(), rgb: None, width: 0, height: 0 }
+    }
+}
+
 /// One box of the print at 1:1: the same resize and paper the TIFF gets,
 /// on a tile around `(nx, ny)`. `view` is the box side in print pixels.
+/// With a `plate` the box is the three positives, each with its lamp.
+#[allow(clippy::too_many_arguments)]
 pub fn render_sharpen_loupe(
     s: &Session,
     weights: &Weights,
+    plate: Option<&PlateView>,
     recipe: &Recipe,
     orientation: u16,
     nx: f64,
@@ -918,39 +1073,68 @@ pub fn render_sharpen_loupe(
     // USM is the only step that reads the mask, and only then is the crop
     // wide enough for its Lanczos-3 resample.
     let want_mask = recipe.sharpen.usm_amount() > 0.0;
-    let (linear, mask) = if ex > sx && ey > sy {
+    let plate = plate.filter(|_| !s.is_mono());
+    let (linear, plates, mask) = if ex > sx && ey > sy {
         let upright_rect = DetailRect { x: sx, y: sy, w: ex - sx, h: ey - sy };
         let sensor = source_rect(orientation, sensor_w, sensor_h, upright_rect);
         let Some(mixed) = measured_window(s, weights, sensor, orientation) else {
-            return SharpenLoupe { gray: Vec::new(), width: 0, height: 0 };
+            return SharpenLoupe::empty();
+        };
+        let plates = match plate {
+            Some(p) => {
+                match s.separation().and_then(|sep| plate_upright(sep, &p.weights, sensor, orientation)) {
+                    Some(planes) => Some(planes),
+                    None => return SharpenLoupe::empty(),
+                }
+            }
+            None => None,
         };
         let mask =
             want_mask.then(|| mask_window(&s.negative, sensor)).flatten().map(|m| orient(&m, orientation));
-        (mixed, mask)
+        (mixed, plates, mask)
     } else {
-        (Plane::zeros(1, 1), None)
+        (Plane::zeros(1, 1), None, None)
     };
-    let window = if ex > sx && ey > sy {
-        PlaneWindow { plane: &linear, origin_x: sx, origin_y: sy, full_w, full_h }
-    } else {
-        PlaneWindow { plane: &linear, origin_x: 0, origin_y: 0, full_w, full_h }
-    };
-    let mask_window = mask.as_ref().map(|m| PlaneWindow {
-        plane: m,
-        origin_x: window.origin_x,
-        origin_y: window.origin_y,
-        full_w,
-        full_h,
-    });
-    let plane = match sharpen_window(window, mask_window, &params, nx, ny, view) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::error!("{e}");
-            return SharpenLoupe { gray: Vec::new(), width: 0, height: 0 };
+    let (origin_x, origin_y) = if ex > sx && ey > sy { (sx, sy) } else { (0, 0) };
+    let mask_window = mask.as_ref().map(|m| PlaneWindow { plane: m, origin_x, origin_y, full_w, full_h });
+    let through = |plane: &Plane, p: &PrintParams| {
+        let window = PlaneWindow { plane, origin_x, origin_y, full_w, full_h };
+        match sharpen_window(window, mask_window, p, nx, ny, view) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!("{e}");
+                None
+            }
         }
     };
-    let gray = plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
-    SharpenLoupe { gray, width: plane.width, height: plane.height }
+    let Some(plane) = through(&linear, &params) else { return SharpenLoupe::empty() };
+    let to_u8 = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let gray = plane.data.par_iter().map(|&v| to_u8(v)).collect();
+    let rgb = match (plate, plates) {
+        (Some(p), Some(planes)) => {
+            // Each positive through the same pass, plus its lamp, as the export does.
+            let mut out = Vec::with_capacity(3);
+            for (plane, lamp) in planes.iter().zip(p.lamps) {
+                let mut q = params.clone();
+                q.recipe.place += lamp;
+                let Some(pos) = through(plane, &q) else { return SharpenLoupe::empty() };
+                if (pos.width, pos.height) != (plane.width, plane.height) {
+                    return SharpenLoupe::empty();
+                }
+                out.push(pos);
+            }
+            let n = plane.data.len();
+            let mut rgb = vec![0u8; n * 3];
+            rgb.par_chunks_mut(3).enumerate().for_each(|(i, px)| {
+                for c in 0..3 {
+                    px[c] = to_u8(out[c].data[i]);
+                }
+            });
+            Some(rgb)
+        }
+        _ => None,
+    };
+    SharpenLoupe { gray, rgb, width: plane.width, height: plane.height }
 }
 
 /// The whole sidecar as a plane in [0, 1]; an error when its length does
@@ -1369,6 +1553,8 @@ pub struct PreviewImage {
     /// Quarter turns this image was rendered with (`ViewParams::rotation`).
     pub rotation: u8,
     pub gray: Vec<u8>,
+    /// The plate in colour, interleaved R, G, B, when the view asked for one.
+    pub rgb: Option<Vec<u8>>,
     pub hist_view: Histogram,
     pub hist_negative: Histogram,
 }
@@ -1508,25 +1694,41 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
             height: plane.height,
             rotation: v.rotation,
             gray,
+            rgb: None,
             hist_view,
             hist_negative: Histogram::empty(),
         };
     }
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.histograms(s, v, table);
-    let mut mixed = orient(&mix(&pp.sep, &v.weights), rotated(1, v.rotation));
-    if let Some(c) = v.crop {
-        let (fw, fh) = s.upright_size();
-        let turned = c.turned(v.rotation, fw as u32, fh as u32);
-        let scaled = scale_crop(turned, s.preview.scale, mixed.width, mixed.height);
-        mixed = window_plane(&mixed, scaled);
-    }
+    // Turn, then cut the window, on the small planes.
+    let shown = |plane: Plane| -> Plane {
+        let turned = orient(&plane, rotated(1, v.rotation));
+        match v.crop {
+            Some(c) => {
+                let (fw, fh) = s.upright_size();
+                let window = c.turned(v.rotation, fw as u32, fh as u32);
+                let scaled = scale_crop(window, s.preview.scale, turned.width, turned.height);
+                window_plane(&turned, scaled)
+            }
+            None => turned,
+        }
+    };
+    let mixed = shown(mix(&pp.sep, &v.weights));
     let gray = display_bytes(&mixed, v.place, table);
+    let rgb = match v.plate.filter(|_| !s.is_mono()) {
+        Some(plate) => {
+            let planes = mix_plate(&pp.sep, &plate.weights).map(shown);
+            Some(display_rgb(&planes, v.place, plate.lamps, table))
+        }
+        None => None,
+    };
     PreviewImage {
         width: mixed.width,
         height: mixed.height,
         rotation: v.rotation,
         gray,
+        rgb,
         hist_view,
         hist_negative,
     }
@@ -1649,7 +1851,7 @@ mod tests {
                     (0..ask.w).map(move |i| ((ask.x / ask.step + i) * 3 + (ask.y / ask.step + j)) as u8)
                 })
                 .collect();
-            Some(DetailImage { ask, gray })
+            Some(DetailImage { ask, gray, rgb: None })
         }
         let first = DetailAsk { x: 0, y: 0, w: 6, h: 4, step: 2 };
         let have = cover_detail(None, first, paint);
@@ -1683,7 +1885,7 @@ mod tests {
             }
             let ask = DetailAsk { w: ask.w.min(lim_w - ask.x), h: ask.h.min(lim_h - ask.y), ..ask };
             let gray = vec![7u8; ask.w * ask.h];
-            Some(DetailImage { ask, gray })
+            Some(DetailImage { ask, gray, rgb: None })
         }
         let ask = DetailAsk { x: 30, y: 20, w: 20, h: 20, step: 1 };
         let tile = cover_detail(None, ask, clip);
@@ -1936,6 +2138,7 @@ mod histogram_tests {
             show_mask: false,
             rotation: 0,
             crop: None,
+            plate: None,
         };
         let detail = render_detail(
             &session,
@@ -1946,5 +2149,128 @@ mod histogram_tests {
         )
         .unwrap();
         assert_eq!(detail.gray, display_bytes(&session.negative.plane, 0.0, &table));
+    }
+
+    /// A plate on a grey Bayer mosaic: the preview, the 1:1 window, the
+    /// screen grid, the fitted-print window and the print box all carry
+    /// colour bytes, three per sample, and every one of them is grey, and
+    /// equal to the monochrome byte. A red lamp lifts red alone. A pan of
+    /// the tile keeps the colour.
+    #[test]
+    fn a_plate_on_grey_shows_grey_in_colour() {
+        use mimizan_core::cfa::BayerPhase;
+        use mimizan_core::decode::{RawData, Rect, SensorKind};
+        use mimizan_core::pipeline::{self, NegativeParams};
+        use std::sync::Arc;
+        let (w, h) = (48usize, 32usize);
+        // A soft ramp: the separation leaves a grey mosaic grey.
+        let raw: Vec<u16> =
+            (0..w * h).map(|i| (200.0 + 600.0 * ((i % w) as f64 / w as f64)) as u16).collect();
+        let frame = RawFrame {
+            make: "Test".into(),
+            model: "Bayer".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 10,
+            kind: SensorKind::Bayer(BayerPhase::RGGB),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            wb_as_shot: Some([1.0, 1.0, 1.0]),
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        let preview = preview_planes(&neg).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let session = Session {
+            id: next_session_id(),
+            path: "grey.nef".into(),
+            frame: Arc::new(frame),
+            negative: neg,
+            camera_file: None,
+            camera_file_path: None,
+            develop: DevelopParams::default(),
+            preview,
+            raw_hist,
+        };
+        assert!(!session.is_mono());
+        let plate_params = PlateParams::default();
+        // No matrix: the camera set falls back to the channels.
+        let weights = session.plate_weights(&plate_params, Weights::default()).unwrap();
+        assert_eq!(weights, PlateWeights::channels());
+        let plate = PlateView { weights, space: PlateSpace::AdobeRgb, lamps: [0.0; 3] };
+        let tone = Tone::paper().compile();
+        let table = ToneTable::build(&tone);
+        let view = ViewParams {
+            weights: Weights::default(),
+            tone: Tone::paper(),
+            place: 0.0,
+            show_mask: false,
+            rotation: 1,
+            crop: None,
+            plate: Some(plate),
+        };
+        let grey_in_colour = |gray: &[u8], rgb: &[u8]| {
+            assert_eq!(rgb.len(), gray.len() * 3);
+            for (g, px) in gray.iter().zip(rgb.as_chunks::<3>().0) {
+                assert_eq!(*px, [*g, *g, *g], "a grey mosaic prints grey");
+            }
+        };
+
+        let mut cache = HistCache::default();
+        let pv = render_preview(&session, &view, &mut cache, &table);
+        grey_in_colour(&pv.gray, pv.rgb.as_ref().unwrap());
+        assert_eq!(pv.gray.len(), pv.width * pv.height);
+
+        let ask = DetailAsk::pixels(DetailRect { x: 3, y: 2, w: 20, h: 12 });
+        let d = render_detail(&session, &view, ask, &table, None).unwrap();
+        grey_in_colour(&d.gray, d.rgb.as_ref().unwrap());
+        let grid = DetailAsk { x: 0, y: 0, w: 10, h: 8, step: 2 };
+        let d = render_detail(&session, &view, grid, &table, None).unwrap();
+        grey_in_colour(&d.gray, d.rgb.as_ref().unwrap());
+
+        let mut recipe = Recipe::on_paper();
+        recipe.size = Some(mimizan_core::print::PrintSize::Physical { width_in: 1.0, height_in: 1.0 });
+        recipe.dpi = 72.0;
+        let rect = DetailRect { x: 0, y: 0, w: 24, h: 24 };
+        let d = render_print_detail(&session, &view, &recipe, rect, &table).unwrap();
+        grey_in_colour(&d.gray, d.rgb.as_ref().unwrap());
+
+        let o = rotated(1, view.rotation);
+        let lp = render_sharpen_loupe(&session, &view.weights, Some(&plate), &recipe, o, 0.5, 0.5, 16);
+        assert!(lp.width > 0);
+        grey_in_colour(&lp.gray, lp.rgb.as_ref().unwrap());
+
+        // A red lamp: red brighter, green and blue as before.
+        let lit = PlateView { lamps: [0.5, 0.0, 0.0], ..plate };
+        let lit_view = ViewParams { plate: Some(lit), ..view.clone() };
+        let d0 = render_detail(&session, &view, ask, &table, None).unwrap();
+        let d1 = render_detail(&session, &lit_view, ask, &table, None).unwrap();
+        let (a, b) = (d0.rgb.unwrap(), d1.rgb.unwrap());
+        let mut lifted = 0;
+        for (p, q) in a.as_chunks::<3>().0.iter().zip(b.as_chunks::<3>().0) {
+            assert!(q[0] >= p[0]);
+            lifted += (q[0] > p[0]) as usize;
+            assert_eq!(q[1], p[1]);
+            assert_eq!(q[2], p[2]);
+        }
+        assert!(lifted > 0);
+
+        // A pan keeps the colour and matches a fresh render.
+        let paint = |a: DetailAsk| render_detail(&session, &view, a, &table, None);
+        let first = DetailAsk { x: 4, y: 4, w: 16, h: 12, step: 1 };
+        let have = cover_detail(None, first, paint);
+        assert!(have.rgb.is_some());
+        let next = DetailAsk { x: 8, y: 6, w: 16, h: 12, step: 1 };
+        let got = cover_detail(Some(&have), next, paint);
+        let fresh = paint(next).unwrap();
+        assert_eq!(got.gray, fresh.gray);
+        assert_eq!(got.rgb, fresh.rgb);
     }
 }

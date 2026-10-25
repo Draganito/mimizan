@@ -17,13 +17,14 @@
 use crate::session::{
     cover_detail, next_session_id, preview_planes, render_detail, render_preview, render_print_detail,
     render_sharpen_loupe, DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams, HistCache,
-    PreviewImage, RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
+    PlateView, PreviewImage, RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
+use mimizan_core::plate::{mix_plate, PlateInfo};
 use mimizan_core::print::{self as pr, PrintParams, PrintSource};
 use mimizan_core::recipe::{Recipe, Sharpen};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ use std::time::Instant;
 use tracing::info;
 
 /// Work for the `Heavy` thread.
+#[allow(clippy::large_enum_variant)]
 pub enum Job {
     /// Decode and develop a file.
     Open { path: PathBuf, develop: DevelopParams, cameras_dir: PathBuf },
@@ -46,6 +48,8 @@ pub enum Job {
     Export {
         session: Arc<Session>,
         weights: Weights,
+        /// Three positives into one RGB file instead of the grey print.
+        plate: Option<PlateView>,
         recipe: Recipe,
         path: PathBuf,
         /// TIFF orientation to apply (the file's, plus the user's turns).
@@ -144,9 +148,10 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
         Job::Redevelop { session, develop } => {
             redevelop(&session, develop, &status).map(|s| Event::Opened(Arc::new(s)))
         }
-        Job::Export { session, weights, recipe, path, orientation } => {
-            export(&session, weights, recipe, &path, orientation, &status)
-        }
+        Job::Export { session, weights, plate, recipe, path, orientation } => match plate {
+            Some(plate) => export_plate(&session, weights, &plate, recipe, &path, orientation, &status),
+            None => export(&session, weights, recipe, &path, orientation, &status),
+        },
     }
 }
 
@@ -357,6 +362,54 @@ fn export(
     })
 }
 
+/// The three-colour plate: three mixes of the separation, each through
+/// the same pass as the grey print plus its lamp, into one 16-bit RGB
+/// file with the primaries' profile. What `mimizan print` does to a plate
+/// file, without the file.
+fn export_plate(
+    s: &Session,
+    weights: Weights,
+    plate: &PlateView,
+    recipe: Recipe,
+    path: &Path,
+    orientation: u16,
+    status: &dyn Fn(String),
+) -> Result<Event> {
+    let t = Instant::now();
+    recipe.validate()?;
+    let Some(sep) = s.separation() else {
+        return Err(anyhow::anyhow!("a three-colour plate needs a Bayer separation"));
+    };
+    status("mixing the three plates".into());
+    let planes = mix_plate(sep, &plate.weights);
+    let params = PrintParams { recipe, lamps: plate.lamps, ..Default::default() };
+    let mask = if params.sharpens() { Some(s.mask_plane()?) } else { None };
+    let pi = PlateInfo::new(&plate.weights, plate.space, sep.lum.height);
+    let mut info = s.negative.info.clone();
+    info.weights = weights;
+    info.weights_raw = weights.balanced_to_raw(s.wb());
+    info.plate = Some(pi.clone());
+    let description = serde_json::to_value(&info).ok();
+    let [r, g, b] = &planes;
+    let sources = [r, g, b].map(|plane| PrintSource {
+        plane,
+        mask: mask.as_ref(),
+        orientation,
+        name: s.path.display().to_string(),
+        description: description.clone(),
+    });
+    status("rendering the three positives".into());
+    let out = pr::render_plate(sources, &pi, &params);
+    status(format!("writing {}", path.display()));
+    pr::write(&out, path, &params)?;
+    Ok(Event::Exported {
+        tiff: path.to_path_buf(),
+        width: out.info.width,
+        height: out.info.height,
+        ms: t.elapsed().as_millis(),
+    })
+}
+
 pub struct PreviewRequest {
     pub session: Arc<Session>,
     pub view: ViewParams,
@@ -511,7 +564,7 @@ fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewR
                 render_detail(&req.session, &req.view, sub, table, codes)
             })
         };
-        let image = DetailImage { ask: tile.ask, gray: tile.gray.clone() };
+        let image = DetailImage { ask: tile.ask, gray: tile.gray.clone(), rgb: tile.rgb.clone() };
         hold.held = Some(tile);
         Some(image)
     } else {
@@ -537,6 +590,8 @@ fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewR
 pub struct LoupeRequest {
     pub session: Arc<Session>,
     pub weights: Weights,
+    /// The box in colour: the three positives with their lamps.
+    pub plate: Option<PlateView>,
     pub recipe: Recipe,
     pub orientation: u16,
     pub nx: f64,
@@ -615,6 +670,7 @@ fn start_loupe(ctx: &egui::Context) -> (Sender<LoupeRequest>, Receiver<LoupeResu
                     render_sharpen_loupe(
                         &req.session,
                         &req.weights,
+                        req.plate.as_ref(),
                         &req.recipe,
                         req.orientation,
                         req.nx,
@@ -626,7 +682,7 @@ fn start_loupe(ctx: &egui::Context) -> (Sender<LoupeRequest>, Receiver<LoupeResu
                     Ok(image) => image,
                     Err(payload) => {
                         tracing::error!("loupe render failed: {}", panic_message(&payload));
-                        SharpenLoupe { gray: Vec::new(), width: 0, height: 0 }
+                        SharpenLoupe { gray: Vec::new(), rgb: None, width: 0, height: 0 }
                     }
                 };
                 if results.send(LoupeResult { generation, image }).is_err() {
@@ -647,5 +703,89 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         s.clone()
     } else {
         "unknown panic".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{next_session_id, preview_planes, RawHistogram};
+    use mimizan_core::cfa::BayerPhase;
+    use mimizan_core::decode::{RawData, RawFrame, Rect, SensorKind};
+    use mimizan_core::pipeline::NegativeParams;
+    use mimizan_core::plate::{PlateSpace, PlateWeights};
+
+    /// The export of a plate from a grey mosaic is a 16-bit RGB file whose
+    /// three channels are equal, the same size the grey export has, and a
+    /// blue lamp lifts the blue channel alone.
+    #[test]
+    fn plate_export_writes_grey_as_equal_channels() {
+        let (w, h) = (40usize, 24usize);
+        let raw: Vec<u16> =
+            (0..w * h).map(|i| (150.0 + 700.0 * ((i / w) as f64 / h as f64)) as u16).collect();
+        let frame = RawFrame {
+            make: "Test".into(),
+            model: "Bayer".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 10,
+            kind: SensorKind::Bayer(BayerPhase::RGGB),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            wb_as_shot: Some([1.0, 1.0, 1.0]),
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        let negative = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        let preview = preview_planes(&negative).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let session = Session {
+            id: next_session_id(),
+            path: "grey.nef".into(),
+            frame: Arc::new(frame),
+            negative,
+            camera_file: None,
+            camera_file_path: None,
+            develop: DevelopParams::default(),
+            preview,
+            raw_hist,
+        };
+        let dir = std::env::temp_dir().join(format!("mimizan-gui-plate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let quiet = |_s: String| {};
+        let grey = dir.join("grey.tif");
+        let recipe = Recipe::on_paper();
+        let ev = export(&session, Weights::default(), recipe.clone(), &grey, 1, &quiet).unwrap();
+        let Event::Exported { width, height, .. } = ev else { panic!("not exported") };
+
+        let plate =
+            PlateView { weights: PlateWeights::channels(), space: PlateSpace::AdobeRgb, lamps: [0.0; 3] };
+        let path = dir.join("plate.tif");
+        let ev =
+            export_plate(&session, Weights::default(), &plate, recipe.clone(), &path, 1, &quiet).unwrap();
+        let Event::Exported { width: pw, height: ph, .. } = ev else { panic!("not exported") };
+        assert_eq!((pw, ph), (width, height));
+        let [r, g, b] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
+        assert_eq!((r.width, r.height), (width, height));
+        assert_eq!(r.data, g.data, "grey prints grey");
+        assert_eq!(g.data, b.data, "grey prints grey");
+        let mono = mimizan_core::tiffin::read_gray(&grey).unwrap();
+        assert_eq!(mono.plane.data, g.data, "the green positive is the grey print");
+
+        let lit = PlateView { lamps: [0.0, 0.0, 0.5], ..plate };
+        let path = dir.join("plate_blue.tif");
+        export_plate(&session, Weights::default(), &lit, recipe, &path, 1, &quiet).unwrap();
+        let [r2, g2, b2] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
+        assert_eq!(r2.data, r.data);
+        assert_eq!(g2.data, g.data);
+        assert!(b2.data.iter().zip(&b.data).all(|(x, y)| x >= y));
+        assert!(b2.data.iter().zip(&b.data).any(|(x, y)| x > y));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

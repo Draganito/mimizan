@@ -6,6 +6,7 @@
 //! swap the whole state, and every state is one export.
 
 use mimizan_core::mix::Weights;
+use mimizan_core::plate::PlateParams;
 use mimizan_core::recipe::Recipe;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -14,12 +15,24 @@ pub struct Edit {
     pub recipe: Recipe,
     /// Clockwise quarter turns added to the file's orientation (0..3).
     pub rotation: u8,
+    /// The three-colour plate: taking filters and projection primaries.
+    /// `None` is the monochrome negative. Not in the recipe, like the
+    /// weights: it is the negative's, not the print's.
+    pub plate: Option<PlateParams>,
+    /// The red and the blue lamp of the projector, stops added to those
+    /// two positives. Only read while `plate` is on.
+    pub lamps: [f64; 2],
 }
 
 impl Edit {
     /// The untouched development: the paper at its base exposure.
     pub fn new(weights: Weights) -> Self {
-        Self { weights, recipe: Recipe::on_paper(), rotation: 0 }
+        Self { weights, recipe: Recipe::on_paper(), rotation: 0, plate: None, lamps: [0.0; 2] }
+    }
+
+    /// The three lamps the print takes: red, green (fixed), blue.
+    pub fn lamps_rgb(&self) -> [f64; 3] {
+        [self.lamps[0], 0.0, self.lamps[1]]
     }
 }
 
