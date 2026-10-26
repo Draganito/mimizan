@@ -58,7 +58,7 @@ triples, each summing to one so grey gives three equal plates:
   panchromatic emulsion, crosstalk included (red passes 8 % of green,
   blue 25 %). The emulsion is the camera file's calibrated response, or
   the native 0.25 / 0.50 / 0.25 without one; the mix of the monochrome
-  negative does not reach the plate (0.15.1; before, the mix stood behind
+  negative does not reach the plate (0.15.2; before, the mix stood behind
   the glass).
   The softer palette of the historical glass. For the Z f: red
   `0.820 0.180 0`, green `0.033 0.905 0.062`, blue `0.012 0.264 0.725`.
