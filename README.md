@@ -22,7 +22,7 @@ The name is the beach at Mimizan, where the idea came up watching the surf: sepa
 
 ![Mimizan Lab in the monochrome process: the negative on the left, the print in the middle, the enlarger below, the sheet and its 1:1 box on the right, the strip of film along the bottom](docs/gui.jpg)
 
-![The same file in the plate process: the toolbar switched to Plate, the Enlarger with the taking filters and the two lamps, the print in colour, the strip as slides](docs/gui_plate.jpg)
+![The plate process: the toolbar switched to Plate, the Enlarger with the taking filters, the primaries and the two lamps, the print in colour on its sheet with a border, and the 1:1 box with the sharpening measured for that print](docs/gui_plate.jpg)
 
 ## The negative
 
