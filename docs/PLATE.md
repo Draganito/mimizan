@@ -95,19 +95,24 @@ mimizan print photo_plate.tif -o photo_colour.tif --paper 0,-0.5 --lamp 0.1,-0.1
 ```
 
 Without `--plate` nothing changes: the same file and the same recipe give
-the same bytes as 0.12.0. The plate came in 0.13.0.
+the same bytes as 0.12.0. The plate came in 0.13.0; 0.14.0 made it the second process of the desktop.
 
-**The desktop.** The Negative window has a *Plate* section under the
-histogram: the switch, the filter set and the primaries, and the three
-weight rows they come to. It is a re-mix, not a re-development: the
+**The desktop.** The plate is the second process of the darkroom, beside
+the monochrome negative: *Monochrome · Plate* in the toolbar, or the key
+P. The choice is the darkroom's, not the file's: the strip shows the folder
+as slides, the Enlarger shows the taking filters and the primaries where
+the monochrome mix stands (the Wratten set keeps the mix beside it, since
+it follows it), the two lamps follow the paper's two exposures as sliders
+in stops, the Print window names the RGB file and its profile, and the next
+file opens in the same process. It is a re-mix, not a re-development: the
 separation stays, the picture turns to colour at once, in the fitted view,
-at 100 % and in the print box, all through the same table as the grey.
-Under the paper's two exposures the Enlarger gains the two lamps, red and
-blue, as sliders in stops. Export writes the RGB TIFF the command writes.
-The histograms stay those of the monochrome mix, the plate's luminance;
-the strip stays the film. The plate and the lamps are part of the
-development the history undoes, and like the weights they are not written
-into the recipe sidecar.
+at 100 % and in the print box, all through the same table as the grey. The
+print histogram stays the monochrome mix's, the plate's luminance, with the
+three channels drawn as outlines over it. The plate and the lamps are part
+of the development the history undoes, and the recipe beside the RAW
+carries them (`plate`: filters, primaries, lamps) and the mix (`mix`), so
+a file comes back in the process it was left in; `negative --recipe` and
+`print --recipe` read the same file.
 
 ## Measured
 

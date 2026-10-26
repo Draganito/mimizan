@@ -2,10 +2,10 @@
 Type=Application
 Name=Mimizan Lab
 Icon=mimizan
-Comment=Bayer RAW to linear monochrome negative, no demosaic
+Comment=Darkroom for Bayer RAW: monochrome negative or three-colour plate, no demosaic
 Exec=mimizan-gui %f
 StartupWMClass=mimizan-gui
 Terminal=false
 Categories=Graphics;Photography;
 MimeType=image/x-nikon-nef;image/x-adobe-dng;image/x-canon-cr2;image/x-canon-cr3;image/x-sony-arw;image/x-fuji-raf;image/x-panasonic-rw2;image/x-olympus-orf;image/x-pentax-pef;
-Keywords=raw;monochrome;negative;bayer;darkroom;
+Keywords=raw;monochrome;colour;negative;plate;bayer;darkroom;

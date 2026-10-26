@@ -1,8 +1,8 @@
-# Interpolation-Free Monochrome Negatives from Bayer Mosaics by Carrier Separation
+# Interpolation-Free Monochrome Negatives and Three-Colour Plates from Bayer Mosaics by Carrier Separation
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.13.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.14.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
@@ -979,9 +979,14 @@ and 7 of 24 ahead; at twice the sampling 47.2 (47.5) against RCD 45.4,
 - The desktop treats the plate as a re-mix of the resident separation
   (`ViewParams.plate`): the fitted view, the 100 % view and the print box
   carry an RGB buffer next to the grey one and go through the same tone
-  table; histograms stay those of the monochrome mix. The lamps are two
-  sliders under the paper's exposures. Plate and lamps are part of the
-  development the history undoes and are not written to the recipe sidecar.
+  table; the print histogram stays the monochrome mix's, with the three
+  channels as outlines over it. Since 0.14 the plate is the desktop's
+  second process, switched in the toolbar: the taking filters and the
+  primaries stand in the Enlarger where the mix stands, the lamps are two
+  sliders under the paper's exposures, and the strip shows slides. Plate
+  and lamps are part of the development the history undoes; the recipe
+  beside the RAW carries them (`plate`) and the mix (`mix`), and `negative
+  --recipe` and `print --recipe` read the same file.
 - Without `--plate` nothing changes: the same file and recipe give the
   bytes of 0.12.0 (the monochrome tests are unchanged; only the metadata
   now carries `xyz_to_cam` where the file has one).

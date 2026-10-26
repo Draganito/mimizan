@@ -1,6 +1,6 @@
 [package]
 name = "mimizan-core"
-description = "Bayer RAW to linear monochrome negative: luminance estimation without demosaicing"
+description = "Bayer RAW to linear monochrome negative or three-colour plate: carrier separation without demosaicing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -1,12 +1,14 @@
 # Mimizan Lab
 
-A darkroom for the digital negative.
+A darkroom for the digital negative, with two processes.
 
-You open a colour RAW. Mimizan Lab makes a monochrome negative from it and prints that negative the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one.
+You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process.
 
-Mimizan Lab also accepts a file from a monochrome sensor, for anyone who wants to develop it here. That sensor has no colour filter, so the file opens as the measurement.
+**Monochrome.** The negative is printed the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one. A measured Ilford Multigrade, no hidden curve.
 
-Since 0.13 it prints colour too, one way: the three-colour plate. The same negative, mixed three times through three taking filters and printed through the same paper, the way Prokudin-Gorsky made colour a century ago. Still without demosaicing.
+**Plate.** The same separation is mixed three times, through three taking filters, into three plates, and the three are printed together through the same paper and the same two exposures into one colour file: Prokudin-Gorsky's three-colour process on the Bayer mosaic. Two lamps, red and blue, are the only colour control.
+
+The switch between the two is in the toolbar, and the whole darkroom follows it: the strip of film, the Enlarger, the print. A file from a monochrome sensor opens as the measurement; that sensor has no colour filter and no plate.
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
@@ -18,7 +20,9 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
-![Mimizan Lab with a file open: the negative on the left, the print in the middle with the crop table, the enlarger below, the sheet and its 1:1 box on the right](docs/gui.jpg)
+![Mimizan Lab in the monochrome process: the negative on the left, the print in the middle, the enlarger below, the sheet and its 1:1 box on the right, the strip of film along the bottom](docs/gui.jpg)
+
+![The same file in the plate process: the toolbar switched to Plate, the Enlarger with the taking filters and the two lamps, the print in colour, the strip as slides](docs/gui_plate.jpg)
 
 ## The negative
 
@@ -46,11 +50,13 @@ A third measurement opens the colour band again. Where the two copies agree, the
 
 That is why the negative is finer where a lens really draws. A demosaicer invents two of the three colour values at every photosite and needs an assumption about the local edge to do it; the error of that assumption survives the sum to grey. The separation leaves the luminance intact up to the carriers and takes away only the colour. Detail a lens puts below the band limit of the sensor passes through untouched, which is where the 2.4 to 4.3 dB over RCD on the Z f files and the twenty-four of twenty-four at the band limit come from. Only where the detail is sharper than any lens delivers do luminance and colour truly overlap in the spectrum; there the switch above computes those samples and the mask records where.
 
+## The monochrome print
+
 The print is a measured sheet of Ilford Multigrade. Soft is grade 00, ISO R 160. Hard is grade 5, ISO R 50. There is no hidden tone curve. The preview is that paper, and the TIFF is that sheet. The same recipe gives the same bytes.
 
 On the Kodak set, brought to the band limit of a photograph, the linear negative is 51.8 dB. The best of the sixteen demosaicers we ran, DCB in RawTherapee, is 49.1 dB; RCD is 48.9 dB. All twenty-four pictures are above every one of them: VNG, PPG, AHD, DCB, DHT and AAHD in libraw, and fast, VNG4, AHD, EAHD, HPHD, DCB, LMMSE, IGV, AMaZE and RCD in RawTherapee. With the switch set the mean is 52.4 dB and 5% of the pixels are computed. On four Nikon Z f files at the sharpness the camera recorded, the linear mean is 53.9 dB against 50.7 dB for RCD, and all four are above it by 2.4 to 4.3 dB; the switch costs 0.3 dB there. Where a lens-like picture still reaches the sensor, the linear mean is 51.6 dB and DCB is 51.5 dB; nine of the twenty-four lead every demosaicer. The switch puts that mean at 52.6 dB, with 12% computed, and twenty-three lead. On detail sharper than any lens delivers, LMMSE in RawTherapee leads the linear negative, 43.1 dB to 37.3 dB. The switch passes that Kodak test at 42.1 dB, with half the pixels computed, and still trails by a decibel. On the four Z f files made twice as sharp as the camera saw them, RCD leads by 0.5 to 1.9 dB, with the switch and without it. The means, and how many pictures lead, are in the paper.
 
-It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no noise reduction, no lens correction, and colour only as the plate below. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
+It opens a Bayer RAW, and a file from a sensor with no colour filter. Not a RAW converter: no noise reduction, no lens correction, no saturation, no hue. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
 
 ## The plate
 
@@ -72,37 +78,39 @@ The negative is written as one grey TIFF with the three frames stacked, blue, gr
 
 Measured on the Kodak set against sixteen demosaicers of libraw and RawTherapee, CPSNR: behind a lens the plate is 45.0 dB against 46.2 for RCD and LMMSE, with the last-octave switch 46.5 dB and first by the mean; at twice the sampling 47.2 dB against 45.4, nineteen of twenty-four ahead. Only on pixel-sharp charts, which no camera produces, does the band limit cost it against the edge-directed demosaicers. The green channel leads everywhere by 2 to 5 dB: it is `L̂ + Ĉ1'`, not interpolated.
 
-In the window, *Plate* sits under the histogram of the Negative panel: the switch, the filter set and the primaries, and the three weight rows they come to. The picture turns to colour at once, fitted, at 1:1 and in the print box; it is a re-mix of the separation, not a re-development. The Enlarger gains the two lamps under the paper's exposures. Export writes the RGB TIFF. On the command line it is `--plate` on `negative` and `--lamp R,B` on `print`. [docs/PLATE.md](docs/PLATE.md) has the method, the file format and the measurements; the paper has it in §8.7.
+In the window the plate is the second process: *Plate* in the toolbar, next to *Monochrome*, or the key P. The picture turns to colour at once, fitted, at 1:1 and in the print box; it is a re-mix of the separation, not a re-development. The Enlarger shows the taking filters and the primaries where the monochrome mix stood, and the two lamps under the paper's exposures. The strip shows the folder as slides. The Print panel says what it will write, a 16-bit RGB TIFF with the profile. The recipe saved next to the RAW remembers the process, the filters and the lamps, so the file opens again in colour. On the command line it is `--plate` on `negative` and `--lamp R,B` on `print`, or `--recipe` with the desktop's file on both. [docs/PLATE.md](docs/PLATE.md) has the method, the file format and the measurements; the paper has it in §8.7.
 
 ## A session
 
-Drop a RAW file or a folder on the window, or open one. The folder lies along the bottom as a strip of negatives. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. Tab hides the three panels. Scroll zooms the print about the pointer; a double click switches between fitted and 1:1. Undo is Ctrl+Z, redo is Ctrl+Shift+Z or Ctrl+Y. Reset puts the controls back to their defaults and leaves the negative where it is.
+Drop a RAW file or a folder on the window, or open one. The folder lies along the bottom as a strip of film: negatives in the monochrome process, slides in the plate, either one inverted on request. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. Tab hides the three panels.
+
+*Monochrome* and *Plate* in the toolbar, or P, are the process. The choice is the darkroom's: the strip, the Enlarger and the print follow it, and the next file opens in it. A file with a recipe beside it opens in the process the recipe was saved in. Scroll zooms the print about the pointer; a double click switches between fitted and 1:1. Undo is Ctrl+Z, redo is Ctrl+Shift+Z or Ctrl+Y. Reset puts the controls back to their defaults and leaves the negative where it is.
 
 The picture in the middle is the print. A white border is added around it, and a black edge can sit inside that white, never wider than it, so the sheet is judged as it will go on the wall. The crosshair marks the spot the 1:1 box in *Print* is reading.
 
-*Negative* is the file and the development. The histogram reads the print, the linear negative, or the raw channels, on a linear or a log axis. White balance is as shot, gray world, none, or a manual red and blue. The mask is Dubois, adaptive, or off. *Reconstruct the last octave*, off by default, computes the samples where luminance and colour overlap; the mask beside the negative records where. *Repair defects* fills dead photosites. Apply recomputes the picture. A monochrome sensor has none of the colour controls: the file is the measurement. *Plate* turns the negative into three: the same separation mixed through three taking filters, the camera's matrix, Wratten 25/58/47, or the bare channels, and shown in colour at once. It is a re-mix, not a re-development; the histograms stay the negative's.
+*Negative* is the file and the development. The histogram reads the print, the linear negative, or the raw channels, on a linear or a log axis. White balance is as shot, gray world, none, or a manual red and blue. The mask is Dubois, adaptive, or off. *Reconstruct the last octave*, off by default, computes the samples where luminance and colour overlap; the mask beside the negative records where. *Repair defects* fills dead photosites. Apply recomputes the picture. A monochrome sensor has none of the colour controls: the file is the measurement. The *process* line names what the file is developed in; in the plate, the print histogram carries the three channels as outlines over the mix.
 
-*Enlarger* holds the mix and the only tone controls a sheet of paper has. The mix is Native, one quarter, one half, one quarter, or Panchromatic when a camera file is loaded, or a filter in front of that: yellow 8, yellow-green 11, orange 16, red 25, green 58, blue 47. R and B move the same mix by hand; G is what remains, and the three sum to one. *soft* is filter 00, *hard* is filter 5, both in stops of time from the base print, two stops either way. *base* returns there. The zone bar is that paper from its black to its white. More soft light greys the highlights. Less hard light opens the shadows. A drag on the bar is one more or less second under the enlarger, and moves both exposures together. The line under the sliders names the single grade this pair equals, and how many stops of the scene the paper holds. With a plate on, two more sliders follow: the red and the blue lamp of the projector, in stops added to that positive. Green is the reference; grey stays grey at zero.
+*Enlarger* holds the filter in front of the paper and the only tone controls a sheet of paper has. In the monochrome process the filter is the mix: Native, one quarter, one half, one quarter, or Panchromatic when a camera file is loaded, or a filter in front of that: yellow 8, yellow-green 11, orange 16, red 25, green 58, blue 47. R and B move the same mix by hand; G is what remains, and the three sum to one. *soft* is filter 00, *hard* is filter 5, both in stops of time from the base print, two stops either way. *base* returns there. The zone bar is that paper from its black to its white. More soft light greys the highlights. Less hard light opens the shadows. A drag on the bar is one more or less second under the enlarger, and moves both exposures together. The line under the sliders names the single grade this pair equals, and how many stops of the scene the paper holds. In the plate the filter row is the three taking filters, the camera's matrix, Wratten 25/58/47 behind the mix, or the bare channels, and the primaries the plates are projected through; two more sliders follow the exposures: the red and the blue lamp of the projector, in stops added to that positive. Green is the reference; grey stays grey at zero.
 
 *Crop* frames the picture. The list opens as a table: the picture's own ratio, read from its pixels, then each sheet both ways — 4×5 and 5×4, on through 20×24 — and a square across the row. The side that is framed is sunk. *Apply* makes that window the picture, in whole pixels. Enter does the same. 90° turns the picture itself.
 
-*Print* sets the sheet and writes one 16-bit TIFF, grey, or RGB with an Adobe RGB or sRGB profile when the plate is on. Native keeps the negative's pixels and writes the dpi into the file. Paper fits the picture into a size in centimetres at that dpi; the black edge and the white border are added around it. Resample is B-spline by default, or area (each output pixel is the source area it covers: a mean when shrinking, the pixel held when enlarging), Mitchell, Catmull–Rom, or Lanczos. Peak is a high-pass sharpening of that print: the picture plus an amount of itself minus a Gaussian blur. The radius is that blur, in print pixels, measured on the negative and multiplied by the print's scale, including a reduction. The amount does not change. The box under it is those print pixels at 1:1; drag it, or drag the crosshair on the sheet. The recipe is saved next to the RAW and comes back when the file is opened. Leaving a changed recipe asks first.
+*Print* sets the sheet and writes one 16-bit TIFF; its first line says which, grey with the paper's gamma, or RGB with the Adobe RGB or sRGB profile in the plate. Native keeps the negative's pixels and writes the dpi into the file. Paper fits the picture into a size in centimetres at that dpi; the black edge and the white border are added around it. Resample is B-spline by default, or area (each output pixel is the source area it covers: a mean when shrinking, the pixel held when enlarging), Mitchell, Catmull–Rom, or Lanczos. Peak is a high-pass sharpening of that print: the picture plus an amount of itself minus a Gaussian blur. The radius is that blur, in print pixels, measured on the negative and multiplied by the print's scale, including a reduction. The amount does not change. The box under it is those print pixels at 1:1; drag it, or drag the crosshair on the sheet. The recipe is saved next to the RAW, with the process, the mix or the filters and the lamps, and comes back when the file is opened. Leaving a changed recipe asks first.
 
 ## Get it
 
 Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/releases).
 
-Debian and Ubuntu: [mimizan_0.13.0-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.13.0/mimizan_0.13.0-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.14.0-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.14.0/mimizan_0.14.0-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.13.0-1_amd64.deb
+sudo apt install ./mimizan_0.14.0-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.13.0-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.13.0/mimizan-0.13.0-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
+Windows, 64-bit Intel and AMD: [mimizan-0.14.0-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.14.0/mimizan-0.14.0-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
 
-Apple silicon: [mimizan-0.13.0-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.13.0/mimizan-0.13.0-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+Apple silicon: [mimizan-0.14.0-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.14.0/mimizan-0.14.0-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 
@@ -144,7 +152,14 @@ mimizan negative photo.nef -o photo_plate.tif --plate              # camera filt
 mimizan print photo_plate.tif -o photo_colour.tif --size 30x40cm --lamp 0.1,-0.1
 ```
 
-`--plate` writes the three-frame plate instead of the negative; `print` recognises it and writes the RGB sheet, here with a tenth of a stop more red lamp and less blue. The rest is `mimizan --help`.
+`--plate` writes the three-frame plate instead of the negative; `print` recognises it and writes the RGB sheet, here with a tenth of a stop more red lamp and less blue.
+
+```bash
+mimizan negative photo.nef -o photo_plate.tif --recipe photo.recipe.json
+mimizan print photo_plate.tif -o photo_colour.tif --recipe photo.recipe.json
+```
+
+The file the desktop saves next to the RAW carries the whole development, process, mix or filters, lamps and print; the two commands read it and reproduce the window's export. The rest is `mimizan --help`.
 
 ## The method
 

@@ -1621,9 +1621,24 @@ impl App {
                 });
                 if let Some(img) = shot {
                     let [w, h] = img.size;
+                    // `MIMIZAN_SCREENSHOT_WIDTH`: scaled to that width for
+                    // a document. A `.jpg` has no alpha.
+                    let width =
+                        std::env::var("MIMIZAN_SCREENSHOT_WIDTH").ok().and_then(|v| v.parse::<u32>().ok());
                     let res = image::RgbaImage::from_raw(w as u32, h as u32, img.as_raw().to_vec())
                         .ok_or_else(|| anyhow::anyhow!("screenshot buffer"))
-                        .and_then(|im| im.save(&path).map_err(Into::into));
+                        .and_then(|im| {
+                            let mut im = image::DynamicImage::ImageRgba8(im);
+                            if let Some(tw) = width.filter(|tw| *tw > 0 && *tw < im.width()) {
+                                let th =
+                                    (u64::from(im.height()) * u64::from(tw) / u64::from(im.width())) as u32;
+                                im = im.resize_exact(tw, th.max(1), image::imageops::FilterType::Lanczos3);
+                            }
+                            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("jpg")) {
+                                im = image::DynamicImage::ImageRgb8(im.to_rgb8());
+                            }
+                            im.save(&path).map_err(Into::into)
+                        });
                     match res {
                         Ok(()) => tracing::info!("screenshot {}", path.display()),
                         Err(e) => tracing::error!("screenshot: {e}"),

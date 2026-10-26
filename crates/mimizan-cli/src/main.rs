@@ -20,7 +20,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[command(
     name = "mimizan",
     version,
-    about = "Bayer RAW to linear monochrome negative, or a three-colour plate; no demosaic"
+    about = "Bayer RAW to a linear monochrome negative or a three-colour plate; no demosaic"
 )]
 struct Cli {
     /// Log level filter (e.g. info, debug, mimizan_core=trace)

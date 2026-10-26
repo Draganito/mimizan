@@ -37,11 +37,12 @@ section = "graphics"
 priority = "optional"
 depends = "$auto"
 extended-description = """\
-Bayer RAW to linear monochrome negative without demosaicing: luminance is
-estimated directly from the mosaic (pixel-adaptive frequency separation),
-written as 16-bit linear TIFF with a mask sidecar, and
-printed through a split-grade paper model, USM optional. Includes the mimizan CLI
-and the mimizan-gui desktop app."""
+Bayer RAW to a linear monochrome negative or a three-colour plate without
+demosaicing: the luminance and the two chrominances are separated from the
+mosaic (pixel-adaptive frequency separation) and written as 16-bit linear
+TIFF with a mask sidecar; the negative is printed through a split-grade
+paper model, the plate through the same paper into an RGB file with its
+profile. Includes the mimizan CLI and the mimizan-gui desktop app."""
 assets = [
     ["target/release/mimizan", "usr/bin/", "755"],
     ["target/release/mimizan-gui", "usr/bin/", "755"],
