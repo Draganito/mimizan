@@ -293,6 +293,15 @@ struct Rings {
     black: u8,
 }
 
+/// What is drawn over and around the picture on the stage from the edit:
+/// the sheet's rings and the crosshair (the 1:1 box's spot, in picture
+/// fractions). Held as one while the picture belongs to the previous file.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct StageDress {
+    rings: Rings,
+    cross: Option<[f64; 2]>,
+}
+
 /// The taking filters resolved for one session, one plate choice and one
 /// base mix, so the resolution runs when those change, not every frame.
 struct PlateResolved {
@@ -326,10 +335,14 @@ fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
     tile_has_picture && !tile_matches_shown
 }
 
-/// The rings to hold while another file takes the edit: the ones on the
-/// stage now, if a picture is there. Rings already held stay held: the
-/// stage still shows the file they were taken from.
-fn rings_to_hold(held: Option<Rings>, stage_has_picture: bool, now: impl FnOnce() -> Rings) -> Option<Rings> {
+/// The dress to hold while another file takes the edit: the one on the
+/// stage now, if a picture is there. A dress already held stays held: the
+/// stage still shows the file it was taken from.
+fn dress_to_hold(
+    held: Option<StageDress>,
+    stage_has_picture: bool,
+    now: impl FnOnce() -> StageDress,
+) -> Option<StageDress> {
     held.or_else(|| stage_has_picture.then(now))
 }
 
@@ -440,12 +453,13 @@ pub struct App {
     picture_gen: u64,
     /// A finished print box kept back until the main picture shows its exposure.
     held_loupe: Option<LoupeResult>,
-    /// The rings of the picture still on the stage while the next file's
+    /// The dress of the picture still on the stage while the next file's
     /// first preview is on its way. The edit is already that file's, so its
     /// rings would dress the old pixels in the new recipe's border (and
-    /// refit them) for that moment. Taken before the edit changes, let go
-    /// when the new picture lands.
-    held_rings: Option<Rings>,
+    /// refit them), and its crosshair would jump to the old picture's
+    /// centre, for that moment. Taken before the edit changes, let go when
+    /// the new picture lands.
+    held_dress: Option<StageDress>,
 
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
@@ -617,7 +631,7 @@ impl App {
             shown_picture: None,
             picture_gen: 0,
             held_loupe: None,
-            held_rings: None,
+            held_dress: None,
             zoom_to_1to1: false,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
@@ -1082,7 +1096,7 @@ impl App {
     /// The rings the edit asks for around the texture on the stage. Flat
     /// values, painted under the picture, not rendered into it. The mask
     /// view and the open crop are not a sheet. Only meaningful while the
-    /// texture is this session's picture: `held_rings` covers the moment
+    /// texture is this session's picture: `held_dress` covers the moment
     /// it is not.
     fn rings(&self) -> Rings {
         let [tw, _] = self.tex_size;
@@ -1100,18 +1114,23 @@ impl App {
         }
     }
 
-    /// The rings to paint now: the held ones while the stage still shows
+    /// The dress the edit asks for: its rings and its crosshair.
+    fn dress(&self) -> StageDress {
+        StageDress { rings: self.rings(), cross: self.sharpen_at }
+    }
+
+    /// The dress to paint now: the held one while the stage still shows
     /// the previous file, otherwise the edit's.
-    fn stage_rings(&self) -> Rings {
-        self.held_rings.unwrap_or_else(|| self.rings())
+    fn stage_dress(&self) -> StageDress {
+        self.held_dress.unwrap_or_else(|| self.dress())
     }
 
     /// Another file is about to take the edit while this one's picture
-    /// stays on the stage: keep its rings until the new picture lands. A
-    /// third file opened before that keeps the rings already held; the
+    /// stays on the stage: keep its dress until the new picture lands. A
+    /// third file opened before that keeps the dress already held; the
     /// edit's would belong to the second.
-    fn hold_rings(&mut self) {
-        self.held_rings = rings_to_hold(self.held_rings, self.texture.is_some(), || self.rings());
+    fn hold_dress(&mut self) {
+        self.held_dress = dress_to_hold(self.held_dress, self.texture.is_some(), || self.dress());
     }
 
     /// Pixel size the 100% view addresses. A centimetre size addresses the
@@ -1555,7 +1574,7 @@ impl App {
                     if fresh {
                         // Before the session and the edit are the new file's:
                         // the rings are measured against the old session's size.
-                        self.hold_rings();
+                        self.hold_dress();
                         // A preview of the old file still on its way is not
                         // this file's picture: it must not land on the stage
                         // and let the rings go. The next request is numbered
@@ -1641,7 +1660,7 @@ impl App {
                         self.texture = None;
                         self.detail_texture = None;
                         self.detail_rect = None;
-                        self.held_rings = None;
+                        self.held_dress = None;
                     }
                     self.current_path = self.session.as_ref().map(|s| s.path.clone());
                 }
@@ -1797,8 +1816,8 @@ impl App {
         let shows_picture = r.image.is_some();
         self.apply_preview(ctx, r);
         if shows_picture {
-            // The stage shows this session's pixels: the edit's rings fit them.
-            self.held_rings = None;
+            // The stage shows this session's pixels: the edit's dress fits them.
+            self.held_dress = None;
             self.shown_picture = self.preview_picture.clone();
             self.flush_loupe(ctx);
         }
@@ -3600,9 +3619,9 @@ impl App {
         if tw == 0 || th == 0 {
             return;
         }
-        // The two rings belong to the pixels on the stage, not to the edit
-        // alone: see `held_rings`.
-        let Rings { black_tex, white_tex, white, black } = self.stage_rings();
+        // The rings and the crosshair belong to the pixels on the stage, not
+        // to the edit alone: see `held_dress`.
+        let StageDress { rings: Rings { black_tex, white_tex, white, black }, cross } = self.stage_dress();
         let border_tex = black_tex + white_tex;
         // The sheet (picture plus both rings) is what fits the opening.
         // A zoom grows it from this same fit, so the first step does not jump.
@@ -3655,13 +3674,14 @@ impl App {
             let white_pts = white_tex * scale;
             let black_pts = black_tex * scale;
             let border_pts = white_pts + black_pts;
-            let max_pan = pan_limit(size + Vec2::splat(2.0 * border_pts), stage.size());
-            let pan = pan.clamp(-max_pan, max_pan);
-            (sheet_rect(stage, pan, size), white_pts, black_pts, max_pan, pan)
+            let bounds = pan_bounds(size + Vec2::splat(2.0 * border_pts), stage, room);
+            let pan = pan.clamp(bounds.0, bounds.1);
+            (sheet_rect(stage, pan, size), white_pts, black_pts, bounds, pan)
         };
         let (rect_now, _, _, _, _) = place(self.zoom, self.pan);
+        // The cross that is drawn is the one that can be grabbed.
         let on_cross = |rect: Rect, p: Pos2| {
-            self.sharpen_at.is_some_and(|[nx, ny]| {
+            cross.is_some_and(|[nx, ny]| {
                 let c =
                     Pos2::new(rect.left() + nx as f32 * rect.width(), rect.top() + ny as f32 * rect.height());
                 c.distance(p) <= CROSS_GRAB
@@ -3683,7 +3703,7 @@ impl App {
                 self.pan = Vec2::ZERO;
             }
         }
-        let (mut rect, white_pts, black_pts, max_pan, pan) = place(self.zoom, self.pan);
+        let (mut rect, white_pts, black_pts, bounds, pan) = place(self.zoom, self.pan);
         self.pan = pan;
         let crosshair_released = self.cross_drag && !response.is_pointer_button_down_on();
         if !response.is_pointer_button_down_on() {
@@ -3710,7 +3730,7 @@ impl App {
                 self.crop_interact(ui, &response, rect);
             }
             if response.dragged() && self.crop_drag.is_none() {
-                self.pan = (self.pan + response.drag_delta()).clamp(-max_pan, max_pan);
+                self.pan = (self.pan + response.drag_delta()).clamp(bounds.0, bounds.1);
                 (rect, _, _, _, _) = place(self.zoom, self.pan);
             }
         }
@@ -3796,7 +3816,7 @@ impl App {
         }
         // After the sharp tile and the crop shade, or the cross disappears
         // under them once the preview would be upscaled.
-        if let Some([nx, ny]) = self.sharpen_at {
+        if let Some([nx, ny]) = cross {
             let p = Pos2::new(rect.left() + nx as f32 * rect.width(), rect.top() + ny as f32 * rect.height());
             let mark = Color32::from_rgb(255, 210, 60);
             let arm = 7.0;
@@ -4971,7 +4991,37 @@ fn pan_limit(sheet: Vec2, opening: Vec2) -> Vec2 {
     ((sheet - opening) * 0.5).max(Vec2::ZERO)
 }
 
-/// The sheet stays centred on the opening. Pan moves it inside [`pan_limit`].
+/// The pan's low and high bound: the sheet covers the opening
+/// ([`pan_limit`]), and on each axis where it fits in the room it stays
+/// inside the room. Centred on an opening that sits high in the room (the
+/// enlarger below it), a sheet taller than the opening would otherwise run
+/// out above the room, where nothing paints it, while the room below lay
+/// empty: the top of the print was cut off at 1:1. Only when the sheet is
+/// taller than the room itself does it run past both edges.
+fn pan_bounds(sheet: Vec2, opening: Rect, room: Rect) -> (Vec2, Vec2) {
+    let limit = pan_limit(sheet, opening.size());
+    let (mut lo, mut hi) = (-limit, limit);
+    let c = opening.center();
+    // `c + pan ± sheet / 2` within the room.
+    let in_lo = room.min - c + sheet * 0.5;
+    let in_hi = room.max - c - sheet * 0.5;
+    for axis in 0..2 {
+        if sheet[axis] <= room.size()[axis] {
+            lo[axis] = lo[axis].max(in_lo[axis]);
+            hi[axis] = hi[axis].min(in_hi[axis]);
+            // An opening that reaches out of the room (it never does) would
+            // leave nothing; the nearer bound then stands for both.
+            if lo[axis] > hi[axis] {
+                let mid = 0.5 * (lo[axis] + hi[axis]);
+                lo[axis] = mid;
+                hi[axis] = mid;
+            }
+        }
+    }
+    (lo, hi)
+}
+
+/// The sheet stays centred on the opening. Pan moves it inside [`pan_bounds`].
 fn sheet_rect(opening: Rect, pan: Vec2, size: Vec2) -> Rect {
     Rect::from_center_size(opening.center() + pan, size)
 }
@@ -5172,8 +5222,8 @@ mod path_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving, rings_to_hold,
-        tile_must_wait, CropHit, PaperFormat, Rings,
+        dress_to_hold, hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving,
+        tile_must_wait, CropHit, PaperFormat, Rings, StageDress,
     };
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
 
@@ -5182,14 +5232,15 @@ mod crop_drag_tests {
         // The picture on the stage has no border; the file taking the edit
         // has one. Until that file's picture lands, the stage keeps its own
         // (empty) rings: the new border must not dress the old pixels.
-        let none = Rings::default();
-        let wide = Rings { white_tex: 118.8, ..Rings::default() };
-        assert_eq!(rings_to_hold(None, true, || none), Some(none));
+        let none = StageDress { rings: Rings::default(), cross: Some([0.3, 0.7]) };
+        let wide =
+            StageDress { rings: Rings { white_tex: 118.8, ..Rings::default() }, cross: Some([0.5, 0.5]) };
+        assert_eq!(dress_to_hold(None, true, || none), Some(none));
         // An empty stage has nothing to hold.
-        assert_eq!(rings_to_hold(None, false, || wide), None);
+        assert_eq!(dress_to_hold(None, false, || wide), None);
         // A third file opened before the second's picture lands: the stage
-        // still shows the first, so the first's rings stay held.
-        assert_eq!(rings_to_hold(Some(none), true, || wide), Some(none));
+        // still shows the first, so the first's dress stays held.
+        assert_eq!(dress_to_hold(Some(none), true, || wide), Some(none));
     }
 
     #[test]
@@ -5308,7 +5359,7 @@ mod crop_drag_tests {
 mod dock_tests {
     use super::{
         docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer,
-        hold_magnification, opening_moved, pan_limit, picture_is_fitted, place_docks, sheet_rect,
+        hold_magnification, opening_moved, pan_bounds, pan_limit, picture_is_fitted, place_docks, sheet_rect,
         strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, EXPOSURE_RAIL, PANEL_GAP, PANEL_W, SLIDER_STOPS,
     };
     use egui::{Pos2, Rect, Vec2};
@@ -5436,6 +5487,33 @@ mod dock_tests {
         let limit = pan_limit(sheet, opening.size());
         let slid = sheet_rect(opening, Vec2::new(limit.x, 0.0), sheet);
         assert!((slid.left() - opening.left()).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_sheet_that_fits_the_room_stays_in_it() {
+        // The opening sits high in the room (the enlarger lies below). A
+        // 1:1 print taller than the opening, but not than the room, is not
+        // cut off above the room: it covers the opening and keeps inside.
+        let room = Rect::from_min_max(Pos2::new(0.0, 40.0), Pos2::new(1000.0, 540.0));
+        let opening = Rect::from_min_max(Pos2::new(330.0, 40.0), Pos2::new(670.0, 360.0));
+        let sheet = Vec2::new(300.0, 400.0);
+        let (lo, hi) = pan_bounds(sheet, opening, room);
+        // Narrower than the opening: centred on it.
+        assert_eq!((lo.x, hi.x), (0.0, 0.0));
+        let centred = sheet_rect(opening, Vec2::ZERO.clamp(lo, hi), sheet);
+        assert!(centred.top() >= room.top() - 0.01, "{centred:?}");
+        assert!(centred.bottom() <= room.bottom() + 0.01);
+        // Every bound still covers the opening's height and keeps in the room.
+        for pan in [lo, hi] {
+            let r = sheet_rect(opening, pan, sheet);
+            assert!(r.top() <= opening.top() && r.bottom() >= opening.bottom(), "{r:?} uncovers {opening:?}");
+            assert!(room.contains_rect(r), "{r:?} leaves {room:?}");
+        }
+        // Taller than the room: the old rule, it runs past both edges.
+        let tall = Vec2::new(300.0, 900.0);
+        let (lo, hi) = pan_bounds(tall, opening, room);
+        let limit = pan_limit(tall, opening.size());
+        assert_eq!((lo.y, hi.y), (-limit.y, limit.y));
     }
 
     #[test]
