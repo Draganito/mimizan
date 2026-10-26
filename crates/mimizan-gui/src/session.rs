@@ -1558,6 +1558,20 @@ pub struct PreviewImage {
     pub rgb: Option<Vec<u8>>,
     pub hist_view: Histogram,
     pub hist_negative: Histogram,
+    /// The three channels of the plate as shown, counted on the preview's
+    /// bytes: outlines over the print histogram, which stays the mix's.
+    pub hist_rgb: Option<[[u32; 256]; 3]>,
+}
+
+/// Per-channel histograms of interleaved R G B bytes.
+pub fn rgb_histograms(rgb: &[u8]) -> [[u32; 256]; 3] {
+    let mut out = [[0u32; 256]; 3];
+    for px in rgb.as_chunks::<3>().0 {
+        for (c, &v) in px.iter().enumerate() {
+            out[c][v as usize] += 1;
+        }
+    }
+    out
 }
 
 /// Full-resolution histograms, and the mix codes they are counted from.
@@ -1698,6 +1712,7 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
             rgb: None,
             hist_view,
             hist_negative: Histogram::empty(),
+            hist_rgb: None,
         };
     }
     // Histograms from the full-resolution separation, not the preview copy.
@@ -1724,6 +1739,7 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
         }
         None => None,
     };
+    let hist_rgb = rgb.as_deref().map(rgb_histograms);
     PreviewImage {
         width: mixed.width,
         height: mixed.height,
@@ -1732,6 +1748,7 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
         rgb,
         hist_view,
         hist_negative,
+        hist_rgb,
     }
 }
 

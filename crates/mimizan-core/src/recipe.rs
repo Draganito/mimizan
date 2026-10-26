@@ -10,7 +10,9 @@
 
 use crate::calib::LookFile;
 use crate::error::{Error, Result};
-use crate::print::PrintSize;
+use crate::mix::Weights;
+use crate::plate::{PlateFilters, PlateParams, PlateSpace};
+use crate::print::{PrintSize, LAMP_LIMIT};
 use crate::resize::ResampleKernel;
 use crate::tone::Tone;
 use serde::{Deserialize, Serialize};
@@ -223,6 +225,53 @@ pub struct Recipe {
     /// `None` is the full frame. Old recipes omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<CropRect>,
+    /// The monochrome mix on the balanced channels, for a darkroom that
+    /// develops from the RAW. `None` is the camera's default. A print of
+    /// an already mixed negative ignores it. Old recipes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mix: Option<Weights>,
+    /// The three-colour plate: taking filters, primaries and the two lamps.
+    /// `None` is the monochrome print. Old recipes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plate: Option<PlateRecipe>,
+}
+
+/// The plate as the recipe carries it: which process, and its two lamps.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlateRecipe {
+    /// The taking filters.
+    #[serde(default)]
+    pub filters: PlateFilters,
+    /// The projection primaries, and the profile of the file.
+    #[serde(default)]
+    pub space: PlateSpace,
+    /// The red and the blue lamp, stops added to that positive; green is
+    /// the reference.
+    #[serde(default, skip_serializing_if = "lamps_off")]
+    pub lamps: [f64; 2],
+}
+
+fn lamps_off(l: &[f64; 2]) -> bool {
+    *l == [0.0; 2]
+}
+
+impl PlateRecipe {
+    /// The filters and the primaries, as `negative --plate` takes them.
+    pub fn params(&self) -> PlateParams {
+        PlateParams { filters: self.filters, space: self.space }
+    }
+
+    /// The three lamps the print takes: red, green (zero), blue.
+    pub fn lamps_rgb(&self) -> [f64; 3] {
+        [self.lamps[0], 0.0, self.lamps[1]]
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.lamps.iter().any(|l| !l.is_finite() || l.abs() > LAMP_LIMIT) {
+            return Err(Error::Invalid(format!("lamps {:?} not within ±{LAMP_LIMIT} stops", self.lamps)));
+        }
+        Ok(())
+    }
 }
 
 impl Default for Recipe {
@@ -239,6 +288,8 @@ impl Default for Recipe {
             sharpen: Sharpen::Off,
             peak: Peak::default(),
             crop: None,
+            mix: None,
+            plate: None,
         }
     }
 }
@@ -452,6 +503,18 @@ impl Recipe {
                 return Err(Error::Invalid("crop must cover at least one pixel".into()));
             }
         }
+        if let Some(m) = self.mix {
+            let w = [m.r, m.g, m.b];
+            if w.iter().any(|v| !v.is_finite() || *v < 0.0) || (w.iter().sum::<f64>() - 1.0).abs() > 1e-6 {
+                return Err(Error::Invalid(format!(
+                    "mix R {} G {} B {} must be non-negative and sum to one",
+                    m.r, m.g, m.b
+                )));
+            }
+        }
+        if let Some(p) = &self.plate {
+            p.validate()?;
+        }
         self.sharpen.validate()?;
         self.peak.validate()
     }
@@ -515,6 +578,41 @@ mod tests {
         assert!(!json.contains("peak"), "{json}");
         let back: Recipe = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn plate_and_mix_round_trip_and_are_absent_by_default() {
+        let json = serde_json::to_string(&Recipe::default()).unwrap();
+        assert!(!json.contains("plate") && !json.contains("mix"), "{json}");
+        let r = Recipe {
+            mix: Some(Weights { r: 0.3, g: 0.5, b: 0.2 }),
+            plate: Some(PlateRecipe {
+                filters: PlateFilters::Wratten,
+                space: PlateSpace::Srgb,
+                lamps: [0.1, -0.2],
+            }),
+            ..Recipe::default()
+        };
+        r.validate().unwrap();
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""filters":"wratten""#) && json.contains(r#""space":"srgb""#), "{json}");
+        let back: Recipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r);
+        assert_eq!(back.plate.unwrap().lamps_rgb(), [0.1, 0.0, -0.2]);
+        // Zero lamps are left out; an older file without them reads as zero.
+        let quiet = Recipe { plate: Some(PlateRecipe { lamps: [0.0; 2], ..r.plate.unwrap() }), ..r.clone() };
+        assert!(!serde_json::to_string(&quiet).unwrap().contains("lamps"));
+        let bare = format!(r#"{{"curve":{},"plate":{{}}}}"#, serde_json::to_string(&Tone::paper()).unwrap());
+        let old: Recipe = serde_json::from_str(&bare).unwrap();
+        assert_eq!(
+            old.plate,
+            Some(PlateRecipe { filters: PlateFilters::Camera, space: PlateSpace::AdobeRgb, lamps: [0.0; 2] })
+        );
+        // Out of range is refused.
+        let hot = Recipe { plate: Some(PlateRecipe { lamps: [3.0, 0.0], ..r.plate.unwrap() }), ..r.clone() };
+        assert!(hot.validate().is_err());
+        let off = Recipe { mix: Some(Weights { r: 0.5, g: 0.5, b: 0.5 }), ..Recipe::default() };
+        assert!(off.validate().is_err());
     }
 
     #[test]

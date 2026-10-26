@@ -39,6 +39,9 @@ pub struct NegativeArgs {
     /// `Some(filter set)` makes a three-colour plate.
     pub plate: Option<String>,
     pub plate_space: String,
+    /// A recipe whose `mix` and `plate` develop this negative; the flags
+    /// above override them.
+    pub recipe: Option<PathBuf>,
 }
 
 /// `camera`, `wratten` or `channels`.
@@ -165,6 +168,20 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
             params = params.with_camera_file(cam);
         }
         None => info!("no camera file for '{} {}', using defaults", frame.clean_make, frame.clean_model),
+    }
+    // The desktop's file beside the RAW: its mix and its plate, unless a
+    // flag says otherwise. The print half of it is `print --recipe`'s.
+    if let Some(p) = &a.recipe {
+        let r =
+            mimizan_core::recipe::Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))?;
+        if let Some(m) = r.mix.filter(|_| a.weights.is_none()) {
+            params = params.with_weights(m, WeightSpace::Balanced);
+            info!("recipe mix R {:.3} G {:.3} B {:.3}", m.r, m.g, m.b);
+        }
+        if let Some(pl) = r.plate.filter(|_| a.plate.is_none()) {
+            params.plate = Some(pl.params());
+            info!("recipe plate: {} filters, {} primaries", pl.filters.name(), pl.space.name());
+        }
     }
     if let Some(w) = &a.weights {
         params = params.with_weights(parse_weights(w)?, parse_weight_space(&a.weights_space)?);
@@ -362,9 +379,10 @@ pub fn print(a: &PrintArgs) -> Result<()> {
         recipe.save(p).with_context(|| format!("writing recipe {}", p.display()))?;
         info!("recipe {}", p.display());
     }
+    // The lamps: the flag, else the recipe's plate, else off.
     let lamps = match &a.lamp {
         Some(l) => parse_lamps(l)?,
-        None => [0.0; 3],
+        None => recipe.plate.map(|p| p.lamps_rgb()).unwrap_or([0.0; 3]),
     };
     let p = PrintParams {
         recipe,

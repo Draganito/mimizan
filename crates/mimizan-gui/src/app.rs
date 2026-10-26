@@ -294,6 +294,14 @@ struct PlateResolved {
 /// orientation, point, box side in print pixels.
 type LoupeKey = (u64, Weights, Option<PlateView>, Recipe, u16, [f64; 2], usize);
 
+/// The primaries as the window names them.
+fn space_name(space: PlateSpace) -> &'static str {
+    match space {
+        PlateSpace::AdobeRgb => "Adobe RGB",
+        PlateSpace::Srgb => "sRGB",
+    }
+}
+
 /// The print box has a newer exposure than the picture on screen.
 fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
     tile_has_picture && !tile_matches_shown
@@ -313,8 +321,18 @@ pub struct App {
     folder_generation: u64,
     sort: Sort,
     show_strip: bool,
-    /// Strip tiles inverted (the film), not the print.
+    /// Strip tiles inverted (the film), not the print: one choice per
+    /// process, monochrome and plate.
     strip_negative: bool,
+    strip_negative_plate: bool,
+    /// The process: the three-colour plate or the monochrome negative.
+    /// With a file open it is the edit's (`edit.plate`); this is what the
+    /// next file without a recipe opens in, and what the switch shows
+    /// with nothing open.
+    plate_default: bool,
+    /// The plate's filters and primaries last chosen, so switching the
+    /// process back on returns to them.
+    plate_last: PlateParams,
     /// Strip panel height in points; `strip_height_saved` is what the
     /// config file holds, so a drag is written once, when it ends.
     strip_height: f32,
@@ -430,6 +448,8 @@ pub struct App {
     preview_ms: u128,
     hist_view: Histogram,
     hist_negative: Histogram,
+    /// The plate's three channels, outlines over the print histogram.
+    hist_rgb: Option<[[u32; 256]; 3]>,
     hist_source: HistSource,
     hist_log: bool,
     zoom: f32,
@@ -511,6 +531,12 @@ impl App {
             sort: persisted.sort,
             show_strip: persisted.strip.unwrap_or(true),
             strip_negative: persisted.strip_negative.unwrap_or(true),
+            strip_negative_plate: persisted.strip_negative_plate.unwrap_or(false),
+            plate_default: persisted.plate.unwrap_or(false),
+            plate_last: PlateParams {
+                filters: persisted.plate_filters.unwrap_or_default(),
+                space: persisted.plate_space.unwrap_or_default(),
+            },
             strip_height,
             strip_height_saved: strip_height,
             panels: persisted.panels.unwrap_or([true; 3]),
@@ -578,6 +604,7 @@ impl App {
             preview_ms: 0,
             hist_view: Histogram::empty(),
             hist_negative: Histogram::empty(),
+            hist_rgb: None,
             hist_source: HistSource::View,
             hist_log: false,
             zoom: 1.0,
@@ -622,10 +649,83 @@ impl App {
             sort: self.sort,
             strip: Some(self.show_strip),
             strip_negative: Some(self.strip_negative),
+            strip_negative_plate: Some(self.strip_negative_plate),
             panels: Some(self.panels),
             strip_height: Some(self.strip_height),
+            plate: Some(self.plate_default),
+            plate_filters: Some(self.plate_last.filters),
+            plate_space: Some(self.plate_last.space),
         }
         .save();
+    }
+
+    /// The process shown and switched: the edit's with a file open, the
+    /// default otherwise.
+    fn plate_process(&self) -> bool {
+        match &self.session {
+            Some(_) => self.edit.plate.is_some(),
+            None => self.plate_default,
+        }
+    }
+
+    /// Switch the process. With a file open the development follows (and
+    /// the history records it); the default for the next file follows
+    /// always. A monochrome sensor has no plate and stays as it is.
+    fn set_process(&mut self, plate: bool) {
+        if self.session.as_ref().is_some_and(|s| s.is_mono()) {
+            return;
+        }
+        if let Some(p) = self.edit.plate {
+            self.plate_last = p;
+        }
+        if self.session.is_some() {
+            self.edit.plate = plate.then_some(self.plate_last);
+        }
+        if self.plate_default != plate {
+            self.plate_default = plate;
+            self.strip_textures_drop();
+        }
+        self.persist();
+    }
+
+    /// Whether the strip's frames are inverted in the current process.
+    fn strip_inverted(&self) -> bool {
+        if self.plate_process() {
+            self.strip_negative_plate
+        } else {
+            self.strip_negative
+        }
+    }
+
+    /// The strip's pictures are made again next frame (the process or the
+    /// inversion changed).
+    fn strip_textures_drop(&mut self) {
+        if let Some(f) = &mut self.folder {
+            for e in &mut f.entries {
+                e.texture = None;
+            }
+        }
+    }
+
+    /// Keep the default and the remembered filters in step with the edit,
+    /// which undo, redo and a loaded recipe change behind the switch.
+    fn follow_process(&mut self) {
+        if self.session.as_ref().is_some_and(|s| !s.is_mono()) {
+            let plate = self.edit.plate.is_some();
+            let mut changed = false;
+            if let Some(p) = self.edit.plate.filter(|p| *p != self.plate_last) {
+                self.plate_last = p;
+                changed = true;
+            }
+            if plate != self.plate_default {
+                self.plate_default = plate;
+                self.strip_textures_drop();
+                changed = true;
+            }
+            if changed {
+                self.persist();
+            }
+        }
     }
 
     /// List a folder's RAW files in the strip. The thumbnails follow as the
@@ -1172,7 +1272,12 @@ impl App {
     fn reset(&mut self, fresh: bool) {
         self.export_warned = None;
         let weights = self.session.as_ref().map(|s| s.default_weights()).unwrap_or_default();
-        let e = Edit::new(weights);
+        let mut e = Edit::new(weights);
+        // The process is a mode, not a control: a reset keeps it, and a
+        // fresh file opens in the process the darkroom is in.
+        if self.session.as_ref().is_some_and(|s| !s.is_mono()) && self.plate_default {
+            e.plate = Some(self.plate_last);
+        }
         if fresh {
             self.history = History::new(e.clone());
         }
@@ -1220,8 +1325,15 @@ impl App {
                     }
                 }
                 let mut e = self.edit.clone();
-                e.recipe = r;
+                // A monochrome sensor has no mix and no plate; the file's
+                // entries, if any, are dropped.
+                if self.session.as_ref().is_some_and(|s| s.is_mono()) {
+                    r.mix = None;
+                    r.plate = None;
+                }
+                e.take_recipe(r);
                 self.set_edit(e);
+                self.follow_process();
                 self.close_crop();
                 self.note_peak_source();
                 self.log(format!("loaded recipe {}", path.display()));
@@ -1230,12 +1342,19 @@ impl App {
         }
     }
 
+    /// The recipe as the file beside the RAW gets it: print, mix, plate.
+    fn recipe_for_file(&self) -> Recipe {
+        let bayer = self.session.as_ref().is_some_and(|s| !s.is_mono());
+        self.edit.recipe_for_file(bayer)
+    }
+
     fn save_recipe(&mut self, path: &Path) {
-        match self.edit.recipe.validate().and_then(|_| self.edit.recipe.save(path)) {
+        let r = self.recipe_for_file();
+        match r.validate().and_then(|_| r.save(path)) {
             Ok(()) => {
                 self.log(format!("saved recipe {}", path.display()));
                 if self.recipe_sidecar().as_deref() == Some(path) {
-                    self.recipe_baseline = self.edit.recipe.clone();
+                    self.recipe_baseline = r;
                 }
             }
             Err(e) => self.log(format!("recipe not saved: {e}")),
@@ -1244,7 +1363,7 @@ impl App {
 
     fn should_ask_to_save(&self) -> bool {
         self.screenshot_to.is_none()
-            && recipe_needs_saving(self.session.is_some(), &self.edit.recipe, &self.recipe_baseline)
+            && recipe_needs_saving(self.session.is_some(), &self.recipe_for_file(), &self.recipe_baseline)
     }
 
     /// The window was asked to close. A changed recipe stays until the
@@ -1283,7 +1402,7 @@ impl App {
                     return;
                 };
                 self.save_recipe(&path);
-                if self.edit.recipe == self.recipe_baseline {
+                if self.recipe_for_file() == self.recipe_baseline {
                     self.pending_leave = None;
                     self.follow_leave(ctx, leave);
                 }
@@ -1383,8 +1502,9 @@ impl App {
                         {
                             // The plate in the unattended capture.
                             self.edit.plate = Some(PlateParams { filters, ..PlateParams::default() });
+                            self.follow_process();
                         }
-                        self.recipe_baseline = self.edit.recipe.clone();
+                        self.recipe_baseline = self.recipe_for_file();
                     }
                     // A re-development has new pixels: the measured radius
                     // belongs to the old ones.
@@ -1456,13 +1576,23 @@ impl App {
         self.screenshot_step(ctx);
     }
 
+    /// `MIMIZAN_SCREENSHOT_STRIP`: the capture waits for the strip's
+    /// frames, so the thumbnails are in the picture.
+    fn strip_thumbs_settled(&self) -> bool {
+        self.folder.as_ref().is_none_or(|f| f.entries.iter().all(|e| e.state != ThumbState::Pending))
+    }
+
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot_to.clone() else { return };
         match self.screenshot_state {
             // Wait until a preview is on screen, or until the open has
             // failed or there was nothing to open: the capture then shows
             // the empty stage instead of never happening.
-            0 if self.busy.is_none() && (self.texture.is_some() || self.session.is_none()) => {
+            0 if self.busy.is_none()
+                && (self.texture.is_some() || self.session.is_none())
+                && (std::env::var_os("MIMIZAN_SCREENSHOT_STRIP").is_none()
+                    || self.strip_thumbs_settled()) =>
+            {
                 if std::env::var_os("MIMIZAN_SCREENSHOT_1TO1").is_some() {
                     self.zoom_to_1to1 = true;
                     self.screenshot_state = 4;
@@ -1586,6 +1716,7 @@ impl App {
             }
             self.hist_view = im.hist_view;
             self.hist_negative = im.hist_negative;
+            self.hist_rgb = im.hist_rgb;
         }
         if let Some(d) = r.detail {
             let n = d.ask.w.saturating_mul(d.ask.h);
@@ -1686,7 +1817,11 @@ impl App {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let windows = tool_well(ui, |ui| self.toolbar_windows(ui));
+            let windows = tool_well(ui, |ui| {
+                self.toolbar_windows(ui);
+                ui.add_space(10.0);
+                self.toolbar_process(ui);
+            });
             ui.add_space(gap_l);
             let picture = tool_well(ui, |ui| self.toolbar_picture(ui));
             ui.add_space(gap_r);
@@ -1732,6 +1867,34 @@ impl App {
                 self.persist();
             }
         }
+    }
+
+    /// The process: the monochrome negative or the three-colour plate.
+    /// One of the two is always lit. A monochrome sensor has no plate, so
+    /// the switch is still while such a file is open.
+    fn toolbar_process(&mut self, ui: &mut egui::Ui) {
+        let mono_sensor = self.session.as_ref().is_some_and(|s| s.is_mono());
+        let plate = self.plate_process() && !mono_sensor;
+        let (mono_tip, plate_tip) = if mono_sensor {
+            (
+                "The sensor has no colour filter: this file is the measurement, and it prints monochrome.",
+                "No plate from a monochrome sensor.",
+            )
+        } else {
+            (
+                "The monochrome negative: the luminance separated from the mosaic, printed split-grade (P switches)",
+                "The three-colour plate: the same separation mixed through three taking filters, printed \
+                 through the same paper into one colour file, Prokudin-Gorsky's way (P switches)",
+            )
+        };
+        ui.add_enabled_ui(!mono_sensor, |ui| {
+            if ui.selectable_label(!plate, "Monochrome").on_hover_text(mono_tip).clicked() && plate {
+                self.set_process(false);
+            }
+            if ui.selectable_label(plate, "Plate").on_hover_text(plate_tip).clicked() && !plate {
+                self.set_process(true);
+            }
+        });
     }
 
     fn toolbar_picture(&mut self, ui: &mut egui::Ui) {
@@ -1904,7 +2067,7 @@ impl App {
         let Some(s) = self.session.clone() else {
             ui.label("Open a RAW file or drop it here.");
             ui.add_space(8.0);
-            ui.label(RichText::new("Bayer sensors: Nikon Z f (NEF) and other rawler-supported cameras. Monochrome sensors (DNG without CFA) pass through without separation.").weak());
+            ui.label(RichText::new("Bayer sensors: Nikon Z f (NEF) and other rawler-supported cameras, in either process, the monochrome negative or the three-colour plate. Monochrome sensors (DNG without CFA) pass through without separation.").weak());
             return;
         };
         let n = &s.negative;
@@ -1950,6 +2113,13 @@ impl App {
             ui.end_row();
             ui.label("balance");
             val(ui, format!("R {:.3}  B {:.3} ({})", info.wb[0], info.wb[2], info.report.wb_source));
+            ui.end_row();
+            ui.label("process");
+            val(ui, self.process_label(&s)).on_hover_text(
+                "The process this file is developed in: the monochrome negative, or the three-colour \
+                 plate with its taking filters and primaries. The switch is in the toolbar (P); the \
+                 filters and the lamps are in the Enlarger.",
+            );
             ui.end_row();
             let px = n.plane.data.len() as f64;
             ui.label("saturated");
@@ -2010,9 +2180,6 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.histogram_section(ui);
-        if !s.is_mono() {
-            egui::CollapsingHeader::new("Plate").default_open(true).show(ui, |ui| self.plate_section(ui, &s));
-        }
         ui.collapsing("Development", |ui| {
             ui.label(RichText::new("Changes here recompute the picture.").weak());
             if s.is_mono() {
@@ -2092,102 +2259,95 @@ impl App {
     /// The three-colour plate: on or off, the taking filters, the
     /// projection primaries, and the three weight rows they come to. A
     /// re-mix, not a re-development: the separation stays.
-    fn plate_section(&mut self, ui: &mut egui::Ui, s: &Session) {
-        let mut on = self.edit.plate.is_some();
-        if ui
-            .checkbox(&mut on, "three-colour plate")
-            .on_hover_text(
-                "Three mixes of the one separation through three taking filters, printed together \
-                 through the same paper and the same two exposures, into one RGB file. \
-                 Prokudin-Gorsky's principle on the Bayer mosaic: every pixel of every plate is a \
-                 weighted sum of measured photosites, no demosaicing. The drawing is the \
-                 negative's; the colour is band-limited to the carriers, like the red layer of a film.",
-            )
-            .changed()
-        {
-            self.edit.plate = on.then(PlateParams::default);
+    /// What the Negative window says the file is developed in.
+    fn process_label(&self, s: &Session) -> String {
+        if s.is_mono() {
+            return "monochrome (the sensor)".into();
         }
-        let Some(mut params) = self.edit.plate else {
-            ui.label(RichText::new("Off: the monochrome negative.").weak().small());
-            return;
-        };
-        let has_matrix = s.has_colour_matrix();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("filters").weak());
-            egui::ComboBox::from_id_salt("plate-filters").selected_text(params.filters.name()).show_ui(
-                ui,
-                |ui| {
-                    for f in PlateFilters::ALL {
-                        let hover = match f {
-                            PlateFilters::Camera => {
-                                "The camera's colour matrix towards the primaries, inverted: the \
-                                 colorimetric set, as a RAW converter applies it. Weights go negative \
-                                 off the diagonal. Without a matrix in the file the channels are taken."
-                            }
-                            PlateFilters::Wratten => {
-                                "Wratten 25, 58 and 47 in front of the panchromatic mix, crosstalk \
-                                 included: the softer palette of the historical glass. Follows the mix \
-                                 in the enlarger."
-                            }
-                            PlateFilters::Channels => {
-                                "The balanced channels as they are, straight into R, G and B. What the \
-                                 Library of Congress does with the scanned plates."
-                            }
-                        };
-                        ui.selectable_value(&mut params.filters, f, f.name()).on_hover_text(hover);
+        match self.edit.plate {
+            None => "monochrome negative".into(),
+            Some(p) => {
+                let filters = match self.plate_resolved.as_ref().map(|r| &r.weights) {
+                    Some(Ok(w)) if w.filters != p.filters => {
+                        format!("{} (no matrix: {})", p.filters.name(), w.filters.name())
                     }
-                },
+                    _ => p.filters.name().to_string(),
+                };
+                format!("plate · {filters} · {}", space_name(p.space))
+            }
+        }
+    }
+
+    /// The plate's taking filters and primaries, in the Enlarger where the
+    /// monochrome mix stands: the same decision, the filter in front of
+    /// the paper. The Wratten set follows the mix, so the mix stays with it.
+    fn plate_filters_row(&mut self, ui: &mut egui::Ui, s: &Session) {
+        let Some(mut params) = self.edit.plate else { return };
+        ui.label(RichText::new("filters").weak()).on_hover_text(
+            "The three taking filters: three weight triples on the balanced channels, each summing to \
+             one, so grey gives three equal plates. Every plate is the one separation mixed again; \
+             nothing is demosaiced.",
+        );
+        egui::ComboBox::from_id_salt("plate-filters").selected_text(params.filters.name()).show_ui(
+            ui,
+            |ui| {
+                for f in PlateFilters::ALL {
+                    let hover = match f {
+                    PlateFilters::Camera => {
+                        "The camera's colour matrix towards the primaries, inverted: the colorimetric set, \
+                         as a RAW converter applies it. Weights go negative off the diagonal. Without a \
+                         matrix in the file the channels are taken."
+                    }
+                    PlateFilters::Wratten => {
+                        "Wratten 25, 58 and 47 in front of the mix, crosstalk included: the softer palette \
+                         of the historical glass. Follows the mix beside it."
+                    }
+                    PlateFilters::Channels => {
+                        "The balanced channels as they are, straight into R, G and B. What the Library of \
+                         Congress does with the scanned plates."
+                    }
+                };
+                    ui.selectable_value(&mut params.filters, f, f.name()).on_hover_text(hover);
+                }
+            },
+        );
+        ui.label(RichText::new("primaries").weak())
+            .on_hover_text("The projection filters, and the profile of the file.");
+        egui::ComboBox::from_id_salt("plate-space").selected_text(space_name(params.space)).show_ui(ui, |ui| {
+            ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB").on_hover_text(
+                "Adobe RGB (1998): its curve is exactly the paper's gamma 2.2 and its gamut holds the \
+                 saturated primaries. The file carries the profile.",
             );
-            ui.label(RichText::new("primaries").weak());
-            egui::ComboBox::from_id_salt("plate-space")
-                .selected_text(match params.space {
-                    PlateSpace::AdobeRgb => "Adobe RGB",
-                    PlateSpace::Srgb => "sRGB",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB").on_hover_text(
-                        "Adobe RGB (1998): its curve is exactly the paper's gamma 2.2 and its gamut \
-                         holds the saturated primaries. The file carries the profile.",
-                    );
-                    ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
-                        "sRGB primaries with the paper's gamma 2.2 (not the sRGB curve). The file \
-                         carries the profile.",
-                    );
-                });
+            ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
+                "sRGB primaries with the paper's gamma 2.2 (not the sRGB curve). The file carries the profile.",
+            );
         });
         if self.edit.plate != Some(params) {
             self.edit.plate = Some(params);
         }
-        if params.filters == PlateFilters::Camera && !has_matrix {
-            ui.label(
-                RichText::new("No colour matrix in this file: the channels are taken as they are.")
-                    .small()
-                    .color(ui.visuals().warn_fg_color),
-            );
+        if params.filters == PlateFilters::Wratten {
+            ui.label(RichText::new("behind").weak());
+            self.mix_combo(ui);
         }
         match self.plate_resolved.as_ref().map(|r| &r.weights) {
             Some(Ok(w)) => {
-                let rows = ["red", "green", "blue"];
-                egui::Grid::new("plate-weights").num_columns(4).spacing([10.0, 1.0]).show(ui, |ui| {
-                    for (name, row) in rows.iter().zip(w.rows.iter()) {
-                        ui.label(RichText::new(*name).weak().small());
-                        for v in row {
-                            ui.label(RichText::new(format!("{v:+.3}")).monospace().small());
-                        }
-                        ui.end_row();
-                    }
-                });
-                ui.label(
-                    RichText::new(
-                        "Each row sums to one on the balanced channels R G B, so grey gives three \
-                         equal plates. The screen shows the plate; the histograms stay the mix's.",
-                    )
-                    .weak()
-                    .small(),
-                );
+                let rows: Vec<String> = ["red", "green", "blue"]
+                    .iter()
+                    .zip(w.rows.iter())
+                    .map(|(n, r)| format!("{n:<6} {:+.3} {:+.3} {:+.3}", r[0], r[1], r[2]))
+                    .collect();
+                let note = if params.filters == PlateFilters::Camera && !s.has_colour_matrix() {
+                    "no matrix in this file: the channels are taken"
+                } else {
+                    "weights"
+                };
+                ui.label(RichText::new(note).weak().small()).on_hover_text(format!(
+                    "The three taking filters on the balanced channels R G B:\n{}",
+                    rows.join("\n")
+                ));
             }
             Some(Err(e)) => {
-                ui.label(RichText::new(format!("No plate: {e}")).small().color(ui.visuals().error_fg_color));
+                ui.label(RichText::new(format!("no plate: {e}")).small().color(ui.visuals().error_fg_color));
             }
             None => {}
         }
@@ -2256,7 +2416,8 @@ impl App {
             HistSource::Negative => &self.hist_negative,
             _ => &self.hist_view,
         };
-        histogram_widget(ui, h, egui::vec2(width, 96.0), self.hist_log);
+        let channels = (self.hist_source == HistSource::View).then_some(self.hist_rgb.as_ref()).flatten();
+        histogram_widget(ui, h, channels, egui::vec2(width, 96.0), self.hist_log);
         if h.total > 0 {
             let lo = 100.0 * h.clipped_low();
             let hi = 100.0 * h.clipped_high();
@@ -2397,9 +2558,14 @@ impl App {
     /// Mix as one row, placing, the bar, the grades and the paper's ends.
     fn zones_column(&mut self, ui: &mut egui::Ui, width: f32) {
         let mono = self.session.as_ref().is_some_and(|s| s.is_mono());
+        let plate = !mono && self.edit.plate.is_some();
         ui.horizontal(|ui| {
             if mono {
                 ui.label(RichText::new("The sensor has no colour filter. This is the measurement.").weak());
+            } else if plate {
+                if let Some(s) = self.session.clone() {
+                    self.plate_filters_row(ui, &s);
+                }
             } else {
                 ui.label(RichText::new("mix").weak());
                 self.mix_combo(ui);
@@ -2645,6 +2811,22 @@ impl App {
     /// sharpening mode stays off. Peak, below the tile, is the desktop
     /// high-pass. The 1:1 box is the print pixels.
     fn print_section(&mut self, ui: &mut egui::Ui) {
+        // The file the export writes, first: it is the process's.
+        ui.horizontal(|ui| {
+            print_field_label(ui, "file");
+            let (text, tip) = match self.plate_view() {
+                Some(p) => (
+                    format!("16-bit RGB TIFF · {}", space_name(p.space)),
+                    "The three positives as the channels of one RGB file, with a matrix/TRC profile of \
+                     these primaries and the paper's gamma 2.2.",
+                ),
+                None => (
+                    "16-bit grey TIFF · gamma 2.2".to_string(),
+                    "The sheet as one grey channel with a gamma 2.2 profile.",
+                ),
+            };
+            ui.label(RichText::new(text).weak()).on_hover_text(tip);
+        });
         let mut mode = self.size_mode;
         ui.horizontal(|ui| {
             print_field_label(ui, "size");
@@ -3829,17 +4011,20 @@ impl App {
                 if ui.small_button("×").on_hover_text("Hide the strip (B)").clicked() {
                     self.toggle_strip();
                 }
-                if ui
-                    .selectable_label(self.strip_negative, "negative")
-                    .on_hover_text("Show the frames as the film holds them (inverted), or as the print")
-                    .clicked()
-                {
-                    self.strip_negative = !self.strip_negative;
-                    if let Some(f) = &mut self.folder {
-                        for e in &mut f.entries {
-                            e.texture = None;
-                        }
+                let plate = self.plate_process();
+                let negative = self.strip_inverted();
+                let tip = if plate {
+                    "Show the frames as slides, or inverted, a colour negative without its mask"
+                } else {
+                    "Show the frames as the film holds them (inverted), or as the print"
+                };
+                if ui.selectable_label(negative, "negative").on_hover_text(tip).clicked() {
+                    if plate {
+                        self.strip_negative_plate = !negative;
+                    } else {
+                        self.strip_negative = !negative;
                     }
+                    self.strip_textures_drop();
                     self.persist();
                 }
                 let mut sort = self.sort;
@@ -3886,6 +4071,8 @@ impl App {
                 }
             }
         }
+        let plate = self.plate_process();
+        let negative = self.strip_inverted();
         let Some(folder) = &mut self.folder else { return };
         if folder.entries.is_empty() && folder.subdirs.is_empty() {
             ui.label(RichText::new("No RAW files and no folders here.").weak());
@@ -3894,7 +4081,6 @@ impl App {
         let idle = self.busy.is_none();
         let current = self.current_path.clone();
         let generation = folder.generation;
-        let negative = self.strip_negative;
         let scroll_to = std::mem::take(&mut self.scroll_to_selected);
         let mut clicked: Option<PathBuf> = None;
         let mut go_dir: Option<PathBuf> = None;
@@ -4000,7 +4186,8 @@ impl App {
                     }
                     if e.texture.is_none() {
                         let bad = e.thumb.as_ref().is_some_and(|t| {
-                            t.width == 0 || t.height == 0 || t.gray.len() != t.width.saturating_mul(t.height)
+                            let n = t.width.saturating_mul(t.height);
+                            t.width == 0 || t.height == 0 || t.gray.len() != n || t.rgb.len() != 3 * n
                         });
                         if bad {
                             // Same failure as the 1:1 window: from_gray closes
@@ -4010,16 +4197,20 @@ impl App {
                             e.thumb = None;
                             e.state = ThumbState::Failed;
                         } else if let Some(t) = &e.thumb {
-                            let img = if negative {
-                                ColorImage::from_gray_iter(
-                                    [t.width, t.height],
-                                    t.gray.iter().map(|&g| 255 - g),
-                                )
-                            } else {
-                                ColorImage::from_gray([t.width, t.height], &t.gray)
+                            let size = [t.width, t.height];
+                            let img = match (plate, negative) {
+                                (true, false) => ColorImage::from_rgb(size, &t.rgb),
+                                (true, true) => {
+                                    let inv: Vec<u8> = t.rgb.iter().map(|&v| 255 - v).collect();
+                                    ColorImage::from_rgb(size, &inv)
+                                }
+                                (false, true) => {
+                                    ColorImage::from_gray_iter(size, t.gray.iter().map(|&g| 255 - g))
+                                }
+                                (false, false) => ColorImage::from_gray(size, &t.gray),
                             };
                             e.texture = Some(ctx.load_texture(
-                                format!("thumb-{generation}-{i}-{}", negative as u8),
+                                format!("thumb-{generation}-{i}-{}{}", plate as u8, negative as u8),
                                 img,
                                 TextureOptions::LINEAR,
                             ));
@@ -4207,6 +4398,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.loupe_open = false;
         self.ensure_loupe_point();
+        self.follow_process();
         self.refresh_plate();
         self.handle_dialog(&ctx);
 
@@ -4761,6 +4953,9 @@ impl App {
         }
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             self.apply_crop();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+            self.set_process(!self.plate_process());
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
             let any = self.panels.iter().any(|&p| p);

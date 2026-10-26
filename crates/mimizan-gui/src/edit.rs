@@ -1,13 +1,15 @@
 //! The editable development of one negative and its history. An `Edit` is
 //! the paper's "Entwicklungsdatensatz": the recipe the export renders plus
-//! the two things that are not in the recipe because they are the
-//! negative's, not the print's (the channel weights and the user's turns).
-//! The history is a list of such states, never of pixels: undo and redo
-//! swap the whole state, and every state is one export.
+//! what the export takes beside it (the mix, the plate and its lamps, the
+//! user's turns). The file next to the RAW carries the mix and the plate
+//! inside the recipe (`recipe_for_file`); in memory they are fields of
+//! their own and the recipe's slots stay empty. The history is a list of
+//! such states, never of pixels: undo and redo swap the whole state, and
+//! every state is one export.
 
 use mimizan_core::mix::Weights;
 use mimizan_core::plate::PlateParams;
-use mimizan_core::recipe::Recipe;
+use mimizan_core::recipe::{PlateRecipe, Recipe};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
@@ -33,6 +35,42 @@ impl Edit {
     /// The three lamps the print takes: red, green (fixed), blue.
     pub fn lamps_rgb(&self) -> [f64; 3] {
         [self.lamps[0], 0.0, self.lamps[1]]
+    }
+
+    /// The recipe as the file next to the RAW holds it: the print, plus
+    /// the mix and the plate this development runs under. `mix` is
+    /// written only for a colour sensor (`bayer`); a monochrome sensor
+    /// has no mix.
+    pub fn recipe_for_file(&self, bayer: bool) -> Recipe {
+        let mut r = self.recipe.clone();
+        r.mix = bayer.then_some(self.weights);
+        r.plate = self.plate.filter(|_| bayer).map(|p| PlateRecipe {
+            filters: p.filters,
+            space: p.space,
+            lamps: self.lamps,
+        });
+        r
+    }
+
+    /// Take a loaded recipe apart: the print stays in `recipe`, the mix
+    /// and the plate go to their fields. A recipe without a mix keeps
+    /// the weights the edit had; one without a plate is the monochrome
+    /// process.
+    pub fn take_recipe(&mut self, mut r: Recipe) {
+        if let Some(m) = r.mix.take() {
+            self.weights = m;
+        }
+        match r.plate.take() {
+            Some(p) => {
+                self.plate = Some(p.params());
+                self.lamps = p.lamps;
+            }
+            None => {
+                self.plate = None;
+                self.lamps = [0.0; 2];
+            }
+        }
+        self.recipe = r;
     }
 }
 
@@ -119,6 +157,37 @@ mod tests {
         let mut e = Edit::new(Weights::default());
         e.recipe.place = p;
         e
+    }
+
+    #[test]
+    fn the_file_carries_mix_and_plate_and_comes_back_whole() {
+        use mimizan_core::plate::{PlateFilters, PlateSpace};
+        let mut e = Edit::new(Weights { r: 0.3, g: 0.5, b: 0.2 });
+        e.plate = Some(PlateParams { filters: PlateFilters::Wratten, space: PlateSpace::Srgb });
+        e.lamps = [0.2, -0.1];
+        e.recipe.place = -0.5;
+        let r = e.recipe_for_file(true);
+        assert_eq!(r.mix, Some(e.weights));
+        assert_eq!(
+            r.plate.map(|p| (p.filters, p.space, p.lamps)),
+            Some((PlateFilters::Wratten, PlateSpace::Srgb, [0.2, -0.1]))
+        );
+        assert_eq!(r.place, -0.5);
+        // In memory the slots stay empty.
+        assert!(e.recipe.mix.is_none() && e.recipe.plate.is_none());
+        // Back into a fresh edit: everything returns, the slots stay empty.
+        let mut back = Edit::new(Weights::default());
+        back.take_recipe(r);
+        assert_eq!(back, e);
+        // A monochrome sensor writes neither.
+        let m = e.recipe_for_file(false);
+        assert!(m.mix.is_none() && m.plate.is_none());
+        // A recipe without a plate is the monochrome process, lamps off.
+        let mut mono = e.clone();
+        mono.take_recipe(mimizan_core::recipe::Recipe::on_paper());
+        assert_eq!(mono.plate, None);
+        assert_eq!(mono.lamps, [0.0; 2]);
+        assert_eq!(mono.weights, e.weights, "no mix in the file keeps the weights");
     }
 
     #[test]

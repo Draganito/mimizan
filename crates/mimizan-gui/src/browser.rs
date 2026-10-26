@@ -11,7 +11,8 @@
 use mimizan_core::calib::CameraFile;
 use mimizan_core::decode::Exposure;
 use mimizan_core::pipeline;
-use mimizan_core::thumb::{binned_gray, Thumb};
+use mimizan_core::plate::{PlateFilters, PlateSpace};
+use mimizan_core::thumb::{binned, browser_plate, Thumb};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -283,12 +284,18 @@ fn cache_key(path: &Path, size: u64, modified: SystemTime) -> String {
     format!("{h:016x}")
 }
 
-/// The cached PNG and its JSON, if both are there and readable.
+/// The cached grey and colour PNGs and the JSON, if all three are there and
+/// readable and the same size. A cache from before the colour picture has
+/// no `.rgb.png` and is made again.
 fn cache_load(dir: &Path, key: &str) -> Option<(Thumb, Meta)> {
     let png = image::open(dir.join(format!("{key}.png"))).ok()?.into_luma8();
+    let rgb = image::open(dir.join(format!("{key}.rgb.png"))).ok()?.into_rgb8();
     let meta: Meta = serde_json::from_slice(&std::fs::read(dir.join(format!("{key}.json"))).ok()?).ok()?;
     let (w, h) = (png.width() as usize, png.height() as usize);
-    Some((Thumb { width: w, height: h, gray: png.into_raw() }, meta))
+    if (rgb.width() as usize, rgb.height() as usize) != (w, h) {
+        return None;
+    }
+    Some((Thumb { width: w, height: h, gray: png.into_raw(), rgb: rgb.into_raw() }, meta))
 }
 
 /// Write `name` under `dir` through a temporary file and a rename, so a
@@ -318,7 +325,19 @@ fn cache_store(dir: &Path, key: &str, thumb: &Thumb, meta: &Meta) {
         )
         .is_ok()
     });
-    if !png_ok {
+    let rgb_ok = png_ok
+        && write_atomic(dir, &format!("{key}.rgb.png"), |tmp| {
+            image::save_buffer_with_format(
+                tmp,
+                &thumb.rgb,
+                thumb.width as u32,
+                thumb.height as u32,
+                image::ColorType::Rgb8,
+                image::ImageFormat::Png,
+            )
+            .is_ok()
+        });
+    if !rgb_ok {
         return;
     }
     if let Ok(s) = serde_json::to_vec(meta) {
@@ -465,7 +484,7 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
         .and_then(|p| CameraFile::load(&p).ok())
         .map(|c| c.weights_balanced(wb))
         .unwrap_or_default();
-    let thumb = binned_gray(&frame, weights, wb, THUMB_LONG_EDGE);
+    let thumb = binned(&frame, weights, &browser_plate(&frame), wb, THUMB_LONG_EDGE);
     let meta = Meta {
         make: frame.clean_make.clone(),
         model: frame.clean_model.clone(),
@@ -491,12 +510,22 @@ pub struct Persisted {
     pub sort: Sort,
     /// Strip shown; `None` on a fresh install means "yes".
     pub strip: Option<bool>,
-    /// Strip tiles shown as negatives (the film), not as the print.
+    /// Strip tiles shown as negatives (the film), not as the print, in the
+    /// monochrome process. `None` means yes.
     pub strip_negative: Option<bool>,
+    /// The same for the plate: inverted colour (a colour negative without
+    /// its mask) or the slide. `None` means the slide.
+    pub strip_negative_plate: Option<bool>,
     /// Docked windows open: 0 Negative, 1 Print, 2 Enlarger. `None` means all.
     pub panels: Option<[bool; 3]>,
     /// Height of the strip panel in points (the user drags its top edge).
     pub strip_height: Option<f32>,
+    /// The process a file opens in when it has no recipe: the plate
+    /// (`true`) or the monochrome negative. `None` means monochrome.
+    pub plate: Option<bool>,
+    /// The plate's taking filters and primaries last used.
+    pub plate_filters: Option<PlateFilters>,
+    pub plate_space: Option<PlateSpace>,
 }
 
 /// `$XDG_CONFIG_HOME/mimizan/gui.json`, `%APPDATA%/mimizan/gui.json`, or

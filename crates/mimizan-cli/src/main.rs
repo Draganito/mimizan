@@ -114,6 +114,11 @@ enum Cmd {
         /// Primaries the plate is projected through: adobe-rgb (default) | srgb
         #[arg(long, value_name = "SPACE", default_value = "adobe-rgb")]
         plate_space: String,
+        /// Recipe JSON as the desktop writes it next to the RAW: its mix and
+        /// its plate (process, filters, primaries) develop this negative.
+        /// --weights and --plate override them.
+        #[arg(long)]
+        recipe: Option<PathBuf>,
     },
     /// Negative TIFF -> print file in one pass: size, place, paper or look, border,
     /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC). Every print
@@ -237,6 +242,7 @@ fn main() -> Result<()> {
             crop,
             plate,
             plate_space,
+            recipe,
         } => cmd::negative(&cmd::NegativeArgs {
             raw,
             out,
@@ -256,6 +262,7 @@ fn main() -> Result<()> {
             crop,
             plate,
             plate_space,
+            recipe,
         }),
         Cmd::Print {
             negative,

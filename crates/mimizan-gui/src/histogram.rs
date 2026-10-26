@@ -91,7 +91,15 @@ fn draw_channel(painter: &egui::Painter, rect: egui::Rect, bins: &[u32], log_sca
     painter.add(egui::Shape::line(pts, Stroke::new(1.2, colour)));
 }
 
-pub fn histogram_widget(ui: &mut Ui, h: &Histogram, size: egui::Vec2, log_scale: bool) {
+/// The print or negative histogram as bars; with `channels`, the plate's
+/// three channels as outlines over it, each normalised to its own peak.
+pub fn histogram_widget(
+    ui: &mut Ui,
+    h: &Histogram,
+    channels: Option<&[[u32; 256]; 3]>,
+    size: egui::Vec2,
+    log_scale: bool,
+) {
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
@@ -130,6 +138,12 @@ pub fn histogram_widget(ui: &mut Ui, h: &Histogram, size: egui::Vec2, log_scale:
             0.0,
             colour,
         );
+    }
+
+    if let Some(ch) = channels {
+        for (bins, c) in ch.iter().zip([Color::R, Color::G, Color::B]) {
+            draw_channel(&painter, rect, bins, log_scale, channel_colour(c, false));
+        }
     }
 
     // Mean marker.

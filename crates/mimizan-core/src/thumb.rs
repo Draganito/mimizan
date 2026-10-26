@@ -1,39 +1,57 @@
-//! Small grey pictures of RAW files for a folder browser: the mosaic
-//! binned to a grey picture with the development's balance and mix
-//! weights. No separation is needed, the binning removes the chrominance
-//! carrier. The camera's embedded JPEG was measured as the alternative and
-//! rejected: rawler decodes it in 250-430 ms on a Z f file, the mosaic in
-//! 340-420 ms, and the JPEG carries the camera's tone curve, not ours.
+//! Small pictures of RAW files for a folder browser: the mosaic binned to
+//! the balanced channels, then mixed once to the grey of the development's
+//! weights and once to the colour of the plate's taking filters. No
+//! separation is needed, the binning removes the chrominance carrier. The
+//! camera's embedded JPEG was measured as the alternative and rejected:
+//! rawler decodes it in 250-430 ms on a Z f file, the mosaic in 340-420 ms,
+//! and the JPEG carries the camera's tone curve, not ours.
 
 use crate::cfa::Color;
 use crate::decode::{RawFrame, SensorKind};
 use crate::mix::Weights;
 use crate::plane::Plane;
+use crate::plate::{PlateSpace, PlateWeights};
 use crate::print::orient;
 use rayon::prelude::*;
 
-/// 8-bit grey, gamma 2.2, upright (the file's orientation applied).
+/// 8-bit, gamma 2.2, upright (the file's orientation applied): the grey
+/// mix and, interleaved R G B, the plate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Thumb {
     pub width: usize,
     pub height: usize,
     pub gray: Vec<u8>,
+    /// The colour plate of the same bins, `3 * width * height` bytes.
+    pub rgb: Vec<u8>,
 }
 
-impl Thumb {
-    fn from_plane(p: &Plane, orientation: u16) -> Self {
-        let p = if (2..=8).contains(&orientation) { orient(p, orientation) } else { p.clone() };
-        let gray = p.data.iter().map(|v| (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8).collect();
-        Self { width: p.width, height: p.height, gray }
-    }
+fn encode(v: f64) -> u8 {
+    (v.clamp(0.0, 1.0).powf(1.0 / 2.2) * 255.0).round() as u8
+}
+
+/// The taking filters a browser shows: the camera's matrix towards sRGB
+/// (the screen's primaries), the bare channels when the file has none.
+pub fn browser_plate(frame: &RawFrame) -> PlateWeights {
+    frame
+        .xyz_to_cam
+        .as_ref()
+        .and_then(|m| PlateWeights::camera(m, PlateSpace::Srgb).ok())
+        .unwrap_or_else(PlateWeights::channels)
 }
 
 /// The mosaic inside its crop, binned by an even factor so the long edge
 /// is at most `long_edge`. Each bin averages its samples per colour after
-/// black and white levels, applies `wb` (G = 1) and mixes with `weights`
-/// (balanced space); a monochrome sensor averages everything. Values above
-/// 1 are clipped, like the negative's saturated pixels.
-pub fn binned_gray(frame: &RawFrame, weights: Weights, wb: [f64; 3], long_edge: usize) -> Thumb {
+/// black and white levels and applies `wb` (G = 1); the grey is the mix
+/// with `weights` (balanced space), the colour the three rows of `plate`.
+/// A monochrome sensor averages everything and is grey in both. Values
+/// above 1 are clipped, like the negative's saturated pixels.
+pub fn binned(
+    frame: &RawFrame,
+    weights: Weights,
+    plate: &PlateWeights,
+    wb: [f64; 3],
+    long_edge: usize,
+) -> Thumb {
     let c = frame.crop;
     let long = c.w.max(c.h).max(1);
     let mut f = (long as f64 / long_edge.max(1) as f64).ceil().max(2.0) as usize;
@@ -42,49 +60,90 @@ pub fn binned_gray(frame: &RawFrame, weights: Weights, wb: [f64; 3], long_edge: 
     }
     let ow = (c.w / f).max(1);
     let oh = (c.h / f).max(1);
-    let w = [weights.r, weights.g, weights.b];
-    let mut out = Plane::zeros(ow, oh);
-    out.data.par_chunks_mut(ow).enumerate().for_each(|(oy, row)| {
-        for (ox, px) in row.iter_mut().enumerate() {
-            let mut sum = [0.0f64; 3];
-            let mut n = [0usize; 3];
-            let y0 = c.y + oy * f;
-            let x0 = c.x + ox * f;
-            for y in y0..(y0 + f).min(c.y + c.h) {
-                for x in x0..(x0 + f).min(c.x + c.w) {
-                    let black = frame.black_at(x, y);
-                    let white = frame.white_at(x, y);
-                    let v =
-                        ((frame.data.get(y * frame.width + x) - black) / (white - black).max(1.0)).max(0.0);
-                    let ch = match frame.kind {
-                        SensorKind::Bayer(ph) => match ph.color_at(x, y) {
-                            Color::R => 0,
-                            Color::G => 1,
-                            Color::B => 2,
-                        },
-                        SensorKind::Mono => 1,
-                    };
-                    sum[ch] += v;
-                    n[ch] += 1;
-                }
-            }
-            *px = match frame.kind {
-                SensorKind::Bayer(_) => (0..3)
-                    .filter(|&i| n[i] > 0)
-                    .map(|i| w[i] * wb[i] * sum[i] / n[i] as f64)
-                    .sum::<f64>()
-                    .min(1.0),
-                SensorKind::Mono => {
-                    if n[1] > 0 {
-                        (sum[1] / n[1] as f64).min(1.0)
-                    } else {
-                        0.0
+    // Four planes: the balanced R, G, B means of each bin, and the mono
+    // sensor's one channel in G.
+    let mut chan = [Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh)];
+    let (r, gb) = chan.split_at_mut(1);
+    let (g, b) = gb.split_at_mut(1);
+    r[0].data
+        .par_chunks_mut(ow)
+        .zip(g[0].data.par_chunks_mut(ow))
+        .zip(b[0].data.par_chunks_mut(ow))
+        .enumerate()
+        .for_each(|(oy, ((rr, gg), bb))| {
+            for ox in 0..ow {
+                let mut sum = [0.0f64; 3];
+                let mut n = [0usize; 3];
+                let y0 = c.y + oy * f;
+                let x0 = c.x + ox * f;
+                for y in y0..(y0 + f).min(c.y + c.h) {
+                    for x in x0..(x0 + f).min(c.x + c.w) {
+                        let black = frame.black_at(x, y);
+                        let white = frame.white_at(x, y);
+                        let v = ((frame.data.get(y * frame.width + x) - black) / (white - black).max(1.0))
+                            .max(0.0);
+                        let ch = match frame.kind {
+                            SensorKind::Bayer(ph) => match ph.color_at(x, y) {
+                                Color::R => 0,
+                                Color::G => 1,
+                                Color::B => 2,
+                            },
+                            SensorKind::Mono => 1,
+                        };
+                        sum[ch] += v;
+                        n[ch] += 1;
                     }
                 }
-            };
+                let mean = |i: usize| if n[i] > 0 { wb[i] * sum[i] / n[i] as f64 } else { 0.0 };
+                match frame.kind {
+                    SensorKind::Bayer(_) => {
+                        rr[ox] = mean(0);
+                        gg[ox] = mean(1);
+                        bb[ox] = mean(2);
+                    }
+                    SensorKind::Mono => {
+                        let v = if n[1] > 0 { sum[1] / n[1] as f64 } else { 0.0 };
+                        rr[ox] = v;
+                        gg[ox] = v;
+                        bb[ox] = v;
+                    }
+                }
+            }
+        });
+    let upright = |p: &Plane| {
+        if (2..=8).contains(&frame.orientation) {
+            orient(p, frame.orientation)
+        } else {
+            p.clone()
+        }
+    };
+    let [r, g, b] = [upright(&chan[0]), upright(&chan[1]), upright(&chan[2])];
+    let (width, height) = (r.width, r.height);
+    let n = width * height;
+    let mono = matches!(frame.kind, SensorKind::Mono);
+    let w = [weights.r, weights.g, weights.b];
+    let mut gray = vec![0u8; n];
+    let mut rgb = vec![0u8; 3 * n];
+    gray.par_iter_mut().zip(rgb.par_chunks_mut(3)).enumerate().for_each(|(i, (gy, px))| {
+        let c = [r.data[i], g.data[i], b.data[i]];
+        if mono {
+            let v = encode(c[1]);
+            *gy = v;
+            px.fill(v);
+            return;
+        }
+        *gy = encode((0..3).map(|k| w[k] * c[k]).sum::<f64>());
+        for (out, row) in px.iter_mut().zip(plate.rows.iter()) {
+            *out = encode((0..3).map(|k| row[k] * c[k]).sum::<f64>());
         }
     });
-    Thumb::from_plane(&out, frame.orientation)
+    Thumb { width, height, gray, rgb }
+}
+
+/// The grey picture alone, with the bare channels as its colour: the
+/// older entry point, kept for callers that have no plate.
+pub fn binned_gray(frame: &RawFrame, weights: Weights, wb: [f64; 3], long_edge: usize) -> Thumb {
+    binned(frame, weights, &PlateWeights::channels(), wb, long_edge)
 }
 
 #[cfg(test)]
@@ -130,15 +189,25 @@ mod tests {
         for &v in &t.gray {
             assert!((v as i32 - expect as i32).abs() <= 1, "{v} vs {expect}");
         }
+        // Grey is grey in colour too, and the colour has three bytes a pixel.
+        assert_eq!(t.rgb.len(), 3 * t.gray.len());
+        for (px, &g) in t.rgb.as_chunks::<3>().0.iter().zip(&t.gray) {
+            assert!(px.iter().all(|&v| (v as i32 - g as i32).abs() <= 1), "{px:?} vs {g}");
+        }
     }
 
     #[test]
     fn balance_and_weights_apply_per_colour() {
-        // Red sites at full scale, the rest dark: the grey is w_r * wb_r.
+        // Red sites at full scale, the rest dark: the grey is w_r * wb_r,
+        // and with the bare channels the colour is red alone.
         let f = frame(32, 32, |x, y| if x % 2 == 0 && y % 2 == 0 { 4195 } else { 100 }, 1);
         let t = binned_gray(&f, Weights { r: 0.5, g: 0.25, b: 0.25 }, [1.6, 1.0, 1.2], 8);
         let expect = ((0.5f64 * 1.6).min(1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
         assert!(t.gray.iter().all(|&v| (v as i32 - expect as i32).abs() <= 1), "{:?}", &t.gray[..4]);
+        for px in t.rgb.as_chunks::<3>().0 {
+            assert_eq!(px[0], 255, "{px:?}");
+            assert_eq!((px[1], px[2]), (0, 0), "{px:?}");
+        }
     }
 
     #[test]
@@ -146,5 +215,16 @@ mod tests {
         let f = frame(64, 32, |_, _| 100 + 737, 6);
         let t = binned_gray(&f, Weights::default(), [1.0; 3], 16);
         assert_eq!((t.width, t.height), (8, 16));
+        assert_eq!(t.rgb.len(), 3 * 8 * 16);
+    }
+
+    #[test]
+    fn browser_plate_takes_the_matrix_when_there_is_one() {
+        let mut f = frame(8, 8, |_, _| 100 + 737, 1);
+        assert_eq!(browser_plate(&f), PlateWeights::channels());
+        // The identity matrix is a camera whose channels are XYZ; it has a
+        // valid inverse, so the camera set is taken.
+        f.xyz_to_cam = Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert_eq!(browser_plate(&f).filters, crate::plate::PlateFilters::Camera);
     }
 }
