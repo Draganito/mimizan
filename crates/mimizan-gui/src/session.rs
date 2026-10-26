@@ -29,28 +29,22 @@ use std::sync::{Arc, OnceLock};
 pub const PREVIEW_MAX: usize = 1800;
 
 /// Settings that need a new separation (ingest + separate), not just a re-mix.
+///
+/// Every photosite stays as measured: the desktop has no defect repair and
+/// no reconstruction. Defects are counted and shown in the Negative window;
+/// the command's `--repair-defects` is there for a hot pixel from a long
+/// exposure.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DevelopParams {
     pub wb: WhiteBalance,
     pub mask: MaskMode,
-    /// Defect repair. The desktop starts with it off (every photosite stays
-    /// as measured, the Negative window has the switch); the command keeps
-    /// it on until `--no-defects`, because a batch has nobody looking.
-    pub fix_defects: bool,
-    /// Nonlinear reconstruction of the last octave (`reconstruct.rs`). Off
-    /// everywhere until asked for: a pixel that passes through it is
-    /// computed, not measured. Since the baseband tensor in the separation
-    /// the linear path is within 0.3 dB of it on real pictures and above it
-    /// at the camera's own band limit; it still pays on pixel-sharp
-    /// synthetic material, so the switch stays.
-    pub reconstruct: bool,
 }
 
 impl Default for DevelopParams {
     fn default() -> Self {
         // Pixel-adaptive Dubois separation is the default; the fixed estimator
         // and the block mask stay available under Development.
-        Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois, fix_defects: false, reconstruct: false }
+        Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois }
     }
 }
 
@@ -58,11 +52,7 @@ impl DevelopParams {
     pub fn negative_params(&self, cam: Option<CameraFile>) -> NegativeParams {
         let mut p = NegativeParams { keep_separation: true, ..NegativeParams::default() };
         p.ingest.wb = self.wb;
-        p.ingest.fix_defects = self.fix_defects;
         p.separate.mask = self.mask;
-        if self.reconstruct {
-            p.separate.reconstruct = Some(Default::default());
-        }
         if let Some(c) = cam {
             p = p.with_camera_file(c);
         }
@@ -304,7 +294,6 @@ pub fn preview_planes(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         mask_max: Plane::zeros(1, 1),
         rounds: sep.rounds,
         phase: sep.phase,
-        computed: sep.computed,
     };
     Ok(PreviewPlanes { sep: sep_small, mask, scale: sh.scale() })
 }
@@ -323,7 +312,6 @@ fn preview_measured(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         mask_max: Plane::zeros(1, 1),
         rounds: 0,
         phase: mimizan_core::cfa::BayerPhase::RGGB,
-        computed: 0.0,
     };
     Ok(PreviewPlanes { sep, mask, scale: sh.scale() })
 }
@@ -812,7 +800,6 @@ fn crop_separation(sep: &Separation, src: DetailRect) -> Option<Separation> {
         mask_max: Plane::zeros(1, 1),
         rounds: sep.rounds,
         phase: sep.phase,
-        computed: sep.computed,
     })
 }
 
@@ -1794,7 +1781,6 @@ mod tests {
             mask_max: Plane::zeros(1, 1),
             rounds: 1,
             phase: mimizan_core::cfa::BayerPhase::RGGB,
-            computed: 0.0,
         };
         let wts = Weights { r: 0.2, g: 0.6, b: 0.2 };
         let o = 6u16;
@@ -1848,7 +1834,6 @@ mod tests {
             mask_max: Plane::zeros(1, 1),
             rounds: 1,
             phase: mimizan_core::cfa::BayerPhase::RGGB,
-            computed: 0.0,
         };
         let wts = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let mixed = mix(&sep, &wts);
@@ -1918,15 +1903,12 @@ mod tests {
         assert!(next.ask.y + next.ask.h <= 30);
     }
 
-    /// The desktop program starts with every pixel measured: the last
-    /// octave is reconstructed only when the switch is set.
+    /// The desktop program leaves every photosite as measured: no defect
+    /// repair, whatever the core's default says.
     #[test]
-    fn reconstruct_starts_off() {
-        let p = DevelopParams::default();
-        assert!(!p.reconstruct);
-        assert!(p.negative_params(None).separate.reconstruct.is_none());
-        let on = DevelopParams { reconstruct: true, ..p };
-        assert!(on.negative_params(None).separate.reconstruct.is_some());
+    fn the_desktop_never_repairs_defects() {
+        let p = DevelopParams::default().negative_params(None);
+        assert!(!p.ingest.repair_defects);
     }
 }
 
@@ -1952,15 +1934,8 @@ mod histogram_tests {
             *a = 0.02 * ((i % 7) as f64 - 3.0);
             *b = 0.01 * ((i % 5) as f64 - 2.0);
         }
-        let sep = Separation {
-            lum,
-            c1,
-            c2,
-            mask_max: Plane::zeros(1, 1),
-            rounds: 1,
-            phase: BayerPhase::RGGB,
-            computed: 0.0,
-        };
+        let sep =
+            Separation { lum, c1, c2, mask_max: Plane::zeros(1, 1), rounds: 1, phase: BayerPhase::RGGB };
         let wts = Weights { r: 0.3, g: 0.5, b: 0.2 };
         let look = LookFile::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2005,7 +1980,6 @@ mod histogram_tests {
             mask_max: Plane::zeros(1, 1),
             rounds: 1,
             phase: BayerPhase::RGGB,
-            computed: 0.0,
         }
     }
 
@@ -2077,7 +2051,6 @@ mod histogram_tests {
             mask_max: Plane::zeros(5, 4),
             rounds: 0,
             phase: BayerPhase::RGGB,
-            computed: 0.0,
         };
         let w = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let tone = Tone::paper().compile();
@@ -2118,7 +2091,6 @@ mod histogram_tests {
         let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         assert!(neg.separation.is_none());
-        assert!(!neg.info.reconstruct);
         let preview = preview_planes(&neg).unwrap();
         assert_eq!(preview.sep.lum.data, neg.plane.data);
         assert!(preview.sep.c1.data.iter().all(|&v| v == 0.0));

@@ -58,8 +58,11 @@ pub struct IngestParams {
     pub sat_dilate: usize,
     /// A sample this many sigma outside its same-colour neighbours is a defect.
     pub defect_sigma: f64,
-    /// Run the defect repair at all.
-    pub fix_defects: bool,
+    /// Replace the defects by their neighbours' median. Off by default:
+    /// every photosite stays as measured and the report only counts them.
+    /// On for a hot pixel from a long exposure or an old sensor without its
+    /// own pixel map.
+    pub repair_defects: bool,
     /// Noise model in normalised raw units, before balance.
     pub noise: NoiseModel,
     pub wb: WhiteBalance,
@@ -71,7 +74,7 @@ impl Default for IngestParams {
             sat_margin: 0.02,
             sat_dilate: 2,
             defect_sigma: 8.0,
-            fix_defects: true,
+            repair_defects: false,
             noise: NoiseModel::default(),
             wb: WhiteBalance::AsShot,
         }
@@ -98,8 +101,13 @@ pub struct IngestReport {
     pub saturated_raw: usize,
     /// Photosites inside the dilated saturation mask.
     pub saturated_dilated: usize,
-    /// Photosites the defect repair replaced.
+    /// Photosites the defect rule flags: more than `defect_sigma` sigma
+    /// outside the range of their same-colour neighbours. Counted always;
+    /// replaced only when `defects_repaired`.
     pub defects: usize,
+    /// Whether those photosites were replaced by the neighbour median
+    /// (`IngestParams::repair_defects`) or left as measured.
+    pub defects_repaired: bool,
     /// Rows (crop-relative) with more than eight defects and more than 50
     /// times the mean row count.
     pub defect_hot_rows: Vec<usize>,
@@ -332,8 +340,7 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
 
     let (saturated, sat_dilated_count) = dilate_counted(&sat_raw, w, h, p.sat_dilate);
     let step = if phase.is_some() { 2usize } else { 1usize };
-    let (plane_data, defects, hot_rows) =
-        if p.fix_defects { repair_defects(&norm, &saturated, w, h, step, p) } else { (norm, 0, Vec::new()) };
+    let (plane_data, defects, hot_rows) = scan_defects(norm, &saturated, w, h, step, p);
 
     let (min_norm, max_norm) = plane_data
         .par_iter()
@@ -377,6 +384,7 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             saturated_raw: sat_raw_count,
             saturated_dilated: sat_dilated_count,
             defects,
+            defects_repaired: p.repair_defects,
             defect_hot_rows: hot_rows,
             min_norm,
             max_norm,
@@ -439,26 +447,29 @@ fn median_of(v: &mut [f64]) -> f64 {
 }
 
 /// Same-phase neighbour median test: a sample far outside the range of its
-/// eight same-colour neighbours is replaced by their median.
-fn repair_defects(
-    src: &[f64],
+/// eight same-colour neighbours is a defect. Every defect is counted; with
+/// `p.repair_defects` it is also replaced by the neighbour median,
+/// otherwise the plane comes back as it went in. The medians are formed
+/// from the measured neighbours in either case. Returns the plane, the
+/// defect count and the hot rows.
+fn scan_defects(
+    mut data: Vec<f64>,
     saturated: &[u8],
     w: usize,
     h: usize,
     step: usize,
     p: &IngestParams,
 ) -> (Vec<f64>, usize, Vec<usize>) {
-    let mut out = vec![0.0f64; w * h];
-    let row_counts: Vec<usize> = out
-        .par_chunks_mut(w)
-        .enumerate()
-        .map(|(y, row)| {
-            let mut count = 0usize;
+    // Pass 1, read-only and parallel: the defects of every row as
+    // `(x, median)`. Defects are rare, so the lists are short.
+    let found: Vec<Vec<(usize, f64)>> = (0..h)
+        .into_par_iter()
+        .map(|y| {
+            let mut row_defects = Vec::new();
             let mut buf = [0.0f64; 8];
             for x in 0..w {
-                let v = src[y * w + x];
+                let v = data[y * w + x];
                 if saturated[y * w + x] != 0 {
-                    row[x] = v;
                     continue;
                 }
                 let mut n = 0usize;
@@ -476,12 +487,11 @@ fn repair_defects(
                         if saturated[ni] != 0 {
                             continue;
                         }
-                        buf[n] = src[ni];
+                        buf[n] = data[ni];
                         n += 1;
                     }
                 }
                 if n < 3 {
-                    row[x] = v;
                     continue;
                 }
                 let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -497,20 +507,27 @@ fn repair_defects(
                 if excursion <= 0.0 {
                     // Inside the range: can never exceed a non-negative threshold,
                     // and the median (a sort per pixel) is not needed.
-                    row[x] = v;
                     continue;
                 }
                 let med = median_of(&mut buf[..n]);
                 if excursion > (p.defect_sigma * p.noise.sigma(med)).max(hi - lo) {
-                    row[x] = med;
-                    count += 1;
-                } else {
-                    row[x] = v;
+                    row_defects.push((x, med));
                 }
             }
-            count
+            row_defects
         })
         .collect();
+
+    // Pass 2, only when asked: write the medians.
+    if p.repair_defects {
+        for (y, row) in found.iter().enumerate() {
+            for &(x, med) in row {
+                data[y * w + x] = med;
+            }
+        }
+    }
+
+    let row_counts: Vec<usize> = found.iter().map(Vec::len).collect();
     let total: usize = row_counts.iter().sum();
     let mean = total as f64 / h.max(1) as f64;
     let hot: Vec<usize> = if total > 0 {
@@ -523,7 +540,7 @@ fn repair_defects(
     } else {
         Vec::new()
     };
-    (out, total, hot)
+    (data, total, hot)
 }
 
 #[cfg(test)]
@@ -607,7 +624,7 @@ mod tests {
         let mut raw = vec![0u16; w * h];
         raw[w + 1] = 500;
         let frame = |kind| frame(w, h, kind, 1000.0, Rect { x: 1, y: 1, w: 5, h: 5 }, raw.clone());
-        let p = IngestParams { fix_defects: false, ..IngestParams::default() };
+        let p = IngestParams::default();
         let mono = ingest(&frame(SensorKind::Mono), &p).unwrap();
         assert_eq!((mono.plane.width, mono.plane.height), (5, 5));
         assert!((mono.plane.at(0, 0) - 0.5).abs() < 1e-12);
@@ -616,15 +633,40 @@ mod tests {
         assert!(bayer.plane.at(0, 0).abs() < 1e-12);
     }
 
+    /// A hot pixel is counted whether or not it is repaired; the plane is
+    /// touched only when the repair is asked for.
     #[test]
-    fn hot_pixel_is_repaired() {
+    fn hot_pixel_is_counted_and_repaired_only_on_request() {
         let (w, h) = (9, 9);
         let mut v = vec![0.2f64; w * h];
         v[4 * w + 4] = 0.9;
         let sat = vec![0u8; w * h];
         let p = IngestParams::default();
-        let (out, n, _) = repair_defects(&v, &sat, w, h, 2, &p);
+        assert!(!p.repair_defects);
+        let (out, n, _) = scan_defects(v.clone(), &sat, w, h, 2, &p);
+        assert_eq!(n, 1);
+        assert_eq!(out, v, "without repair the plane is returned as measured");
+        let p = IngestParams { repair_defects: true, ..p };
+        let (out, n, _) = scan_defects(v, &sat, w, h, 2, &p);
         assert_eq!(n, 1);
         assert!((out[4 * w + 4] - 0.2).abs() < 1e-12);
+    }
+
+    /// The report says what happened to the defects it counted.
+    #[test]
+    fn the_report_records_whether_defects_were_repaired() {
+        let (w, h) = (8usize, 8usize);
+        let mut raw = vec![200u16; w * h];
+        raw[4 * w + 4] = 900;
+        let full = Rect { x: 0, y: 0, w, h };
+        let f = frame(w, h, SensorKind::Mono, 1000.0, full, raw);
+        let left = ingest(&f, &IngestParams::default()).unwrap();
+        assert_eq!(left.report.defects, 1);
+        assert!(!left.report.defects_repaired);
+        assert!((left.plane.at(4, 4) - 0.9).abs() < 1e-12);
+        let fixed = ingest(&f, &IngestParams { repair_defects: true, ..IngestParams::default() }).unwrap();
+        assert_eq!(fixed.report.defects, 1);
+        assert!(fixed.report.defects_repaired);
+        assert!((fixed.plane.at(4, 4) - 0.2).abs() < 1e-12);
     }
 }

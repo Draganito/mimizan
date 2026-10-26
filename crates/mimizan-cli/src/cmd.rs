@@ -31,8 +31,7 @@ pub struct NegativeArgs {
     pub wb: String,
     pub cutoff: f64,
     pub rounds: usize,
-    pub reconstruct: bool,
-    pub fix_defects: bool,
+    pub repair_defects: bool,
     pub preview: Option<PathBuf>,
     pub preview_scale: usize,
     pub crop: Option<String>,
@@ -147,15 +146,12 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     info!("decode {} ms", decode_ms);
 
     let mut params = NegativeParams::default();
-    params.ingest.fix_defects = a.fix_defects;
+    params.ingest.repair_defects = a.repair_defects;
     params.ingest.wb = parse_wb(&a.wb)?;
     params.separate.mask = parse_mask(&a.mask)?;
     params.separate.cutoff = a.cutoff;
     params.separate.rounds_max = a.rounds;
     warn_inert_flags(&params.separate, a.cutoff, a.rounds);
-    if a.reconstruct {
-        params.separate.reconstruct = Some(Default::default());
-    }
 
     let cam_path = match &a.camera {
         Some(p) => Some(p.clone()),
@@ -210,9 +206,6 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
             pi.space.name()
         );
     }
-    if neg.info.reconstruct {
-        info!("reconstruct on: {:.1} % of the picture computed, not measured", 100.0 * neg.info.computed);
-    }
     let desc = serde_json::to_string(&neg.info)?;
     let t = Instant::now();
     write_gray16(
@@ -237,11 +230,11 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         info!("preview {}", p.display());
     }
     let pixels = neg.plane.data.len().max(1) as f64;
-    if neg.info.report.defects as f64 > 0.001 * pixels {
-        warn!(
-            "defect rate {:.3} % is high; check the noise model",
-            100.0 * neg.info.report.defects as f64 / pixels
-        );
+    let defects = neg.info.report.defects;
+    if defects as f64 > 0.001 * pixels {
+        warn!("defect rate {:.3} % is high; check the noise model", 100.0 * defects as f64 / pixels);
+    } else if defects > 0 && !neg.info.report.defects_repaired {
+        info!("{defects} defective photosite(s) left as measured (--repair-defects replaces them)");
     }
     info!("total {} ms", t_all.elapsed().as_millis());
     Ok(())
@@ -493,14 +486,14 @@ pub fn info(raw: &Path, as_json: bool) -> Result<()> {
 pub fn dump(
     raw: &Path,
     out: &Path,
-    fix_defects: bool,
+    repair_defects: bool,
     preview: Option<&Path>,
     preview_scale: usize,
 ) -> Result<()> {
     let t = Instant::now();
     let frame = RawlerDecoder.decode(raw).with_context(|| format!("decoding {}", raw.display()))?;
     info!("decoded in {} ms", t.elapsed().as_millis());
-    let params = IngestParams { fix_defects, ..IngestParams::default() };
+    let params = IngestParams { repair_defects, ..IngestParams::default() };
     let t = Instant::now();
     let mosaic = ingest(&frame, &params)?;
     info!("ingest in {} ms: {}", t.elapsed().as_millis(), serde_json::to_string(&mosaic.report)?);

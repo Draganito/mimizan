@@ -258,7 +258,6 @@ mod tests {
             mask_max: one(0.5),
             rounds: 1,
             phase: crate::cfa::BayerPhase::RGGB,
-            computed: 0.0,
         };
         let red = mix(&sep, &Weights { r: 1.0, g: 0.0, b: 0.0 });
         assert!((red.at(0, 0) - r).abs() < 1e-12);
@@ -333,7 +332,6 @@ mod tests {
                 mask_max: one(0.5),
                 rounds: 1,
                 phase: crate::cfa::BayerPhase::RGGB,
-                computed: 0.0,
             };
             mix(&sep, &bal_w).at(0, 0)
         };

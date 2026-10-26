@@ -89,11 +89,6 @@ pub struct NegativeInfo {
     /// Chroma cutoff of the Kaiser low-pass. The `dubois` mask has its own
     /// bands and does not read it; the value is recorded as configured.
     pub cutoff: f64,
-    /// Nonlinear reconstruction was enabled (`reconstruct.rs`).
-    pub reconstruct: bool,
-    /// Mean β of that reconstruction: fraction of the picture that was
-    /// computed from a direction decision instead of filtered. 0 when off.
-    pub computed: f64,
     pub report: IngestReport,
     pub timing: Timing,
     /// Present when the file is a three-colour plate (`plate.rs`): frame
@@ -172,8 +167,6 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         mask: p.separate.mask,
         rounds: 0,
         cutoff: p.separate.cutoff,
-        reconstruct: p.separate.reconstruct.is_some(),
-        computed: 0.0,
         report: mosaic.report.clone(),
         timing: Timing { decode_ms, ingest_ms, separate_ms: 0, mix_ms: 0 },
         plate: None,
@@ -210,11 +203,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             let sep = separate(&mosaic, &p.separate)?;
             info.timing.separate_ms = t.elapsed().as_millis();
             info.rounds = sep.rounds;
-            info.computed = sep.computed;
             info!("separate {} ms, {} rounds", info.timing.separate_ms, sep.rounds);
-            if info.reconstruct {
-                info!("reconstruct: {:.1} % of the picture computed", 100.0 * sep.computed);
-            }
             // The mosaic plane is no longer needed: free it before mixing.
             let Mosaic { saturated, plane: mosaic_plane, .. } = mosaic;
             drop(mosaic_plane);
@@ -234,10 +223,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         }
         None => {
             let Mosaic { saturated, plane, .. } = mosaic;
-            // The measurement is the picture. Reconstruction and the colour
-            // mask were not run, so the record must not say they were.
-            info.reconstruct = false;
-            info.computed = 0.0;
+            // The measurement is the picture; the colour mask was not run.
             // No carriers on a mono sensor: sharpening allowed except at saturation.
             let allowed = (crate::separate::FIXED_MASK_VALUE * 255.0).round() as u8;
             let mask8 = saturated.iter().map(|&s| if s != 0 { 255 } else { allowed }).collect();

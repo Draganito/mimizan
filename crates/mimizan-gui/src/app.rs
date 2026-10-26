@@ -416,8 +416,6 @@ pub struct App {
     wb_choice: WbChoice,
     wb_manual: [f64; 3],
     mask_mode: MaskMode,
-    fix_defects: bool,
-    reconstruct: bool,
     /// The plate's taking filters for the current edit, or why there are none.
     plate_resolved: Option<PlateResolved>,
 
@@ -583,8 +581,6 @@ impl App {
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
             mask_mode: DevelopParams::default().mask,
-            fix_defects: DevelopParams::default().fix_defects,
-            reconstruct: DevelopParams::default().reconstruct,
             plate_resolved: None,
             show_mask: false,
             texture: None,
@@ -907,12 +903,7 @@ impl App {
             WbChoice::None => WhiteBalance::None,
             WbChoice::Manual => WhiteBalance::Manual(self.wb_manual),
         };
-        DevelopParams {
-            wb,
-            mask: self.mask_mode,
-            fix_defects: self.fix_defects,
-            reconstruct: self.reconstruct,
-        }
+        DevelopParams { wb, mask: self.mask_mode }
     }
 
     fn view_params(&self) -> ViewParams {
@@ -2120,11 +2111,14 @@ impl App {
             val(ui, info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "monochrome".into()));
             ui.end_row();
             ui.label("orientation");
-            val(ui, if self.rotation() == 0 {
-                format!("{}", n.orientation)
-            } else {
-                format!("{} + {}° cw", n.orientation, 90 * self.rotation() as u16)
-            });
+            val(
+                ui,
+                if self.rotation() == 0 {
+                    format!("{}", n.orientation)
+                } else {
+                    format!("{} + {}° cw", n.orientation, 90 * self.rotation() as u16)
+                },
+            );
             ui.end_row();
             ui.label("balance");
             val(ui, format!("R {:.3}  B {:.3} ({})", info.wb[0], info.wb[2], info.report.wb_source));
@@ -2138,19 +2132,29 @@ impl App {
             ui.end_row();
             let px = n.plane.data.len() as f64;
             ui.label("saturated");
-            val(ui, format!(
-                "{:.2} % ({:.2} % dilated)",
-                100.0 * info.report.saturated_raw as f64 / px,
-                100.0 * info.report.saturated_dilated as f64 / px
-            ));
+            val(
+                ui,
+                format!(
+                    "{:.2} % ({:.2} % dilated)",
+                    100.0 * info.report.saturated_raw as f64 / px,
+                    100.0 * info.report.saturated_dilated as f64 / px
+                ),
+            );
             ui.end_row();
             ui.label("defects");
-            val(ui, format!("{} ({:.3} %)", info.report.defects, 100.0 * info.report.defects as f64 / px));
+            val(ui, format!("{} ({:.3} %)", info.report.defects, 100.0 * info.report.defects as f64 / px))
+                .on_hover_text(
+                    "Photosites more than eight sigma outside the range of their same-colour neighbours. \
+                     Counted, not touched: every photosite stays as measured. The command's \
+                     --repair-defects replaces them for a hot pixel from a long exposure.",
+                );
             ui.end_row();
             ui.label("camera file");
             match &s.camera_file_path {
-                Some(p) => val(ui, p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
-                    .on_hover_text(p.display().to_string()),
+                Some(p) => {
+                    val(ui, p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default())
+                        .on_hover_text(p.display().to_string())
+                }
                 None => val(ui, RichText::new("none (defaults)").weak()),
             };
             ui.end_row();
@@ -2162,33 +2166,30 @@ impl App {
                 val(ui, format!("{:?}, {} round(s)", info.mask, info.rounds));
             }
             ui.end_row();
-            if info.reconstruct {
-                ui.label("reconstruct");
-                val(ui,
-                    RichText::new(format!("on: {:.1} % of the picture computed", 100.0 * info.computed))
-                        .color(egui::Color32::from_rgb(230, 170, 60)),
-                )
-                .on_hover_text("Mean of the per-pixel share that came from the direction decision; the sidecar mask holds it per pixel (204 = measured ... 252 = computed).");
-                ui.end_row();
-            }
             ui.label("timing");
-            val(ui, if s.is_mono() {
-                format!("decode {} · ingest {} ms", info.timing.decode_ms, info.timing.ingest_ms)
-            } else {
-                format!(
-                    "decode {} · ingest {} · separate {} ms",
-                    info.timing.decode_ms, info.timing.ingest_ms, info.timing.separate_ms
-                )
-            });
+            val(
+                ui,
+                if s.is_mono() {
+                    format!("decode {} · ingest {} ms", info.timing.decode_ms, info.timing.ingest_ms)
+                } else {
+                    format!(
+                        "decode {} · ingest {} · separate {} ms",
+                        info.timing.decode_ms, info.timing.ingest_ms, info.timing.separate_ms
+                    )
+                },
+            );
             ui.end_row();
             ui.label("preview");
-            val(ui, format!(
-                "{} x {} ({:.1} %), {} ms",
-                self.tex_size[0],
-                self.tex_size[1],
-                100.0 * s.preview.scale,
-                self.preview_ms
-            ));
+            val(
+                ui,
+                format!(
+                    "{} x {} ({:.1} %), {} ms",
+                    self.tex_size[0],
+                    self.tex_size[1],
+                    100.0 * s.preview.scale,
+                    self.preview_ms
+                ),
+            );
             ui.end_row();
         });
 
@@ -2196,64 +2197,48 @@ impl App {
         ui.separator();
         self.histogram_section(ui);
         ui.collapsing("Development", |ui| {
-            ui.label(RichText::new("Changes here recompute the picture.").weak());
             if s.is_mono() {
                 ui.label(
                     RichText::new(
-                        "This sensor records luminance only. White balance, the mask and \
-                         reconstruction do not apply.",
+                        "This sensor records luminance only: the file is the measurement, there is \
+                         nothing to develop. White balance and the mask do not apply.",
                     )
                     .weak(),
                 );
-            } else {
-                ui.label(RichText::new("Separation, no demosaic.").weak());
+                return;
             }
-            if !s.is_mono() {
-                egui::ComboBox::from_label("white balance")
-                    .selected_text(match self.wb_choice {
-                        WbChoice::AsShot => "as shot",
-                        WbChoice::GrayWorld => "gray world",
-                        WbChoice::None => "none",
-                        WbChoice::Manual => "manual",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
-                    });
-                if self.wb_choice == WbChoice::Manual {
-                    ui.horizontal(|ui| {
-                        ui.label("R");
-                        ui.add(egui::DragValue::new(&mut self.wb_manual[0]).range(0.1..=8.0).speed(0.01));
-                        ui.label("B");
-                        ui.add(egui::DragValue::new(&mut self.wb_manual[2]).range(0.1..=8.0).speed(0.01));
-                    });
-                    self.wb_manual[1] = 1.0;
-                }
-                egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
-                    ui,
-                    |ui| {
-                        ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
-                        ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
-                        ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
-                    },
-                );
-                ui.checkbox(&mut self.reconstruct, "reconstruct the last octave");
-                if self.reconstruct {
-                    ui.label(
-                        RichText::new(
-                            "Missing pixels are computed, not measured: where luminance and colour \
-                         overlap at the pixel grid, a per-pixel direction decision replaces the \
-                         linear filter. Sharper fine detail, but no longer a fixed-weight sum of \
-                         measured values. The sidecar records where.",
-                        )
-                        .small()
-                        .color(egui::Color32::from_rgb(230, 170, 60)),
-                    );
-                }
+            ui.label(RichText::new("Changes here recompute the picture.").weak());
+            ui.label(RichText::new("Separation, no demosaic.").weak());
+            egui::ComboBox::from_label("white balance")
+                .selected_text(match self.wb_choice {
+                    WbChoice::AsShot => "as shot",
+                    WbChoice::GrayWorld => "gray world",
+                    WbChoice::None => "none",
+                    WbChoice::Manual => "manual",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
+                    ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
+                    ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
+                    ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
+                });
+            if self.wb_choice == WbChoice::Manual {
+                ui.horizontal(|ui| {
+                    ui.label("R");
+                    ui.add(egui::DragValue::new(&mut self.wb_manual[0]).range(0.1..=8.0).speed(0.01));
+                    ui.label("B");
+                    ui.add(egui::DragValue::new(&mut self.wb_manual[2]).range(0.1..=8.0).speed(0.01));
+                });
+                self.wb_manual[1] = 1.0;
             }
-            ui.checkbox(&mut self.fix_defects, "repair defects");
+            egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
+                ui,
+                |ui| {
+                    ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
+                    ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
+                    ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
+                },
+            );
             let differs = self.develop_params() != s.develop;
             if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
                 self.busy = Some("re-developing".into());

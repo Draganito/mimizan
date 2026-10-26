@@ -116,10 +116,6 @@ struct ImageResult {
     mimizan_block: Quality,
     /// Default pipeline (`--mask dubois`).
     mimizan: Quality,
-    /// Default pipeline plus the optional nonlinear step (`--reconstruct`).
-    mimizan_reconstruct: Quality,
-    /// Mean β of that step: share of the picture it computed.
-    computed: f64,
     /// Index into `METHODS` of the best external result on this picture.
     best: Option<usize>,
     crop: (usize, usize),
@@ -290,7 +286,6 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
     let fixed = SeparateParams { mask: MaskMode::Off, ..SeparateParams::default() };
     let block = SeparateParams { mask: MaskMode::Adaptive, ..SeparateParams::default() };
     let default = SeparateParams::default();
-    let reconstruct = SeparateParams { reconstruct: Some(Default::default()), ..SeparateParams::default() };
     let mut images = Vec::new();
 
     for file in &files {
@@ -320,14 +315,9 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
         let mim_fixed = mix(&separate(&fb.mosaic, &fixed)?, &native);
         let mim_block = mix(&separate(&fb.mosaic, &block)?, &native);
         let mim = mix(&separate(&fb.mosaic, &default)?, &native);
-        let sep_rec = separate(&fb.mosaic, &reconstruct)?;
-        let computed = sep_rec.computed;
-        let mim_rec = mix(&sep_rec, &native);
-        drop(sep_rec);
         let q_fixed = kodak::quality(&mim_fixed, &truth, a.border);
         let q_block = kodak::quality(&mim_block, &truth, a.border);
         let q_mim = kodak::quality(&mim, &truth, a.border);
-        let q_rec = kodak::quality(&mim_rec, &truth, a.border);
 
         let mut demosaic: Vec<Option<Quality>> = Vec::new();
         let mut best: Option<(usize, f64, Plane)> = None;
@@ -399,13 +389,11 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
             })
             .collect();
         eprintln!(
-            "{stem}: {} | Mimizan {:.2} (fixed {:.2}, block mask {:.2}) | + reconstruct {:.2} ({:.1} % computed)",
+            "{stem}: {} | Mimizan {:.2} (fixed {:.2}, block mask {:.2})",
             line.join(" | "),
             q_mim.psnr_db,
             q_fixed.psnr_db,
-            q_block.psnr_db,
-            q_rec.psnr_db,
-            100.0 * computed
+            q_block.psnr_db
         );
 
         images.push(ImageResult {
@@ -416,8 +404,6 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
             mimizan_fixed: q_fixed,
             mimizan_block: q_block,
             mimizan: q_mim,
-            mimizan_reconstruct: q_rec,
-            computed,
             best: best_idx,
             crop: (cx, cy),
             strip: strip_name,
@@ -565,10 +551,10 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
     // PSNR table
     s.push_str("## PSNR (dB, luminance)\n\n");
     s.push_str(&format!(
-        "| Picture | {} | Mimizan fixed | Mimizan block mask | Mimizan | Mimizan + reconstruct | computed |\n",
+        "| Picture | {} | Mimizan fixed | Mimizan block mask | Mimizan |\n",
         header_methods.join(" | ")
     ));
-    s.push_str(&format!("|---|{}---|---|---|---|---|\n", "---|".repeat(METHODS.len())));
+    s.push_str(&format!("|---|{}---|---|---|\n", "---|".repeat(METHODS.len())));
     for im in &r.images {
         let cols: Vec<String> = im.demosaic.iter().map(|q| fmt(q.map(|q| q.psnr_db), 2)).collect();
         let best_ext = im.best.and_then(|i| im.demosaic[i].map(|q| q.psnr_db));
@@ -580,72 +566,62 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
             }
         };
         s.push_str(&format!(
-            "| {} | {} | {:.2} | {:.2} | {} | {} | {:.1} % |\n",
+            "| {} | {} | {:.2} | {:.2} | {} |\n",
             im.stem,
             cols.join(" | "),
             im.mimizan_fixed.psnr_db,
             im.mimizan_block.psnr_db,
-            bold(im.mimizan.psnr_db),
-            bold(im.mimizan_reconstruct.psnr_db),
-            100.0 * im.computed
+            bold(im.mimizan.psnr_db)
         ));
     }
     let means: Vec<String> = (0..METHODS.len())
         .map(|i| fmt(mean(r.images.iter().filter_map(|im| im.demosaic[i].map(|q| q.psnr_db))), 2))
         .collect();
     s.push_str(&format!(
-        "| **mean ({n})** | {} | {:.2} | {:.2} | **{:.2}** | **{:.2}** | {:.1} % |\n\n",
+        "| **mean ({n})** | {} | {:.2} | {:.2} | **{:.2}** |\n\n",
         means.iter().map(|m| format!("**{m}**")).collect::<Vec<_>>().join(" | "),
         mean(r.images.iter().map(|im| im.mimizan_fixed.psnr_db)).unwrap_or(f64::NAN),
         mean(r.images.iter().map(|im| im.mimizan_block.psnr_db)).unwrap_or(f64::NAN),
-        mean(r.images.iter().map(|im| im.mimizan.psnr_db)).unwrap_or(f64::NAN),
-        mean(r.images.iter().map(|im| im.mimizan_reconstruct.psnr_db)).unwrap_or(f64::NAN),
-        100.0 * mean(r.images.iter().map(|im| im.computed)).unwrap_or(f64::NAN)
+        mean(r.images.iter().map(|im| im.mimizan.psnr_db)).unwrap_or(f64::NAN)
     ));
     let reference = if only_bilinear(r) {
         "the bilinear baseline (no external converter ran)"
     } else {
         "the best external demosaicer"
     };
-    s.push_str(&format!(
-        "Bold in the two Mimizan columns: at least as good as {reference} on that picture. \
-         \"computed\" is the share of the picture the reconstruction step took over (mean β).\n\n"
-    ));
+    s.push_str(&format!("Bold in the Mimizan column: at least as good as {reference} on that picture.\n\n"));
 
     // SSIM table
     s.push_str("## SSIM (luminance)\n\n");
     s.push_str(&format!(
-        "| Picture | {} | Mimizan fixed | Mimizan block mask | Mimizan | Mimizan + reconstruct |\n",
+        "| Picture | {} | Mimizan fixed | Mimizan block mask | Mimizan |\n",
         header_methods.join(" | ")
     ));
-    s.push_str(&format!("|---|{}---|---|---|---|\n", "---|".repeat(METHODS.len())));
+    s.push_str(&format!("|---|{}---|---|---|\n", "---|".repeat(METHODS.len())));
     for im in &r.images {
         let cols: Vec<String> = im.demosaic.iter().map(|q| fmt(q.map(|q| q.ssim), 4)).collect();
         s.push_str(&format!(
-            "| {} | {} | {:.4} | {:.4} | {:.4} | {:.4} |\n",
+            "| {} | {} | {:.4} | {:.4} | {:.4} |\n",
             im.stem,
             cols.join(" | "),
             im.mimizan_fixed.ssim,
             im.mimizan_block.ssim,
-            im.mimizan.ssim,
-            im.mimizan_reconstruct.ssim
+            im.mimizan.ssim
         ));
     }
     let means: Vec<String> = (0..METHODS.len())
         .map(|i| fmt(mean(r.images.iter().filter_map(|im| im.demosaic[i].map(|q| q.ssim))), 4))
         .collect();
     s.push_str(&format!(
-        "| **mean ({n})** | {} | {:.4} | {:.4} | **{:.4}** | **{:.4}** |\n\n",
+        "| **mean ({n})** | {} | {:.4} | {:.4} | **{:.4}** |\n\n",
         means.iter().map(|m| format!("**{m}**")).collect::<Vec<_>>().join(" | "),
         mean(r.images.iter().map(|im| im.mimizan_fixed.ssim)).unwrap_or(f64::NAN),
         mean(r.images.iter().map(|im| im.mimizan_block.ssim)).unwrap_or(f64::NAN),
-        mean(r.images.iter().map(|im| im.mimizan.ssim)).unwrap_or(f64::NAN),
-        mean(r.images.iter().map(|im| im.mimizan_reconstruct.ssim)).unwrap_or(f64::NAN)
+        mean(r.images.iter().map(|im| im.mimizan.ssim)).unwrap_or(f64::NAN)
     ));
 
     // Wins
     let mut wins = 0;
-    let mut wins_rec = 0;
     let mut compared = 0;
     for im in &r.images {
         if let Some(b) = im.best.and_then(|i| im.demosaic[i]) {
@@ -653,24 +629,18 @@ fn markdown(r: &Report, strips_rel: &Path) -> String {
             if im.mimizan.psnr_db >= b.psnr_db {
                 wins += 1;
             }
-            if im.mimizan_reconstruct.psnr_db >= b.psnr_db {
-                wins_rec += 1;
-            }
         }
     }
     if compared > 0 {
         s.push_str(&format!(
-            "Mimizan is at or above {reference} on {wins} of {compared} pictures (PSNR); \
-             with the reconstruction step on {wins_rec} of {compared}. \
+            "Mimizan is at or above {reference} on {wins} of {compared} pictures (PSNR). \
              \"Mimizan\" is the default pipeline (`--mask dubois`: pixel-adaptive weighting of the two C2 copies \
              and of two direction-dependent C1 bands, elongated pass bands). \"Mimizan fixed\" is the same \
              separation with square 0.15 c/px bands and the two C2 copies averaged (`--mask off`); \
              \"Mimizan block mask\" is the fixed separation with the 64 px block-spectrum mask (`--mask adaptive`). \
              The differences between the three columns are what the adaptive steps contribute. \
-             \"Mimizan + reconstruct\" is the default pipeline with the optional nonlinear step (`--reconstruct`, \
-             off by default): where the linear luminance still carries energy near the carriers, a per-pixel \
-             direction decision on the colour differences replaces the filter output. Those pixels are computed, \
-             not measured; the \"computed\" column says how many.\n\n"
+             Every Mimizan pixel is a fixed-weight sum of measured values; nothing is computed from a model \
+             of the picture.\n\n"
         ));
     }
 

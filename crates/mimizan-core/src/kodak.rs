@@ -112,6 +112,7 @@ pub fn mosaic_rgb(rgb: &Rgb, phase: BayerPhase, noise: NoiseModel, name: &str) -
             saturated_raw: 0,
             saturated_dilated: 0,
             defects: 0,
+            defects_repaired: false,
             defect_hot_rows: vec![],
             min_norm: 0.0,
             max_norm: 1.0,

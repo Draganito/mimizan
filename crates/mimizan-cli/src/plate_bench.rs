@@ -61,8 +61,6 @@ struct ImageResult {
     demosaic: Vec<Option<ColourQuality>>,
     /// The plate, default separation.
     plate: ColourQuality,
-    /// The plate with `--reconstruct`.
-    plate_reconstruct: ColourQuality,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -118,7 +116,7 @@ fn markdown(r: &Report) -> String {
         (c, rr, g, b)
     };
     // Leads: per picture, which method has the highest CPSNR.
-    let mut leads = vec![0usize; r.methods.len() + 2];
+    let mut leads = vec![0usize; r.methods.len() + 1];
     for img in &r.images {
         let mut best = (f64::NEG_INFINITY, 0usize);
         for (k, q) in img.demosaic.iter().enumerate() {
@@ -131,9 +129,6 @@ fn markdown(r: &Report) -> String {
         if img.plate.cpsnr_db > best.0 {
             best = (img.plate.cpsnr_db, r.methods.len());
         }
-        if img.plate_reconstruct.cpsnr_db > best.0 {
-            best = (img.plate_reconstruct.cpsnr_db, r.methods.len() + 1);
-        }
         leads[best.1] += 1;
     }
     for (k, name) in r.methods.iter().enumerate() {
@@ -143,9 +138,7 @@ fn markdown(r: &Report) -> String {
         }
     }
     let (c, rr, g, b) = pick(&|i: &ImageResult| Some(i.plate));
-    rows.push(("**Mimizan plate** (linear)".into(), c, rr, g, b, leads[r.methods.len()]));
-    let (c, rr, g, b) = pick(&|i: &ImageResult| Some(i.plate_reconstruct));
-    rows.push(("**Mimizan plate** + reconstruct".into(), c, rr, g, b, leads[r.methods.len() + 1]));
+    rows.push(("**Mimizan plate**".into(), c, rr, g, b, leads[r.methods.len()]));
     rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     s.push_str("| Method | CPSNR | R | G | B | leads |\n|---|---|---|---|---|---|\n");
     for (name, c, rr, g, b, l) in &rows {
@@ -163,8 +156,8 @@ fn markdown(r: &Report) -> String {
     for &k in &present {
         s.push_str(&format!(" {} |", r.methods[k]));
     }
-    s.push_str(" plate | plate+rec |\n|---|");
-    for _ in 0..present.len() + 2 {
+    s.push_str(" plate |\n|---|");
+    for _ in 0..present.len() + 1 {
         s.push_str("---|");
     }
     s.push('\n');
@@ -173,7 +166,7 @@ fn markdown(r: &Report) -> String {
         for &k in &present {
             s.push_str(&format!(" {} |", fmt(img.demosaic[k].map(|q| q.cpsnr_db))));
         }
-        s.push_str(&format!(" {:.2} | {:.2} |\n", img.plate.cpsnr_db, img.plate_reconstruct.cpsnr_db));
+        s.push_str(&format!(" {:.2} |\n", img.plate.cpsnr_db));
     }
     s
 }
@@ -223,7 +216,6 @@ pub fn plate_bench(a: &PlateBenchArgs) -> Result<()> {
     }
 
     let default = SeparateParams::default();
-    let reconstruct = SeparateParams { reconstruct: Some(Default::default()), ..SeparateParams::default() };
     let mut images = Vec::new();
     for file in &files {
         let stem = stem_of(file)?;
@@ -264,13 +256,12 @@ pub fn plate_bench(a: &PlateBenchArgs) -> Result<()> {
             }
         }
         let plate = colour_quality(&plate_rgb(&fb.mosaic, &default)?, &rgb, a.border);
-        let plate_reconstruct = colour_quality(&plate_rgb(&fb.mosaic, &reconstruct)?, &rgb, a.border);
         let best_ext = demosaic.iter().flatten().map(|q| q.cpsnr_db).fold(f64::NEG_INFINITY, f64::max);
         eprintln!(
-            "{stem}: plate {:.2} dB (R {:.2} G {:.2} B {:.2}), +reconstruct {:.2} dB, best demosaicer {:.2} dB",
-            plate.cpsnr_db, plate.psnr_r_db, plate.psnr_g_db, plate.psnr_b_db, plate_reconstruct.cpsnr_db, best_ext
+            "{stem}: plate {:.2} dB (R {:.2} G {:.2} B {:.2}), best demosaicer {:.2} dB",
+            plate.cpsnr_db, plate.psnr_r_db, plate.psnr_g_db, plate.psnr_b_db, best_ext
         );
-        images.push(ImageResult { stem, width: w, height: h, demosaic, plate, plate_reconstruct });
+        images.push(ImageResult { stem, width: w, height: h, demosaic, plate });
     }
 
     let report = Report {

@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.14.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.15.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
@@ -28,9 +28,10 @@ to decide it.
 The weighting of the three colour responses (the "mix" — panchromatic,
 filter emulation, or a fitted copy of a monochrome sensor) is applied after
 separation and is band-limited, so resolution and grain are those of the
-luminance estimate for every mix. An optional nonlinear step reconstructs
-the last octave where luminance provably overlaps the carriers, and records
-per pixel how much of the result was computed rather than measured. The
+luminance estimate for every mix. Every output pixel is a fixed-weight
+sum of measured photosites; since 0.15 the pipeline has no computed pixel
+anywhere (the nonlinear last-octave step of 0.11–0.14 is described in §5
+and measured in §8.3 as the record of why it could go). The
 same separation, mixed three times through three taking filters and
 printed through one paper, gives a three-colour plate in Prokudin-Gorsky's
 sense: colour without demosaicing, in register by construction, with the
@@ -221,7 +222,11 @@ maximum $\mathrm{hi}$. If
 
 $$ \max(v - \mathrm{hi},\ \mathrm{lo} - v) > \max\big(8\,\sigma(\mathrm{med}),\ \mathrm{hi} - \mathrm{lo}\big) $$
 
-replace $v := \mathrm{med}$. The neighbour range $\mathrm{hi} - \mathrm{lo}$
+$v$ is a defect. It is counted in the negative's description in every
+case; it is replaced by $\mathrm{med}$ only on request (`--repair-defects`;
+the desktop never does), for a hot pixel from a long exposure or a sensor
+without its own pixel map. The default leaves it as measured. The
+neighbour range $\mathrm{hi} - \mathrm{lo}$
 is a model-free noise scale (≈ 3σ for eight samples) that keeps the rule
 valid above the ISO the defaults describe. Comparing to the median alone
 would flag one pixel at every sharp edge (8 % of all photosites on the Z f
@@ -511,24 +516,27 @@ measured estimates, and where the base band is flat it is silent. Hence:
 
 ---
 
-## 5. Nonlinear reconstruction of the last octave (`--reconstruct`)
+## 5. The nonlinear last-octave step of 0.11–0.14 (removed in 0.15)
 
-The library, the command and, since 0.12, the desktop program leave this
-step off until it is asked for (`--reconstruct`, the checkbox under
-Negative). The criterion for turning it off was set before the work of
-0.12 began: the linear path had to come within 0.5 dB of what 0.11
-delivered with this step on. It came within 0.35 dB on lens-like, 0.13 dB
-at 2× and 0.31 dB on the binned Z f files, and 2 dB above it at the
-camera's own band limit (§8.3). On the new estimator the step is still
-worth 0.5–1.0 dB on the realistic conditions and costs 0.3 dB at the band
-limit; what it is decisive for is pixel-sharp synthetic material.
+This section is the record of a step the program no longer has. 0.11 ran
+it by default; 0.12 turned it off once the linear path came within
+0.35 dB of it on lens-like material, 0.13 dB at 2× and 0.31 dB on the
+binned Z f files, and 2 dB above it at the camera's own band limit (§8.3).
+On the tensor estimator it was still worth 0.5–1.0 dB on those conditions
+and cost 0.3 dB at the band limit; what it was decisive for was
+pixel-sharp synthetic material, which no camera produces. 0.15 removed
+it: a pixel that passed through it was computed from a model of the
+picture, and the one claim the method makes — every pixel a measured sum —
+held only with the switch off. The code (`reconstruct.rs`) is in the
+history of the repository up to v0.14.0; the description stays here so the
+numbers of §8.3 and §8.4 can be read.
 
 Where luminance lies near the carriers, no linear filter can separate it
 from chrominance. Demosaicers resolve this with an assumption — colour
 differences $G - R$, $G - B$ are locally smooth — and a per-pixel direction
-decision. This optional step does the same, but only where the linear
-estimate still carries energy near the carriers, and it writes per pixel
-how much of the result is computed rather than measured.
+decision. This step did the same, but only where the linear estimate
+still carried energy near the carriers, and it wrote per pixel how much
+of the result was computed rather than measured.
 
 ### 5.1 Estimator (Zhang & Wu 2005, written from the paper)
 
@@ -582,11 +590,12 @@ $$ \beta = \mathrm{clamp}\!\left( \frac{r - \mathrm{lo}}{\mathrm{hi} - \mathrm{l
 $$ \hat L := \hat L + \beta\,(L_n - \hat L), \qquad \hat C_1, \hat C_2 \text{ likewise}, \qquad
    \mathrm{mask\_max} := 0.8 + 0.19\,\beta . $$
 
-Where the linear separation was clean, only noise remains near the carriers
-($r \approx 1$) and $\beta = 0$: the pixel stays measured. The sidecar (§7.2)
-carries 204 = measured, 252 = fully computed, linear in between. The
-negative's description records `reconstruct: true` and `computed` (mean
-$\beta$).
+Where the linear separation was clean, only noise remained near the
+carriers ($r \approx 1$) and $\beta = 0$: the pixel stayed measured. The
+sidecar (§7.2) carried 204 = measured, 252 = fully computed, linear in
+between, and the description recorded `reconstruct: true` and `computed`
+(mean $\beta$). Negatives written by 0.11–0.14 with the step on still
+carry those fields; `print` does not read them.
 
 Rejected by measurement (§8.4): a detector on the difference of the two
 luminance estimates, on the local gradient, or as a scale-free share of
@@ -676,7 +685,8 @@ calibration shot and written to the camera file.
 $\mathrm{value} = \mathrm{round}(\mathrm{clamp}(\mathrm{out}, 0, 1)\cdot 65535)$.
 Embedded ICC: grey, D50, `kTRC` = gamma 1.0 (linear grey). `ImageDescription`
 holds JSON with camera, phase, balance, weights in both spaces, mask mode,
-rounds, noise parameters, `reconstruct`/`computed`, program version. The RAW
+rounds, noise parameters, defect count and whether the defects were
+repaired, program version. The RAW
 orientation is carried as the TIFF `Orientation` tag; pixels are not turned
 (source: the raw IFD; if it reports nothing turned, the EXIF orientation).
 A plate (`--plate`) is the same file three frames tall, blue, green, red
@@ -688,9 +698,11 @@ mask sidecar is one frame for all three.
 
 `<name>.mask.tif`, 8 bit. In the default path it is 204 everywhere
 (= threshold 0.8, "sharpening allowed": the carriers are suppressed by the
-low-pass in every block) and 255 at dilated saturated photosites. With
-`--reconstruct` it is $\mathrm{round}(255\,(0.8 + 0.19\,\beta))$. The print
-stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$.
+low-pass in every block) and 255 at dilated saturated photosites. The
+print stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$. (Negatives
+of 0.11–0.14 with the removed step on carry
+$\mathrm{round}(255\,(0.8 + 0.19\,\beta))$ there; the gate reads them the
+same way.)
 
 ### 7.3 Output stage (for completeness)
 
@@ -813,7 +825,10 @@ $\hat L$, demodulate, subtract the estimated leak from the copies,
 re-weight): −1 dB at 2×, none at 1×. Noise-energy subtraction in the
 weights: no effect in any condition.
 
-### 8.3 With reconstruction
+### 8.3 With the removed nonlinear step (0.11–0.14)
+
+Measured on 0.14, the last version with the step. The **linear default**
+column is what 0.15 ships.
 
 | Condition | 0.11 + reconstruct (the old default) | **linear default** | + reconstruct | computed share | best of 16 | at or above the best |
 |---|---|---|---|---|---|---|
@@ -835,9 +850,12 @@ twice the camera's sharpness the method stays below RCD even with
 $\beta = 1$ everywhere (0.11 subset: 38.52 vs 39.49): on real noise the
 estimator, not the detector, is the limit. Pixel-sharp is the one condition
 where the step is decisive, and even there LMMSE (RawTherapee), which is
-built from the same Zhang–Wu estimator, stays 1 dB ahead.
+built from the same Zhang–Wu estimator, stays 1 dB ahead. That table is
+the case for removing it: on every condition a camera can produce the
+linear path is ahead of every demosaicer or within the noise of the step,
+and the step's only clear win is on material no lens delivers.
 
-### 8.4 Design sweep for the nonlinear step (subset)
+### 8.4 Design sweep for the removed nonlinear step (subset, 0.11–0.14)
 
 | Variant | 1× | 2× | raw | soft | lens |
 |---|---|---|---|---|---|
@@ -947,15 +965,14 @@ negative, and the colour resolves to the carriers' band limit, about
 0.25 c/px, like the red layer of a tripack film.
 
 CPSNR on sRGB-encoded values, Kodak set, `bench plate`, channels filters,
-linear separation (`--reconstruct` in brackets), against the best of the
-sixteen demosaicers of §8.1: pixel-sharp 33.5 (38.3) dB against LMMSE
-39.4, 0 (1) of 24 ahead; behind a lens (σ 0.75 px) 45.0 (46.5) against
-RCD 46.2 and LMMSE 46.2, the plate with reconstruction first by the mean
-and 7 of 24 ahead; at twice the sampling 47.2 (47.5) against RCD 45.4,
-19 of 24 ahead with reconstruction and 4 without. The plate's green is
+against the best of the sixteen demosaicers of §8.1 (in brackets the
+removed step of §5, measured on 0.14): pixel-sharp 33.5 (38.3) dB against
+LMMSE 39.4, 0 (1) of 24 ahead; behind a lens (σ 0.75 px) 45.0 (46.5)
+against RCD 46.2 and LMMSE 46.2, 0 (7) of 24 ahead; at twice the sampling
+47.2 (47.5) against RCD 45.4, 4 (19) of 24 ahead. The plate's green is
 its strongest channel in every condition, 3–5 dB above its own red and
 blue, and behind a lens and at twice the sampling it is above every
-demosaicer's green (by 0.3 and 3.4 dB on the linear path): it is
+demosaicer's green (by 0.3 and 3.4 dB): it is
 `L̂ + Ĉ1'`, not interpolated; the blue is the weakest, where the camera's
 balance gain is largest. Method, file format and limits are in
 `docs/PLATE.md`.
@@ -1039,8 +1056,7 @@ balance gain is largest. Method, file format and limits are in
 - Filter transmissions are approximations; a measured variant would be
   fitted like the monochrome weights.
 - The noise model defaults describe a 24-MP camera at base ISO; the defect
-  rule's model-free fallback keeps it safe, the detector of §5.2 scales
-  with it.
+  rule's model-free fallback keeps it safe.
 - Only 2×2 CFAs. X-Trans has carriers too, but at other positions with other
   copies; it is not implemented.
 - The plate's colour is the chrominance of the carriers and resolves to
@@ -1051,7 +1067,8 @@ balance gain is largest. Method, file format and limits are in
   twice the sampling.
 - The Ĉ1 leak on diagonal colour alternation at 3–4 px period, which the
   monochrome negative showed as grey beads, is false colour on the plate.
-  Same cause; `--reconstruct` reduces it.
+  Same cause; the removed step of §5 reduced it, at the price of computed
+  pixels.
 - The chrominance carries low-frequency colour noise (19–21 % σ for the
   red filter on the Z f, §6.1), colour mottle like dye clouds. No noise
   reduction, as a matter of principle; the plate's chroma noise has not
@@ -1140,7 +1157,8 @@ decimal and doubled the run time; default one round.
 input:  raw CFA array, black/white levels, CFA phase (ε, a, b), as-shot WB
 1.  m := (raw − black) / (white − black)                      §3.1
 2.  sat := raw ≥ white·0.98, dilate 2 px                       §3.2
-3.  defect rule on same-phase 8-neighbourhood, σ(s) of §3.3    §3.4
+3.  defect rule on same-phase 8-neighbourhood, σ(s) of §3.3;
+    count always, replace only with --repair-defects            §3.4
 4.  m := m · k_c  (k_G = 1, as-shot normalised to G)           §3.5
 5.  kernels: Kaiser-sinc, Δf 0.15, A 40 dB, 15 taps, DC/Nyquist-corrected,
     fc = 0.15 (n), 0.30 (w), 0.25 (r), 0.30 (t); G_σ: Gaussian σ 3 px   §4.1
@@ -1156,7 +1174,7 @@ input:  raw CFA array, black/white levels, CFA phase (ε, a, b), as-shot WB
 8.  C2 := wH·C2a + (1−wH)·C2b;  C1 := wH·C1H + (1−wH)·C1V
     C1 += (wH·κa + (1−wH)·κb)·(LPr²(ε·sx·sy·m) − C1)
 9.  L := m − ε·sx·sy·C1 − (a·sx + b·sy)·C2                    §4.3
-10. [optional] β from the carrier residue of L (σ 2 px, 20/80);
+10. (0.11–0.14 only, removed) β from the carrier residue of L;
     Zhang–Wu LMMSE in m^(1/2.2); L, C1, C2 += β·(nonlinear − linear)   §5
 11. out := L + (wG − wR − wB)·C1 + 2·(wR − wB)·C2              §6
 12. TIFF 16 bit linear grey + JSON description; mask sidecar   §7
@@ -1175,12 +1193,11 @@ plate (--plate [camera|wratten|channels]):                     §8.7
 ```
 
 Every constant in this recipe is a default of the published code and can be
-checked against `crates/mimizan-core/src/{filter,dubois,reconstruct,mix}.rs`,
+checked against `crates/mimizan-core/src/{filter,dubois,mix}.rs`,
 for the plate `{plate,print,icc}.rs`, and their tests.
 
 The colour benchmark of §8.7 is `mimizan bench plate` (pixel-sharp),
 `mimizan bench plate --blur 0.75` (behind a lens) and
 `mimizan bench plate --scale 2` (twice the sampling); each run scores the
-plate with and without reconstruction against the demosaiced RGB of libraw
-and RawTherapee 5.11;
+plate against the demosaiced RGB of libraw and RawTherapee 5.11;
 CPSNR on sRGB-encoded values, border 16 px, report and JSON in `out/plate/`.

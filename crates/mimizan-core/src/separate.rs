@@ -38,12 +38,6 @@ pub struct SeparateParams {
     /// Parameters of the `Dubois` mode (ignored otherwise).
     #[serde(default)]
     pub dubois: crate::dubois::DuboisParams,
-    /// Optional nonlinear reconstruction applied after the separation
-    /// (`reconstruct.rs`). `None` keeps every pixel a fixed-weight sum of
-    /// measured values; `Some` lets the detector replace doubtful pixels by
-    /// a directional colour-difference estimate.
-    #[serde(default)]
-    pub reconstruct: Option<crate::reconstruct::ReconstructParams>,
 }
 
 impl Default for SeparateParams {
@@ -57,7 +51,6 @@ impl Default for SeparateParams {
             mask: MaskMode::Dubois,
             rounds_max: 1,
             dubois: Default::default(),
-            reconstruct: None,
         }
     }
 }
@@ -80,16 +73,12 @@ pub struct Separation {
     pub c2: Plane,
     /// Where output sharpening is allowed, per pixel in [0,1]. `Adaptive`:
     /// `max(M_1, M_2a, M_2b)` of the block mask. `Off` and `Dubois`:
-    /// `FIXED_MASK_VALUE` everywhere. With `reconstruct`, `reconstruct::apply`
-    /// replaces it by `FIXED_MASK_VALUE + (0.99 − FIXED_MASK_VALUE)·β`.
+    /// `FIXED_MASK_VALUE` everywhere.
     pub mask_max: Plane,
     /// Refinement rounds that ran.
     pub rounds: usize,
     /// Bayer phase of the mosaic the separation was made from.
     pub phase: BayerPhase,
-    /// Mean β of the nonlinear reconstruction: the fraction of the picture
-    /// that was computed rather than filtered. 0 without `reconstruct`.
-    pub computed: f64,
 }
 
 /// The Nyquist carrier `(−1)^x`: +1 on even, −1 on odd indices.
@@ -152,20 +141,15 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
     drop(c2b);
     let lum = luminance(m, phase, &c1, &c2a);
     let mask_max = Plane::from_vec(m.width, m.height, vec![FIXED_MASK_VALUE; m.width * m.height]);
-    Separation { lum, c1, c2: c2a, mask_max, rounds: 1, phase, computed: 0.0 }
+    Separation { lum, c1, c2: c2a, mask_max, rounds: 1, phase }
 }
 
-/// Separate a Bayer mosaic in the mode `p.mask` names, then run the optional
-/// nonlinear reconstruction. A monochrome mosaic is an error.
+/// Separate a Bayer mosaic in the mode `p.mask` names. Every output pixel
+/// is a fixed-weight sum of measured values; nothing is computed from a
+/// model of the picture. A monochrome mosaic is an error.
 pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
     let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
-    let mut sep = separate_linear(mosaic, phase, p);
-    if let Some(r) = &p.reconstruct {
-        let t = std::time::Instant::now();
-        sep.computed = crate::reconstruct::apply(&mut sep, &mosaic.plane, &mosaic.noise, r);
-        tracing::debug!("reconstruct {} ms, computed {:.3}", t.elapsed().as_millis(), sep.computed);
-    }
-    Ok(sep)
+    Ok(separate_linear(mosaic, phase, p))
 }
 
 fn separate_linear(mosaic: &Mosaic, phase: BayerPhase, p: &SeparateParams) -> Separation {

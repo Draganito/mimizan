@@ -382,7 +382,6 @@ mod tests {
             mask_max: one(0.5),
             rounds: 1,
             phase: crate::cfa::BayerPhase::RGGB,
-            computed: 0.0,
         }
     }
 

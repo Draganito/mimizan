@@ -28,7 +28,6 @@ pub mod plate;
 pub mod preview;
 pub mod print;
 pub mod recipe;
-pub mod reconstruct;
 pub mod resize;
 pub mod separate;
 pub mod synth;

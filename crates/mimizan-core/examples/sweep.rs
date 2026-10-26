@@ -5,7 +5,6 @@
 //! the four Z f NEFs of `testdata/README.md`.
 //!
 //!     cargo run --release -p mimizan-core --example sweep -- lens x2 sharp raw soft
-//!       --rec           add the reconstruction as a variant
 //!       --per-image     one figure per picture (--lin: linear RMSE in dB)
 //!       --lum-only      neutral copies of the pictures (every error is leak)
 //!       --chroma-only   flat luminance with the pictures' chrominance
@@ -146,7 +145,6 @@ fn variants() -> Vec<(String, SeparateParams)> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let rec = args.iter().any(|a| a == "--rec");
     let per_image = args.iter().any(|a| a == "--per-image");
     let conds: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let native = Weights::default();
@@ -154,12 +152,6 @@ fn main() {
     let mut variants = variants();
     if args.iter().any(|a| a == "--quick") {
         variants.retain(|(n, _)| n == "default");
-    }
-    if rec {
-        variants.push((
-            "reconstruct".into(),
-            SeparateParams { reconstruct: Some(Default::default()), ..SeparateParams::default() },
-        ));
     }
     for (name, _) in &variants {
         table.push((name.clone(), Vec::new()));
@@ -176,16 +168,15 @@ fn main() {
             continue;
         }
         if let Some(i) = args.iter().position(|a| a == "--dump") {
-            // Error maps (|err| × 8, sRGB-encoded) of the default and the
-            // reconstruction for one picture, into /tmp/sweep.
+            // Error maps (|err| × 8, sRGB-encoded) of the 0.11 separation and
+            // the default for one picture, into /tmp/sweep.
             let stem = &args[i + 1];
             let c = cases.iter().find(|c| &c.stem == stem).expect("stem");
             std::fs::create_dir_all("/tmp/sweep").unwrap();
-            let rec = SeparateParams { reconstruct: Some(Default::default()), ..SeparateParams::default() };
             let mut outs = Vec::new();
             let mut errs = Vec::new();
             let old = d(|p| *p = DuboisParams::without_tensor());
-            for (name, p) in [("0.11", old), ("default", SeparateParams::default()), ("reconstruct", rec)] {
+            for (name, p) in [("0.11", old), ("default", SeparateParams::default())] {
                 let out = mix(&separate(&c.mosaic, &p).unwrap(), &native);
                 outs.push(out.clone());
                 errs.push(Plane::from_vec(
@@ -206,10 +197,10 @@ fn main() {
                 kodak::write_gray_png(Path::new(&format!("/tmp/sweep/{stem}_{name}.png")), &out).unwrap();
             }
             kodak::write_gray_png(Path::new(&format!("/tmp/sweep/{stem}_truth.png")), &c.truth).unwrap();
-            // Strip mosaic | default | reconstruct | truth at the hardest
-            // window of the default, and at an optional --at x,y.
+            // Strip 0.11 | default | truth and the two error maps at the
+            // hardest window of 0.11, and at an optional --at x,y.
             let (cx, cy) = kodak::hardest_window(&[&outs[0]], &c.truth, 96, BORDER);
-            let panels = [&outs[0], &outs[1], &outs[2], &c.truth, &errs[0], &errs[1], &errs[2]];
+            let panels = [&outs[0], &outs[1], &c.truth, &errs[0], &errs[1]];
             kodak::write_strip(Path::new(&format!("/tmp/sweep/{stem}_strip.png")), &panels, cx, cy, 96, 4)
                 .unwrap();
             eprintln!("hardest window at {cx},{cy}");

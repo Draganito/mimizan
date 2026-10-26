@@ -347,7 +347,7 @@ pub fn separate_dubois(mosaic: &Mosaic, phase: BayerPhase, p: &DuboisParams) -> 
     let w = m.width;
     let lum = luminance(m, phase, &c1, &c2);
     let mask_max = Plane::from_vec(w, m.height, vec![FIXED_MASK_VALUE; w * m.height]);
-    Separation { lum, c1, c2, mask_max, rounds: 1, phase, computed: 0.0 }
+    Separation { lum, c1, c2, mask_max, rounds: 1, phase }
 }
 
 #[cfg(test)]
@@ -394,6 +394,7 @@ mod tests {
                 saturated_raw: 0,
                 saturated_dilated: 0,
                 defects: 0,
+                defects_repaired: false,
                 defect_hot_rows: vec![],
                 min_norm: 0.0,
                 max_norm: 1.0,

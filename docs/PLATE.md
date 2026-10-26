@@ -95,7 +95,7 @@ mimizan print photo_plate.tif -o photo_colour.tif --paper 0,-0.5 --lamp 0.1,-0.1
 ```
 
 Without `--plate` nothing changes: the same file and the same recipe give
-the same bytes as 0.12.0. The plate came in 0.13.0; 0.14.0 made it the second process of the desktop.
+the same bytes as 0.12.0. The plate came in 0.13.0; 0.14.0 made it the second process of the desktop; 0.15.0 removed the last computed pixel (§5 of the paper).
 
 **The desktop.** The plate is the second process of the darkroom, beside
 the monochrome negative: *Monochrome · Plate* in the toolbar, or the key
@@ -126,38 +126,41 @@ Three conditions, as in the monochrome bench: the pictures pixel-sharp
 before sampling, the sharpest real lens on a real sensor), and at twice
 the size (`--scale 2`, the picture upsampled 2× before sampling, a 48 MP
 sensor seen from the distance of 12 MP). Mean CPSNR and R/G/B PSNR in dB;
-the leads column counts pictures won.
+the leads column counts pictures won. The rows marked *removed* are the
+plate with the nonlinear last-octave step of 0.11–0.14; 0.15 took that
+step out (every pixel is a measured sum again), and the rows stay so the
+decision can be read against the numbers it was made on.
 
 Pixel-sharp (the synthetic case no camera produces):
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
 | LMMSE (RawTherapee) | 39.42 | 39.14 | 42.29 | 38.27 | 23/24 |
-| **plate** + reconstruct | 38.31 | 38.51 | 40.86 | 36.71 | 1/24 |
+| plate + reconstruct (removed) | 38.31 | 38.51 | 40.86 | 36.71 | 1/24 |
 | AMaZE (RawTherapee) | 36.49 | 36.04 | 39.93 | 35.42 | 0/24 |
 | DCB (RawTherapee) | 35.87 | 35.69 | 38.70 | 34.90 | 0/24 |
 | DHT (libraw) | 35.35 | 34.78 | 37.13 | 34.75 | 0/24 |
-| **plate** (linear) | 33.46 | 33.57 | 36.57 | 31.70 | 0/24 |
+| **plate** | 33.46 | 33.57 | 36.57 | 31.70 | 0/24 |
 | VNG (libraw) | 33.26 | 32.94 | 36.60 | 31.77 | 0/24 |
 
 Behind a lens (σ 0.75 px):
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| **plate** + reconstruct | 46.51 | 47.96 | 52.63 | 43.75 | 7/24 |
+| plate + reconstruct (removed) | 46.51 | 47.96 | 52.63 | 43.75 | 7/24 |
 | RCD (RawTherapee) | 46.19 | 45.91 | 50.05 | 45.18 | 6/24 |
 | LMMSE (RawTherapee) | 46.16 | 44.99 | 49.27 | 45.95 | 8/24 |
 | DCB (RawTherapee) | 46.03 | 46.18 | 51.55 | 44.61 | 3/24 |
 | AMaZE (RawTherapee) | 45.61 | 45.55 | 49.64 | 44.51 | 0/24 |
-| **plate** (linear) | 44.98 | 47.16 | 51.83 | 41.92 | 0/24 |
+| **plate** | 44.98 | 47.16 | 51.83 | 41.92 | 0/24 |
 | AHD (libraw) | 41.90 | 44.58 | 48.43 | 38.74 | 0/24 |
 
 Twice the size (scale 2):
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| **plate** + reconstruct | 47.53 | 48.15 | 52.96 | 45.20 | 19/24 |
-| **plate** (linear) | 47.24 | 48.37 | 53.09 | 44.62 | 4/24 |
+| plate + reconstruct (removed) | 47.53 | 48.15 | 52.96 | 45.20 | 19/24 |
+| **plate** | 47.24 | 48.37 | 53.09 | 44.62 | 4/24 |
 | RCD (RawTherapee) | 45.42 | 45.32 | 49.21 | 44.16 | 0/24 |
 | DCB (RawTherapee) | 45.22 | 45.42 | 49.73 | 43.78 | 0/24 |
 | LMMSE (RawTherapee) | 44.75 | 44.09 | 47.65 | 44.04 | 1/24 |
@@ -165,12 +168,12 @@ Twice the size (scale 2):
 | AHD (libraw) | 42.43 | 44.06 | 47.89 | 39.65 | 0/24 |
 
 Reading: on the synthetic pixel-sharp pictures the band limit of the
-chrominance costs the linear plate 6 dB against the best demosaicer, and
-`--reconstruct` recovers all but 1.1 dB of it. As soon as the picture
-has passed a lens the plate is level with the best (RCD, LMMSE, DCB within
-0.5 dB, every other demosaicer behind), and at the sampling of a real
-high-resolution sensor the plate leads by 2 dB with no reconstruction at
-all. The green channel of the plate is ahead everywhere by 2–5 dB: it is
+chrominance costs the plate 6 dB against the best demosaicer; the removed
+step recovered all but 1.1 dB of it, by computing pixels. As soon as the
+picture has passed a lens the plate is level with the best (RCD, LMMSE,
+DCB within 0.5 dB, every other demosaicer behind), and at the sampling of
+a real high-resolution sensor the plate leads by 2 dB. That is why the
+step could go: it paid only where no camera goes. The green channel of the plate is ahead everywhere by 2–5 dB: it is
 the luminance plus Ĉ1' only, not interpolated. The blue trails, as it does
 in every method: one photosite in four, and the sRGB encoding weights its
 errors most.
@@ -183,7 +186,8 @@ errors most.
   edge-directed demosaicers, which reconstruct colour at the pixel.
 - The Ĉ1 leak on diagonal colour alternation at 3–4 px period (the colour
   zone plates of the studio scene) is false colour here, where the
-  negative showed grey beads. Same cause; `--reconstruct` reduces it.
+  negative showed grey beads. Same cause; the removed nonlinear step
+  reduced it, the plate shows it.
 - The chrominance carries low-frequency colour noise (19–21 % σ for the
   red filter on the Z f, paper §6.1): colour mottle like dye clouds. No
   noise reduction, as a matter of principle; not yet measured for the plate.

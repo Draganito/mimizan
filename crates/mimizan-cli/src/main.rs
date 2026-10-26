@@ -44,9 +44,11 @@ enum Cmd {
         raw: PathBuf,
         #[arg(short, long)]
         out: PathBuf,
-        /// Skip the defect repair: every photosite stays as measured
+        /// Replace defective photosites (far outside their same-colour neighbours) by the
+        /// neighbour median. Off by default: every photosite stays as measured, the report
+        /// counts the defects
         #[arg(long)]
-        no_defects: bool,
+        repair_defects: bool,
         /// Also write a gamma-encoded PNG quick look, downscaled by --preview-scale
         #[arg(long)]
         preview: Option<PathBuf>,
@@ -86,15 +88,11 @@ enum Cmd {
         /// Cross-term refinement rounds, 1 = single pass (adaptive only)
         #[arg(long, default_value_t = 1)]
         rounds: usize,
-        /// Nonlinear reconstruction of the last octave: where luminance and
-        /// chrominance overlap, pixels are computed from a per-pixel direction
-        /// decision instead of filtered. Missing pixels are then calculated,
-        /// not measured; the sidecar records where.
+        /// Replace defective photosites (far outside their same-colour neighbours) by the
+        /// neighbour median. Off by default: every photosite stays as measured, the report
+        /// counts the defects
         #[arg(long)]
-        reconstruct: bool,
-        /// Skip the defect repair: every photosite stays as measured
-        #[arg(long)]
-        no_defects: bool,
+        repair_defects: bool,
         /// Also write a gamma-encoded PNG quick look, downscaled by --preview-scale
         #[arg(long)]
         preview: Option<PathBuf>,
@@ -220,8 +218,8 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).with_writer(std::io::stderr).init();
     match cli.cmd {
         Cmd::Info { raw, json } => cmd::info(&raw, json),
-        Cmd::Dump { raw, out, no_defects, preview, preview_scale } => {
-            cmd::dump(&raw, &out, !no_defects, preview.as_deref(), preview_scale)
+        Cmd::Dump { raw, out, repair_defects, preview, preview_scale } => {
+            cmd::dump(&raw, &out, repair_defects, preview.as_deref(), preview_scale)
         }
         Cmd::Negative {
             raw,
@@ -235,8 +233,7 @@ fn main() -> Result<()> {
             wb,
             cutoff,
             rounds,
-            reconstruct,
-            no_defects,
+            repair_defects,
             preview,
             preview_scale,
             crop,
@@ -255,8 +252,7 @@ fn main() -> Result<()> {
             wb,
             cutoff,
             rounds,
-            reconstruct,
-            fix_defects: !no_defects,
+            repair_defects,
             preview,
             preview_scale,
             crop,
