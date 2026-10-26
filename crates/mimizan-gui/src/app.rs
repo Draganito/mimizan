@@ -9,8 +9,8 @@ use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{DetailAsk, DevelopParams, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
-    Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest,
-    PreviewResult,
+    available_memory, develop_memory, Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, PeakMeasure,
+    PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
 };
 use crate::zone_bar::zone_bar;
 use egui::{
@@ -302,6 +302,13 @@ fn space_name(space: PlateSpace) -> &'static str {
     }
 }
 
+/// Whether a development of `need` bytes must have the current session's
+/// memory first: it does not fit in `available` with a third to spare.
+/// Unknown free memory (0) never releases anything.
+fn must_make_room(need: u64, available: u64) -> bool {
+    available != 0 && need as f64 > available as f64 / 1.3
+}
+
 /// The print box has a newer exposure than the picture on screen.
 fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
     tile_has_picture && !tile_matches_shown
@@ -315,6 +322,12 @@ pub struct App {
     preview: Preview,
     thumbs: Thumbs,
     session: Option<Arc<Session>>,
+    /// Path of a session let go to make room for the development under
+    /// way (`make_room`). The picture stays on screen as its texture; the
+    /// result decides whether it was the same file.
+    released: Option<PathBuf>,
+    /// "Apply" was pressed: the re-development starts with the next frame.
+    redevelop: Option<DevelopParams>,
 
     // Folder strip
     folder: Option<Folder>,
@@ -524,6 +537,8 @@ impl App {
             preview: Preview::spawn(cc.egui_ctx.clone()),
             thumbs: Thumbs::spawn(cc.egui_ctx.clone(), cameras_dir.clone()),
             session: None,
+            released: None,
+            redevelop: None,
             folder: None,
             folder_generation: 0,
             sort: persisted.sort,
@@ -1251,11 +1266,47 @@ impl App {
             }
         }
         self.current_path = Some(path.clone());
+        self.make_room();
         self.heavy.send(Job::Open {
             path,
             develop: self.develop_params(),
             cameras_dir: self.cameras_dir.clone(),
         });
+    }
+
+    /// Let the session go before a development when the two would not fit
+    /// in free memory together. The next file is most often from the same
+    /// camera, so the measure is this session's own development; the
+    /// worker checks the real frame once it is decoded. The picture stays
+    /// on screen as its texture until the new one arrives; the `Opened`
+    /// event finds the path in `released`.
+    fn make_room(&mut self) {
+        let Some(s) = self.session.as_ref() else { return };
+        let (need, path) = (develop_memory(&s.frame), s.path.clone());
+        let available = available_memory();
+        if !must_make_room(need, available) {
+            return;
+        }
+        let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        self.log(format!(
+            "{name} let go to make room: a development holds about {}, {} is free",
+            memory_text(need),
+            memory_text(available)
+        ));
+        self.released = Some(path);
+        self.session = None;
+    }
+
+    /// The re-development "Apply" asked for, sent now that no panel holds
+    /// a clone of the session.
+    fn start_redevelop(&mut self) {
+        let Some(develop) = self.redevelop.take() else { return };
+        let Some(source) = self.session.as_ref().map(|s| Redevelop::of(s)) else {
+            self.busy = None;
+            return;
+        };
+        self.make_room();
+        self.heavy.send(Job::Redevelop { source, develop });
     }
 
     /// Controls back to the session's defaults; the negative stays. A new
@@ -1437,7 +1488,8 @@ impl App {
             match ev {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
-                    let fresh = self.session.as_ref().is_none_or(|old| old.path != s.path);
+                    let before = self.session.as_ref().map(|old| old.path.clone()).or(self.released.take());
+                    let fresh = before.is_none_or(|old| old != s.path);
                     let t = &s.negative.info.timing;
                     let name =
                         s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
@@ -1512,6 +1564,12 @@ impl App {
                     self.busy = None;
                     // A failed open leaves the previous picture on the stage;
                     // the strip must point at that one, not at the failure.
+                    // A picture let go for room is gone with its texture.
+                    if self.released.take().is_some() {
+                        self.texture = None;
+                        self.detail_texture = None;
+                        self.detail_rect = None;
+                    }
                     self.current_path = self.session.as_ref().map(|s| s.path.clone());
                 }
             }
@@ -2241,8 +2299,10 @@ impl App {
             );
             let differs = self.develop_params() != s.develop;
             if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
+                // Sent at the start of the next frame, when this panel's
+                // clone of the session is gone and `make_room` can free it.
                 self.busy = Some("re-developing".into());
-                self.heavy.send(Job::Redevelop { session: Arc::clone(&s), develop: self.develop_params() });
+                self.redevelop = Some(self.develop_params());
             }
         });
 
@@ -4390,6 +4450,7 @@ impl eframe::App for App {
     /// Worker results are collected here: eframe calls `logic` even while the
     /// window is hidden or covered, so an export finishes and logs regardless.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.start_redevelop();
         self.handle_events(ctx);
         self.guard_close(ctx);
     }
@@ -5029,9 +5090,25 @@ mod path_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        hit_crop, moved_crop, picture_terms, recipe_needs_saving, tile_must_wait, CropHit, PaperFormat,
+        hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving, tile_must_wait, CropHit,
+        PaperFormat,
     };
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
+
+    #[test]
+    fn the_session_goes_when_the_next_development_would_not_fit() {
+        // A 24 MP development, about 1.8 GB: with 2 GB free the picture on
+        // the stage goes first; with 6 GB free it stays; a machine that
+        // cannot say keeps everything.
+        let need = mimizan_core::pipeline::develop_memory(
+            6048,
+            4032,
+            mimizan_core::decode::SensorKind::Bayer(mimizan_core::cfa::BayerPhase::RGGB),
+        );
+        assert!(must_make_room(need, 2_000_000_000));
+        assert!(!must_make_room(need, 6_000_000_000));
+        assert!(!must_make_room(need, 0));
+    }
 
     #[test]
     fn grabbing_does_not_jump() {

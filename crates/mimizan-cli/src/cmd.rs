@@ -145,6 +145,21 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     let decode_ms = t.elapsed().as_millis();
     info!("decode {} ms", decode_ms);
 
+    // Past the machine's whole memory the separation ends in the OOM
+    // killer, not in an error; below it, it is only slow.
+    let need = pipeline::develop_memory(frame.width, frame.height, frame.kind);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    if sys.total_memory() > 0 && need > sys.total_memory() {
+        bail!(
+            "{}x{} would hold about {} while separating, this machine has {} in all",
+            frame.width,
+            frame.height,
+            mimizan_core::print::memory_text(need),
+            mimizan_core::print::memory_text(sys.total_memory())
+        );
+    }
+
     let mut params = NegativeParams::default();
     params.ingest.repair_defects = a.repair_defects;
     params.ingest.wb = parse_wb(&a.wb)?;

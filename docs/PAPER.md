@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.15.0
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.15.1
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
@@ -491,8 +491,10 @@ Cost on a 24.4-MP file (Ryzen 7 5700U, 16 threads, f64): separation 2.7 s
 with the default path, 3.7 s from file to TIFF; 2.17 s without the tensor
 (1.12 s without the ring, 0.75 s for the fixed estimator). The tensor is
 one separable low-pass of the mosaic, the two squared second differences
-and two Gaussian passes. Peak eleven full f64 planes including the mosaic
-(2.2 GB), ten without the tensor.
+and two Gaussian passes. Peak nine full f64 planes including the mosaic
+(1.8 GB), eight without the tensor: the two wide copies of the coherence
+step are convolved a second time where the bands are opened rather than
+held across the step (0.15.1; the same bits, 1.5 % of the time).
 
 ### 4.6 What the linear path guarantees
 

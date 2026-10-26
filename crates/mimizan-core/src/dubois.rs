@@ -201,9 +201,10 @@ fn orientation(m: &Plane, kb: &[f64], g: &[f64], scratch: &mut Plane) -> Plane {
 }
 
 /// The estimation: returns `(c1, c2)`. Planes are dropped as early as the
-/// data flow allows and the low-passes run in place; the peak is eleven
-/// full planes (mosaic included) with the coherence step and the tensor,
-/// ten without the tensor, seven without either.
+/// data flow allows and the low-passes run in place; the peak is nine full
+/// planes (mosaic included) with the coherence step and the tensor, eight
+/// without the tensor, seven without either. `pipeline::develop_memory`
+/// quotes this figure.
 fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Plane, Plane) {
     let c = phase.carriers();
     let (w, h) = (m.width, m.height);
@@ -253,15 +254,25 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
     // copy the orientation declares clean is opened further, by the
     // anisotropy scaled with that copy's weight; kappa then becomes the
     // weighted mean of the two gains, for C1.
+    //
+    // The wide copies `a_w`, `b_w` are each made twice: once for the ring,
+    // dropped at once, and again when the bands are opened. Holding them
+    // across the coherence step would put two more full planes under the
+    // peak; the second convolution costs a few per cent of the time and
+    // gives the same bits.
     let kappa = ra.map(|(kr, mut ra)| {
-        convolve_rows_mod_into(m, kr, |x, _| sign_x(x), &mut row);
-        let a_w = convolve_cols_signed(&row, kr, |_| c.a);
-        ring_in_place(&a_w, &mut ra);
+        let wide_a = |row: &mut Plane| {
+            convolve_rows_mod_into(m, kr, |x, _| sign_x(x), row);
+            convolve_cols_signed(row, kr, |_| c.a)
+        };
+        let wide_b = |row: &mut Plane| {
+            convolve_rows_mod_into(m, kr, |_, _| 1.0, row);
+            convolve_cols_signed(row, kr, |y| c.b * sign_x(y))
+        };
+        ring_in_place(&wide_a(&mut row), &mut ra);
         convolve_rows_mod_into(m, &k.kn, |_, _| 1.0, &mut row);
         let mut rb = convolve_cols_signed(&row, &k.kn, |y| c.b * sign_x(y));
-        convolve_rows_mod_into(m, kr, |_, _| 1.0, &mut row);
-        let b_w = convolve_cols_signed(&row, kr, |y| c.b * sign_x(y));
-        ring_in_place(&b_w, &mut rb);
+        ring_in_place(&wide_b(&mut row), &mut rb);
 
         let mut kappa = Plane::from_vec(w, h, ra.data.par_iter().zip(&rb.data).map(|(a, b)| a * b).collect());
         lowpass_in_place(&mut kappa, &k.g, &mut row);
@@ -272,6 +283,7 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
             *x = if d > 1e-18 { (*x / d).clamp(0.0, 1.0).powf(p.ring_power) } else { 0.0 };
         });
         drop((ra, rb));
+        let a_w = wide_a(&mut row);
         match (&orient, p.ring_tensor > 0.0) {
             (Some(t), true) => {
                 let gamma = p.ring_tensor;
@@ -283,6 +295,7 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
                     },
                 );
                 drop(a_w);
+                let b_w = wide_b(&mut row);
                 c2b.data.par_iter_mut().zip(&b_w.data).zip(&kappa.data).zip(&t.data).zip(&wa.data).for_each(
                     |((((b, w), k), t), wa)| {
                         let c = (gamma * (2.0 * t - 1.0).abs()).min(1.0);
@@ -299,7 +312,7 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
             _ => {
                 open_in_place(&mut c2, &a_w, &kappa);
                 drop(a_w);
-                open_in_place(&mut c2b, &b_w, &kappa);
+                open_in_place(&mut c2b, &wide_b(&mut row), &kappa);
             }
         }
         kappa

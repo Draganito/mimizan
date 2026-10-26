@@ -107,7 +107,8 @@ pub struct Negative {
     pub info: NegativeInfo,
     /// Saturation map of the mosaic (same size as `plane`).
     pub saturated: Vec<u8>,
-    /// Only with `NegativeParams::keep_separation`.
+    /// Only with `NegativeParams::keep_separation`. Its `mask_max` is
+    /// released (a 1×1 plane): `mask8` is the mask.
     pub separation: Option<crate::separate::Separation>,
 }
 
@@ -208,6 +209,10 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             let Mosaic { saturated, plane: mosaic_plane, .. } = mosaic;
             drop(mosaic_plane);
             let mask8 = mask_sidecar(&sep.mask_max, &saturated)?;
+            // The mask lives on as the sidecar; its f64 plane is not
+            // needed by anyone who keeps the separation.
+            let mut sep = sep;
+            sep.mask_max = Plane::zeros(1, 1);
             let t = Instant::now();
             let (plane, separation) = if let Some((w, space)) = plate_weights {
                 info.plate = Some(crate::plate::PlateInfo::new(&w, space, sep.lum.height));
@@ -260,9 +265,35 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
         .collect())
 }
 
+/// Bytes a development of a `w×h` frame holds at its widest point. Bayer:
+/// the Dubois estimate at its peak, nine f64 planes (`dubois::estimate`),
+/// over the 16-bit frame and the saturation map. Mono: the normalised
+/// plane beside the measured one, over the same two. A guide for refusing
+/// a file the machine cannot hold, measured to about a tenth; what it does
+/// not see is the allocator and whatever else the process has open.
+pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind) -> u64 {
+    let px = w as u64 * h as u64;
+    let planes = match kind {
+        crate::decode::SensorKind::Bayer(_) => 9,
+        crate::decode::SensorKind::Mono => 2,
+    };
+    px * (planes * 8 + 2 + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn develop_memory_is_the_dubois_peak() {
+        // 24 MP Bayer: nine planes of 195 MB plus the frame, measured 2.1 GB
+        // over the process baseline. Mono is a fraction of that.
+        let bayer =
+            develop_memory(6048, 4032, crate::decode::SensorKind::Bayer(crate::cfa::BayerPhase::RGGB));
+        assert!((1.8e9..2.0e9).contains(&(bayer as f64)), "{bayer}");
+        let mono = develop_memory(6048, 4032, crate::decode::SensorKind::Mono);
+        assert!(mono * 3 < bayer, "{mono} vs {bayer}");
+    }
 
     #[test]
     fn a_short_saturation_list_is_an_error() {

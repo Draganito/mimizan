@@ -39,8 +39,10 @@ use tracing::info;
 pub enum Job {
     /// Decode and develop a file.
     Open { path: PathBuf, develop: DevelopParams, cameras_dir: PathBuf },
-    /// Develop the already decoded frame again with other parameters.
-    Redevelop { session: Arc<Session>, develop: DevelopParams },
+    /// Develop the already decoded frame again with other parameters. The
+    /// frame alone, not the session: the UI may let the session go while
+    /// this runs, so its planes are not held beside the new ones.
+    Redevelop { source: Redevelop, develop: DevelopParams },
     /// One export, one file. The 16-bit TIFF is the recipe rendered in one
     /// pass against the negative: placing, paper or look, size and border.
     /// The desktop GUI sends the sharpening mode off; peak, when the recipe
@@ -145,8 +147,8 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
         Job::Open { path, develop, cameras_dir } => {
             open(&path, develop, &cameras_dir, &status).map(|s| Event::Opened(Arc::new(s)))
         }
-        Job::Redevelop { session, develop } => {
-            redevelop(&session, develop, &status).map(|s| Event::Opened(Arc::new(s)))
+        Job::Redevelop { source, develop } => {
+            redevelop(source, develop, &status).map(|s| Event::Opened(Arc::new(s)))
         }
         Job::Export { session, weights, plate, recipe, path, orientation } => match plate {
             Some(plate) => export_plate(&session, weights, &plate, recipe, &path, orientation, &status),
@@ -155,11 +157,64 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
     }
 }
 
+/// What a re-development needs from the session it replaces.
+pub struct Redevelop {
+    pub path: PathBuf,
+    pub frame: Arc<mimizan_core::decode::RawFrame>,
+    pub decode_ms: u128,
+    pub camera_file: Option<CameraFile>,
+    pub camera_file_path: Option<PathBuf>,
+}
+
+impl Redevelop {
+    pub fn of(s: &Session) -> Self {
+        Self {
+            path: s.path.clone(),
+            frame: Arc::clone(&s.frame),
+            decode_ms: s.negative.info.timing.decode_ms,
+            camera_file: s.camera_file.clone(),
+            camera_file_path: s.camera_file_path.clone(),
+        }
+    }
+}
+
+/// Free memory as the system reports it; 0 when it cannot say.
+pub fn available_memory() -> u64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.available_memory()
+}
+
+/// Bytes the development of this frame holds at its peak.
+pub fn develop_memory(frame: &mimizan_core::decode::RawFrame) -> u64 {
+    pipeline::develop_memory(frame.width, frame.height, frame.kind)
+}
+
+/// Refuse a development the machine cannot hold. Past the free memory it
+/// ends in the OOM killer or a frozen machine, not in an error, and the
+/// panic catcher sees nothing of it.
+fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame) -> Result<()> {
+    let (need, available) = (develop_memory(frame), available_memory());
+    if available == 0 || need <= available {
+        return Ok(());
+    }
+    let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    anyhow::bail!(
+        "{name} not developed: {}x{} would hold about {} while separating, {} is free. Close other \
+         programs or other pictures and open it again",
+        frame.width,
+        frame.height,
+        pr::memory_text(need),
+        pr::memory_text(available)
+    )
+}
+
 fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
     status(format!("decoding {}", path.display()));
     let t = Instant::now();
     let frame = pipeline::decode(path).with_context(|| format!("decoding {}", path.display()))?;
     let decode_ms = t.elapsed().as_millis();
+    check_memory(path, &frame)?;
     let frame = Arc::new(frame);
 
     // The camera file only supplies suggested weights and the USM amount;
@@ -175,16 +230,9 @@ fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn
     develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)
 }
 
-fn redevelop(s: &Session, develop: DevelopParams, status: &dyn Fn(String)) -> Result<Session> {
-    develop_frame(
-        s.path.clone(),
-        Arc::clone(&s.frame),
-        s.negative.info.timing.decode_ms,
-        s.camera_file.clone(),
-        s.camera_file_path.clone(),
-        develop,
-        status,
-    )
+fn redevelop(r: Redevelop, develop: DevelopParams, status: &dyn Fn(String)) -> Result<Session> {
+    check_memory(&r.path, &r.frame)?;
+    develop_frame(r.path, r.frame, r.decode_ms, r.camera_file, r.camera_file_path, develop, status)
 }
 
 fn develop_frame(
