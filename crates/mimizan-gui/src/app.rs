@@ -281,6 +281,18 @@ struct SharedPicture {
     plate: Option<PlateView>,
 }
 
+/// The two rings painted around the picture on the stage, in texture
+/// pixels, with their flat values: the print's black film edge and white
+/// paper against its picture, so they keep their proportion at any size
+/// and dpi. Zero widths are no sheet.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct Rings {
+    black_tex: f32,
+    white_tex: f32,
+    white: u8,
+    black: u8,
+}
+
 /// The taking filters resolved for one session, one plate choice and one
 /// base mix, so the resolution runs when those change, not every frame.
 struct PlateResolved {
@@ -312,6 +324,13 @@ fn must_make_room(need: u64, available: u64) -> bool {
 /// The print box has a newer exposure than the picture on screen.
 fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
     tile_has_picture && !tile_matches_shown
+}
+
+/// The rings to hold while another file takes the edit: the ones on the
+/// stage now, if a picture is there. Rings already held stay held: the
+/// stage still shows the file they were taken from.
+fn rings_to_hold(held: Option<Rings>, stage_has_picture: bool, now: impl FnOnce() -> Rings) -> Option<Rings> {
+    held.or_else(|| stage_has_picture.then(now))
 }
 
 /// The whole desktop state: the open session, the edit and its history,
@@ -421,6 +440,12 @@ pub struct App {
     picture_gen: u64,
     /// A finished print box kept back until the main picture shows its exposure.
     held_loupe: Option<LoupeResult>,
+    /// The rings of the picture still on the stage while the next file's
+    /// first preview is on its way. The edit is already that file's, so its
+    /// rings would dress the old pixels in the new recipe's border (and
+    /// refit them) for that moment. Taken before the edit changes, let go
+    /// when the new picture lands.
+    held_rings: Option<Rings>,
 
     /// "1:1" button pressed; applied by the preview panel, which knows the fit scale.
     zoom_to_1to1: bool,
@@ -592,6 +617,7 @@ impl App {
             shown_picture: None,
             picture_gen: 0,
             held_loupe: None,
+            held_rings: None,
             zoom_to_1to1: false,
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
@@ -1053,6 +1079,41 @@ impl App {
         Some(mimizan_core::print::layout(w, h, 1, &params))
     }
 
+    /// The rings the edit asks for around the texture on the stage. Flat
+    /// values, painted under the picture, not rendered into it. The mask
+    /// view and the open crop are not a sheet. Only meaningful while the
+    /// texture is this session's picture: `held_rings` covers the moment
+    /// it is not.
+    fn rings(&self) -> Rings {
+        let [tw, _] = self.tex_size;
+        if self.show_mask || self.crop_open || tw == 0 {
+            return Rings::default();
+        }
+        let Some(l) = self.print_layout() else { return Rings::default() };
+        let scale = tw as f32 / l.image_w.max(1) as f32;
+        let tone = self.edit.recipe.curve.compile();
+        Rings {
+            black_tex: l.black_px as f32 * scale,
+            white_tex: l.border_px as f32 * scale,
+            white: (tone.white().clamp(0.0, 1.0) * 255.0).round() as u8,
+            black: (tone.eval(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+        }
+    }
+
+    /// The rings to paint now: the held ones while the stage still shows
+    /// the previous file, otherwise the edit's.
+    fn stage_rings(&self) -> Rings {
+        self.held_rings.unwrap_or_else(|| self.rings())
+    }
+
+    /// Another file is about to take the edit while this one's picture
+    /// stays on the stage: keep its rings until the new picture lands. A
+    /// third file opened before that keeps the rings already held; the
+    /// edit's would belong to the second.
+    fn hold_rings(&mut self) {
+        self.held_rings = rings_to_hold(self.held_rings, self.texture.is_some(), || self.rings());
+    }
+
     /// Pixel size the 100% view addresses. A centimetre size addresses the
     /// fitted print; otherwise the negative (the crop, when one is committed).
     fn inspect_size(&self) -> (usize, usize) {
@@ -1491,6 +1552,16 @@ impl App {
                 Event::Opened(s) => {
                     let before = self.session.as_ref().map(|old| old.path.clone()).or(self.released.take());
                     let fresh = before.is_none_or(|old| old != s.path);
+                    if fresh {
+                        // Before the session and the edit are the new file's:
+                        // the rings are measured against the old session's size.
+                        self.hold_rings();
+                        // A preview of the old file still on its way is not
+                        // this file's picture: it must not land on the stage
+                        // and let the rings go. The next request is numbered
+                        // above every one sent so far.
+                        self.picture_gen = self.generation + 1;
+                    }
                     let t = &s.negative.info.timing;
                     let name =
                         s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
@@ -1570,6 +1641,7 @@ impl App {
                         self.texture = None;
                         self.detail_texture = None;
                         self.detail_rect = None;
+                        self.held_rings = None;
                     }
                     self.current_path = self.session.as_ref().map(|s| s.path.clone());
                 }
@@ -1725,6 +1797,8 @@ impl App {
         let shows_picture = r.image.is_some();
         self.apply_preview(ctx, r);
         if shows_picture {
+            // The stage shows this session's pixels: the edit's rings fit them.
+            self.held_rings = None;
             self.shown_picture = self.preview_picture.clone();
             self.flush_loupe(ctx);
         }
@@ -3526,21 +3600,9 @@ impl App {
         if tw == 0 || th == 0 {
             return;
         }
-        // The two rings, in texture pixels: the print's black and white
-        // against its picture (`layout`), so they keep their proportion at
-        // any size and dpi. Flat values, painted under the picture, not
-        // rendered into it. The mask view and the open crop are not a sheet.
-        let (black_tex, white_tex, white, black) = if self.show_mask || self.crop_open {
-            (0.0, 0.0, 0, 0)
-        } else if let Some(l) = self.print_layout() {
-            let scale = tw as f32 / l.image_w.max(1) as f32;
-            let tone = self.edit.recipe.curve.compile();
-            let white = (tone.white().clamp(0.0, 1.0) * 255.0).round() as u8;
-            let black = (tone.eval(0.0).clamp(0.0, 1.0) * 255.0).round() as u8;
-            (l.black_px as f32 * scale, l.border_px as f32 * scale, white, black)
-        } else {
-            (0.0, 0.0, 0, 0)
-        };
+        // The two rings belong to the pixels on the stage, not to the edit
+        // alone: see `held_rings`.
+        let Rings { black_tex, white_tex, white, black } = self.stage_rings();
         let border_tex = black_tex + white_tex;
         // The sheet (picture plus both rings) is what fits the opening.
         // A zoom grows it from this same fit, so the first step does not jump.
@@ -5110,10 +5172,25 @@ mod path_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving, tile_must_wait, CropHit,
-        PaperFormat,
+        hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving, rings_to_hold,
+        tile_must_wait, CropHit, PaperFormat, Rings,
     };
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
+
+    #[test]
+    fn the_rings_on_the_stage_stay_with_its_picture() {
+        // The picture on the stage has no border; the file taking the edit
+        // has one. Until that file's picture lands, the stage keeps its own
+        // (empty) rings: the new border must not dress the old pixels.
+        let none = Rings::default();
+        let wide = Rings { white_tex: 118.8, ..Rings::default() };
+        assert_eq!(rings_to_hold(None, true, || none), Some(none));
+        // An empty stage has nothing to hold.
+        assert_eq!(rings_to_hold(None, false, || wide), None);
+        // A third file opened before the second's picture lands: the stage
+        // still shows the first, so the first's rings stay held.
+        assert_eq!(rings_to_hold(Some(none), true, || wide), Some(none));
+    }
 
     #[test]
     fn the_session_goes_when_the_next_development_would_not_fit() {
