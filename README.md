@@ -100,17 +100,17 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 
 The separation works in double precision on the whole frame: a 24-megapixel file holds about 1.8 GB while it is developed, 45 megapixels 3.4 GB, 61 megapixels 4.5 GB, and the open picture keeps most of that afterwards. When the next file would not fit beside the open one, the desktop lets the open one go first; a file that does not fit at all is refused with the two figures in the log rather than started.
 
-Debian and Ubuntu: [mimizan_0.15.4-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.15.4/mimizan_0.15.4-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.15.5-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.15.5/mimizan_0.15.5-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.15.4-1_amd64.deb
+sudo apt install ./mimizan_0.15.5-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.15.4-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.15.4/mimizan-0.15.4-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
+Windows, 64-bit Intel and AMD: [mimizan-0.15.5-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.15.5/mimizan-0.15.5-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
 
-Apple silicon: [mimizan-0.15.4-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.15.4/mimizan-0.15.4-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+Apple silicon: [mimizan-0.15.5-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.15.5/mimizan-0.15.5-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 
