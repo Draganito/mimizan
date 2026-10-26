@@ -579,6 +579,16 @@ fn start_preview(ctx: &egui::Context) -> (Sender<PreviewRequest>, Receiver<Previ
     (tx, rx)
 }
 
+/// The held window's samples may be reused only while they sit on the same
+/// grid as the ask: the same exposure, the same kind of pixels (print or
+/// file), and the same print. A new border, size, dpi or kernel refits the
+/// picture, so the print's pixels move under the window; pieced together
+/// with fresh strips, the old ones showed two pictures at two scales until
+/// the view changed.
+fn held_tile_stale(view_changed: bool, print_kind_changed: bool, inspect_changed: bool) -> bool {
+    view_changed || print_kind_changed || inspect_changed
+}
+
 fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewResult> {
     let t = Instant::now();
     let key = (req.session.id, req.view.clone());
@@ -595,7 +605,7 @@ fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewR
     let detail = if detail_due {
         let ask = req.detail?;
         let print = req.inspect.is_some();
-        if view_changed || print != hold.held_print {
+        if held_tile_stale(view_changed, print != hold.held_print, hold.last_inspect != req.inspect) {
             hold.held = None;
         }
         hold.held_print = print;
@@ -762,6 +772,17 @@ mod tests {
     use mimizan_core::decode::{RawData, RawFrame, Rect, SensorKind};
     use mimizan_core::pipeline::NegativeParams;
     use mimizan_core::plate::{PlateSpace, PlateWeights};
+
+    /// A wider border refits the print: the held window's samples no longer
+    /// sit on the picture's grid, and must not be pieced into the new one.
+    #[test]
+    fn a_new_print_drops_the_held_window() {
+        assert!(held_tile_stale(false, false, true));
+        assert!(held_tile_stale(true, false, false));
+        assert!(held_tile_stale(false, true, false));
+        // A pan of the same print reuses what is rendered.
+        assert!(!held_tile_stale(false, false, false));
+    }
 
     /// The export of a plate from a grey mosaic is a 16-bit RGB file whose
     /// three channels are equal, the same size the grey export has, and a
