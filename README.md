@@ -12,6 +12,8 @@ The switch between the two is in the toolbar, and the whole darkroom follows it:
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
+![Dragan Bojovic, a plate printed with Mimizan Lab: Nikon Z f, Micro-Nikkor 60 mm, Wratten filters, Multigrade soft −1.26 hard +0.33, a 5.7 cm sheet with a 3.5 mm white border and a 0.1 mm film edge, 676 × 676 pixels at 300 dpi, shown 1:1](docs/dragan.jpg)
+
 > Lift the colour off. Print what remains.
 >
 > Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Nothing is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
