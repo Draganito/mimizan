@@ -30,7 +30,12 @@ filter emulation, or a fitted copy of a monochrome sensor) is applied after
 separation and is band-limited, so resolution and grain are those of the
 luminance estimate for every mix. An optional nonlinear step reconstructs
 the last octave where luminance provably overlaps the carriers, and records
-per pixel how much of the result was computed rather than measured. On a
+per pixel how much of the result was computed rather than measured. The
+same separation, mixed three times through three taking filters and
+printed through one paper, gives a three-colour plate in Prokudin-Gorsky's
+sense: colour without demosaicing, in register by construction, with the
+colour band-limited to the carriers and the drawing that of the negative
+(§8.7). On a
 24-picture Kodak benchmark re-mosaicked at lens-like sharpness the linear
 default reaches 51.6 dB luminance PSNR against 51.5 dB for the best of
 sixteen demosaicers (DCB, RawTherapee); band-limited at 2× it reaches
@@ -85,7 +90,10 @@ estimator of the Zhang–Wu family computes the missing samples, and the
 result is blended in with a per-pixel weight that is written to the output.
 
 The remainder of the pipeline — mixing (§6) and encoding (§7) — is
-deliberately simple; the method's claim rests on §§2–5.
+deliberately simple; the method's claim rests on §§2–5. The colour plate
+(§8.7) adds nothing to the separation: it is the mixing of §6 run three
+times, which is why it inherits every guarantee of §4.6 and every limit
+of §10.
 
 ---
 
@@ -671,6 +679,10 @@ holds JSON with camera, phase, balance, weights in both spaces, mask mode,
 rounds, noise parameters, `reconstruct`/`computed`, program version. The RAW
 orientation is carried as the TIFF `Orientation` tag; pixels are not turned
 (source: the raw IFD; if it reports nothing turned, the EXIF orientation).
+A plate (`--plate`) is the same file three frames tall, blue, green, red
+from the top, in sensor orientation, with a `plate` object in the JSON
+(frame order, frame height, filter set, the three weight triples); the
+mask sidecar is one frame for all three.
 
 ### 7.2 Mask sidecar
 
@@ -717,7 +729,21 @@ ramp). USM is
 $x + a(x - G_\sigma \ast x)$, masked as in 7.2; Richardson–Lucy inverts
 that same Gaussian, 1–10 passes, every pixel, before the USM. At native
 size, when shrinking, and for an area enlargement, $\sigma = 0$ and that
-pass is a copy. The file
+pass is a copy. *Peak*, the desktop's sharpening, is a high-pass on the
+print after the paper, $x + a\,(x - G_r \ast x)$ with $r$ in print pixels
+(0.3–8) and $a$ up to 4, both in the recipe. The desktop measures them
+once on the native-size print: short edge profiles across the picture,
+the soft ones dropped, the sharpest tenth averaged, and the smallest
+$(r, a)$ that bring that edge to MTF50 = 0.35 c/px without the contrast at
+0.25 c/px passing 0.70 (`peak.rs`); a picture without such an edge keeps
+the default radius and $a = 0$. The radius is then multiplied by the
+print's scale; the paper border is left out. A plate is printed by running this pass three times over its three
+frames with the same crop, size, paper and two exposures, the lamps
+added as stops to the placing of the red and the blue pass, peak with the
+one radius on each; the three positives are the channels of a 16-bit RGB
+TIFF (or JPEG) whose profile is a matrix/TRC profile of the projection
+primaries (Adobe RGB 1998 by default, sRGB on request) with the paper's
+gamma 2.2. The file
 still records the one-arc-minute radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
 that number is not applied. There is no
@@ -923,11 +949,15 @@ negative, and the colour resolves to the carriers' band limit, about
 CPSNR on sRGB-encoded values, Kodak set, `bench plate`, channels filters,
 linear separation (`--reconstruct` in brackets), against the best of the
 sixteen demosaicers of §8.1: pixel-sharp 33.5 (38.3) dB against LMMSE
-39.4, 1 (0) of 24 ahead; behind a lens (σ 0.75 px) 45.0 (46.5) against
+39.4, 0 (1) of 24 ahead; behind a lens (σ 0.75 px) 45.0 (46.5) against
 RCD 46.2 and LMMSE 46.2, the plate with reconstruction first by the mean
 and 7 of 24 ahead; at twice the sampling 47.2 (47.5) against RCD 45.4,
-19 of 24 ahead with reconstruction and 4 without. The green channel leads everywhere by 2–5 dB: it is
-`L̂ + Ĉ1'`, not interpolated. Method, file format and limits are in
+19 of 24 ahead with reconstruction and 4 without. The plate's green is
+its strongest channel in every condition, 3–5 dB above its own red and
+blue, and behind a lens and at twice the sampling it is above every
+demosaicer's green (by 0.3 and 3.4 dB on the linear path): it is
+`L̂ + Ĉ1'`, not interpolated; the blue is the weakest, where the camera's
+balance gain is largest. Method, file format and limits are in
 `docs/PLATE.md`.
 
 ## 9. Implementation notes
