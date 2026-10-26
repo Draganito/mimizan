@@ -20,9 +20,7 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
-![Mimizan Lab in the monochrome process: the negative on the left, the print in the middle, the enlarger below, the sheet and its 1:1 box on the right, the strip of film along the bottom](docs/gui.jpg)
-
-![The plate process: the toolbar switched to Plate, the Enlarger with the taking filters, the primaries and the two lamps, the print in colour on its sheet with a border, and the 1:1 box with the sharpening measured for that print](docs/gui_plate.jpg)
+![Mimizan Lab in the plate process: the negative on the left, the colour print in the middle at 21 %, the Enlarger below with the taking filters, the primaries, soft and hard light and the two lamps, the sheet and its 1:1 box with the measured sharpening on the right](docs/gui.jpg)
 
 ## The negative
 
