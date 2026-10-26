@@ -54,8 +54,12 @@ triples, each summing to one so grey gives three equal plates:
   blue `−0.023 −0.302 +1.325`. The matrix is read from rawler's
   per-illuminant table (D65 first); the file's own single matrix was
   empty for the Z f.
-- `wratten`: the panchromatic base weights behind Wratten 25, 58 and 47
-  from `mix.rs`, crosstalk included (red passes 8 % of green, blue 25 %).
+- `wratten`: Wratten 25, 58 and 47 from `mix.rs` in front of the
+  panchromatic emulsion, crosstalk included (red passes 8 % of green,
+  blue 25 %). The emulsion is the camera file's calibrated response, or
+  the native 0.25 / 0.50 / 0.25 without one; the mix of the monochrome
+  negative does not reach the plate (0.15.1; before, the mix stood behind
+  the glass).
   The softer palette of the historical glass. For the Z f: red
   `0.820 0.180 0`, green `0.033 0.905 0.062`, blue `0.012 0.264 0.725`.
 - `channels`: the balanced channels as they are, what the Library of

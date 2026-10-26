@@ -104,7 +104,7 @@ enum Cmd {
         crop: Option<String>,
         /// Three-colour plate instead of one negative (Prokudin-Gorsky):
         /// the three taking filters are camera (the file's colour matrix,
-        /// default) | wratten (25/58/47 in front of the panchromatic mix) |
+        /// default) | wratten (25/58/47 in front of the panchromatic emulsion: the camera file's response, or the native) |
         /// channels (the balanced channels as they are). The file holds the
         /// three frames stacked, blue, green, red; `print` makes it a colour print.
         #[arg(long, value_name = "FILTERS", num_args = 0..=1, default_missing_value = "camera")]

@@ -175,11 +175,12 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     let orientation = mosaic.orientation;
 
     // The plate's taking filters, resolved before the separation so a bad
-    // matrix fails early. The Wratten set filters the base weights, before
-    // any contrast filter.
+    // matrix fails early. The emulsion behind the Wratten glass is the
+    // camera file's panchromatic response, or the native one: not the
+    // mix, which is one negative's filter choice (`plate_base`).
     let plate_weights = match (&p.plate, mosaic.phase) {
         (Some(pp), Some(_)) => {
-            let base = p.weights.to_balanced(p.weights_space, mosaic.wb);
+            let base = plate_base(p.camera_file.as_ref(), mosaic.wb);
             let w = crate::plate::PlateWeights::resolve(pp, base, mosaic.xyz_to_cam.as_ref())?;
             for (name, row) in ["red", "green", "blue"].iter().zip(w.rows) {
                 info!(
@@ -246,6 +247,14 @@ pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
     let decode_ms = t.elapsed().as_millis();
     info!("decode {} ms", decode_ms);
     negative_from_frame(&frame, p, decode_ms)
+}
+
+/// The panchromatic emulsion behind the plate's Wratten glass, on the
+/// balanced channels: the camera file's calibrated response when there is
+/// one, else the native 0.25 / 0.50 / 0.25. A fact of the file, not a
+/// choice; the mix is for one negative and does not reach the plate.
+pub fn plate_base(camera_file: Option<&CameraFile>, wb: [f64; 3]) -> Weights {
+    camera_file.map(|c| c.weights_balanced(wb)).unwrap_or_default()
 }
 
 /// The 8-bit sidecar: `round(255 · mask_max)`, 255 where saturated.

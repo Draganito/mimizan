@@ -946,7 +946,8 @@ impl App {
             self.plate_resolved = None;
             return;
         }
-        let base = self.weights();
+        // The emulsion behind the Wratten glass is the file's, not the mix.
+        let base = s.default_weights();
         let same = self
             .plate_resolved
             .as_ref()
@@ -2386,8 +2387,27 @@ impl App {
             self.edit.plate = Some(params);
         }
         if params.filters == PlateFilters::Wratten {
+            // The emulsion behind the glass is a fact of the file, not a
+            // choice: the camera file's calibrated response, or the native.
+            let (name, hover) = match s.camera_file_path.as_ref().and_then(|p| p.file_name()) {
+                Some(f) => (
+                    "Panchromatic",
+                    format!(
+                        "The emulsion behind Wratten 25, 58 and 47: the panchromatic response calibrated \
+                         for this sensor ({}). It sets how much the three plates overlap.",
+                        f.to_string_lossy()
+                    ),
+                ),
+                None => (
+                    "Native",
+                    "The emulsion behind Wratten 25, 58 and 47: the native 0.25 / 0.50 / 0.25, red and \
+                     blue equally sensitive, as no camera file calibrates this sensor. It sets how much \
+                     the three plates overlap."
+                        .to_string(),
+                ),
+            };
             ui.label(RichText::new("behind").weak());
-            self.mix_combo(ui);
+            ui.label(RichText::new(name).weak()).on_hover_text(hover);
         }
         match self.plate_resolved.as_ref().map(|r| &r.weights) {
             Some(Ok(w)) => {

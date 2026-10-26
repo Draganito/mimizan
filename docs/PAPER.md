@@ -959,8 +959,8 @@ each the full-resolution luminance plus a band-limited chrominance, each
 pixel a weighted sum of measured photosites, the three in register by
 construction. Three such mixes through a set of taking filters (the
 camera's matrix towards the output primaries, inverted and row-normalised;
-or Wratten 25/58/47 in front of the panchromatic mix; or the bare
-channels), printed through one paper with one pair of exposures and three
+or Wratten 25/58/47 in front of the panchromatic emulsion, the camera
+file's response or the native one, never the mix; or the bare channels), printed through one paper with one pair of exposures and three
 lamps, are Prokudin-Gorsky's additive process on the separation. No
 demosaicing enters; the drawing of the colour print is the drawing of the
 negative, and the colour resolves to the carriers' band limit, about
@@ -1183,7 +1183,8 @@ input:  raw CFA array, black/white levels, CFA phase (ε, a, b), as-shot WB
 
 plate (--plate [camera|wratten|channels]):                     §8.7
 13. W := filter rows w_R, w_G, w_B (camera: row-normalised
-    (xyz_to_cam · rgb_to_xyz)⁻¹; wratten: Wratten 25/58/47 × base weights;
+    (xyz_to_cam · rgb_to_xyz)⁻¹; wratten: Wratten 25/58/47 × emulsion (camera file's weights, else
+    native);
     channels: identity)
 14. plate_c := step 11 with w := W_c, for c = R, G, B
 15. TIFF 16 bit linear grey, frames stacked B, G, R from the top,

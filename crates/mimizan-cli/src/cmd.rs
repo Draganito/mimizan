@@ -210,6 +210,12 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         params.plate =
             Some(PlateParams { filters: parse_plate_filters(f)?, space: parse_plate_space(&a.plate_space)? });
     }
+    if params.plate.is_some() && a.weights.is_some() {
+        warn!(
+            "--weights is the mix of one negative; the plate's emulsion is the camera file's response or \
+             the native one, so it has no effect here"
+        );
+    }
 
     let neg = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
     if let Some(pi) = &neg.info.plate {

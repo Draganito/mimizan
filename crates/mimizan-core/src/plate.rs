@@ -16,9 +16,10 @@
 //! * [`PlateFilters::Camera`]: the rows of the camera's colour matrix,
 //!   mapped to the output primaries. Colorimetric; the weights may be
 //!   negative. What colour film does with its orange mask.
-//! * [`PlateFilters::Wratten`]: the panchromatic base weights behind the
-//!   red 25, green 58 and blue 47 glass of `mix.rs`, crosstalk included.
-//!   The softer palette of the historical filters.
+//! * [`PlateFilters::Wratten`]: the red 25, green 58 and blue 47 glass of
+//!   `mix.rs` in front of the panchromatic emulsion (`pipeline::plate_base`:
+//!   the camera file's response, or the native), crosstalk included. The
+//!   softer palette of the historical filters.
 //! * [`PlateFilters::Channels`]: the balanced sensor channels as they are,
 //!   which is how the Library of Congress composites the plates: each
 //!   frame straight into one channel.
@@ -237,8 +238,9 @@ impl PlateWeights {
         Ok(Self { rows, filters: PlateFilters::Camera })
     }
 
-    /// The set `p` asks for. `base` is the panchromatic mix the Wratten set
-    /// filters; `xyz_to_cam` the file's matrix, if any.
+    /// The set `p` asks for. `base` is the panchromatic emulsion the
+    /// Wratten set filters (`pipeline::plate_base`); `xyz_to_cam` the
+    /// file's matrix, if any.
     pub fn resolve(p: &PlateParams, base: Weights, xyz_to_cam: Option<&[[f64; 3]; 3]>) -> Result<Self> {
         match p.filters {
             PlateFilters::Channels => Ok(Self::channels()),
