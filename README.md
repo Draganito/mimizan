@@ -12,7 +12,7 @@ The switch between the two is in the toolbar, and the whole darkroom follows it:
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
-![Dragan Bojovic, a plate printed with Mimizan Lab: Nikon Z f, Micro-Nikkor 60 mm, Wratten filters, Multigrade soft −1.26 hard +0.33, a 5.7 cm sheet with a 3.5 mm white border and a 0.1 mm film edge, 676 × 676 pixels at 300 dpi, shown 1:1](docs/dragan.jpg)
+![Dragan Bojovic, a plate printed with Mimizan Lab: Nikon Z f, Micro-Nikkor 60 mm, Wratten filters, Multigrade soft −1.26 hard +0.33, a 5.7 cm sheet with a 3.5 mm white border and a 0.1 mm film edge, 676 × 676 pixels at 300 dpi, shown 1:1 inside a one-pixel line that is not part of the print](docs/dragan.jpg)
 
 > Lift the colour off. Print what remains.
 >
