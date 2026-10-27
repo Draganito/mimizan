@@ -98,6 +98,17 @@ fn rational(v: f64) -> Rational {
     Rational { n: (v.max(0.0) * f64::from(DENOM)).round() as u32, d: DENOM as u32 }
 }
 
+/// TIFF asks every value to start on a word boundary; the encoder writes
+/// them back to back. An ASCII value of even length (with its NUL) keeps
+/// the next one aligned, so odd strings get one trailing space.
+fn even(s: &str) -> Cow<'_, str> {
+    if (s.len() + 1) % 2 == 0 {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(format!("{s} "))
+    }
+}
+
 /// What the DNG says about the camera and the balance.
 pub struct DngMeta<'a> {
     pub make: &'a str,
@@ -240,16 +251,16 @@ pub fn write_dng(
         d.write_tag(Tag::NewSubfileType, 0u32)?;
         d.write_tag(Tag::PlanarConfiguration, 1u16)?;
         d.write_tag(Tag::Orientation, 1u16)?;
-        d.write_tag(Tag::Make, meta.make)?;
-        d.write_tag(Tag::Model, meta.model)?;
-        d.write_tag(Tag::ImageDescription, meta.description)?;
-        d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
+        d.write_tag(Tag::Make, &*even(meta.make))?;
+        d.write_tag(Tag::Model, &*even(meta.model))?;
+        d.write_tag(Tag::ImageDescription, &*even(meta.description))?;
+        d.write_tag(Tag::Software, &*even(concat!("mimizan ", env!("CARGO_PKG_VERSION"))))?;
         // DNGVersion, DNGBackwardVersion.
         d.write_tag(Tag::Unknown(50706), &[1u8, 4, 0, 0][..])?;
         d.write_tag(Tag::Unknown(50707), &[1u8, 1, 0, 0][..])?;
         // UniqueCameraModel.
         let unique = format!("{} {}", meta.make.trim(), meta.model.trim());
-        d.write_tag(Tag::Unknown(50708), unique.trim().to_string().as_str())?;
+        d.write_tag(Tag::Unknown(50708), &*even(unique.trim()))?;
         // BlackLevel, WhiteLevel: one per sample.
         d.write_tag(Tag::Unknown(50714), &[0u32, 0, 0][..])?;
         d.write_tag(Tag::Unknown(50717), &[65535u32, 65535, 65535][..])?;
@@ -358,7 +369,8 @@ mod tests {
         assert_eq!(neutral.len(), 3);
         assert!((neutral[0] - 0.5).abs() < 1e-6 && (neutral[1] - 1.0).abs() < 1e-6);
         assert!((neutral[2] - 1.0 / 1.5).abs() < 1e-6, "{neutral:?}");
-        assert_eq!(dec.get_tag_ascii_string(Tag::Unknown(50708)).unwrap(), "Mimizan Test");
+        // Trailing space pads an odd string to a word boundary; readers trim it.
+        assert_eq!(dec.get_tag_ascii_string(Tag::Unknown(50708)).unwrap().trim_end(), "Mimizan Test");
 
         let DecodingResult::U16(px) = dec.read_image().unwrap() else { panic!("not u16") };
         assert_eq!(px.len(), 3 * 4 * 3);
