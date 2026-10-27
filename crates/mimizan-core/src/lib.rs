@@ -17,6 +17,7 @@ pub mod filter;
 pub mod icc;
 pub mod ingest;
 pub mod kodak;
+pub mod linear;
 pub mod mask;
 pub mod metrics;
 pub mod mix;

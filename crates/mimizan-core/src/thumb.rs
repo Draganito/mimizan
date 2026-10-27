@@ -192,6 +192,7 @@ mod tests {
             crop: Rect { x: 0, y: 0, w, h },
             orientation,
             xyz_to_cam: None,
+            illuminant: None,
             wb_as_shot: None,
             exposure: Exposure::default(),
             data: RawData::Integer(data),

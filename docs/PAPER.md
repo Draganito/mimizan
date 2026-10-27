@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.15.6
+Dragan Bojovic, October 2026. Version of record for Mimizan 0.16.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
@@ -735,7 +735,27 @@ of 0.11–0.14 with the removed step on carry
 $\mathrm{round}(255\,(0.8 + 0.19\,\beta))$ there; the gate reads them the
 same way.)
 
-### 7.3 Output stage (for completeness)
+### 7.3 The linear DNG (0.16)
+
+For a converter other than Mimizan's print stage, the plate of the bare
+channels (`PlateWeights::channels()`: $\hat L + $ its band-limited
+chrominance on each balanced channel, §6.1) is written as a DNG 1.4 with
+`PhotometricInterpretation = LinearRaw` (34892), three 16-bit samples per
+pixel, uncompressed, one IFD. Each channel is divided by its balance
+multiplier $k_c$ before quantisation, so the samples are in the camera's
+raw space again and a neutral reads the as-shot neutral; `WhiteLevel` is
+65535 per channel and `BlackLevel` 0. `ColorMatrix1` is the file's
+XYZ→camera matrix as `SRATIONAL`, `CalibrationIlluminant1` the EXIF
+light source it was measured under (0 when the file does not say, which
+converters read as D65), `AsShotNeutral` $(1/k_R, 1, 1/k_B)$, and
+`UniqueCameraModel` the make and model, so the converter applies the
+profile it has for that camera. Orientation and crop are applied to the
+pixels (a permutation and a window; nothing is resampled) and the file
+carries orientation 1. `ImageDescription` holds the negative's JSON with
+the plate object. The monochrome counterpart of this export is the
+negative TIFF of §7.1 framed the same way, with its mask sidecar.
+
+### 7.4 Output stage (for completeness)
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
 carries as JSON): mix → orientation → crop window (whole pixels of the

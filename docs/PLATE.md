@@ -133,6 +133,17 @@ carries them (`plate`: filters, primaries, lamps) and the mix (`mix`), so
 a file comes back in the process it was left in; `negative --recipe` and
 `print --recipe` read the same file.
 
+## Out of the darkroom
+
+Since 0.16 the plate can leave as a linear DNG instead of a print
+(*Negative…* in the Print window, `mimizan negative --dng`). It is the
+channels plate with the white balance undone, three samples per pixel
+under `LinearRaw`, the camera's matrix and as-shot neutral in the tags:
+a RAW of that camera with the demosaicing already done by the
+separation. Lightroom, darktable or RawTherapee open it and apply their
+own profile, white balance and tone. The taking filters, the projector
+lamps and the paper are not in it; they are the print's.
+
 ## Measured
 
 `mimizan bench plate`: the Kodak set as fake Bayer mosaics, the plate with

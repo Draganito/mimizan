@@ -668,6 +668,7 @@ mod tests {
             crop,
             orientation: 1,
             xyz_to_cam: None,
+            illuminant: None,
             wb_as_shot: None,
             exposure: Default::default(),
             data: crate::decode::RawData::Integer(raw),

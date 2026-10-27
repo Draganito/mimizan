@@ -219,6 +219,15 @@ enum CropHit {
     Corner(CropCorner),
 }
 
+/// Which file the save dialog is about to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportKind {
+    /// The print: paper, size, border.
+    Print,
+    /// The linear negative or DNG for another program.
+    Linear,
+}
+
 /// Why the recipe question is on screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Leave {
@@ -514,6 +523,8 @@ pub struct App {
     crop_drag: Option<CropDrag>,
 
     dialog: FileDialog,
+    /// What the open save dialog will write when a name is picked.
+    export_kind: ExportKind,
     cameras_dir: PathBuf,
     /// Recipe as opened, as reset, or as last saved next to the RAW.
     recipe_baseline: Recipe,
@@ -667,6 +678,7 @@ impl App {
             crop_drag: None,
             // A launch from the Store has its working directory in System32.
             // The save dialog always opens on the directory set for this export.
+            export_kind: ExportKind::Print,
             dialog: {
                 let mut dialog = FileDialog::new();
                 dialog.config_mut().opening_mode = OpeningMode::AlwaysInitialDir;
@@ -1315,7 +1327,30 @@ impl App {
             self.dialog.config_mut().initial_directory = dir;
         }
         self.dialog.config_mut().default_file_name = format!("{stem}.tif");
+        self.export_kind = ExportKind::Print;
         self.dialog.save_file();
+    }
+
+    /// The linear export's dialog: `<stem>.dng` in the plate process,
+    /// `<stem>.negative.tif` otherwise, beside the RAW.
+    fn start_linear_export(&mut self) {
+        let stem = self
+            .session
+            .as_ref()
+            .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "mimizan".into());
+        if let Some(dir) = self.export_directory() {
+            self.dialog.config_mut().initial_directory = dir;
+        }
+        self.dialog.config_mut().default_file_name =
+            if self.linear_is_dng() { format!("{stem}.dng") } else { format!("{stem}.negative.tif") };
+        self.export_kind = ExportKind::Linear;
+        self.dialog.save_file();
+    }
+
+    /// The linear export is a DNG in the plate process of a Bayer file.
+    fn linear_is_dng(&self) -> bool {
+        self.edit.plate.is_some() && self.session.as_ref().is_some_and(|s| !s.is_mono())
     }
 
     /// The TIFF belongs next to the RAW. With no file open, the strip's
@@ -1948,17 +1983,33 @@ impl App {
     fn handle_dialog(&mut self, ctx: &egui::Context) {
         self.dialog.update(ctx);
         let Some(path) = self.dialog.take_picked() else { return };
-        if let Some(s) = &self.session {
-            let path = with_ext(path, "tif");
-            self.busy = Some("exporting".into());
-            self.heavy.send(Job::Export {
-                session: Arc::clone(s),
-                weights: self.weights(),
-                plate: self.plate_view(),
-                recipe: self.print_recipe(),
-                path,
-                orientation: self.export_orientation(),
-            });
+        let Some(s) = &self.session else { return };
+        match self.export_kind {
+            ExportKind::Print => {
+                let path = with_ext(path, "tif");
+                self.busy = Some("exporting".into());
+                self.heavy.send(Job::Export {
+                    session: Arc::clone(s),
+                    weights: self.weights(),
+                    plate: self.plate_view(),
+                    recipe: self.print_recipe(),
+                    path,
+                    orientation: self.export_orientation(),
+                });
+            }
+            ExportKind::Linear => {
+                let plate = self.linear_is_dng();
+                let path = with_ext(path, if plate { "dng" } else { "tif" });
+                self.busy = Some("exporting".into());
+                self.heavy.send(Job::ExportLinear {
+                    session: Arc::clone(s),
+                    weights: self.weights(),
+                    plate,
+                    crop: self.print_recipe().crop,
+                    path,
+                    orientation: self.export_orientation(),
+                });
+            }
         }
     }
 
@@ -2967,6 +3018,19 @@ impl App {
         {
             self.start_export();
         }
+        ui.add_space(4.0);
+        let hover = self.linear_hover_text();
+        if ui
+            .add_enabled(
+                idle && has,
+                egui::Button::new("Negative…").min_size(Vec2::new(ui.available_width(), 24.0)),
+            )
+            .on_disabled_hover_text(hover.clone())
+            .on_hover_text(hover)
+            .clicked()
+        {
+            self.start_linear_export();
+        }
         // The note stays while the estimate it was about is the current one.
         if let Some(need) = self.export_warned.filter(|n| Some(*n) == self.export_memory()) {
             ui.label(
@@ -3420,6 +3484,38 @@ impl App {
                 "Writes the print on the {look}{rot}{local}:\n\
                  <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC{sharpen}, recipe in the description"
             ),
+        }
+    }
+
+    /// What the linear export writes, for the Negative button.
+    fn linear_hover_text(&self) -> String {
+        let Some(s) = &self.session else { return "Open a RAW file first.".into() };
+        let (w, h) = self.picture_size();
+        let rot = if self.rotation() != 0 {
+            format!(", turned {}°", 90 * self.rotation() as u16)
+        } else {
+            String::new()
+        };
+        let crop = if self.edit.recipe.crop.is_some() { ", the crop" } else { ", the whole frame" };
+        if self.linear_is_dng() {
+            format!(
+                "Writes the separation for another program, no print{rot}{crop}:\n\
+                 <name>.dng  {w} x {h} px, linear DNG, three 16-bit channels a pixel (no demosaicing left to \
+                 do), the camera's colour matrix and as-shot white balance in the tags. A RAW converter opens \
+                 it as a RAW of this camera; the colour is band-limited to the carriers under the full \
+                 luminance."
+            )
+        } else if s.is_mono() {
+            format!(
+                "Writes the negative for another program, no print{rot}{crop}:\n\
+                 <name>.tif  {w} x {h} px, 16 bit linear grey, the mask beside it as <name>.mask.tif"
+            )
+        } else {
+            format!(
+                "Writes the mixed negative for another program, no print{rot}{crop}:\n\
+                 <name>.tif  {w} x {h} px, 16 bit linear grey (the mix as it stands, weights in the \
+                 description), the mask beside it as <name>.mask.tif"
+            )
         }
     }
 
@@ -4057,7 +4153,9 @@ fn start_folder() -> Option<PathBuf> {
 }
 
 fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
-    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext) || e.eq_ignore_ascii_case("tiff")) {
+    let alias = ext == "tif";
+    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext) || (alias && e.eq_ignore_ascii_case("tiff")))
+    {
         p
     } else {
         p.with_extension(ext)

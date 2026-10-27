@@ -96,23 +96,25 @@ The picture in the middle is the print. A white border is added around it, and a
 
 *Print* sets the sheet and writes one 16-bit TIFF; its first line says which, grey with the paper's gamma, or RGB with the Adobe RGB or sRGB profile in the plate. Native keeps the negative's pixels and writes the dpi into the file. Paper fits the picture into a size in centimetres at that dpi; the black edge and the white border are added around it. Resample is B-spline by default, or area (each output pixel is the source area it covers: a mean when shrinking, the pixel held when enlarging), Mitchell, Catmull–Rom, or Lanczos. Peak is a high-pass sharpening of that print: the picture plus an amount of itself minus a Gaussian blur. The radius is that blur, in print pixels, measured on the negative and multiplied by the print's scale, including a reduction. The amount does not change. The box under it is those print pixels at 1:1; drag it, or drag the crosshair on the sheet. The recipe is saved next to the RAW, with the process, the mix or the filters and the lamps, and comes back when the file is opened. Leaving a changed recipe asks first.
 
+*Negative…* under the Export button is the way out of the darkroom for anyone who wants Mimizan's separation and their own converter on top: the picture without paper, lamps or border, turned and cropped as the recipe says, nothing else applied. In the monochrome process it is the mixed negative as a linear 16-bit grey TIFF with the mask beside it, the same file the command writes. In the plate process it is a linear DNG: the three balanced channels of the separation with the white balance undone, three 16-bit samples per pixel, the camera's colour matrix and as-shot white balance in the tags. A RAW converter opens it as a RAW of that camera and has no demosaicing left to do; white balance, profile and tone are its own. Every sample is still a weighted sum of measured photosites; the colour in it is band-limited to the carriers, under the full-resolution luminance.
+
 ## Get it
 
 Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/releases).
 
 The separation works in double precision on the whole frame: a 24-megapixel file holds about 1.8 GB while it is developed, 45 megapixels 3.4 GB, 61 megapixels 4.5 GB, and the open picture keeps most of that afterwards. When the next file would not fit beside the open one, the desktop lets the open one go first; a file that does not fit at all is refused with the two figures in the log rather than started.
 
-Debian and Ubuntu: [mimizan_0.15.6-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.15.6/mimizan_0.15.6-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.16.0-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.16.0/mimizan_0.16.0-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.15.6-1_amd64.deb
+sudo apt install ./mimizan_0.16.0-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.15.6-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.15.6/mimizan-0.15.6-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
+Windows, 64-bit Intel and AMD: [mimizan-0.16.0-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.16.0/mimizan-0.16.0-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
 
-Apple silicon: [mimizan-0.15.6-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.15.6/mimizan-0.15.6-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
+Apple silicon: [mimizan-0.16.0-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.16.0/mimizan-0.16.0-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 
@@ -155,6 +157,12 @@ mimizan print photo_plate.tif -o photo_colour.tif --size 30x40cm --lamp 0.1,-0.1
 ```
 
 `--plate` writes the three-frame plate instead of the negative; `print` recognises it and writes the RGB sheet, here with a tenth of a stop more red lamp and less blue.
+
+```bash
+mimizan negative photo.nef -o photo.dng --dng
+```
+
+`--dng` writes the linear DNG instead: the channels of the separation for another converter, the camera's matrix and white balance in the tags, no mask, the recipe's crop applied when `--recipe` names one.
 
 ```bash
 mimizan negative photo.nef -o photo_plate.tif --recipe photo.recipe.json

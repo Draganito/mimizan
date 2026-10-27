@@ -24,9 +24,9 @@ use mimizan_core::calib::CameraFile;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
-use mimizan_core::plate::{mix_plate, PlateInfo};
+use mimizan_core::plate::{mix_plate, PlateInfo, PlateSpace, PlateWeights};
 use mimizan_core::print::{self as pr, PrintParams, PrintSource};
-use mimizan_core::recipe::{Recipe, Sharpen};
+use mimizan_core::recipe::{CropRect, Recipe, Sharpen};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -55,6 +55,20 @@ pub enum Job {
         recipe: Recipe,
         path: PathBuf,
         /// TIFF orientation to apply (the file's, plus the user's turns).
+        orientation: u16,
+    },
+    /// The linear export: the separation for another program, no print.
+    /// In the monochrome process the mixed negative as a linear grey TIFF
+    /// with its mask beside it; in the plate process the channels as a
+    /// linear DNG. Only the crop and the turns are applied.
+    ExportLinear {
+        session: Arc<Session>,
+        weights: Weights,
+        /// The DNG of the channels plate instead of the grey negative.
+        plate: bool,
+        /// Window on the turned picture, as the print recipe carries it.
+        crop: Option<CropRect>,
+        path: PathBuf,
         orientation: u16,
     },
 }
@@ -154,6 +168,9 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
             Some(plate) => export_plate(&session, weights, &plate, recipe, &path, orientation, &status),
             None => export(&session, weights, recipe, &path, orientation, &status),
         },
+        Job::ExportLinear { session, weights, plate, crop, path, orientation } => {
+            export_linear(&session, weights, plate, crop, &path, orientation, &status)
+        }
     }
 }
 
@@ -454,6 +471,55 @@ fn export_plate(
         tiff: path.to_path_buf(),
         width: out.info.width,
         height: out.info.height,
+        ms: t.elapsed().as_millis(),
+    })
+}
+
+/// The linear export. Monochrome process: the mixed negative (the file's
+/// own plane on a monochrome sensor) as a linear grey TIFF, the mask
+/// beside it. Plate process: the channels plate, white balance undone, as
+/// a linear DNG with the camera's matrix. Both upright and cut to `crop`.
+fn export_linear(
+    s: &Session,
+    weights: Weights,
+    plate: bool,
+    crop: Option<CropRect>,
+    path: &Path,
+    orientation: u16,
+    status: &dyn Fn(String),
+) -> Result<Event> {
+    use mimizan_core::linear::{write_dng, write_negative, DngMeta};
+    let t = Instant::now();
+    let mut info = s.negative.info.clone();
+    info.weights = weights;
+    info.weights_raw = weights.balanced_to_raw(s.wb());
+    let written = if plate {
+        let Some(sep) = s.separation() else {
+            return Err(anyhow::anyhow!("a linear DNG needs a Bayer separation"));
+        };
+        status("mixing the three channels".into());
+        let channels = PlateWeights::channels();
+        let planes = mix_plate(sep, &channels);
+        info.plate = Some(PlateInfo::new(&channels, PlateSpace::default(), sep.lum.height));
+        let desc = serde_json::to_string(&info)?;
+        let meta = DngMeta::of(&s.frame, s.wb(), &desc)
+            .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
+        status(format!("writing {}", path.display()));
+        let [r, g, b] = &planes;
+        write_dng(path, [r, g, b], orientation, crop, &meta)?
+    } else {
+        status(if s.is_mono() { "framing".into() } else { "mixing".into() });
+        let mixed = mixed_plane(s, &weights)?;
+        let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
+        let mask = s.mask_plane()?;
+        let desc = serde_json::to_string(&info)?;
+        status(format!("writing {}", path.display()));
+        write_negative(path, plane, Some(&mask), orientation, crop, &desc)?
+    };
+    Ok(Event::Exported {
+        tiff: path.to_path_buf(),
+        width: written.width,
+        height: written.height,
         ms: t.elapsed().as_millis(),
     })
 }
@@ -806,6 +872,7 @@ mod tests {
             crop: Rect { x: 0, y: 0, w, h },
             orientation: 1,
             xyz_to_cam: None,
+            illuminant: None,
             wb_as_shot: Some([1.0, 1.0, 1.0]),
             exposure: Default::default(),
             data: RawData::Integer(raw),

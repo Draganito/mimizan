@@ -121,6 +121,11 @@ pub struct RawFrame {
     pub orientation: u16,
     /// XYZ -> camera matrix (rows R,G,B), if the file provides one.
     pub xyz_to_cam: Option<[[f64; 3]; 3]>,
+    /// The illuminant `xyz_to_cam` was measured under, as the EXIF
+    /// `LightSource` code the DNG `CalibrationIlluminant1` tag takes:
+    /// 21 D65, 20 D55, 23 D50, 22 D75, 1 daylight, 9 fine weather, 10
+    /// cloudy. `None` when the file does not say.
+    pub illuminant: Option<u16>,
     /// As-shot white balance multipliers R,G,B normalised to G = 1, if present.
     pub wb_as_shot: Option<[f64; 3]>,
     pub exposure: Exposure,
@@ -251,7 +256,7 @@ impl RawDecoder for RawlerDecoder {
         // first (D65, the daylight matrix the plate wants; else the other
         // daylight-like entries; else whatever there is), then the older
         // single matrix.
-        let xyz_to_cam = {
+        let (xyz_to_cam, illuminant) = {
             use rawler::imgop::xyz::Illuminant as I;
             let from_flat = |m: &[f32]| -> Option<[[f64; 3]; 3]> {
                 if m.len() < 9 || m.iter().take(9).all(|v| *v == 0.0) {
@@ -260,23 +265,30 @@ impl RawDecoder for RawlerDecoder {
                 let r = |i: usize| [f64::from(m[3 * i]), f64::from(m[3 * i + 1]), f64::from(m[3 * i + 2])];
                 Some([r(0), r(1), r(2)])
             };
+            // The illuminant as the EXIF LightSource code (what a DNG's
+            // CalibrationIlluminant1 holds); rawler's enum carries it.
+            let code = |k: &I| *k as u16;
             let preferred = [I::D65, I::D55, I::Daylight, I::D50, I::D75, I::FineWeather, I::CloudyWeather];
-            preferred
+            let found = preferred
                 .iter()
-                .find_map(|k| img.color_matrix.get(k).and_then(|m| from_flat(m)))
+                .find_map(|k| img.color_matrix.get(k).and_then(|m| from_flat(m)).map(|m| (m, Some(code(k)))))
                 .or_else(|| {
                     let mut keys: Vec<_> = img.color_matrix.keys().collect();
                     keys.sort_by_key(|k| **k as u16);
-                    keys.into_iter().find_map(|k| from_flat(&img.color_matrix[k]))
+                    keys.into_iter().find_map(|k| from_flat(&img.color_matrix[k]).map(|m| (m, Some(code(k)))))
                 })
                 .or_else(|| {
                     let m = img.xyz_to_cam;
                     let nonzero = m.iter().take(3).flatten().any(|v| *v != 0.0);
                     nonzero.then(|| {
                         let r = |i: usize| [f64::from(m[i][0]), f64::from(m[i][1]), f64::from(m[i][2])];
-                        [r(0), r(1), r(2)]
+                        ([r(0), r(1), r(2)], None)
                     })
-                })
+                });
+            match found {
+                Some((m, i)) => (Some(m), i),
+                None => (None, None),
+            }
         };
 
         let wb_as_shot = {
@@ -315,6 +327,7 @@ impl RawDecoder for RawlerDecoder {
             crop,
             orientation,
             xyz_to_cam,
+            illuminant,
             wb_as_shot,
             exposure,
             data,

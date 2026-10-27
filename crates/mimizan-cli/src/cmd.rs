@@ -41,6 +41,8 @@ pub struct NegativeArgs {
     /// A recipe whose `mix` and `plate` develop this negative; the flags
     /// above override them.
     pub recipe: Option<PathBuf>,
+    /// Write a linear DNG of the channels plate instead of the negative.
+    pub dng: bool,
 }
 
 /// `camera`, `wratten` or `channels`.
@@ -216,6 +218,31 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
              the native one, so it has no effect here"
         );
     }
+    // The DNG is the channels plate, nothing else: the converter does the
+    // colour. The recipe's crop still applies.
+    let recipe_crop = a
+        .recipe
+        .as_ref()
+        .map(|p| mimizan_core::recipe::Recipe::load(p).map(|r| r.crop))
+        .transpose()?
+        .flatten();
+    if a.dng {
+        if frame.kind == SensorKind::Mono {
+            bail!(
+                "a linear DNG is the colour plate of a Bayer sensor; this file is monochrome, write the TIFF"
+            );
+        }
+        if a.filter.is_some() {
+            bail!("--filter is a contrast filter for one negative; the DNG carries the three channels");
+        }
+        if let Some(pl) = &params.plate {
+            if pl.filters != PlateFilters::Channels {
+                info!("DNG: the plate goes out as the channels, not through {} filters", pl.filters.name());
+            }
+        }
+        params.plate =
+            Some(PlateParams { filters: PlateFilters::Channels, space: parse_plate_space(&a.plate_space)? });
+    }
 
     let neg = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
     if let Some(pi) = &neg.info.plate {
@@ -229,16 +256,35 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     }
     let desc = serde_json::to_string(&neg.info)?;
     let t = Instant::now();
-    write_gray16(
-        &a.out,
-        &neg.plane,
-        &TiffMeta { description: &desc, trc: GrayTrc::Linear, orientation: neg.orientation, dpi: None },
-    )?;
-    let side = sidecar_path(&a.out);
-    // The mask is one frame: the same for the three plates of a plate.
-    let mask_h = neg.info.plate.as_ref().map_or(neg.plane.height, |pi| pi.frame_height);
-    write_gray8(&side, neg.plane.width, mask_h, &neg.mask8, "mimizan mask: 255*max(M), 255=saturated")?;
-    info!("wrote {} + {} in {} ms", a.out.display(), side.display(), t.elapsed().as_millis());
+    if a.dng {
+        let pi = neg.info.plate.as_ref().context("the DNG needs the plate")?;
+        let [r, g, b] = mimizan_core::plate::split(&neg.plane, pi)?;
+        let meta = mimizan_core::linear::DngMeta::of(&frame, neg.info.wb, &desc)
+            .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
+        let w = mimizan_core::linear::write_dng(&a.out, [&r, &g, &b], neg.orientation, recipe_crop, &meta)?;
+        info!(
+            "wrote {} ({}x{} linear DNG, {}) in {} ms",
+            a.out.display(),
+            w.width,
+            w.height,
+            match recipe_crop {
+                Some(_) => "the recipe's crop",
+                None => "the whole frame",
+            },
+            t.elapsed().as_millis()
+        );
+    } else {
+        write_gray16(
+            &a.out,
+            &neg.plane,
+            &TiffMeta { description: &desc, trc: GrayTrc::Linear, orientation: neg.orientation, dpi: None },
+        )?;
+        let side = sidecar_path(&a.out);
+        // The mask is one frame: the same for the three plates of a plate.
+        let mask_h = neg.info.plate.as_ref().map_or(neg.plane.height, |pi| pi.frame_height);
+        write_gray8(&side, neg.plane.width, mask_h, &neg.mask8, "mimizan mask: 255*max(M), 255=saturated")?;
+        info!("wrote {} + {} in {} ms", a.out.display(), side.display(), t.elapsed().as_millis());
+    }
 
     if let Some(p) = &a.preview {
         mimizan_core::preview::write_png(&neg.plane, p, a.preview_scale, true)?;

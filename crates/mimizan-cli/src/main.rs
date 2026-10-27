@@ -117,6 +117,14 @@ enum Cmd {
         /// --weights and --plate override them.
         #[arg(long)]
         recipe: Option<PathBuf>,
+        /// Linear DNG instead of the negative TIFF: the three balanced
+        /// channels of the separation with the white balance undone, three
+        /// samples a pixel (LinearRaw), the camera's colour matrix and
+        /// as-shot neutral in the tags. A RAW converter opens it as a RAW of
+        /// the camera and skips its own demosaicing. Bayer sensors only; the
+        /// recipe's crop is applied; no mask sidecar.
+        #[arg(long)]
+        dng: bool,
     },
     /// Negative TIFF -> print file in one pass: size, place, paper or look, border,
     /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC). Every print
@@ -240,6 +248,7 @@ fn main() -> Result<()> {
             plate,
             plate_space,
             recipe,
+            dng,
         } => cmd::negative(&cmd::NegativeArgs {
             raw,
             out,
@@ -259,6 +268,7 @@ fn main() -> Result<()> {
             plate,
             plate_space,
             recipe,
+            dng,
         }),
         Cmd::Print {
             negative,
