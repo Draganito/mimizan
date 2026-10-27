@@ -67,9 +67,11 @@ impl SeparateParams {
 pub struct Separation {
     /// Estimated luminance `L̂` (full resolution).
     pub lum: Plane,
-    /// Low-pass chrominance `Ĉ1'`, mask gain already folded in.
+    /// Low-pass chrominance `Ĉ1'`, mask gain and the colour gate
+    /// ([`Mosaic::chroma_gate`]) already folded in.
     pub c1: Plane,
-    /// Combined low-pass chrominance `Ĉ2'`, mask gain already folded in.
+    /// Combined low-pass chrominance `Ĉ2'`, mask gain and the colour gate
+    /// already folded in.
     pub c2: Plane,
     /// Where output sharpening is allowed, per pixel in [0,1]. `Adaptive`:
     /// `max(M_1, M_2a, M_2b)` of the block mask. `Off` and `Dubois`:
@@ -147,9 +149,40 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
 /// Separate a Bayer mosaic in the mode `p.mask` names. Every output pixel
 /// is a fixed-weight sum of measured values; nothing is computed from a
 /// model of the picture. A monochrome mosaic is an error.
+///
+/// The luminance is estimated with the full chrominance subtracted. The
+/// chrominance handed on to the mixes is then gated by
+/// [`Mosaic::chroma_gate`]: where a green photosite is burnt out, the
+/// colour differences are false (towards magenta, whatever the scene), so
+/// the mixes get none of them there and the three plates of a colour
+/// print, like a filtered negative, take the luminance alone. `L̂` and the
+/// native mix are untouched.
 pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
     let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
-    Ok(separate_linear(mosaic, phase, p))
+    let mut sep = separate_linear(mosaic, phase, p);
+    if let Some(gate) = &mosaic.chroma_gate {
+        gate_chroma(&mut sep, gate)?;
+    }
+    Ok(sep)
+}
+
+/// `Ĉ1' ← g·Ĉ1'`, `Ĉ2' ← g·Ĉ2'` with `g = gate / 255` per pixel.
+pub fn gate_chroma(sep: &mut Separation, gate: &[u8]) -> crate::Result<()> {
+    if gate.len() != sep.c1.data.len() || gate.len() != sep.c2.data.len() {
+        return Err(crate::Error::Invalid(format!(
+            "colour gate has {} entries, the separation {}",
+            gate.len(),
+            sep.c1.data.len()
+        )));
+    }
+    for c in [&mut sep.c1, &mut sep.c2] {
+        c.data.par_iter_mut().zip(gate.par_iter()).for_each(|(v, &g)| {
+            if g != 255 {
+                *v *= f64::from(g) / 255.0;
+            }
+        });
+    }
+    Ok(())
 }
 
 fn separate_linear(mosaic: &Mosaic, phase: BayerPhase, p: &SeparateParams) -> Separation {
@@ -216,6 +249,97 @@ mod tests {
                     assert!((c1.at(x, y) - (-r + 2.0 * g - b) / 4.0).abs() < 1e-9);
                     assert!((c2.at(x, y) - (r - b) / 4.0).abs() < 1e-9);
                 }
+            }
+        }
+    }
+
+    /// A neutral field with a burnt-out patch, balanced R 2, G 1, B 1.5:
+    /// inside the patch the mosaic reads (2, 1, 1.5), a false magenta. The
+    /// gate takes that colour out of the mixes, so the three plates are
+    /// equal there and equal to the luminance; the luminance itself, and
+    /// so the native negative, is what the ungated separation gives.
+    #[test]
+    fn burnt_out_green_leaves_the_plates_neutral_and_the_luminance_alone() {
+        use crate::decode::{RawData, RawFrame, Rect, SensorKind};
+        use crate::ingest::{ingest, IngestParams, WhiteBalance};
+        use crate::plate::{mix_plate, PlateWeights};
+
+        let (w, h) = (96usize, 96usize);
+        let phase = BayerPhase::RGGB;
+        let patch = |x: usize, y: usize| (36..60).contains(&x) && (36..60).contains(&y);
+        // The field is a neutral 0.3 once balanced; the patch is at white.
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if patch(x, y) {
+                    1000
+                } else {
+                    match phase.color_at(x, y) {
+                        Color::R => 150,
+                        Color::G => 300,
+                        Color::B => 200,
+                    }
+                }
+            })
+            .collect();
+        let frame = RawFrame {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 12,
+            kind: SensorKind::Bayer(phase),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let wb = [2.0, 1.0, 1.5];
+        let p = IngestParams { wb: WhiteBalance::Manual(wb), ..IngestParams::default() };
+        let mosaic = ingest(&frame, &p).unwrap();
+        assert!(mosaic.chroma_gate.is_some());
+        let mut ungated = mosaic.clone();
+        ungated.chroma_gate = None;
+
+        for sp in [
+            SeparateParams::default(),
+            SeparateParams { mask: MaskMode::Off, ..Default::default() },
+            SeparateParams { mask: MaskMode::Adaptive, ..Default::default() },
+        ] {
+            let gated = separate(&mosaic, &sp).unwrap();
+            let plain = separate(&ungated, &sp).unwrap();
+            assert_eq!(gated.lum.data, plain.lum.data, "{:?}: the luminance does not see the gate", sp.mask);
+            // The mixes see it: the camera's channels straight into the plates.
+            let [r, g, b] = mix_plate(&gated, &PlateWeights::channels());
+            let [r0, g0, b0] = mix_plate(&plain, &PlateWeights::channels());
+            for y in 40..56 {
+                for x in 40..56 {
+                    let l = gated.lum.at(x, y);
+                    assert!((r.at(x, y) - l).abs() < 1e-9 && (g.at(x, y) - l).abs() < 1e-9, "{:?}", sp.mask);
+                    assert!((b.at(x, y) - l).abs() < 1e-9, "{:?}", sp.mask);
+                    // Without the gate the patch is magenta: red and blue over green.
+                    assert!(
+                        r0.at(x, y) > g0.at(x, y) + 0.5 && b0.at(x, y) > g0.at(x, y) + 0.2,
+                        "{:?}",
+                        sp.mask
+                    );
+                }
+            }
+            // At the centre, the luminance is the sum of the three clips.
+            let l = (wb[0] + 2.0 * wb[1] + wb[2]) / 4.0;
+            assert!((gated.lum.at(48, 48) - l).abs() < 0.05, "{:?}: {}", sp.mask, gated.lum.at(48, 48));
+            // Far from the patch the field is neutral and measured either way.
+            for (x, y) in [(8, 8), (8, 88), (88, 8), (88, 88)] {
+                let v = (r.at(x, y), g.at(x, y), b.at(x, y));
+                assert!((v.0 - 0.3).abs() < 1e-4 && (v.1 - 0.3).abs() < 1e-4, "{:?} {v:?}", sp.mask);
+                assert!((v.2 - 0.3).abs() < 1e-4, "{:?} {v:?}", sp.mask);
+                assert_eq!(r.at(x, y), r0.at(x, y));
             }
         }
     }

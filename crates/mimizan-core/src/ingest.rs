@@ -49,6 +49,10 @@ pub enum WhiteBalance {
     None,
 }
 
+/// Default of [`IngestParams::sat_margin`]: a raw sample at or above
+/// `white · (1 − 0.02)` counts as saturated. The thumbnails use the same.
+pub const SAT_MARGIN: f64 = 0.02;
+
 /// Settings of the ingest stage.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IngestParams {
@@ -56,6 +60,12 @@ pub struct IngestParams {
     pub sat_margin: f64,
     /// Radius, in pixels, the saturation mask grows by.
     pub sat_dilate: usize,
+    /// Half-width, in pixels, of the chrominance low-pass of the
+    /// separation (`dubois`: 0.15 c/px, transition 0.15, 40 dB → 15 taps).
+    /// The colour gate falls off over it: a pixel whose chrominance support
+    /// reaches into burnt-out green photosites gets that share of its
+    /// colour taken away ([`Mosaic::chroma_gate`]).
+    pub colour_reach: usize,
     /// A sample this many sigma outside its same-colour neighbours is a defect.
     pub defect_sigma: f64,
     /// Replace the defects by their neighbours' median. Off by default:
@@ -71,8 +81,9 @@ pub struct IngestParams {
 impl Default for IngestParams {
     fn default() -> Self {
         Self {
-            sat_margin: 0.02,
+            sat_margin: SAT_MARGIN,
             sat_dilate: 2,
+            colour_reach: 7,
             defect_sigma: 8.0,
             repair_defects: false,
             noise: NoiseModel::default(),
@@ -101,6 +112,11 @@ pub struct IngestReport {
     pub saturated_raw: usize,
     /// Photosites inside the dilated saturation mask.
     pub saturated_dilated: usize,
+    /// Green photosites at or above the saturation level: where the
+    /// colour differences are false and the chrominance is gated out
+    /// ([`Mosaic::chroma_gate`]). 0 on a monochrome sensor.
+    #[serde(default)]
+    pub saturated_green: usize,
     /// Photosites the defect rule flags: more than `defect_sigma` sigma
     /// outside the range of their same-colour neighbours. Counted always;
     /// replaced only when `defects_repaired`.
@@ -127,6 +143,22 @@ pub struct Mosaic {
     pub phase: Option<BayerPhase>,
     /// 1 where saturated (after dilation), else 0. Same size as `plane`.
     pub saturated: Vec<u8>,
+    /// How much of its chrominance each pixel keeps, 255 = all, 0 = none;
+    /// same size as `plane`. `None` when no green photosite is burnt out
+    /// (or on a monochrome sensor): the separation then takes the colour
+    /// as estimated.
+    ///
+    /// Green has the lowest clip of the three balanced channels (its
+    /// multiplier is one; red and blue are raised above it), so where a
+    /// green photosite is burnt out every colour difference around it is
+    /// false, and false in the same direction whatever the scene: towards
+    /// magenta. Where only red or blue burn out, the difference is a lower
+    /// bound in the right direction and stays. The gate is 0 on the
+    /// dilated set of burnt-out green photosites and rises to 255 over
+    /// [`IngestParams::colour_reach`] pixels, by the share of the
+    /// chrominance support that is not burnt out. The luminance is not
+    /// touched: a gated pixel prints as the monochrome print shows it.
+    pub chroma_gate: Option<Vec<u8>>,
     /// Noise model in raw normalised units (before balance).
     pub noise: NoiseModel,
     /// Multipliers R,G,B applied to `plane` (G = 1).
@@ -339,6 +371,11 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
     }
 
     let (saturated, sat_dilated_count) = dilate_counted(&sat_raw, w, h, p.sat_dilate);
+    let (chroma_gate, sat_green_count) = match phase {
+        Some(ph) => chroma_gate(&sat_raw, w, h, ph, p.sat_dilate, p.colour_reach),
+        None => (None, 0),
+    };
+    drop(sat_raw);
     let step = if phase.is_some() { 2usize } else { 1usize };
     let (plane_data, defects, hot_rows) = scan_defects(norm, &saturated, w, h, step, p);
 
@@ -367,6 +404,7 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
         plane,
         phase,
         saturated,
+        chroma_gate,
         noise: p.noise,
         wb,
         orientation: frame.orientation,
@@ -383,6 +421,7 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             crop,
             saturated_raw: sat_raw_count,
             saturated_dilated: sat_dilated_count,
+            saturated_green: sat_green_count,
             defects,
             defects_repaired: p.repair_defects,
             defect_hot_rows: hot_rows,
@@ -392,6 +431,73 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             wb_source,
         },
     })
+}
+
+/// The colour gate of [`Mosaic::chroma_gate`] from the raw saturation map:
+/// `(gate, burnt-out green photosites)`. `None` when no green photosite is
+/// saturated. The gate is 0 on the burnt-out green photosites dilated by
+/// `dilate` pixels, and outside that set `255 · (1 − f)`, where `f` is the
+/// share of the `(2·reach + 1)²` window around the pixel that lies in the
+/// dilated set: the share of its chrominance support that was not
+/// measured. The window is a separable box, so `f` is exact and the same
+/// on any machine.
+fn chroma_gate(
+    sat_raw: &[u8],
+    w: usize,
+    h: usize,
+    phase: BayerPhase,
+    dilate: usize,
+    reach: usize,
+) -> (Option<Vec<u8>>, usize) {
+    let mut green = vec![0u8; w * h];
+    let count: usize = green
+        .par_chunks_mut(w)
+        .zip(sat_raw.par_chunks(w))
+        .enumerate()
+        .map(|(y, (row, src))| {
+            let mut n = 0usize;
+            for (x, (o, &s)) in row.iter_mut().zip(src).enumerate() {
+                if s != 0 && phase.color_at(x, y) == Color::G {
+                    *o = 1;
+                    n += 1;
+                }
+            }
+            n
+        })
+        .sum();
+    if count == 0 {
+        return (None, 0);
+    }
+    let (blind, _) = dilate_counted(&green, w, h, dilate);
+    drop(green);
+    // Separable box sums of the dilated set: rows first, as u16 counts.
+    let span = 2 * reach + 1;
+    let mut rows = vec![0u16; w * h];
+    rows.par_chunks_mut(w).zip(blind.par_chunks(w)).for_each(|(out, src)| {
+        for (x, o) in out.iter_mut().enumerate() {
+            let lo = x.saturating_sub(reach);
+            let hi = (x + reach).min(w - 1);
+            *o = src[lo..=hi].iter().map(|&v| u16::from(v)).sum();
+        }
+    });
+    let mut gate = vec![255u8; w * h];
+    gate.par_chunks_mut(w).zip(blind.par_chunks(w)).enumerate().for_each(|(y, (out, src))| {
+        let lo = y.saturating_sub(reach);
+        let hi = (y + reach).min(h - 1);
+        for (x, o) in out.iter_mut().enumerate() {
+            if src[x] != 0 {
+                *o = 0;
+                continue;
+            }
+            let inside: u32 = (lo..=hi).map(|yy| u32::from(rows[yy * w + x])).sum();
+            // The window is cut at the frame; the share counts what it holds.
+            let window = (hi - lo + 1) as u32 * ((x + reach).min(w - 1) - x.saturating_sub(reach) + 1) as u32;
+            debug_assert!(window > 0 && window <= (span * span) as u32);
+            let keep = 1.0 - f64::from(inside) / f64::from(window);
+            *o = (255.0 * keep).round() as u8;
+        }
+    });
+    (Some(gate), count)
 }
 
 /// Chebyshev dilation of a 0/1 mask by `r` pixels (separable max filter).
@@ -598,6 +704,45 @@ mod tests {
         f.data = crate::decode::RawData::Float(data);
         let err = ingest(&f, &IngestParams::default()).unwrap_err();
         assert!(err.to_string().contains("not a number"), "{err}");
+    }
+
+    /// A burnt-out patch of a neutral field: the colour gate is closed on
+    /// the green photosites of the patch and their neighbours, falls off
+    /// over `colour_reach`, and is open far away. Only green photosites
+    /// close it: a patch that burns out red alone leaves no gate at all.
+    #[test]
+    fn colour_gate_closes_on_burnt_out_green_only() {
+        let (w, h) = (64usize, 64usize);
+        let full = Rect { x: 0, y: 0, w, h };
+        let phase = BayerPhase::RGGB;
+        let patch = |x: usize, y: usize| (20..28).contains(&x) && (20..28).contains(&y);
+        // The whole patch at white (every colour), the field at a fifth.
+        let raw: Vec<u16> = (0..w * h).map(|i| if patch(i % w, i / w) { 1000 } else { 200 }).collect();
+        let p = IngestParams { wb: WhiteBalance::Manual([2.0, 1.0, 1.5]), ..IngestParams::default() };
+        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw), &p).unwrap();
+        assert_eq!(m.report.saturated_green, 32, "8×8 patch: half its photosites are green");
+        let gate = m.chroma_gate.as_ref().expect("a burnt-out green photosite closes the gate");
+        assert_eq!(gate.len(), w * h);
+        // Closed on the patch and the two pixels of dilation around it.
+        for (x, y) in [(20, 20), (27, 27), (18, 24), (29, 24), (24, 18), (24, 29)] {
+            assert_eq!(gate[y * w + x], 0, "({x},{y})");
+        }
+        // Rising with the distance from the patch, open at the reach.
+        let row: Vec<u8> = (30..40).map(|x| gate[24 * w + x]).collect();
+        assert!(row.windows(2).all(|p| p[0] <= p[1]), "{row:?}");
+        assert!(row[0] > 0 && row[0] < 255, "{row:?}");
+        assert!(gate[24 * w + 29 + p.colour_reach] < 255, "{row:?}");
+        assert_eq!(gate[24 * w + 30 + p.colour_reach], 255, "{row:?}");
+        assert_eq!(gate[5 * w + 5], 255);
+        assert_eq!(gate[(h - 1) * w + w - 1], 255);
+        // The same patch burnt out in red alone: no gate.
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| if patch(i % w, i / w) && phase.color_at(i % w, i / w) == Color::R { 1000 } else { 200 })
+            .collect();
+        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw), &p).unwrap();
+        assert!(m.report.saturated_raw > 0);
+        assert_eq!(m.report.saturated_green, 0);
+        assert!(m.chroma_gate.is_none());
     }
 
     #[test]

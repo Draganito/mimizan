@@ -197,7 +197,8 @@ A photosite is saturated if $\mathrm{raw} \ge \mathrm{white}\,(1 -
 mask is dilated by 2 px (the same-phase neighbours share the estimation
 error). Saturated photosites keep their clipped value in the picture; they
 are excluded from every statistic and fit and marked 255 in the mask sidecar
-(§7.2).
+(§7.2). Saturated *green* photosites also close the colour gate of §6.5;
+their count is `saturated_green` in the report.
 
 ### 3.3 Noise model
 
@@ -677,6 +678,34 @@ deterministic, no local minima. Pass: RMSE ≤ 5 % of the mean reference
 brightness. The result is converted to raw space with the multipliers of the
 calibration shot and written to the camera file.
 
+### 6.5 The colour gate at saturation (0.15.6)
+
+The balance of §3.5 sets where each channel clips: a saturated photosite
+of colour $c$ reads $k_c$, with $k_G = 1$ and $k_R, k_B$ above it (1.6 to
+2.3 on a daylight file). A burnt-out neutral therefore enters the
+separation as $(k_R, 1, k_B)$: a chrominance $\hat C_1 = (2 - k_R - k_B)/4
+< 0$ that no scene had, false in the same direction, towards magenta,
+whatever the scene was. Any mix with $w_G \ne w_R + w_B$ shows it, and the
+plate of §8.7 shows it most, since the camera matrix's negative
+coefficients send the green plate below paper white while red and blue go
+over it (pink highlights, 0.13 to 0.15.5).
+
+Let $S_G$ be the set of saturated green photosites (§3.2), $D_2$ the
+dilation by 2 px, and $W_7(x)$ the $15 \times 15$ window around $x$, the
+support of the chrominance low-pass of §4.5. The gate is
+
+$$ g(x) = \begin{cases} 0 & x \in D_2(S_G) \\[2pt] 1 - \dfrac{|W_7(x) \cap D_2(S_G)|}{|W_7(x)|} & \text{otherwise} \end{cases} $$
+
+and the chrominance handed to §6.1 is $g\,\hat C_1'$, $g\,\hat C_2'$. The
+luminance $\hat L$ is estimated with the full chrominance subtracted and
+is not touched, so the native mix is unchanged to the bit; every other
+mix, and each of the three plates, takes $\hat L$ alone where the gate is
+closed, and a share of the colour where the chrominance support reaches
+into burnt-out green. Only green closes the gate: where red or blue alone
+saturate, the colour difference is a lower bound in the right direction
+and stays. The window is a separable box, so $g$ is exact and the same on
+every machine; it is stored as 8 bits per pixel. Nothing is reconstructed.
+
 ---
 
 ## 7. The negative
@@ -1075,8 +1104,11 @@ balance gain is largest. Method, file format and limits are in
   red filter on the Z f, §6.1), colour mottle like dye clouds. No noise
   reduction, as a matter of principle; the plate's chroma noise has not
   been measured yet.
-- Clipped photosites clamp at 1 in every channel, so a clipped highlight
-  goes to paper white in all three; there is no highlight reconstruction.
+- Where a green photosite is burnt out the plate has no colour (§6.5): a
+  burnt-out neutral goes to paper white in all three, a subject that burns
+  out green alone prints grey, and real colour within seven pixels of a
+  burnt-out highlight is reduced by the share of its support that was
+  burnt out. There is no highlight reconstruction.
 - The plate has two lamps and nothing else: no saturation, no hue, no
   per-channel curve. The filter transmissions of `wratten` are the same
   approximations as the monochrome weights; the `camera` matrix is the

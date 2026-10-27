@@ -2287,10 +2287,18 @@ impl App {
             val(
                 ui,
                 format!(
-                    "{:.2} % ({:.2} % dilated)",
+                    "{:.2} % ({:.2} % dilated, {:.2} % green)",
                     100.0 * info.report.saturated_raw as f64 / px,
-                    100.0 * info.report.saturated_dilated as f64 / px
+                    100.0 * info.report.saturated_dilated as f64 / px,
+                    100.0 * info.report.saturated_green as f64 / px
                 ),
+            )
+            .on_hover_text(
+                "Photosites at the sensor's clip, and the mask grown around them where no sharpening is \
+                 applied. The green share is where the colour is taken out: green has the lowest clip \
+                 of the three balanced channels, so a burnt-out green photosite makes every colour \
+                 difference around it false, towards magenta. There the plates, and a filtered \
+                 negative, take the luminance alone; the native negative is unchanged.",
             );
             ui.end_row();
             ui.label("defects");

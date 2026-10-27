@@ -67,9 +67,24 @@ triples, each summing to one so grey gives three equal plates:
   picture itself and there is no camera.
 
 The white balance before the separation stays what it was: it is the ratio
-of the three exposure times. Clipped photosites clamp at 1 in every
-channel, so a clipped highlight goes to paper white in all three, like
-the shoulder of a slide; there is no highlight reconstruction.
+of the three exposure times. It also sets where each channel clips. A
+burnt-out photosite reads its multiplier: green 1, red and blue 1.6 to
+2.3 on a daylight file. A burnt-out neutral therefore leaves the sensor as
+`(k_R, 1, k_B)`, a strong magenta no scene had, and the camera matrix,
+with its negative coefficients, sends the green plate below paper white
+while red and blue go over it. Up to 0.15.5 that printed as pink
+highlights. Since 0.15.6 the separation gates the chrominance where a
+green photosite is burnt out: green has the lowest clip of the three, so
+there every colour difference is false, and false in the same direction
+whatever the scene was. Where only red or blue burn out, the difference is
+a lower bound in the right direction and stays; a poppy stays red. The
+gate is closed on the burnt-out green photosites and the two pixels around
+them, and opens over the seven pixels of the chrominance kernel by the
+share of the support that was measured. Where it is closed the three
+plates are the luminance, which is what the monochrome print shows there:
+the highlight goes to paper white in all three, like the shoulder of a
+slide. Nothing is reconstructed, and the luminance, and with it the native
+negative, does not see the gate.
 
 **The file.** One 16-bit linear grey TIFF with the three frames stacked,
 blue at the top, green, red at the bottom, in the sensor orientation; the

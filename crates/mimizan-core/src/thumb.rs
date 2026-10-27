@@ -8,6 +8,7 @@
 
 use crate::cfa::Color;
 use crate::decode::{RawFrame, SensorKind};
+use crate::ingest::SAT_MARGIN;
 use crate::mix::Weights;
 use crate::plane::Plane;
 use crate::plate::{PlateSpace, PlateWeights};
@@ -62,26 +63,32 @@ pub fn binned(
     let oh = (c.h / f).max(1);
     // Four planes: the balanced R, G, B means of each bin, and the mono
     // sensor's one channel in G.
-    let mut chan = [Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh)];
-    let (r, gb) = chan.split_at_mut(1);
-    let (g, b) = gb.split_at_mut(1);
+    // The fourth marks bins with a burnt-out green photosite: there the
+    // colour is false (towards magenta, `ingest::Mosaic::chroma_gate`)
+    // and the plate shows the luminance, as the developed picture does.
+    let mut chan = [Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh)];
+    let (r, gbs) = chan.split_at_mut(1);
+    let (g, bs) = gbs.split_at_mut(1);
+    let (b, s) = bs.split_at_mut(1);
     r[0].data
         .par_chunks_mut(ow)
         .zip(g[0].data.par_chunks_mut(ow))
         .zip(b[0].data.par_chunks_mut(ow))
+        .zip(s[0].data.par_chunks_mut(ow))
         .enumerate()
-        .for_each(|(oy, ((rr, gg), bb))| {
+        .for_each(|(oy, (((rr, gg), bb), ss))| {
             for ox in 0..ow {
                 let mut sum = [0.0f64; 3];
                 let mut n = [0usize; 3];
+                let mut green_burnt = false;
                 let y0 = c.y + oy * f;
                 let x0 = c.x + ox * f;
                 for y in y0..(y0 + f).min(c.y + c.h) {
                     for x in x0..(x0 + f).min(c.x + c.w) {
                         let black = frame.black_at(x, y);
                         let white = frame.white_at(x, y);
-                        let v = ((frame.data.get(y * frame.width + x) - black) / (white - black).max(1.0))
-                            .max(0.0);
+                        let raw = frame.data.get(y * frame.width + x);
+                        let v = ((raw - black) / (white - black).max(1.0)).max(0.0);
                         let ch = match frame.kind {
                             SensorKind::Bayer(ph) => match ph.color_at(x, y) {
                                 Color::R => 0,
@@ -90,6 +97,9 @@ pub fn binned(
                             },
                             SensorKind::Mono => 1,
                         };
+                        if ch == 1 && raw >= white * (1.0 - SAT_MARGIN) {
+                            green_burnt = true;
+                        }
                         sum[ch] += v;
                         n[ch] += 1;
                     }
@@ -100,6 +110,7 @@ pub fn binned(
                         rr[ox] = mean(0);
                         gg[ox] = mean(1);
                         bb[ox] = mean(2);
+                        ss[ox] = f64::from(u8::from(green_burnt));
                     }
                     SensorKind::Mono => {
                         let v = if n[1] > 0 { sum[1] / n[1] as f64 } else { 0.0 };
@@ -117,7 +128,7 @@ pub fn binned(
             p.clone()
         }
     };
-    let [r, g, b] = [upright(&chan[0]), upright(&chan[1]), upright(&chan[2])];
+    let [r, g, b, s] = [upright(&chan[0]), upright(&chan[1]), upright(&chan[2]), upright(&chan[3])];
     let (width, height) = (r.width, r.height);
     let n = width * height;
     let mono = matches!(frame.kind, SensorKind::Mono);
@@ -130,6 +141,14 @@ pub fn binned(
             let v = encode(c[1]);
             *gy = v;
             px.fill(v);
+            return;
+        }
+        if s.data[i] != 0.0 {
+            // Burnt-out green: no colour, the luminance in the grey and in
+            // all three of the plate, as the separation's gate leaves them.
+            let l = encode(0.25 * c[0] + 0.5 * c[1] + 0.25 * c[2]);
+            *gy = l;
+            px.fill(l);
             return;
         }
         *gy = encode((0..3).map(|k| w[k] * c[k]).sum::<f64>());
@@ -207,6 +226,30 @@ mod tests {
         for px in t.rgb.as_chunks::<3>().0 {
             assert_eq!(px[0], 255, "{px:?}");
             assert_eq!((px[1], px[2]), (0, 0), "{px:?}");
+        }
+    }
+
+    /// A burnt-out bin under a daylight balance reads (k_R, 1, k_B), a
+    /// magenta no scene had. The red-alone test above keeps its colour;
+    /// here green is burnt out too, and the bin is grey in the plate: the
+    /// luminance (k_R + 2 + k_B)/4, clipped to white at the encoding.
+    #[test]
+    fn burnt_out_green_bins_have_no_colour() {
+        let wb = [2.0, 1.0, 1.5];
+        let f = frame(32, 32, |_, _| 4195, 1);
+        let t = binned_gray(&f, Weights::default(), wb, 8);
+        for px in t.rgb.as_chunks::<3>().0 {
+            assert_eq!(px, &[255, 255, 255], "{px:?}");
+        }
+        assert!(t.gray.iter().all(|&v| v == 255));
+        // The same bins with the channels unbalanced show the magenta the
+        // gate removes: white level but 1.0 everywhere → grey; so use a
+        // half-burnt field: green at the clip, red and blue below it.
+        let f = frame(32, 32, |x, y| if (x + y) % 2 == 1 { 4195 } else { 2200 }, 1);
+        let t = binned_gray(&f, Weights::default(), wb, 8);
+        for px in t.rgb.as_chunks::<3>().0 {
+            assert_eq!(px[0], px[1], "{px:?}");
+            assert_eq!(px[1], px[2], "{px:?}");
         }
     }
 
