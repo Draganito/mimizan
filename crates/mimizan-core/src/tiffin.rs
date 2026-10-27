@@ -6,8 +6,15 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
+
+/// Our own files, however large: a three-colour plate of a 47-megapixel
+/// camera is 280 MB of samples, over the decoder's 256 MiB default.
+fn open(path: &Path) -> Result<Decoder<BufReader<File>>> {
+    let f = BufReader::new(File::open(path)?);
+    Ok(Decoder::new(f)?.with_limits(Limits::unlimited()))
+}
 
 /// A grey TIFF as read: pixels, description, and the two tags the print
 /// pass needs.
@@ -24,8 +31,7 @@ pub struct GrayTiff {
 
 /// 8- or 16-bit single-channel TIFF to a Plane in [0,1].
 pub fn read_gray(path: &Path) -> Result<GrayTiff> {
-    let f = BufReader::new(File::open(path)?);
-    let mut dec = Decoder::new(f)?;
+    let mut dec = open(path)?;
     let (w, h) = dec.dimensions()?;
     let description = dec.get_tag_ascii_string(Tag::ImageDescription).ok();
     let orientation =
@@ -44,8 +50,7 @@ pub fn read_gray(path: &Path) -> Result<GrayTiff> {
 
 /// 8- or 16-bit three-channel TIFF (a plate print) to `[r, g, b]` in [0,1].
 pub fn read_rgb16(path: &Path) -> Result<[Plane; 3]> {
-    let f = BufReader::new(File::open(path)?);
-    let mut dec = Decoder::new(f)?;
+    let mut dec = open(path)?;
     let (w, h) = dec.dimensions()?;
     let (w, h) = (w as usize, h as usize);
     let data: Vec<f64> = match dec.read_image()? {
@@ -67,16 +72,14 @@ pub fn read_rgb16(path: &Path) -> Result<[Plane; 3]> {
 
 /// Only the ImageDescription, without decoding pixels.
 pub fn read_gray_header(path: &Path) -> Result<Option<String>> {
-    let f = BufReader::new(File::open(path)?);
-    let mut dec = Decoder::new(f)?;
+    let mut dec = open(path)?;
     Ok(dec.get_tag_ascii_string(Tag::ImageDescription).ok())
 }
 
 /// Mask sidecar as raw u8 values, `(width, height, samples)`, exactly one
 /// sample per pixel.
 pub fn read_mask8(path: &Path) -> Result<(usize, usize, Vec<u8>)> {
-    let f = BufReader::new(File::open(path)?);
-    let mut dec = Decoder::new(f)?;
+    let mut dec = open(path)?;
     let (w, h) = dec.dimensions()?;
     let (w, h) = (w as usize, h as usize);
     match dec.read_image()? {
