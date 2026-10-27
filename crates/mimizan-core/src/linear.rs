@@ -102,7 +102,7 @@ fn rational(v: f64) -> Rational {
 /// them back to back. An ASCII value of even length (with its NUL) keeps
 /// the next one aligned, so odd strings get one trailing space.
 fn even(s: &str) -> Cow<'_, str> {
-    if (s.len() + 1) % 2 == 0 {
+    if (s.len() + 1).is_multiple_of(2) {
         Cow::Borrowed(s)
     } else {
         Cow::Owned(format!("{s} "))
