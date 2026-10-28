@@ -150,14 +150,17 @@ enum Cmd {
         /// Placing in stops before the curve: L * 2^place (0 = untouched)
         #[arg(long, value_name = "STOPS", allow_hyphen_values = true)]
         place: Option<f64>,
-        /// Paper size "WxH<cm|mm|in>", e.g. 30x40cm (image fitted, box rotates with it)
+        /// Sheet "WxH<cm|mm|in>", e.g. 30x40cm: the file is this sheet, turned the
+        /// picture's way; the picture is fitted into what the rings leave and
+        /// centred. Without it, the file is the picture's pixels plus the rings
         #[arg(long)]
         size: Option<String>,
         /// Resampling kernel: b-spline (default, no overshoot) | area (alias
         /// box: mean of the covered pixels) | lanczos3 | catmull-rom | mitchell
         #[arg(long, value_name = "KERNEL")]
         resample: Option<String>,
-        /// Paper border around the picture, mm, filled with paper white
+        /// Paper border around the picture, mm, filled with paper white; with
+        /// --size the least paper, more where the sheet's ratio is not the picture's
         #[arg(long, value_name = "MM")]
         border_mm: Option<f64>,
         /// Black film edge around the picture, mm, inside the white border

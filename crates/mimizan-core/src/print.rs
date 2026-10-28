@@ -147,12 +147,20 @@ pub struct PrintInfo {
     /// The recipe this pass ran (Zonensystem paper, section 11): place,
     /// curve, kernel, size, border, sharpening mode.
     pub recipe: Recipe,
-    /// White border in pixels on each side, when there is one.
+    /// White border asked for, pixels on each side, when there is one. The
+    /// least paper; a sheet whose ratio is not the picture's has more on
+    /// two sides (`picture_x`, `picture_y` say where the picture sits).
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub border_px: usize,
-    /// Black edge in pixels on each side, inside the white border.
+    /// Black edge in pixels on each side, directly around the picture.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub black_px: usize,
+    /// The picture's top-left corner on the sheet, pixels. Omitted when
+    /// the picture is the whole file.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub picture_x: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub picture_y: usize,
     /// USM amount of the sharpening mode, 0 when none.
     pub usm_amount: f64,
     /// One arc minute at the viewing distance, in print pixels. Recorded
@@ -446,18 +454,30 @@ pub struct PrintSource<'a> {
     pub description: Option<serde_json::Value>,
 }
 
-/// Where the picture lands: its pixel size, the two rings around it, the sheet
-/// (picture plus black plus white), and the viewing model's numbers.
+/// Where the picture lands: its pixel size, its place on the sheet, the two
+/// rings around it, the sheet itself, and the viewing model's numbers.
+///
+/// With a size, the sheet is that size, turned to the picture's
+/// orientation; the picture is fitted into what the rings leave of it and
+/// centred, the black edge lies directly around the picture, and every
+/// other pixel is paper. Where the sheet's ratio is not the picture's,
+/// the paper is wider than `border_px` on two sides: the border is the
+/// least paper, the sheet is the sheet. Without a size, the sheet is the
+/// picture's pixels plus the rings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
     /// Picture size after the fit, pixels.
     pub image_w: usize,
     pub image_h: usize,
-    /// White border on each side, pixels.
+    /// The picture's top-left corner on the sheet, pixels.
+    pub picture_x: usize,
+    pub picture_y: usize,
+    /// White paper asked for on each side, pixels; the least there is.
     pub border_px: usize,
-    /// Black edge on each side, inside the white, pixels.
+    /// Black edge on each side, directly around the picture, pixels. Cut
+    /// off where it would leave the sheet.
     pub black_px: usize,
-    /// Output file size: picture plus twice the black edge plus twice the white.
+    /// Output file size: the sheet.
     pub out_w: usize,
     pub out_h: usize,
     /// Viewing distance, mm (given, or the sheet diagonal).
@@ -469,55 +489,6 @@ pub struct Layout {
     pub resample_sigma_px: f64,
     /// One arc minute at `viewing_mm`, print pixels. Recorded, not applied.
     pub usm_radius_px: f64,
-}
-
-/// Paper box, in pixels, whose fitted picture is exactly `picture_w` pixels
-/// wide. The height is that same scale, `round(img_h · picture_w / img_w)`,
-/// and `border` pixels of paper sit outside the picture on every side.
-///
-/// The inner height is `ceil`, not the rounded height: `fit_dims` takes the
-/// tighter side, and a ceil keeps the width the tighter one, so the rounded
-/// height still fits inside the box.
-pub fn box_for_picture_width(img_w: usize, img_h: usize, picture_w: usize, border: usize) -> (usize, usize) {
-    let picture_w = picture_w.max(1);
-    let inner_h = (picture_w as f64 * img_h as f64 / img_w.max(1) as f64).ceil().max(1.0) as usize;
-    (picture_w.saturating_add(2 * border), inner_h.saturating_add(2 * border))
-}
-
-/// Paper box, in pixels, whose fitted picture is exactly `picture_h` pixels
-/// tall. Mirror of [`box_for_picture_width`].
-pub fn box_for_picture_height(img_w: usize, img_h: usize, picture_h: usize, border: usize) -> (usize, usize) {
-    let picture_h = picture_h.max(1);
-    let inner_w = (picture_h as f64 * img_w as f64 / img_h.max(1) as f64).ceil().max(1.0) as usize;
-    (inner_w.saturating_add(2 * border), picture_h.saturating_add(2 * border))
-}
-
-/// Which side of the sheet the user typed. The other follows the picture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SheetSide {
-    Width,
-    Height,
-}
-
-/// Paper box, in pixels, whose `side` is exactly `sheet_px`: the sheet in
-/// the printer. The picture fills what `frame` pixels of rings on every
-/// side leave of that side, at least one pixel; the other picture side
-/// follows the image ratio, and the other sheet side is that plus the
-/// rings. `layout` gives the typed side back exactly; the other may come
-/// out one pixel under the box (a ceil here, a round in the fit), which is
-/// why the fields show the layout, not the box.
-pub fn sheet_from_side(
-    img_w: usize,
-    img_h: usize,
-    sheet_px: usize,
-    frame: usize,
-    side: SheetSide,
-) -> (usize, usize) {
-    let inner = sheet_px.saturating_sub(2 * frame).max(1);
-    match side {
-        SheetSide::Width => box_for_picture_width(img_w, img_h, inner, frame),
-        SheetSide::Height => box_for_picture_height(img_w, img_h, inner, frame),
-    }
 }
 
 /// The crop window inside an upright image, or the whole image.
@@ -555,11 +526,13 @@ pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
     out
 }
 
-/// Layout for a negative of `w×h` (before orientation). Both rings are taken
-/// from the paper box before the fit, so picture plus black plus white never
-/// exceeds the size asked for, unless the frame alone is wider than the
-/// sheet, which leaves one pixel of picture. With no size, the rings are
-/// added outside the crop window and the picture pixels stay as they are.
+/// Layout for a negative of `w×h` (before orientation). With a size, the
+/// file is that sheet, turned the picture's way; both rings are taken from
+/// it before the fit, so the picture plus black plus white never exceeds
+/// it, unless the frame alone is wider than the sheet, which leaves one
+/// pixel of picture. The picture sits centred, so paper the ratio leaves
+/// over lies evenly on two sides. With no size, the rings are added
+/// outside the crop window and the picture pixels stay as they are.
 pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let r = &p.recipe;
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
@@ -569,15 +542,19 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let black = r.black_px();
     let frame = white.saturating_add(black);
     let frame2 = frame.saturating_mul(2);
-    let (image_w, image_h) = match r.size {
+    let (image_w, image_h, out_w, out_h) = match r.size {
         Some(sz) => {
             let (bw, bh) = sz.pixels(r.dpi);
+            // The sheet the picture's way, as `fit_dims` turns its box.
+            let (bw, bh) = if (w > h) != (bw > bh) { (bh, bw) } else { (bw, bh) };
             // A frame wider than the paper leaves one pixel of picture.
-            fit_dims(w, h, bw.saturating_sub(frame2).max(1), bh.saturating_sub(frame2).max(1))
+            let (iw, ih) = fit_dims(w, h, bw.saturating_sub(frame2).max(1), bh.saturating_sub(frame2).max(1));
+            (iw, ih, bw.max(iw), bh.max(ih))
         }
-        None => (w, h),
+        None => (w, h, w.saturating_add(frame2), h.saturating_add(frame2)),
     };
-    let (out_w, out_h) = (image_w.saturating_add(frame2), image_h.saturating_add(frame2));
+    let picture_x = (out_w - image_w) / 2;
+    let picture_y = (out_h - image_h) / 2;
     let viewing_mm = p.viewing_distance_mm.unwrap_or_else(|| {
         let diag_in = ((out_w as f64 / r.dpi).powi(2) + (out_h as f64 / r.dpi).powi(2)).sqrt();
         diag_in * 25.4
@@ -587,6 +564,8 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     Layout {
         image_w,
         image_h,
+        picture_x,
+        picture_y,
         border_px: white,
         black_px: black,
         out_w,
@@ -622,8 +601,9 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     let mid = (ch as f64 * lay.image_w as f64).min(cw as f64 * lay.image_h as f64);
     let resize =
         if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
-    // The picture and the sheet it is copied into; no rings, no copy.
-    let frame = if lay.border_px + lay.black_px > 0 { m * picture + sheet } else { 0.0 };
+    // The picture and the sheet it is copied into; a sheet that is the
+    // picture needs no copy.
+    let frame = if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) { m * picture + sheet } else { 0.0 };
     // Picture cut out, blur scratch, blur, result; Richardson–Lucy keeps
     // estimate, blurred, ratio and correction as well.
     let peak = if r.peak.applies() { sheet + 4.0 * picture } else { 0.0 };
@@ -688,7 +668,9 @@ struct LoupeGeom {
     pic_y: usize,
     pic_w: usize,
     pic_h: usize,
-    border: usize,
+    /// The picture's corner on the sheet.
+    off_x: usize,
+    off_y: usize,
     image_w: usize,
     image_h: usize,
 }
@@ -710,13 +692,14 @@ fn peak_halo_px(recipe: &Recipe, enlargement: f64) -> usize {
 
 fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize, peak_halo: usize) -> LoupeGeom {
     let (image_w, image_h) = (lay.image_w, lay.image_h);
-    // Picture inset: white on the outside, black between that and the picture.
-    let border = lay.border_px + lay.black_px;
+    // Where the picture sits on the sheet: paper outside, black between it
+    // and the picture.
+    let (off_x, off_y) = (lay.picture_x, lay.picture_y);
     let (sheet_w, sheet_h) = (lay.out_w, lay.out_h);
     let vw = view.min(sheet_w).max(1);
     let vh = view.min(sheet_h).max(1);
-    let pick_x = (nx.clamp(0.0, 1.0) * image_w.saturating_sub(1) as f64).round() as isize + border as isize;
-    let pick_y = (ny.clamp(0.0, 1.0) * image_h.saturating_sub(1) as f64).round() as isize + border as isize;
+    let pick_x = (nx.clamp(0.0, 1.0) * image_w.saturating_sub(1) as f64).round() as isize + off_x as isize;
+    let pick_y = (ny.clamp(0.0, 1.0) * image_h.saturating_sub(1) as f64).round() as isize + off_y as isize;
     let mut left = pick_x - vw as isize / 2;
     let mut top = pick_y - vh as isize / 2;
     left = left.clamp(0, sheet_w as isize - vw as isize);
@@ -733,19 +716,14 @@ fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize, pea
     let tile_y = (top - halo).max(0) as usize;
     let tile_r = (left + vw as isize + halo).min(sheet_w as isize) as usize;
     let tile_b = (top + vh as isize + halo).min(sheet_h as isize) as usize;
-    let pic_x0 = border;
-    let pic_y0 = border;
-    let pic_x1 = border + image_w;
-    let pic_y1 = border + image_h;
-    let ix0 = tile_x.max(pic_x0);
-    let iy0 = tile_y.max(pic_y0);
+    let pic_x1 = off_x + image_w;
+    let pic_y1 = off_y + image_h;
+    let ix0 = tile_x.max(off_x);
+    let iy0 = tile_y.max(off_y);
     let ix1 = tile_r.min(pic_x1);
     let iy1 = tile_b.min(pic_y1);
-    let (pic_x, pic_y, pic_w, pic_h) = if ix0 < ix1 && iy0 < iy1 {
-        (ix0 - border, iy0 - border, ix1 - ix0, iy1 - iy0)
-    } else {
-        (0, 0, 0, 0)
-    };
+    let (pic_x, pic_y, pic_w, pic_h) =
+        if ix0 < ix1 && iy0 < iy1 { (ix0 - off_x, iy0 - off_y, ix1 - ix0, iy1 - iy0) } else { (0, 0, 0, 0) };
     LoupeGeom {
         view_x: left as usize,
         view_y: top as usize,
@@ -759,10 +737,22 @@ fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize, pea
         pic_y,
         pic_w,
         pic_h,
-        border,
+        off_x,
+        off_y,
         image_w,
         image_h,
     }
+}
+
+/// The black edge's rectangle on the sheet, `(x0, y0, x1, y1)`: the picture
+/// plus `black_px` on every side, cut at the sheet's edges.
+fn black_rect(lay: &Layout) -> (usize, usize, usize, usize) {
+    (
+        lay.picture_x.saturating_sub(lay.black_px),
+        lay.picture_y.saturating_sub(lay.black_px),
+        (lay.picture_x + lay.image_w).saturating_add(lay.black_px).min(lay.out_w),
+        (lay.picture_y + lay.image_h).saturating_add(lay.black_px).min(lay.out_h),
+    )
 }
 
 /// Upright source pixels the loupe resamples. When USM is on, the mask is
@@ -823,20 +813,7 @@ pub fn sharpen_window(
     let white = tone.white();
     let mut tile = Plane::from_vec(g.tile_w, g.tile_h, vec![white; g.tile_w * g.tile_h]);
     if lay.black_px > 0 {
-        let x0 = lay.border_px;
-        let y0 = lay.border_px;
-        paint_sheet_rect(
-            &mut tile,
-            g.tile_x,
-            g.tile_y,
-            (
-                x0,
-                y0,
-                x0 + lay.black_px + lay.image_w + lay.black_px,
-                y0 + lay.black_px + lay.image_h + lay.black_px,
-            ),
-            tone.eval(0.0),
-        );
+        paint_sheet_rect(&mut tile, g.tile_x, g.tile_y, black_rect(&lay), tone.eval(0.0));
     }
     let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
     // The plane window is in full-image coordinates. The resize maps the
@@ -847,8 +824,8 @@ pub fn sharpen_window(
         let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
         let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic)?;
         crate::tone::render(&mut picture, p.recipe.place, &tone);
-        let ox = g.pic_x + g.border - g.tile_x;
-        let oy = g.pic_y + g.border - g.tile_y;
+        let ox = g.pic_x + g.off_x - g.tile_x;
+        let oy = g.pic_y + g.off_y - g.tile_y;
         for y in 0..g.pic_h {
             tile.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(picture.row(y));
         }
@@ -908,26 +885,44 @@ fn paint_sheet_rect(
 
 /// Surround `p` with `b` pixels of `value` on every side.
 pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
-    frame_sheet(p, 0, b, value, value)
+    let (w, h) = (p.width + 2 * b, p.height + 2 * b);
+    let lay = Layout {
+        image_w: p.width,
+        image_h: p.height,
+        picture_x: b,
+        picture_y: b,
+        border_px: b,
+        black_px: 0,
+        out_w: w,
+        out_h: h,
+        viewing_mm: 0.0,
+        enlargement: 1.0,
+        resample_sigma_px: 0.0,
+        usm_radius_px: 0.0,
+    };
+    on_sheet(p, &lay, value, value)
 }
 
-/// The sheet: `p` inside `black` pixels of `black_value`, inside `white`
-/// pixels of `white_value`, in one allocation.
-fn frame_sheet(p: &Plane, black: usize, white: usize, black_value: f64, white_value: f64) -> Plane {
-    let frame = black + white;
-    if frame == 0 {
+/// The sheet of `lay`: `white_value` everywhere, the black edge in
+/// `black_value` around the picture, and `p` (the picture, `image_w ×
+/// image_h`) at its place, in one allocation. A sheet that is the picture
+/// is a copy.
+fn on_sheet(p: &Plane, lay: &Layout, black_value: f64, white_value: f64) -> Plane {
+    debug_assert_eq!((p.width, p.height), (lay.image_w, lay.image_h));
+    let (w, h) = (lay.out_w, lay.out_h);
+    if (w, h) == (p.width, p.height) {
         return p.clone();
     }
-    let (w, h) = (p.width + 2 * frame, p.height + 2 * frame);
+    let (bx0, by0, bx1, by1) = if lay.black_px > 0 { black_rect(lay) } else { (0, 0, 0, 0) };
+    let (px0, py0) = (lay.picture_x, lay.picture_y);
+    let (px1, py1) = (px0 + p.width, py0 + p.height);
     let mut out = Plane::from_vec(w, h, vec![white_value; w * h]);
-    out.data.par_chunks_mut(w).enumerate().skip(white).take(p.height + 2 * black).for_each(|(y, row)| {
-        let inner = &mut row[white..w - white];
-        if y < frame || y >= frame + p.height {
-            inner.fill(black_value);
-        } else {
-            inner[..black].fill(black_value);
-            inner[black..black + p.width].copy_from_slice(p.row(y - frame));
-            inner[black + p.width..].fill(black_value);
+    out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        if y >= by0 && y < by1 {
+            row[bx0..bx1].fill(black_value);
+        }
+        if y >= py0 && y < py1 {
+            row[px0..px1].copy_from_slice(p.row(y - py0));
         }
     });
     out
@@ -1061,17 +1056,22 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
             tone.white()
         );
     }
-    let frame = lay.black_px + lay.border_px;
-    if frame > 0 {
-        // Both rings in one allocation. The mask gets 0 there: nothing to
-        // sharpen on paper.
-        plane = frame_sheet(&plane, lay.black_px, lay.border_px, tone.eval(0.0), tone.white());
+    if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) {
+        if lay.picture_x > lay.black_px + lay.border_px || lay.picture_y > lay.black_px + lay.border_px {
+            info!(
+                "sheet {}x{} px, picture at {},{}: the ratio leaves more paper than the border",
+                lay.out_w, lay.out_h, lay.picture_x, lay.picture_y
+            );
+        }
+        // The sheet in one allocation. The mask gets 0 off the picture:
+        // nothing to sharpen on paper.
+        plane = on_sheet(&plane, &lay, tone.eval(0.0), tone.white());
         if let Some(m) = mask.take() {
-            mask = Some(add_border(&m, frame, 0.0));
+            mask = Some(on_sheet(&m, &lay, 0.0, 0.0));
         }
     }
 
-    let picture = (frame, frame, lay.image_w, lay.image_h);
+    let picture = (lay.picture_x, lay.picture_y, lay.image_w, lay.image_h);
     let deconv_n = apply_sharpen(&mut plane, mask.as_ref(), r, &lay, picture);
     let print_radius = peak_print_radius(r.peak.radius, lay.enlargement);
     apply_peak_picture(&mut plane, r, picture, print_radius);
@@ -1110,6 +1110,8 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         recipe: r.clone(),
         border_px: lay.border_px,
         black_px: lay.black_px,
+        picture_x: lay.picture_x,
+        picture_y: lay.picture_y,
         usm_amount: r.sharpen.usm_amount(),
         usm_radius_px: lay.usm_radius_px,
         resample_sigma_px: lay.resample_sigma_px,
@@ -1321,10 +1323,10 @@ mod tests {
         assert!(is_jpeg_path(Path::new("a/b.JPG")) && !is_jpeg_path(Path::new("a/b.tif")));
     }
 
-    /// The GUI's centimetre fields describe the picture. The box they write
-    /// is that picture plus the border, and `layout` must give the picture
-    /// back: the side the user typed, exactly, and the other side from the
-    /// one scale `fit_dims` uses.
+    /// A box built for a picture side is that picture plus the border, and
+    /// `layout` gives the picture back: that side exactly, the other from
+    /// the one scale `fit_dims` uses, and the file is the box with the
+    /// picture centred in it.
     #[test]
     fn box_for_picture_round_trips_through_layout() {
         let dpi = 300.0;
@@ -1341,54 +1343,25 @@ mod tests {
         }
     }
 
-    /// The typed side of the sheet is the file's side, exactly, with the
-    /// rings as set and the picture filling the rest; rings wider than the
-    /// sheet leave one pixel of picture.
-    #[test]
-    fn sheet_from_side_is_the_file_side() {
-        let dpi = 300.0;
-        for (img_w, img_h) in [(5504, 8256), (4032, 3024), (3, 5), (1, 1)] {
-            for sheet in [1, 10, 400, 3543, 4724] {
-                for frame in [0, 1, 118, 236, 3000] {
-                    for side in [SheetSide::Width, SheetSide::Height] {
-                        let (bw, bh) = sheet_from_side(img_w, img_h, sheet, frame, side);
-                        let typed = if side == SheetSide::Width { bw } else { bh };
-                        let inner = sheet.saturating_sub(2 * frame).max(1);
-                        assert_eq!(
-                            typed,
-                            inner + 2 * frame,
-                            "{img_w}x{img_h} sheet {sheet} frame {frame} {side:?}"
-                        );
-                        if 2 * frame < sheet {
-                            assert_eq!(typed, sheet);
-                        }
-                        let p = PrintParams {
-                            recipe: Recipe {
-                                size: Some(PrintSize::Physical {
-                                    width_in: bw as f64 / dpi,
-                                    height_in: bh as f64 / dpi,
-                                }),
-                                dpi,
-                                border_mm: frame as f64 / dpi * 25.4,
-                                ..Recipe::default()
-                            },
-                            ..Default::default()
-                        };
-                        let lay = layout(img_w, img_h, 1, &p);
-                        let (out_typed, out_other, box_other) = match side {
-                            SheetSide::Width => (lay.out_w, lay.out_h, bh),
-                            SheetSide::Height => (lay.out_h, lay.out_w, bw),
-                        };
-                        assert_eq!(out_typed, typed);
-                        // The other side: the box is a ceil, the fit a round,
-                        // so the file may be one pixel under the box.
-                        assert!(box_other - out_other <= 1, "{box_other} vs {out_other}");
-                        let picture = if side == SheetSide::Width { lay.image_w } else { lay.image_h };
-                        assert_eq!(picture, inner);
-                    }
-                }
-            }
-        }
+    /// Test helper. Paper box, in pixels, whose fitted picture is exactly `picture_w` pixels
+    /// wide. The height is that same scale, `round(img_h · picture_w / img_w)`,
+    /// and `border` pixels of paper sit outside the picture on every side.
+    ///
+    /// The inner height is `ceil`, not the rounded height: `fit_dims` takes the
+    /// tighter side, and a ceil keeps the width the tighter one, so the rounded
+    /// height still fits inside the box.
+    fn box_for_picture_width(img_w: usize, img_h: usize, picture_w: usize, border: usize) -> (usize, usize) {
+        let picture_w = picture_w.max(1);
+        let inner_h = (picture_w as f64 * img_h as f64 / img_w.max(1) as f64).ceil().max(1.0) as usize;
+        (picture_w.saturating_add(2 * border), inner_h.saturating_add(2 * border))
+    }
+
+    /// Paper box, in pixels, whose fitted picture is exactly `picture_h` pixels
+    /// tall. Mirror of [`box_for_picture_width`].
+    fn box_for_picture_height(img_w: usize, img_h: usize, picture_h: usize, border: usize) -> (usize, usize) {
+        let picture_h = picture_h.max(1);
+        let inner_w = (picture_h as f64 * img_w as f64 / img_h.max(1) as f64).ceil().max(1.0) as usize;
+        (inner_w.saturating_add(2 * border), picture_h.saturating_add(2 * border))
     }
 
     fn check_picture_box(
@@ -1426,7 +1399,128 @@ mod tests {
         let expect = (along as f64 * picture as f64 / (if drive_width { img_w } else { img_h }) as f64)
             .round() as usize;
         assert_eq!(other, expect.max(1), "the other side is the one scale");
-        assert_eq!((lay.out_w, lay.out_h), (lay.image_w + 2 * border, lay.image_h + 2 * border));
+        // The file is the box; the picture sits centred, at least the
+        // border in from every edge (the box's ceil may leave one more
+        // pixel of paper, split as evenly as a pixel splits).
+        assert_eq!((lay.out_w, lay.out_h), (bw, bh));
+        assert!(lay.picture_x >= border && lay.picture_y >= border);
+        assert!(lay.picture_x - border <= 1 && lay.picture_y - border <= 1);
+        assert_eq!(lay.picture_x, (bw - lay.image_w) / 2);
+        assert_eq!(lay.picture_y, (bh - lay.image_h) / 2);
+    }
+
+    /// A sheet whose ratio is not the picture's keeps its size: the picture
+    /// is fitted into what the rings leave and centred, the border is the
+    /// least paper, the black edge lies against the picture, and the rest
+    /// of the sheet is paper. The 1:1 box reads the same pixels.
+    #[test]
+    fn the_sheet_stays_and_the_picture_is_centred() {
+        let (w, h) = (60, 40);
+        let plane = Plane::from_vec(w, h, vec![0.5; w * h]);
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "flat".into(), description: None };
+        // 10x8 in at 100 dpi with 1.2 in of border and 0.2 in of black: the
+        // inner box is 720x520, the 3:2 picture 720x480, the sheet stays
+        // 1000x800, the picture sits at (140, 160): 1.4 in of paper left and
+        // right, the 1.2 asked for above and below.
+        let p = PrintParams {
+            recipe: Recipe {
+                size: Some(PrintSize::Physical { width_in: 10.0, height_in: 8.0 }),
+                dpi: 100.0,
+                border_mm: 1.2 * 25.4,
+                black_mm: 0.2 * 25.4,
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        let lay = layout(w, h, 1, &p);
+        assert_eq!((lay.image_w, lay.image_h), (720, 480));
+        assert_eq!((lay.out_w, lay.out_h), (1000, 800));
+        assert_eq!((lay.picture_x, lay.picture_y), (140, 160));
+        assert_eq!((lay.border_px, lay.black_px), (120, 20));
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (1000, 800));
+        assert_eq!((out.info.picture_x, out.info.picture_y), (140, 160));
+        let grey = 0.5f64.powf(1.0 / 2.2);
+        // Paper to the black edge, black to the picture, picture inside.
+        assert_eq!(out.plane.at(119, 400), 1.0);
+        assert_eq!(out.plane.at(120, 400), 0.0);
+        assert_eq!(out.plane.at(139, 400), 0.0);
+        assert!((out.plane.at(140, 400) - grey).abs() < 1e-12);
+        assert!((out.plane.at(859, 400) - grey).abs() < 1e-12);
+        assert_eq!(out.plane.at(860, 400), 0.0);
+        assert_eq!(out.plane.at(879, 400), 0.0);
+        assert_eq!(out.plane.at(880, 400), 1.0);
+        assert_eq!(out.plane.at(500, 139), 1.0);
+        assert_eq!(out.plane.at(500, 140), 0.0);
+        assert_eq!(out.plane.at(500, 159), 0.0);
+        assert!((out.plane.at(500, 160) - grey).abs() < 1e-12);
+        assert!((out.plane.at(500, 639) - grey).abs() < 1e-12);
+        assert_eq!(out.plane.at(500, 640), 0.0);
+        assert_eq!(out.plane.at(500, 660), 1.0);
+        assert_eq!(out.plane.at(0, 0), 1.0);
+        assert_eq!(out.plane.at(999, 799), 1.0);
+        // The portrait sheet turned the picture's way is the same file.
+        let turned = PrintParams {
+            recipe: Recipe {
+                size: Some(PrintSize::Physical { width_in: 8.0, height_in: 10.0 }),
+                ..p.recipe.clone()
+            },
+            ..Default::default()
+        };
+        assert_eq!(layout(w, h, 1, &turned), lay);
+        // The 1:1 box at the picture's corner shows the same sheet pixels.
+        let full = out.plane;
+        let window = PlaneWindow { plane: &plane, origin_x: 0, origin_y: 0, full_w: w, full_h: h };
+        let view = 64;
+        let boxed = sharpen_window(window, None, &p, 0.0, 0.0, view).unwrap();
+        assert_eq!((boxed.width, boxed.height), (view, view));
+        // The box is centred on the picture's first pixel, (140, 160), and
+        // reads the sheet from (108, 128).
+        for y in 0..view {
+            for x in 0..view {
+                assert!(
+                    (boxed.at(x, y) - full.at(108 + x, 128 + y)).abs() < 1e-12,
+                    "box {x},{y} vs sheet {},{}",
+                    108 + x,
+                    128 + y
+                );
+            }
+        }
+    }
+
+    /// A recipe without a sheet (the pixels, rings added outside) said as
+    /// a sheet of `pixels + 2·frame` at the dpi is the same file to the
+    /// pixel: the desktop reads older recipes that way, and its 1:1 is the
+    /// case without rings.
+    #[test]
+    fn the_pixels_with_their_rings_are_a_sheet() {
+        for &(w, h) in &[(6048usize, 4024usize), (4024, 6048), (7, 3), (1, 1), (8256, 5504), (3000, 3000)] {
+            for &dpi in &[300.0, 254.0, 72.0, 1200.0, 36.0, 333.333] {
+                for &(border_mm, black_mm) in
+                    &[(0.0, 0.0), (20.0, 0.0), (0.0, 3.0), (12.5, 2.0), (100.0, 100.0)]
+                {
+                    let bare = Recipe { dpi, border_mm, black_mm, ..Recipe::default() };
+                    let frame = bare.frame_px();
+                    let sheet = Recipe {
+                        size: Some(PrintSize::Physical {
+                            width_in: (w + 2 * frame) as f64 / dpi,
+                            height_in: (h + 2 * frame) as f64 / dpi,
+                        }),
+                        ..bare.clone()
+                    };
+                    let a = layout(w, h, 1, &PrintParams { recipe: bare, ..Default::default() });
+                    let b = layout(w, h, 1, &PrintParams { recipe: sheet, ..Default::default() });
+                    assert_eq!((a.image_w, a.image_h), (w, h));
+                    assert_eq!(
+                        (b.image_w, b.image_h, b.out_w, b.out_h),
+                        (a.image_w, a.image_h, a.out_w, a.out_h),
+                        "{w}x{h} at {dpi} dpi, rings {border_mm}/{black_mm} mm"
+                    );
+                    assert_eq!(b.enlargement, 1.0);
+                }
+            }
+        }
     }
 
     /// The border is taken from the paper, filled with the curve's white,
@@ -1438,7 +1532,8 @@ mod tests {
         let src =
             PrintSource { plane: &plane, mask: None, orientation: 1, name: "flat".into(), description: None };
         // 1 inch of border at 100 dpi on a 6x4 inch sheet: the 3:2 picture
-        // fits the 400x200 inner box as 300x200, the file is 500x400.
+        // fits the 400x200 inner box as 300x200, the file is the 600x400
+        // sheet, and the picture sits centred at (150, 100).
         let p = PrintParams {
             recipe: Recipe {
                 size: Some(PrintSize::Physical { width_in: 6.0, height_in: 4.0 }),
@@ -1451,21 +1546,23 @@ mod tests {
         let lay = layout(w, h, 1, &p);
         assert_eq!(
             (lay.image_w, lay.image_h, lay.border_px, lay.out_w, lay.out_h),
-            (300, 200, 100, 500, 400)
+            (300, 200, 100, 600, 400)
         );
+        assert_eq!((lay.picture_x, lay.picture_y), (150, 100));
         let out = render_planes(&src, &p);
-        assert_eq!((out.plane.width, out.plane.height), (500, 400));
+        assert_eq!((out.plane.width, out.plane.height), (600, 400));
         assert_eq!(out.info.border_px, 100);
-        assert_eq!((out.info.width, out.info.height), (500, 400));
+        assert_eq!((out.info.width, out.info.height), (600, 400));
         let white = p.recipe.curve.compile().white();
         assert_eq!(white, 1.0);
         assert_eq!(out.plane.at(0, 0), 1.0);
-        assert_eq!(out.plane.at(99, 399), 1.0);
-        assert_eq!(out.plane.at(499, 0), 1.0);
+        assert_eq!(out.plane.at(149, 399), 1.0);
+        assert_eq!(out.plane.at(599, 0), 1.0);
         let grey = 0.5f64.powf(1.0 / 2.2);
-        assert!((out.plane.at(100, 100) - grey).abs() < 1e-12);
-        assert!((out.plane.at(399, 299) - grey).abs() < 1e-12);
-        assert_eq!(out.plane.at(400, 299), 1.0);
+        assert!((out.plane.at(150, 100) - grey).abs() < 1e-12);
+        assert!((out.plane.at(449, 299) - grey).abs() < 1e-12);
+        assert_eq!(out.plane.at(450, 299), 1.0);
+        assert_eq!(out.plane.at(449, 300), 1.0);
         // A look with a damped paper white fills the border with that value;
         // on paper the border is unexposed paper, 1 whatever the exposures.
         let mut look = crate::calib::LookFile::neutral();
@@ -1485,7 +1582,7 @@ mod tests {
         };
         let out3 = render_planes(&src, &p3);
         assert_eq!(out3.plane.at(0, 0), 1.0);
-        assert!(out3.plane.at(100, 100) < grey);
+        assert!(out3.plane.at(150, 100) < grey);
     }
 
     /// Both rings are added around the crop window. A pixel inside the crop

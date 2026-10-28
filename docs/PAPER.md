@@ -761,7 +761,10 @@ Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
 carries as JSON): mix → orientation → crop window (whole pixels of the
 upright negative; omitted, the full frame) → size → placing and tone in one
 step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
-paper border → [deconvolution →] USM → file. Resizing is separable in
+sheet (with a size, the file is that sheet turned the picture's way, the
+picture fitted into what the black edge and the paper border leave and
+centred, the border being the least paper; without one, the picture's
+pixels plus the rings) → [deconvolution →] USM → file. Resizing is separable in
 f64. The convolution kernels are stretched by the scale factor when
 shrinking; the kernel is a parameter (B-spline default, Lanczos-3,
 Mitchell, Catmull-Rom, or area). Area is the overlap of the pixel

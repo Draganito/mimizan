@@ -21,9 +21,14 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace, PlateWeights};
-use mimizan_core::print::{
-    memory_estimate, memory_text, peak_print_radius, sheet_from_side, PrintSize, SheetSide, LAMP_LIMIT,
-};
+use mimizan_core::print::{memory_estimate, memory_text, peak_print_radius, PrintSize, LAMP_LIMIT};
+
+/// Which side of the sheet the user typed. The other follows the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SheetSide {
+    Width,
+    Height,
+}
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
@@ -31,13 +36,6 @@ use mimizan_core::tone::Tone;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Print size choice of the export section; `Recipe::size` is derived.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SizeMode {
-    Native,
-    Paper,
-}
 
 /// US darkroom paper, as a ratio. The long side follows the picture until
 /// the ratio is turned.
@@ -282,16 +280,33 @@ struct SharedPicture {
     plate: Option<PlateView>,
 }
 
-/// The two rings painted around the picture on the stage, in texture
-/// pixels, with their flat values: the print's black film edge and white
-/// paper against its picture, so they keep their proportion at any size
-/// and dpi. Zero widths are no sheet.
+/// The sheet painted around the picture on the stage, in texture pixels,
+/// with its flat values: the print's black film edge against the picture,
+/// and the paper out to the sheet's edge, which is as wide on the left as
+/// on the right and as wide above as below, but not the same both ways
+/// when the sheet's ratio is not the picture's. Measured against the
+/// picture, so the proportion holds at any size and dpi. Zero widths are
+/// no sheet.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 struct Rings {
     black_tex: f32,
-    white_tex: f32,
+    /// Picture edge to sheet edge, left and right.
+    frame_x_tex: f32,
+    /// Picture edge to sheet edge, above and below.
+    frame_y_tex: f32,
     white: u8,
     black: u8,
+}
+
+impl Rings {
+    /// The black edge as painted: cut where it would leave the sheet.
+    fn black_shown(&self) -> Vec2 {
+        Vec2::new(self.black_tex.min(self.frame_x_tex), self.black_tex.min(self.frame_y_tex))
+    }
+
+    fn frame(&self) -> Vec2 {
+        Vec2::new(self.frame_x_tex, self.frame_y_tex)
+    }
 }
 
 /// What is drawn over and around the picture on the stage from the edit:
@@ -410,12 +425,10 @@ pub struct App {
     edit: Edit,
     history: History,
     // Export section
-    size_mode: SizeMode,
-    /// The sheet in the printer as the fields show it, centimetres.
+    /// The sheet in the printer as the fields show it, centimetres. The
+    /// recipe always has a sheet once a file is open; 1:1 is the sheet
+    /// that is the picture's pixels, not a mode of its own.
     sheet_cm: [f64; 2],
-    /// The side of the sheet the user typed last. It is held exactly when
-    /// the rings, the dpi or the crop change; the other side follows.
-    sheet_anchor: SheetSide,
     /// What the Print window's lengths are shown and typed in.
     ruler: Ruler,
     /// The export estimate the user was warned about. A second click with
@@ -612,7 +625,6 @@ impl App {
             cpu: CpuMeter::new(),
             edit: Edit::new(Weights::default()),
             history: History::new(Edit::new(Weights::default())),
-            size_mode: SizeMode::Native,
             export_warned: None,
             ram_total: {
                 let mut sys = sysinfo::System::new();
@@ -620,7 +632,6 @@ impl App {
                 sys.total_memory()
             },
             sheet_cm: [30.0, 40.0],
-            sheet_anchor: SheetSide::Width,
             ruler: persisted.ruler.unwrap_or_default(),
             sharpen_at: None,
             peak_held: false,
@@ -881,17 +892,51 @@ impl App {
             self.keep_scale = None;
         }
         self.edit = e;
-        self.size_mode = match self.edit.recipe.size {
-            None => SizeMode::Native,
-            Some(PrintSize::Physical { .. }) => SizeMode::Paper,
-        };
-        if self.edit.recipe.size.is_some() {
-            self.show_sheet();
+        // A recipe without a sheet (the defaults, or an older file) meant
+        // the picture's pixels with the rings added outside. That file,
+        // said as a sheet: the same pixels, the same TIFF.
+        if self.edit.recipe.size.is_none() {
+            self.edit.recipe.size = self.sheet_of_pixels(self.edit.recipe.frame_px());
         }
+        self.show_sheet();
+    }
+
+    /// The sheet that is the picture's pixels plus `frame` pixels of rings
+    /// on every side, at the recipe's dpi. `layout` gives these pixels
+    /// back exactly. Absent until a file is open.
+    fn sheet_of_pixels(&self, frame: usize) -> Option<PrintSize> {
+        let (uw, uh) = self.picture_size();
+        let dpi = self.edit.recipe.dpi;
+        if uw == 0 || uh == 0 || dpi <= 0.0 {
+            return None;
+        }
+        Some(PrintSize::Physical {
+            width_in: (uw + 2 * frame) as f64 / dpi,
+            height_in: (uh + 2 * frame) as f64 / dpi,
+        })
+    }
+
+    /// 1:1: the sheet is the picture's pixels, no border, no black edge, no
+    /// scaling. The start; a length typed from here is a sheet of its
+    /// own, and a ring set from here is taken from these pixels.
+    fn set_one_to_one(&mut self) {
+        self.edit.recipe.border_mm = 0.0;
+        self.edit.recipe.black_mm = 0.0;
+        if let Some(sheet) = self.sheet_of_pixels(0) {
+            self.edit.recipe.size = Some(sheet);
+        }
+        self.show_sheet();
+    }
+
+    /// Whether the file is the picture's pixels with nothing around them.
+    fn is_one_to_one(&self) -> bool {
+        let Some(l) = self.print_layout() else { return false };
+        let (uw, uh) = self.picture_size();
+        (l.out_w, l.out_h) == (uw, uh) && (l.image_w, l.image_h) == (uw, uh)
     }
 
     /// The file's size in centimetres, from the layout the recipe produces:
-    /// the sheet with its rings, or the bare negative.
+    /// the sheet, turned the picture's way.
     fn file_cm(&self) -> Option<[f64; 2]> {
         let l = self.print_layout()?;
         let dpi = self.edit.recipe.dpi;
@@ -908,43 +953,51 @@ impl App {
         }
     }
 
-    /// Write the sheet whose `side` is the field the user typed, exactly.
-    /// The picture fills what the rings leave of that side; the other side
-    /// follows the crop and the rings. Then show the sheet the file has.
+    /// Write the sheet whose `side` is the field the user typed, exactly;
+    /// the other side follows the picture's proportion, so the sheet is
+    /// always the crop's shape. The rings are taken from inside it, so
+    /// with rings the picture sits centred with paper left over on two
+    /// sides. Then show the sheet the file has.
     fn apply_sheet(&mut self, side: SheetSide) {
         let (uw, uh) = self.picture_size();
         let dpi = self.edit.recipe.dpi;
         if uw == 0 || uh == 0 || dpi <= 0.0 {
             return;
         }
-        self.sheet_anchor = side;
         let typed = match side {
             SheetSide::Width => self.sheet_cm[0],
             SheetSide::Height => self.sheet_cm[1],
         };
-        let px = (typed / 2.54 * dpi).round().max(1.0) as usize;
-        let (bw, bh) = sheet_from_side(uw, uh, px, self.edit.recipe.frame_px(), side);
-        self.edit.recipe.size =
-            Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi });
+        let typed_px = (typed / 2.54 * dpi).round().max(1.0);
+        let (bw, bh) = match side {
+            SheetSide::Width => (typed_px, (typed_px * uh as f64 / uw as f64).round().max(1.0)),
+            SheetSide::Height => ((typed_px * uw as f64 / uh as f64).round().max(1.0), typed_px),
+        };
+        self.edit.recipe.size = Some(PrintSize::Physical { width_in: bw / dpi, height_in: bh / dpi });
         self.show_sheet();
     }
 
-    /// The sheet again from its anchored side, after the rings, the dpi or
-    /// the crop moved under it.
-    fn reapply_sheet(&mut self) {
-        self.apply_sheet(self.sheet_anchor);
-    }
-
-    /// First sheet: 40 cm on the long side, the short side from the picture.
-    fn set_long_edge_cm(&mut self, long_cm: f64) {
-        let (uw, uh) = self.picture_size();
-        if uh >= uw && uh > 0 {
-            self.sheet_cm = [0.0, long_cm];
-            self.apply_sheet(SheetSide::Height);
-        } else if uw > 0 {
-            self.sheet_cm = [long_cm, 0.0];
-            self.apply_sheet(SheetSide::Width);
+    /// The dpi moved from `dpi_before`. With the px ruler the pixels the
+    /// fields show stay and the inches follow; with cm or in the sheet
+    /// keeps its size (the recipe holds inches) and the pixels follow.
+    /// `rings_before` are the border and the black edge in pixels at the
+    /// old dpi.
+    fn follow_dpi(&mut self, dpi_before: f64, rings_before: (usize, usize)) {
+        let dpi = self.edit.recipe.dpi;
+        if dpi <= 0.0 || dpi_before <= 0.0 {
+            return;
         }
+        if self.ruler == Ruler::Pixels {
+            let (border_px, black_px) = rings_before;
+            self.edit.recipe.border_mm = border_px as f64 / dpi * 25.4;
+            self.edit.recipe.black_mm = black_px as f64 / dpi * 25.4;
+            if let Some(sheet) = self.edit.recipe.size {
+                let (bw, bh) = sheet.pixels(dpi_before);
+                self.edit.recipe.size =
+                    Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi });
+            }
+        }
+        self.show_sheet();
     }
 
     fn undo(&mut self) {
@@ -1127,7 +1180,8 @@ impl App {
         let tone = self.edit.recipe.curve.compile();
         Rings {
             black_tex: l.black_px as f32 * scale,
-            white_tex: l.border_px as f32 * scale,
+            frame_x_tex: l.picture_x as f32 * scale,
+            frame_y_tex: l.picture_y as f32 * scale,
             white: (tone.white().clamp(0.0, 1.0) * 255.0).round() as u8,
             black: (tone.eval(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
         }
@@ -1227,6 +1281,7 @@ impl App {
         if fw == 0 || fh == 0 {
             return;
         }
+        let was_one_to_one = self.is_one_to_one();
         self.edit.recipe.crop = Some(self.crop_draft.sanitized(fw, fh));
         self.close_crop();
         self.zoom = 1.0;
@@ -1235,9 +1290,32 @@ impl App {
         self.loupe_key = None;
         self.loupe_tex = None;
         self.cross_drag = false;
-        if self.edit.recipe.size.is_some() {
-            self.reapply_sheet();
+        // A new window is a new picture, and the sheet takes its
+        // proportion. No sheet set yet (1:1 lit): the window's pixels,
+        // still 1:1. A sheet set: its long side stays, the short side
+        // follows the crop.
+        if was_one_to_one {
+            self.set_one_to_one();
+        } else {
+            self.sheet_follows_crop();
         }
+    }
+
+    /// The sheet in the crop's proportion, its long side held: the long
+    /// side goes where the picture's long side is, the short side is that
+    /// times the picture's ratio.
+    fn sheet_follows_crop(&mut self) {
+        let (uw, uh) = self.picture_size();
+        let dpi = self.edit.recipe.dpi;
+        let Some(PrintSize::Physical { width_in, height_in }) = self.edit.recipe.size else { return };
+        if uw == 0 || uh == 0 || dpi <= 0.0 {
+            return;
+        }
+        let long_px = (width_in.max(height_in) * dpi).round().max(1.0);
+        let short_px = (long_px * uw.min(uh) as f64 / uw.max(uh) as f64).round().max(1.0);
+        let (bw, bh) = if uw >= uh { (long_px, short_px) } else { (short_px, long_px) };
+        self.edit.recipe.size = Some(PrintSize::Physical { width_in: bw / dpi, height_in: bh / dpi });
+        self.show_sheet();
     }
 
     /// Draft window in the picture currently on screen, and that picture's size.
@@ -1443,10 +1521,12 @@ impl App {
         if self.session.as_ref().is_some_and(|s| !s.is_mono()) && self.plate_default {
             e.plate = Some(self.plate_last);
         }
-        if fresh {
-            self.history = History::new(e.clone());
-        }
+        // The edit first: `set_edit` gives the defaults their sheet (the
+        // picture's pixels, 1:1), and a fresh history starts on that.
         self.set_edit(e);
+        if fresh {
+            self.history = History::new(self.edit.clone());
+        }
         // The baseline stays the recipe the file was opened with. Reset is a
         // different development, so closing or opening another file still asks.
         // The file next to the RAW is written only when that question is saved.
@@ -1667,8 +1747,11 @@ impl App {
                             .and_then(|_| std::env::var("MIMIZAN_SCREENSHOT_BORDER").ok())
                             .and_then(|v| v.parse::<f64>().ok())
                         {
-                            // A paper border in the unattended capture.
+                            // A paper border in the unattended capture,
+                            // around the whole picture: the sheet is the
+                            // pixels plus the border.
                             self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
+                            self.edit.recipe.size = self.sheet_of_pixels(self.edit.recipe.frame_px());
                         }
                         if let Some(filters) = self
                             .screenshot_to
@@ -3079,130 +3162,112 @@ impl App {
             };
             ui.label(RichText::new(text).weak()).on_hover_text(tip);
         });
-        let mut mode = self.size_mode;
-        ui.horizontal(|ui| {
-            print_field_label(ui, "size");
-            ui.selectable_value(&mut mode, SizeMode::Native, "native")
-                .on_hover_text("The negative's pixels, printed at the dpi below");
-            ui.selectable_value(&mut mode, SizeMode::Paper, "paper")
-                .on_hover_text("Fit into a paper size at the dpi");
-            // The ruler, at the right of the same row: the unit every
-            // length below is shown and typed in. The recipe keeps inches
-            // and millimetres whichever is chosen.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for r in Ruler::ALL.iter().rev() {
-                    ui.selectable_value(&mut self.ruler, *r, r.name()).on_hover_text(match r {
-                        Ruler::Metric => {
-                            "Centimetres for the picture, millimetres for the border and the black edge"
-                        }
-                        Ruler::Imperial => "Inches",
-                        Ruler::Pixels => "Pixels of the file, at the dpi below",
-                    });
-                }
-            });
-        });
-        self.size_mode = mode;
-        // The size row stays in both modes, so the lines under it do not
-        // jump when native and paper trade places.
-        if mode == SizeMode::Paper {
-            // Entering paper with no size yet. The struct default 30×40 is a
-            // loose box, so the first time takes 40 cm on the long side;
-            // coming back keeps the sheet the fields already show.
-            if self.edit.recipe.size.is_none() && self.export_size().0 > 0 {
-                if self.sheet_cm == [30.0, 40.0] {
-                    self.set_long_edge_cm(40.0);
-                } else {
-                    self.reapply_sheet();
-                }
-            }
-        } else {
-            self.edit.recipe.size = None;
+        // One rule for the sheet: the fields are the sheet in the printer,
+        // always in the crop's proportion. Type one side and the other
+        // follows the picture; the rings are taken from inside the sheet
+        // and the picture fills what they leave, centred. 1:1 is the sheet
+        // that is the picture's pixels, nothing more: the start, lit while
+        // the file is still that.
+        let has_file = self.session.is_some();
+        let one_to_one_now = self.is_one_to_one();
+        let one_to_one = ui
+            .horizontal(|ui| {
+                print_field_label(ui, "size");
+                let one = ui
+                    .add_enabled(has_file, egui::Button::selectable(one_to_one_now, "1:1"))
+                    .on_hover_text(
+                        "The sheet is the picture's pixels: no border, no black edge, no scaling. \
+                         The start; the sheet typed from here stands, and rings, crop and dpi \
+                         fit the picture inside it.",
+                    )
+                    .clicked();
+                // The ruler, at the right of the same row: the unit every
+                // length below is shown and typed in. The recipe keeps inches
+                // and millimetres whichever is chosen.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for r in Ruler::ALL.iter().rev() {
+                        ui.selectable_value(&mut self.ruler, *r, r.name()).on_hover_text(match r {
+                            Ruler::Metric => {
+                                "Centimetres for the sheet, millimetres for the border and the black edge"
+                            }
+                            Ruler::Imperial => "Inches",
+                            Ruler::Pixels => "Pixels of the file, at the dpi below",
+                        });
+                    }
+                });
+                one
+            })
+            .inner;
+        if one_to_one {
+            self.set_one_to_one();
         }
         let dpi_before = self.edit.recipe.dpi;
+        let rings_before = (self.edit.recipe.border_px(), self.edit.recipe.black_px());
         let (width_changed, height_changed) = ui
             .horizontal(|ui| {
                 print_field_label(ui, "");
                 let ruler = self.ruler;
                 let dpi = self.edit.recipe.dpi;
-                match self.size_mode {
-                    SizeMode::Paper => {
-                        // The rings must leave the picture at least a millimetre.
-                        let least = 2.0 * self.edit.recipe.frame_px() as f64 / dpi.max(1.0) * 2.54 + 0.1;
-                        let width = length_field(ui, &mut self.sheet_cm[0], Base::Cm, ruler, dpi, least..=2000.0, true)
-                            .on_hover_text(
-                                "Width of the sheet in the printer. The height follows the crop and the rings. The picture fills what the border and the black edge leave.",
-                            );
-                        ui.label("×");
-                        let height = length_field(ui, &mut self.sheet_cm[1], Base::Cm, ruler, dpi, least..=2000.0, true)
-                            .on_hover_text(
-                                "Height of the sheet in the printer. The width follows the crop and the rings. The picture fills what the border and the black edge leave.",
-                            );
-                        (width.changed(), height.changed())
-                    }
-                    SizeMode::Native => {
-                        let mut cm = self.file_cm().unwrap_or([0.0, 0.0]);
-                        let hover = "The file at this dpi: the negative's pixels and the rings. Paper is where the sheet is set.";
-                        length_field(ui, &mut cm[0], Base::Cm, ruler, dpi, 0.0..=2000.0, false)
-                            .on_disabled_hover_text(hover);
-                        ui.label("×");
-                        length_field(ui, &mut cm[1], Base::Cm, ruler, dpi, 0.0..=2000.0, false)
-                            .on_disabled_hover_text(hover);
-                        (false, false)
-                    }
-                }
+                // The rings must leave the picture at least a millimetre.
+                let least = 2.0 * self.edit.recipe.frame_px() as f64 / dpi.max(1.0) * 2.54 + 0.1;
+                let hover = "The sheet in the printer, in the crop's proportion: type one side, the other \
+                             follows the picture. Shown the picture's way, the long side where the \
+                             picture's long side is. The border and the black edge are taken from inside \
+                             it and the picture fills what they leave, centred.";
+                let width =
+                    length_field(ui, &mut self.sheet_cm[0], Base::Cm, ruler, dpi, least..=2000.0, has_file)
+                        .on_hover_text(hover);
+                ui.label("×");
+                let height =
+                    length_field(ui, &mut self.sheet_cm[1], Base::Cm, ruler, dpi, least..=2000.0, has_file)
+                        .on_hover_text(hover);
+                (width.changed(), height.changed())
             })
             .inner;
         let dpi_changed = ui
             .horizontal(|ui| {
                 print_field_label(ui, "dpi");
-                let response = ui.add(
+                ui.add(
                     egui::DragValue::new(&mut self.edit.recipe.dpi)
                         .range(36.0..=1200.0)
                         .clamp_existing_to_range(false)
                         .speed(1.0)
                         .suffix(" dpi"),
-                );
-                if self.size_mode == SizeMode::Native {
-                    response
-                        .on_hover_text("Written into the TIFF. These pixels print at this size.")
-                        .changed()
-                } else {
-                    response.changed()
-                }
+                )
+                .on_hover_text(
+                    "Pixels per inch, written into the TIFF. With the cm or in ruler the sheet keeps its size \
+                     and the pixels follow; with the px ruler the pixels stay and the size follows.",
+                )
+                .changed()
             })
             .inner;
-        if self.size_mode == SizeMode::Paper {
-            if width_changed {
-                self.apply_sheet(SheetSide::Width);
-            } else if height_changed {
-                self.apply_sheet(SheetSide::Height);
-            } else if dpi_changed && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
-                self.reapply_sheet();
-            } else {
-                self.show_sheet();
-            }
+        if width_changed {
+            self.apply_sheet(SheetSide::Width);
+        } else if height_changed {
+            self.apply_sheet(SheetSide::Height);
+        } else if dpi_changed && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
+            self.follow_dpi(dpi_before, rings_before);
+        } else {
+            self.show_sheet();
         }
         self.print_sheet_line(ui);
-        let border_before = self.edit.recipe.border_mm;
-        let black_before = self.edit.recipe.black_mm;
         // border and black share the row. Wrapped, so a long value breaks
-        // inside the column instead of widening the dock.
+        // inside the column instead of widening the dock. The sheet stands
+        // under a changed ring; the picture refits inside it.
         let ruler = self.ruler;
         let dpi = self.edit.recipe.dpi;
         ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "border");
             length_field(ui, &mut self.edit.recipe.border_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true)
-                .on_hover_text("White paper around the picture, outside the black edge, taken from the sheet. Zero is off.");
+                .on_hover_text(
+                    "White paper around the picture, outside the black edge, taken from the sheet: at least this much; \
+                     more on two sides where the sheet's ratio is not the picture's. Zero is off.",
+                );
             ui.label(RichText::new("black").weak());
             length_field(ui, &mut self.edit.recipe.black_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true).on_hover_text(
-                "Black film edge around the picture, inside the white border when there is one, taken from the sheet. Either ring stands on its own. Zero is off.",
+                "Black film edge against the picture, inside the white border when there is one, taken from the sheet. Either ring stands on its own. Zero is off.",
             );
         });
-        let border_moved = (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON;
-        let black_moved = (black_before - self.edit.recipe.black_mm).abs() > f64::EPSILON;
-        if self.size_mode == SizeMode::Paper && (border_moved || black_moved) {
-            self.reapply_sheet();
-        }
         ui.horizontal(|ui| {
             print_field_label(ui, "resample");
             let r = &mut self.edit.recipe.resample;
@@ -3225,7 +3290,8 @@ impl App {
         self.sharpen_loupe(ui);
     }
 
-    /// The picture inside the sheet, and the export's memory. Absent until a file is open.
+    /// The picture inside the sheet, its scale from the negative's pixels,
+    /// and the export's memory. Absent until a file is open.
     fn print_sheet_line(&self, ui: &mut egui::Ui) {
         let Some(l) = self.print_layout() else { return };
         let dpi = self.edit.recipe.dpi;
@@ -3241,10 +3307,23 @@ impl App {
             Ruler::Imperial => format!("{:.2} × {:.2} in · ", inches(l.image_w), inches(l.image_h)),
             Ruler::Pixels => String::new(),
         };
+        // The scale, so a sheet that resamples says so at a glance.
+        let (uw, uh) = self.picture_size();
+        let scale = if l.image_w == uw && l.image_h == uh {
+            "1:1".to_string()
+        } else {
+            format!("×{:.2}", l.image_w as f64 / uw.max(1) as f64)
+        };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.label(RichText::new(format!("picture {physical}{} × {} px · ", l.image_w, l.image_h)).weak())
-                .on_hover_text("The picture inside the rings. The fields above are the whole file.");
+            ui.label(
+                RichText::new(format!("picture {physical}{} × {} px · {scale} · ", l.image_w, l.image_h))
+                    .weak(),
+            )
+            .on_hover_text(
+                "The picture inside the rings, and its scale from the negative's pixels. \
+                     The fields above are the whole file.",
+            );
             // What the export holds at once, red once the machine cannot.
             if let Some(need) = self.export_memory() {
                 let text = RichText::new(memory_text(need));
@@ -3328,7 +3407,13 @@ impl App {
         let side = (ui.available_width() * ppp).round() as usize;
         self.loupe_px = side.clamp(64, 960);
         if let Some(scale) = self.loupe_layout().map(|l| l.enlargement) {
-            let mut text = if scale > 1.0 { format!("{scale:.2}×") } else { "no enlargement".to_string() };
+            // The same scale the line under the size fields shows; a
+            // reduction is a scale too.
+            let mut text = if (scale - 1.0).abs() < 1e-9 {
+                "1:1 · no scaling".to_string()
+            } else {
+                format!("×{scale:.2}")
+            };
             if self.loupe_shown != self.loupe_sent {
                 text.push_str(" · updating");
             }
@@ -3707,12 +3792,14 @@ impl App {
         }
         // The rings and the crosshair belong to the pixels on the stage, not
         // to the edit alone: see `held_dress`.
-        let StageDress { rings: Rings { black_tex, white_tex, white, black }, cross } = self.stage_dress();
-        let border_tex = black_tex + white_tex;
-        // The sheet (picture plus both rings) is what fits the opening.
-        // A zoom grows it from this same fit, so the first step does not jump.
-        let fit = (stage.width() / (tw as f32 + 2.0 * border_tex))
-            .min(stage.height() / (th as f32 + 2.0 * border_tex));
+        let StageDress { rings, cross } = self.stage_dress();
+        let Rings { white, black, .. } = rings;
+        let frame_tex = rings.frame();
+        // The sheet (picture plus the paper around it) is what fits the
+        // opening. A zoom grows it from this same fit, so the first step
+        // does not jump.
+        let fit = (stage.width() / (tw as f32 + 2.0 * frame_tex.x))
+            .min(stage.height() / (th as f32 + 2.0 * frame_tex.y));
         if let Some(scale) = self.keep_scale.take() {
             self.zoom = (scale / fit).clamp(1.0, MAX_ZOOM);
         } else if let (Some(old_fit), Some(old_stage)) = (self.last_fit, self.last_stage) {
@@ -3757,12 +3844,11 @@ impl App {
         let place = |zoom: f32, pan: Vec2| {
             let scale = fit * zoom;
             let size = Vec2::new(tw as f32 * scale, th as f32 * scale);
-            let white_pts = white_tex * scale;
-            let black_pts = black_tex * scale;
-            let border_pts = white_pts + black_pts;
-            let bounds = pan_bounds(size + Vec2::splat(2.0 * border_pts), stage, room);
+            let frame_pts = frame_tex * scale;
+            let black_pts = rings.black_shown() * scale;
+            let bounds = pan_bounds(size + 2.0 * frame_pts, stage, room);
             let pan = pan.clamp(bounds.0, bounds.1);
-            (sheet_rect(stage, pan, size), white_pts, black_pts, bounds, pan)
+            (sheet_rect(stage, pan, size), frame_pts, black_pts, bounds, pan)
         };
         let (rect_now, _, _, _, _) = place(self.zoom, self.pan);
         // The cross that is drawn is the one that can be grabbed.
@@ -3789,7 +3875,7 @@ impl App {
                 self.pan = Vec2::ZERO;
             }
         }
-        let (mut rect, white_pts, black_pts, bounds, pan) = place(self.zoom, self.pan);
+        let (mut rect, frame_pts, black_pts, bounds, pan) = place(self.zoom, self.pan);
         self.pan = pan;
         let crosshair_released = self.cross_drag && !response.is_pointer_button_down_on();
         if !response.is_pointer_button_down_on() {
@@ -3835,12 +3921,11 @@ impl App {
         let clip = if picture_is_fitted(self.zoom) { stage } else { room };
         let painter = ui.painter_at(clip);
         ui.painter_at(stage).rect_filled(stage, 0.0, Color32::from_gray(28));
-        let border_pts = white_pts + black_pts;
-        if border_pts > 0.0 {
-            painter.rect_filled(rect.expand(border_pts), 0.0, Color32::from_gray(white));
+        if frame_pts.x > 0.0 || frame_pts.y > 0.0 {
+            painter.rect_filled(rect.expand2(frame_pts), 0.0, Color32::from_gray(white));
         }
-        if black_pts > 0.0 {
-            painter.rect_filled(rect.expand(black_pts), 0.0, Color32::from_gray(black));
+        if black_pts.x > 0.0 || black_pts.y > 0.0 {
+            painter.rect_filled(rect.expand2(black_pts), 0.0, Color32::from_gray(black));
         }
         painter.image(tex, rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
@@ -4960,9 +5045,15 @@ fn length_field(
         (Ruler::Pixels, _) => (0, 1.0, " px"),
     };
     let mut shown = *value * k;
+    // Typed text is taken on Enter or when the field is left, not per
+    // keystroke: the value is read back from the layout after every
+    // change, and egui drops text whose value moved under it, so a live
+    // update would rewrite "1" to the clamped minimum before the next
+    // digit. Dragging still updates as it moves.
     let response = ui.add_enabled(
         enabled,
         egui::DragValue::new(&mut shown)
+            .update_while_editing(false)
             .range(range.start() * k..=range.end() * k)
             .clamp_existing_to_range(false)
             .speed(speed)
@@ -5379,8 +5470,10 @@ mod crop_drag_tests {
         // has one. Until that file's picture lands, the stage keeps its own
         // (empty) rings: the new border must not dress the old pixels.
         let none = StageDress { rings: Rings::default(), cross: Some([0.3, 0.7]) };
-        let wide =
-            StageDress { rings: Rings { white_tex: 118.8, ..Rings::default() }, cross: Some([0.5, 0.5]) };
+        let wide = StageDress {
+            rings: Rings { frame_x_tex: 118.8, frame_y_tex: 118.8, ..Rings::default() },
+            cross: Some([0.5, 0.5]),
+        };
         assert_eq!(dress_to_hold(None, true, || none), Some(none));
         // An empty stage has nothing to hold.
         assert_eq!(dress_to_hold(None, false, || wide), None);
