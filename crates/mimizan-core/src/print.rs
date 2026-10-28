@@ -492,6 +492,34 @@ pub fn box_for_picture_height(img_w: usize, img_h: usize, picture_h: usize, bord
     (inner_w.saturating_add(2 * border), picture_h.saturating_add(2 * border))
 }
 
+/// Which side of the sheet the user typed. The other follows the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SheetSide {
+    Width,
+    Height,
+}
+
+/// Paper box, in pixels, whose `side` is exactly `sheet_px`: the sheet in
+/// the printer. The picture fills what `frame` pixels of rings on every
+/// side leave of that side, at least one pixel; the other picture side
+/// follows the image ratio, and the other sheet side is that plus the
+/// rings. `layout` gives the typed side back exactly; the other may come
+/// out one pixel under the box (a ceil here, a round in the fit), which is
+/// why the fields show the layout, not the box.
+pub fn sheet_from_side(
+    img_w: usize,
+    img_h: usize,
+    sheet_px: usize,
+    frame: usize,
+    side: SheetSide,
+) -> (usize, usize) {
+    let inner = sheet_px.saturating_sub(2 * frame).max(1);
+    match side {
+        SheetSide::Width => box_for_picture_width(img_w, img_h, inner, frame),
+        SheetSide::Height => box_for_picture_height(img_w, img_h, inner, frame),
+    }
+}
+
 /// The crop window inside an upright image, or the whole image.
 pub fn source_window(full_w: usize, full_h: usize, crop: Option<CropRect>) -> (usize, usize, usize, usize) {
     match crop {
@@ -1308,6 +1336,56 @@ mod tests {
                 for border in borders {
                     check_picture_box(img_w, img_h, picture, border, dpi, true);
                     check_picture_box(img_w, img_h, picture, border, dpi, false);
+                }
+            }
+        }
+    }
+
+    /// The typed side of the sheet is the file's side, exactly, with the
+    /// rings as set and the picture filling the rest; rings wider than the
+    /// sheet leave one pixel of picture.
+    #[test]
+    fn sheet_from_side_is_the_file_side() {
+        let dpi = 300.0;
+        for (img_w, img_h) in [(5504, 8256), (4032, 3024), (3, 5), (1, 1)] {
+            for sheet in [1, 10, 400, 3543, 4724] {
+                for frame in [0, 1, 118, 236, 3000] {
+                    for side in [SheetSide::Width, SheetSide::Height] {
+                        let (bw, bh) = sheet_from_side(img_w, img_h, sheet, frame, side);
+                        let typed = if side == SheetSide::Width { bw } else { bh };
+                        let inner = sheet.saturating_sub(2 * frame).max(1);
+                        assert_eq!(
+                            typed,
+                            inner + 2 * frame,
+                            "{img_w}x{img_h} sheet {sheet} frame {frame} {side:?}"
+                        );
+                        if 2 * frame < sheet {
+                            assert_eq!(typed, sheet);
+                        }
+                        let p = PrintParams {
+                            recipe: Recipe {
+                                size: Some(PrintSize::Physical {
+                                    width_in: bw as f64 / dpi,
+                                    height_in: bh as f64 / dpi,
+                                }),
+                                dpi,
+                                border_mm: frame as f64 / dpi * 25.4,
+                                ..Recipe::default()
+                            },
+                            ..Default::default()
+                        };
+                        let lay = layout(img_w, img_h, 1, &p);
+                        let (out_typed, out_other, box_other) = match side {
+                            SheetSide::Width => (lay.out_w, lay.out_h, bh),
+                            SheetSide::Height => (lay.out_h, lay.out_w, bw),
+                        };
+                        assert_eq!(out_typed, typed);
+                        // The other side: the box is a ceil, the fit a round,
+                        // so the file may be one pixel under the box.
+                        assert!(box_other - out_other <= 1, "{box_other} vs {out_other}");
+                        let picture = if side == SheetSide::Width { lay.image_w } else { lay.image_h };
+                        assert_eq!(picture, inner);
+                    }
                 }
             }
         }

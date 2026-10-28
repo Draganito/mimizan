@@ -22,8 +22,7 @@ use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{
-    box_for_picture_height, box_for_picture_width, memory_estimate, memory_text, peak_print_radius,
-    PrintSize, LAMP_LIMIT,
+    memory_estimate, memory_text, peak_print_radius, sheet_from_side, PrintSize, SheetSide, LAMP_LIMIT,
 };
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
@@ -38,13 +37,6 @@ use std::sync::Arc;
 enum SizeMode {
     Native,
     Paper,
-}
-
-/// Which centimetre field the user is editing. The other follows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PictureSide {
-    Width,
-    Height,
 }
 
 /// US darkroom paper, as a ratio. The long side follows the picture until
@@ -419,7 +411,11 @@ pub struct App {
     history: History,
     // Export section
     size_mode: SizeMode,
-    paper_cm: [f64; 2],
+    /// The sheet in the printer as the fields show it, centimetres.
+    sheet_cm: [f64; 2],
+    /// The side of the sheet the user typed last. It is held exactly when
+    /// the rings, the dpi or the crop change; the other side follows.
+    sheet_anchor: SheetSide,
     /// What the Print window's lengths are shown and typed in.
     ruler: Ruler,
     /// The export estimate the user was warned about. A second click with
@@ -623,7 +619,8 @@ impl App {
                 sys.refresh_memory();
                 sys.total_memory()
             },
-            paper_cm: [30.0, 40.0],
+            sheet_cm: [30.0, 40.0],
+            sheet_anchor: SheetSide::Width,
             ruler: persisted.ruler.unwrap_or_default(),
             sharpen_at: None,
             peak_held: false,
@@ -889,58 +886,64 @@ impl App {
             Some(PrintSize::Physical { .. }) => SizeMode::Paper,
         };
         if self.edit.recipe.size.is_some() {
-            if let Some(cm) = self.picture_cm() {
-                self.paper_cm = cm;
-            }
+            self.show_sheet();
         }
     }
 
-    /// The picture's size in centimetres, from the layout the recipe produces.
-    fn picture_cm(&self) -> Option<[f64; 2]> {
+    /// The file's size in centimetres, from the layout the recipe produces:
+    /// the sheet with its rings, or the bare negative.
+    fn file_cm(&self) -> Option<[f64; 2]> {
         let l = self.print_layout()?;
         let dpi = self.edit.recipe.dpi;
         if dpi <= 0.0 {
             return None;
         }
-        Some([l.image_w as f64 / dpi * 2.54, l.image_h as f64 / dpi * 2.54])
+        Some([l.out_w as f64 / dpi * 2.54, l.out_h as f64 / dpi * 2.54])
     }
 
-    /// Write a paper box whose picture is the centimetre field on `side`,
-    /// the other side following at the same scale, black and white outside it.
-    /// Then show the centimetres the file actually has.
-    fn apply_picture(&mut self, side: PictureSide) {
+    /// Put the file's size in the sheet fields.
+    fn show_sheet(&mut self) {
+        if let Some(cm) = self.file_cm() {
+            self.sheet_cm = cm;
+        }
+    }
+
+    /// Write the sheet whose `side` is the field the user typed, exactly.
+    /// The picture fills what the rings leave of that side; the other side
+    /// follows the crop and the rings. Then show the sheet the file has.
+    fn apply_sheet(&mut self, side: SheetSide) {
         let (uw, uh) = self.picture_size();
         let dpi = self.edit.recipe.dpi;
         if uw == 0 || uh == 0 || dpi <= 0.0 {
             return;
         }
-        let b = self.edit.recipe.frame_px();
-        let (bw, bh) = match side {
-            PictureSide::Width => {
-                let px = (self.paper_cm[0] / 2.54 * dpi).round().max(1.0) as usize;
-                box_for_picture_width(uw, uh, px, b)
-            }
-            PictureSide::Height => {
-                let px = (self.paper_cm[1] / 2.54 * dpi).round().max(1.0) as usize;
-                box_for_picture_height(uw, uh, px, b)
-            }
+        self.sheet_anchor = side;
+        let typed = match side {
+            SheetSide::Width => self.sheet_cm[0],
+            SheetSide::Height => self.sheet_cm[1],
         };
+        let px = (typed / 2.54 * dpi).round().max(1.0) as usize;
+        let (bw, bh) = sheet_from_side(uw, uh, px, self.edit.recipe.frame_px(), side);
         self.edit.recipe.size =
             Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi });
-        if let Some(cm) = self.picture_cm() {
-            self.paper_cm = cm;
-        }
+        self.show_sheet();
     }
 
-    /// First paper size: 40 cm on the long side, the short side from the negative.
+    /// The sheet again from its anchored side, after the rings, the dpi or
+    /// the crop moved under it.
+    fn reapply_sheet(&mut self) {
+        self.apply_sheet(self.sheet_anchor);
+    }
+
+    /// First sheet: 40 cm on the long side, the short side from the picture.
     fn set_long_edge_cm(&mut self, long_cm: f64) {
         let (uw, uh) = self.picture_size();
         if uh >= uw && uh > 0 {
-            self.paper_cm = [long_cm * uw as f64 / uh as f64, long_cm];
-            self.apply_picture(PictureSide::Height);
+            self.sheet_cm = [0.0, long_cm];
+            self.apply_sheet(SheetSide::Height);
         } else if uw > 0 {
-            self.paper_cm = [long_cm, long_cm * uh as f64 / uw as f64];
-            self.apply_picture(PictureSide::Width);
+            self.sheet_cm = [long_cm, 0.0];
+            self.apply_sheet(SheetSide::Width);
         }
     }
 
@@ -1233,7 +1236,7 @@ impl App {
         self.loupe_tex = None;
         self.cross_drag = false;
         if self.edit.recipe.size.is_some() {
-            self.apply_picture(PictureSide::Width);
+            self.reapply_sheet();
         }
     }
 
@@ -3099,17 +3102,17 @@ impl App {
             });
         });
         self.size_mode = mode;
-        // The centimetre row stays in both modes, so the lines under it do not
+        // The size row stays in both modes, so the lines under it do not
         // jump when native and paper trade places.
         if mode == SizeMode::Paper {
             // Entering paper with no size yet. The struct default 30×40 is a
             // loose box, so the first time takes 40 cm on the long side;
-            // coming back keeps the picture the fields already show.
+            // coming back keeps the sheet the fields already show.
             if self.edit.recipe.size.is_none() && self.export_size().0 > 0 {
-                if self.paper_cm == [30.0, 40.0] {
+                if self.sheet_cm == [30.0, 40.0] {
                     self.set_long_edge_cm(40.0);
                 } else {
-                    self.apply_picture(PictureSide::Width);
+                    self.reapply_sheet();
                 }
             }
         } else {
@@ -3123,20 +3126,22 @@ impl App {
                 let dpi = self.edit.recipe.dpi;
                 match self.size_mode {
                     SizeMode::Paper => {
-                        let width = length_field(ui, &mut self.paper_cm[0], Base::Cm, ruler, dpi, 0.1..=2000.0, true)
+                        // The rings must leave the picture at least a millimetre.
+                        let least = 2.0 * self.edit.recipe.frame_px() as f64 / dpi.max(1.0) * 2.54 + 0.1;
+                        let width = length_field(ui, &mut self.sheet_cm[0], Base::Cm, ruler, dpi, least..=2000.0, true)
                             .on_hover_text(
-                                "Width of the picture. The height follows the negative, one scale for both sides. The black edge and the white border are added around this.",
+                                "Width of the sheet in the printer. The height follows the crop and the rings. The picture fills what the border and the black edge leave.",
                             );
                         ui.label("×");
-                        let height = length_field(ui, &mut self.paper_cm[1], Base::Cm, ruler, dpi, 0.1..=2000.0, true)
+                        let height = length_field(ui, &mut self.sheet_cm[1], Base::Cm, ruler, dpi, least..=2000.0, true)
                             .on_hover_text(
-                                "Height of the picture. The width follows the negative, one scale for both sides. The black edge and the white border are added around this.",
+                                "Height of the sheet in the printer. The width follows the crop and the rings. The picture fills what the border and the black edge leave.",
                             );
                         (width.changed(), height.changed())
                     }
                     SizeMode::Native => {
-                        let mut cm = self.picture_cm().unwrap_or([0.0, 0.0]);
-                        let hover = "The picture at this dpi. Paper is where the size is set.";
+                        let mut cm = self.file_cm().unwrap_or([0.0, 0.0]);
+                        let hover = "The file at this dpi: the negative's pixels and the rings. Paper is where the sheet is set.";
                         length_field(ui, &mut cm[0], Base::Cm, ruler, dpi, 0.0..=2000.0, false)
                             .on_disabled_hover_text(hover);
                         ui.label("×");
@@ -3168,13 +3173,13 @@ impl App {
             .inner;
         if self.size_mode == SizeMode::Paper {
             if width_changed {
-                self.apply_picture(PictureSide::Width);
+                self.apply_sheet(SheetSide::Width);
             } else if height_changed {
-                self.apply_picture(PictureSide::Height);
+                self.apply_sheet(SheetSide::Height);
             } else if dpi_changed && (dpi_before - self.edit.recipe.dpi).abs() > f64::EPSILON {
-                self.apply_picture(PictureSide::Width);
-            } else if let Some(cm) = self.picture_cm() {
-                self.paper_cm = cm;
+                self.reapply_sheet();
+            } else {
+                self.show_sheet();
             }
         }
         self.print_sheet_line(ui);
@@ -3187,16 +3192,16 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "border");
             length_field(ui, &mut self.edit.recipe.border_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true)
-                .on_hover_text("White paper around the picture, outside the black edge. Zero is off.");
+                .on_hover_text("White paper around the picture, outside the black edge, taken from the sheet. Zero is off.");
             ui.label(RichText::new("black").weak());
             length_field(ui, &mut self.edit.recipe.black_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true).on_hover_text(
-                "Black film edge around the picture, inside the white border when there is one. Either ring stands on its own. Zero is off.",
+                "Black film edge around the picture, inside the white border when there is one, taken from the sheet. Either ring stands on its own. Zero is off.",
             );
         });
         let border_moved = (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON;
         let black_moved = (black_before - self.edit.recipe.black_mm).abs() > f64::EPSILON;
         if self.size_mode == SizeMode::Paper && (border_moved || black_moved) {
-            self.apply_picture(PictureSide::Width);
+            self.reapply_sheet();
         }
         ui.horizontal(|ui| {
             print_field_label(ui, "resample");
@@ -3220,22 +3225,26 @@ impl App {
         self.sharpen_loupe(ui);
     }
 
-    /// Pixels of the TIFF and the sheet in centimetres. Absent until a file is open.
+    /// The picture inside the sheet, and the export's memory. Absent until a file is open.
     fn print_sheet_line(&self, ui: &mut egui::Ui) {
         let Some(l) = self.print_layout() else { return };
         let dpi = self.edit.recipe.dpi;
         if dpi <= 0.0 {
             return;
         }
+        // The picture inside the sheet: what the fields above leave it.
         let inches = |px: usize| px as f64 / dpi;
         let physical = match self.ruler {
-            Ruler::Metric => format!("{:.1} × {:.1} cm · ", inches(l.out_w) * 2.54, inches(l.out_h) * 2.54),
-            Ruler::Imperial => format!("{:.2} × {:.2} in · ", inches(l.out_w), inches(l.out_h)),
+            Ruler::Metric => {
+                format!("{:.1} × {:.1} cm · ", inches(l.image_w) * 2.54, inches(l.image_h) * 2.54)
+            }
+            Ruler::Imperial => format!("{:.2} × {:.2} in · ", inches(l.image_w), inches(l.image_h)),
             Ruler::Pixels => String::new(),
         };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.label(RichText::new(format!("{} × {} px · {physical}", l.out_w, l.out_h)).weak());
+            ui.label(RichText::new(format!("picture {physical}{} × {} px · ", l.image_w, l.image_h)).weak())
+                .on_hover_text("The picture inside the rings. The fields above are the whole file.");
             // What the export holds at once, red once the machine cannot.
             if let Some(need) = self.export_memory() {
                 let text = RichText::new(memory_text(need));
