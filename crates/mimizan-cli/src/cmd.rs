@@ -392,9 +392,6 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     if let Some(b) = a.black_mm {
         r.black_mm = b;
     }
-    if r.black_mm > r.border_mm {
-        r.black_mm = r.border_mm;
-    }
     if let Some(d) = a.dpi {
         r.dpi = d;
     }

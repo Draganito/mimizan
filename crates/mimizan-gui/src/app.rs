@@ -3,7 +3,7 @@
 //! Enlarger below). Nothing here changes pixels; it only chooses
 //! parameters and hands them to the workers.
 
-use crate::browser::{self, home_dir, Folder, Persisted, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::browser::{self, home_dir, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
@@ -420,6 +420,8 @@ pub struct App {
     // Export section
     size_mode: SizeMode,
     paper_cm: [f64; 2],
+    /// What the Print window's lengths are shown and typed in.
+    ruler: Ruler,
     /// The export estimate the user was warned about. A second click with
     /// the same estimate goes ahead; a different one warns again.
     export_warned: Option<u64>,
@@ -622,6 +624,7 @@ impl App {
                 sys.total_memory()
             },
             paper_cm: [30.0, 40.0],
+            ruler: persisted.ruler.unwrap_or_default(),
             sharpen_at: None,
             peak_held: false,
             peak_arm: false,
@@ -718,6 +721,7 @@ impl App {
             plate: Some(self.plate_default),
             plate_filters: Some(self.plate_last.filters),
             plate_space: Some(self.plate_last.space),
+            ruler: Some(self.ruler),
         }
         .save();
     }
@@ -3079,6 +3083,20 @@ impl App {
                 .on_hover_text("The negative's pixels, printed at the dpi below");
             ui.selectable_value(&mut mode, SizeMode::Paper, "paper")
                 .on_hover_text("Fit into a paper size at the dpi");
+            // The ruler, at the right of the same row: the unit every
+            // length below is shown and typed in. The recipe keeps inches
+            // and millimetres whichever is chosen.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for r in Ruler::ALL.iter().rev() {
+                    ui.selectable_value(&mut self.ruler, *r, r.name()).on_hover_text(match r {
+                        Ruler::Metric => {
+                            "Centimetres for the picture, millimetres for the border and the black edge"
+                        }
+                        Ruler::Imperial => "Inches",
+                        Ruler::Pixels => "Pixels of the file, at the dpi below",
+                    });
+                }
+            });
         });
         self.size_mode = mode;
         // The centimetre row stays in both modes, so the lines under it do not
@@ -3101,30 +3119,16 @@ impl App {
         let (width_changed, height_changed) = ui
             .horizontal(|ui| {
                 print_field_label(ui, "");
+                let ruler = self.ruler;
+                let dpi = self.edit.recipe.dpi;
                 match self.size_mode {
                     SizeMode::Paper => {
-                        let width = ui
-                            .add(
-                                egui::DragValue::new(&mut self.paper_cm[0])
-                                    .range(0.1..=2000.0)
-                                    .clamp_existing_to_range(false)
-                                    .speed(0.1)
-                                    .fixed_decimals(1)
-                                    .suffix(" cm"),
-                            )
+                        let width = length_field(ui, &mut self.paper_cm[0], Base::Cm, ruler, dpi, 0.1..=2000.0, true)
                             .on_hover_text(
                                 "Width of the picture. The height follows the negative, one scale for both sides. The black edge and the white border are added around this.",
                             );
                         ui.label("×");
-                        let height = ui
-                            .add(
-                                egui::DragValue::new(&mut self.paper_cm[1])
-                                    .range(0.1..=2000.0)
-                                    .clamp_existing_to_range(false)
-                                    .speed(0.1)
-                                    .fixed_decimals(1)
-                                    .suffix(" cm"),
-                            )
+                        let height = length_field(ui, &mut self.paper_cm[1], Base::Cm, ruler, dpi, 0.1..=2000.0, true)
                             .on_hover_text(
                                 "Height of the picture. The width follows the negative, one scale for both sides. The black edge and the white border are added around this.",
                             );
@@ -3132,24 +3136,12 @@ impl App {
                     }
                     SizeMode::Native => {
                         let mut cm = self.picture_cm().unwrap_or([0.0, 0.0]);
-                        let hover = "The picture at this dpi, in centimetres. Paper is where the size is set.";
-                        ui.add_enabled(
-                            false,
-                            egui::DragValue::new(&mut cm[0])
-                                .range(0.0..=2000.0)
-                                .fixed_decimals(1)
-                                .suffix(" cm"),
-                        )
-                        .on_disabled_hover_text(hover);
+                        let hover = "The picture at this dpi. Paper is where the size is set.";
+                        length_field(ui, &mut cm[0], Base::Cm, ruler, dpi, 0.0..=2000.0, false)
+                            .on_disabled_hover_text(hover);
                         ui.label("×");
-                        ui.add_enabled(
-                            false,
-                            egui::DragValue::new(&mut cm[1])
-                                .range(0.0..=2000.0)
-                                .fixed_decimals(1)
-                                .suffix(" cm"),
-                        )
-                        .on_disabled_hover_text(hover);
+                        length_field(ui, &mut cm[1], Base::Cm, ruler, dpi, 0.0..=2000.0, false)
+                            .on_disabled_hover_text(hover);
                         (false, false)
                     }
                 }
@@ -3190,30 +3182,15 @@ impl App {
         let black_before = self.edit.recipe.black_mm;
         // border and black share the row. Wrapped, so a long value breaks
         // inside the column instead of widening the dock.
+        let ruler = self.ruler;
+        let dpi = self.edit.recipe.dpi;
         ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "border");
-            ui.add(
-                egui::DragValue::new(&mut self.edit.recipe.border_mm)
-                    .range(0.0..=100.0)
-                    .clamp_existing_to_range(false)
-                    .speed(0.2)
-                    .suffix(" mm"),
-            )
-            .on_hover_text("White paper around the picture, outside the black edge");
-            if self.edit.recipe.black_mm > self.edit.recipe.border_mm {
-                self.edit.recipe.black_mm = self.edit.recipe.border_mm.max(0.0);
-            }
-            let white_mm = self.edit.recipe.border_mm.max(0.0);
+            length_field(ui, &mut self.edit.recipe.border_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true)
+                .on_hover_text("White paper around the picture, outside the black edge. Zero is off.");
             ui.label(RichText::new("black").weak());
-            ui.add(
-                egui::DragValue::new(&mut self.edit.recipe.black_mm)
-                    .range(0.0..=white_mm)
-                    .clamp_existing_to_range(false)
-                    .speed(0.2)
-                    .suffix(" mm"),
-            )
-            .on_hover_text(
-                "Black film edge between the picture and the white border. It cannot be wider than the white border. Zero is off.",
+            length_field(ui, &mut self.edit.recipe.black_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true).on_hover_text(
+                "Black film edge around the picture, inside the white border when there is one. Either ring stands on its own. Zero is off.",
             );
         });
         let border_moved = (border_before - self.edit.recipe.border_mm).abs() > f64::EPSILON;
@@ -3250,19 +3227,15 @@ impl App {
         if dpi <= 0.0 {
             return;
         }
-        let cm = |px: usize| px as f64 / dpi * 2.54;
+        let inches = |px: usize| px as f64 / dpi;
+        let physical = match self.ruler {
+            Ruler::Metric => format!("{:.1} × {:.1} cm · ", inches(l.out_w) * 2.54, inches(l.out_h) * 2.54),
+            Ruler::Imperial => format!("{:.2} × {:.2} in · ", inches(l.out_w), inches(l.out_h)),
+            Ruler::Pixels => String::new(),
+        };
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            ui.label(
-                RichText::new(format!(
-                    "{} × {} px · {:.1} × {:.1} cm · ",
-                    l.out_w,
-                    l.out_h,
-                    cm(l.out_w),
-                    cm(l.out_h)
-                ))
-                .weak(),
-            );
+            ui.label(RichText::new(format!("{} × {} px · {physical}", l.out_w, l.out_h)).weak());
             // What the export holds at once, red once the machine cannot.
             if let Some(need) = self.export_memory() {
                 let text = RichText::new(memory_text(need));
@@ -4935,6 +4908,64 @@ fn panel_heading(ui: &mut egui::Ui, title: &str) -> bool {
 
 /// Left column of the print dock. Wide enough for the longest word, so
 /// dpi, border and resample start their numbers on the same line.
+/// What a length field holds underneath: the recipe's centimetres (the
+/// picture) or millimetres (the rings).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Base {
+    Cm,
+    Mm,
+}
+
+impl Base {
+    fn per_inch(self) -> f64 {
+        match self {
+            Base::Cm => 2.54,
+            Base::Mm => 25.4,
+        }
+    }
+}
+
+/// A length on the ruler. `value` stays in `base`; the field shows and
+/// takes it in the ruler's unit, converted through `dpi` for pixels.
+/// `range` is in `base`. The same widget whichever unit is on, so the
+/// rows keep their place when the ruler changes.
+fn length_field(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    base: Base,
+    ruler: Ruler,
+    dpi: f64,
+    range: std::ops::RangeInclusive<f64>,
+    enabled: bool,
+) -> egui::Response {
+    let k = match ruler {
+        Ruler::Metric => 1.0,
+        Ruler::Imperial => 1.0 / base.per_inch(),
+        Ruler::Pixels => dpi.max(1.0) / base.per_inch(),
+    };
+    let (decimals, speed, suffix) = match (ruler, base) {
+        (Ruler::Metric, Base::Cm) => (1, 0.1, " cm"),
+        (Ruler::Metric, Base::Mm) => (1, 0.2, " mm"),
+        (Ruler::Imperial, Base::Cm) => (2, 0.05, " in"),
+        (Ruler::Imperial, Base::Mm) => (2, 0.01, " in"),
+        (Ruler::Pixels, _) => (0, 1.0, " px"),
+    };
+    let mut shown = *value * k;
+    let response = ui.add_enabled(
+        enabled,
+        egui::DragValue::new(&mut shown)
+            .range(range.start() * k..=range.end() * k)
+            .clamp_existing_to_range(false)
+            .speed(speed)
+            .fixed_decimals(decimals)
+            .suffix(suffix),
+    );
+    if response.changed() {
+        *value = shown / k;
+    }
+    response
+}
+
 fn print_field_label(ui: &mut egui::Ui, text: &str) {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let width = ui.painter().layout_no_wrap("resample".to_owned(), font.clone(), Color32::WHITE).size().x;

@@ -160,8 +160,8 @@ enum Cmd {
         /// Paper border around the picture, mm, filled with paper white
         #[arg(long, value_name = "MM")]
         border_mm: Option<f64>,
-        /// Black edge between the picture and the white border, mm.
-        /// Never wider than the white border; zero white turns it off.
+        /// Black film edge around the picture, mm, inside the white border
+        /// when there is one; either ring stands on its own.
         #[arg(long, value_name = "MM")]
         black_mm: Option<f64>,
         /// Output resolution, dots per inch (default from the recipe, 360)

@@ -210,9 +210,9 @@ pub struct Recipe {
     /// filled with paper white, the curve's value at linear 1.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub border_mm: f64,
-    /// Black film edge between the picture and the white border, mm.
-    /// Never wider than `border_mm`: a wider value is printed as the white
-    /// width, and zero white turns the edge off. Old recipes omit it.
+    /// Black film edge around the picture, mm, inside the white border
+    /// when there is one. Each ring stands on its own: black alone, white
+    /// alone, or black inside white. Old recipes omit it.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub black_mm: f64,
     /// Scale compensation after the curve.
@@ -549,11 +549,9 @@ impl Recipe {
         self.mm_px(self.border_mm)
     }
 
-    /// Black edge in pixels on each side. Clamped to the white border, so
-    /// rounding cannot put black outside white, and a zero white border
-    /// turns the edge off.
+    /// Black edge in pixels on each side.
     pub fn black_px(&self) -> usize {
-        self.mm_px(self.black_mm.min(self.border_mm)).min(self.border_px())
+        self.mm_px(self.black_mm)
     }
 
     /// Both rings, pixels on each side. The picture sits inside this.
@@ -636,8 +634,11 @@ mod tests {
         assert_eq!(r.border_px(), 283);
         assert_eq!(r.black_px(), 113);
         assert_eq!(r.frame_px(), 396);
+        // Each ring on its own: black may be wider than white, or stand alone.
         let wider = Recipe { black_mm: 40.0, ..r.clone() };
-        assert_eq!(wider.black_px(), wider.border_px());
+        assert_eq!(wider.black_px(), 567);
+        let alone = Recipe { border_mm: 0.0, black_mm: 8.0, ..r.clone() };
+        assert_eq!((alone.border_px(), alone.black_px(), alone.frame_px()), (0, 113, 113));
         // Older fields missing: defaults fill in.
         let minimal: Recipe =
             serde_json::from_str(r#"{"curve":{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}}"#)

@@ -1413,7 +1413,7 @@ mod tests {
     /// Both rings are added around the crop window. A pixel inside the crop
     /// is the same as a print of that window with no border. A pixel outside
     /// the crop is not on the sheet. Black sits against the picture; white
-    /// is the outer edge. A black wider than the white is printed as the white.
+    /// is the outer edge. A black wider than the white is as wide as asked.
     #[test]
     fn black_edge_wraps_the_crop_and_leaves_its_pixels() {
         let (w, h) = (8, 6);
@@ -1430,7 +1430,7 @@ mod tests {
         };
         assert_eq!((recipe.border_px(), recipe.black_px(), recipe.frame_px()), (20, 10, 30));
         let wider = Recipe { black_mm: 9.0, ..recipe.clone() };
-        assert_eq!(wider.black_px(), wider.border_px());
+        assert_eq!(wider.black_px(), 90);
         let src =
             PrintSource { plane: &plane, mask: None, orientation: 1, name: "crop".into(), description: None };
         let p = PrintParams { recipe, ..Default::default() };
@@ -1452,6 +1452,35 @@ mod tests {
         assert!((out.plane.at(33, 32) - bare_out.plane.at(3, 2)).abs() < 1e-12);
         let outside = 0.9f64.powf(1.0 / 2.2);
         assert!(out.plane.data.iter().all(|v| (*v - outside).abs() > 1e-6));
+    }
+
+    /// The black edge stands on its own: with no white border the sheet is
+    /// the picture inside black, and the outermost pixel is black.
+    #[test]
+    fn black_edge_alone_is_the_whole_frame() {
+        let (w, h) = (8, 6);
+        let plane = Plane::from_vec(w, h, vec![0.5; w * h]);
+        let recipe = Recipe { dpi: 254.0, border_mm: 0.0, black_mm: 1.0, ..Recipe::default() };
+        assert_eq!((recipe.border_px(), recipe.black_px(), recipe.frame_px()), (0, 10, 10));
+        let src = PrintSource {
+            plane: &plane,
+            mask: None,
+            orientation: 1,
+            name: "black".into(),
+            description: None,
+        };
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(w, h, 1, &p);
+        assert_eq!((lay.out_w, lay.out_h, lay.black_px, lay.border_px), (28, 26, 10, 0));
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (28, 26));
+        assert_eq!(out.plane.at(0, 0), 0.0);
+        assert_eq!(out.plane.at(9, 9), 0.0);
+        assert_eq!(out.plane.at(27, 25), 0.0);
+        let bare = Recipe { black_mm: 0.0, ..p.recipe.clone() };
+        let bare_out = render_planes(&src, &PrintParams { recipe: bare, ..Default::default() });
+        assert!((out.plane.at(10, 10) - bare_out.plane.at(0, 0)).abs() < 1e-12);
+        assert!(out.plane.data.iter().all(|v| *v < 1.0));
     }
 
     /// The centimetre picture stays the size that was asked. Black and white

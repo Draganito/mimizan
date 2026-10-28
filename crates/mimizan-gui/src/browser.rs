@@ -503,6 +503,33 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
 
 /// `gui.json`. Every field has a default, so a file from an older or newer
 /// version still loads.
+/// The ruler of the Print window: what its lengths are shown and typed
+/// in. The recipe keeps inches and millimetres whatever the ruler says.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Ruler {
+    /// Centimetres for the picture, millimetres for the rings.
+    #[default]
+    Metric,
+    /// Inches for both.
+    Imperial,
+    /// Pixels at the print's dpi for both.
+    Pixels,
+}
+
+impl Ruler {
+    pub const ALL: [Ruler; 3] = [Ruler::Metric, Ruler::Imperial, Ruler::Pixels];
+
+    /// The label on the switch.
+    pub fn name(self) -> &'static str {
+        match self {
+            Ruler::Metric => "cm",
+            Ruler::Imperial => "in",
+            Ruler::Pixels => "px",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Persisted {
@@ -526,6 +553,8 @@ pub struct Persisted {
     /// The plate's taking filters and primaries last used.
     pub plate_filters: Option<PlateFilters>,
     pub plate_space: Option<PlateSpace>,
+    /// The Print window's ruler. `None` means metric.
+    pub ruler: Option<Ruler>,
 }
 
 /// `$XDG_CONFIG_HOME/mimizan/gui.json`, `%APPDATA%/mimizan/gui.json`, or
