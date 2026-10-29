@@ -438,6 +438,10 @@ pub struct App {
     ram_total: u64,
     /// Where the loupe looks, as a fraction of the upright picture.
     sharpen_at: Option<[f64; 2]>,
+    /// The next click on the picture reads a grey card for the white balance.
+    pick_card: bool,
+    /// What the last grey card read, shown under the white-balance row.
+    card_status: Option<String>,
     /// The user edited radius or amount on this file. A measurement will not
     /// replace those numbers.
     peak_held: bool,
@@ -634,6 +638,8 @@ impl App {
             sheet_cm: [30.0, 40.0],
             ruler: persisted.ruler.unwrap_or_default(),
             sharpen_at: None,
+            pick_card: false,
+            card_status: None,
             peak_held: false,
             peak_arm: false,
             peak_gen: 0,
@@ -1031,6 +1037,63 @@ impl App {
             WbChoice::Manual => WhiteBalance::Manual(self.wb_manual),
         };
         DevelopParams { wb, mask: self.mask_mode }
+    }
+
+    /// Read a grey card at `(nx, ny)`, a fraction of the picture on the
+    /// stage, and put its balance into the manual white balance. The point
+    /// goes back through the crop and the turns to the sensor, where a
+    /// 32×32 photosite window is averaged per colour. Apply develops with it.
+    fn read_card(&mut self, nx: f64, ny: f64) {
+        let Some(s) = self.session.clone() else { return };
+        if s.is_mono() {
+            self.card_status = Some("a grey card needs a colour sensor".into());
+            return;
+        }
+        // Picture on the stage: the crop window unless the easel is up.
+        let (pw, ph) = if self.crop_open { self.export_size() } else { self.picture_size() };
+        let (ox, oy) = match (self.crop_open, self.print_recipe().crop) {
+            (false, Some(c)) => (c.x as usize, c.y as usize),
+            _ => (0, 0),
+        };
+        if pw == 0 || ph == 0 {
+            return;
+        }
+        let ux = ox + ((nx * pw as f64) as usize).min(pw - 1);
+        let uy = oy + ((ny * ph as f64) as usize).min(ph - 1);
+        // Upright point to the negative plane, then to the frame.
+        let plane = &s.negative.plane;
+        let spot = crate::session::source_rect(
+            self.export_orientation(),
+            plane.width,
+            plane.height,
+            crate::session::DetailRect { x: ux, y: uy, w: 1, h: 1 },
+        );
+        let crop = s.negative.info.report.crop;
+        let centre = (crop.x + spot.x, crop.y + spot.y);
+        let params = mimizan_core::ingest::IngestParams::default();
+        match mimizan_core::ingest::card_balance(&s.frame, &params, centre, 16) {
+            Ok(r) => {
+                self.wb_manual = r.wb;
+                self.wb_choice = WbChoice::Manual;
+                let [mr, mg, mb] = r.mean;
+                let mut status = format!(
+                    "card at {}, {} · R {:.3} G {:.3} B {:.3} · {} of {} clipped",
+                    centre.0, centre.1, mr, mg, mb, r.clipped, r.total
+                );
+                if r.clipped > 0 {
+                    status.push_str(" · clipped sites left out: a dimmer spot reads truer");
+                } else if mg < 0.02 {
+                    status.push_str(" · dark: the reading is noisy");
+                }
+                self.log(format!("grey card: R {:.3} G 1 B {:.3} ({})", r.wb[0], r.wb[2], status));
+                self.card_status = Some(status);
+            }
+            Err(e) => {
+                let msg = format!("grey card: {e}");
+                self.log(msg.clone());
+                self.card_status = Some(msg);
+            }
+        }
     }
 
     fn view_params(&self) -> ViewParams {
@@ -2510,19 +2573,37 @@ impl App {
             }
             ui.label(RichText::new("Changes here recompute the picture.").weak());
             ui.label(RichText::new("Separation, no demosaic.").weak());
-            egui::ComboBox::from_label("white balance")
-                .selected_text(match self.wb_choice {
-                    WbChoice::AsShot => "as shot",
-                    WbChoice::GrayWorld => "gray world",
-                    WbChoice::None => "none",
-                    WbChoice::Manual => "manual",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
-                    ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
-                });
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("white balance")
+                    .selected_text(match self.wb_choice {
+                        WbChoice::AsShot => "as shot",
+                        WbChoice::GrayWorld => "gray world",
+                        WbChoice::None => "none",
+                        WbChoice::Manual => "manual",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
+                        ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
+                    });
+                ui.label("white balance");
+                let card = ui
+                    .add_enabled(self.busy.is_none(), egui::Button::selectable(self.pick_card, "card"))
+                    .on_hover_text(
+                        "Read a grey card: click the card in the picture. The next click averages a \
+                         32×32 photosite window, leaving out clipped sites, and puts the balance \
+                         into manual. Esc cancels. Apply recomputes.",
+                    );
+                if card.clicked() {
+                    self.pick_card = !self.pick_card;
+                }
+            });
+            if self.pick_card {
+                ui.label(RichText::new("click the grey card in the picture (Esc cancels)").strong());
+            } else if let Some(status) = &self.card_status {
+                ui.label(RichText::new(status).small().weak());
+            }
             if self.wb_choice == WbChoice::Manual {
                 ui.horizontal(|ui| {
                     ui.label("R");
@@ -3915,6 +3996,22 @@ impl App {
             && strip_closes(self.show_strip, clicked_on_picture, crosshair_released)
         {
             self.show_strip = false;
+        }
+        // A grey card is read where the picture is clicked while `card` is
+        // armed. Esc puts the pipette down.
+        if self.pick_card {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.pick_card = false;
+            } else if clicked_on_picture {
+                if let Some(ptr) = response.interact_pointer_pos() {
+                    let nx = ((ptr.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
+                    let ny = ((ptr.y - rect.top()) / rect.height()).clamp(0.0, 1.0) as f64;
+                    self.read_card(nx, ny);
+                }
+                self.pick_card = false;
+            } else if over_picture && response.hover_pos().is_some_and(|p| rect.contains(p)) {
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            }
         }
         // Fitted, the sheet stays in the opening. Zoomed, it paints across
         // the room; the windows are drawn afterwards and lie on it.

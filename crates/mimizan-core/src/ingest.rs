@@ -281,6 +281,90 @@ pub fn gray_world(plane: &Plane, phase: BayerPhase, saturated: &[u8]) -> [f64; 3
     [g / r, 1.0, g / b]
 }
 
+/// What a grey card in the frame measured: the balance and the figures it
+/// rests on, so the user can judge the reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CardReading {
+    /// Balance multipliers R, G, B with G = 1, as `gray_world` gives them.
+    pub wb: [f64; 3],
+    /// Mean of the unsaturated R, G and B photosites, normalised between
+    /// black and white (1.0 = white level).
+    pub mean: [f64; 3],
+    /// Photosites that went into the means.
+    pub counted: usize,
+    /// Photosites of the window at or above the saturation threshold; they
+    /// are left out of the means.
+    pub clipped: usize,
+    /// Photosites in the window.
+    pub total: usize,
+    /// The window as measured, in frame coordinates.
+    pub window: Rect,
+}
+
+/// Balance from a grey card: `mean_G / mean_c` over the unsaturated
+/// photosites of a window of the frame, the same rule as `gray_world` on
+/// the card alone. `centre` is in frame coordinates; the window is
+/// `2·half` wide and high and is pulled inside the frame's crop. A
+/// monochrome sensor, an empty window, or a window with no usable
+/// photosite of a colour is an error.
+pub fn card_balance(
+    frame: &RawFrame,
+    p: &IngestParams,
+    centre: (usize, usize),
+    half: usize,
+) -> crate::Result<CardReading> {
+    let SensorKind::Bayer(phase) = frame.kind else {
+        return Err(crate::Error::Invalid("a grey card needs a Bayer sensor".into()));
+    };
+    let crop = even_crop(frame.crop);
+    if crop.w < 2 || crop.h < 2 || frame.data.len() != frame.width * frame.height {
+        return Err(crate::Error::Invalid("the frame has no usable area".into()));
+    }
+    let side = (2 * half).max(2).min(crop.w).min(crop.h);
+    let x0 = centre.0.saturating_sub(side / 2).clamp(crop.x, crop.x + crop.w - side);
+    let y0 = centre.1.saturating_sub(side / 2).clamp(crop.y, crop.y + crop.h - side);
+    let window = Rect { x: x0, y: y0, w: side, h: side };
+    let (mut sum, mut cnt) = ([0.0f64; 3], [0usize; 3]);
+    let mut clipped = 0usize;
+    for y in y0..y0 + side {
+        for x in x0..x0 + side {
+            let raw = frame.data.get(y * frame.width + x);
+            let white = frame.white_at(x, y);
+            if !(raw.is_finite() && white.is_finite()) {
+                return Err(crate::Error::Invalid("a sensor sample is not a number".into()));
+            }
+            if raw >= white * (1.0 - p.sat_margin) {
+                clipped += 1;
+                continue;
+            }
+            let black = frame.black_at(x, y);
+            let c = phase.color_at(x, y) as usize;
+            sum[c] += (raw - black) / (white - black);
+            cnt[c] += 1;
+        }
+    }
+    if cnt.contains(&0) {
+        return Err(crate::Error::Invalid(format!(
+            "no unsaturated photosite of every colour in the {side}x{side} window ({clipped} clipped)"
+        )));
+    }
+    let mean = [sum[0] / cnt[0] as f64, sum[1] / cnt[1] as f64, sum[2] / cnt[2] as f64];
+    // `<= 0.0` would let NaN through; the sum is finite, so `>` suffices.
+    if !mean.iter().all(|&m| m > 0.0) {
+        return Err(crate::Error::Invalid(
+            "the card is black: a channel's mean is not above the black level".into(),
+        ));
+    }
+    Ok(CardReading {
+        wb: [mean[1] / mean[0], 1.0, mean[1] / mean[2]],
+        mean,
+        counted: cnt.iter().sum(),
+        clipped,
+        total: side * side,
+        window,
+    })
+}
+
 fn normalise_wb(wb: [f64; 3]) -> [f64; 3] {
     if wb[1] <= 0.0 || !wb.iter().all(|v| v.is_finite() && *v > 0.0) {
         return [1.0; 3];
@@ -673,6 +757,40 @@ mod tests {
             exposure: Default::default(),
             data: crate::decode::RawData::Integer(raw),
         }
+    }
+
+    /// A grey card of R 2000, G 4000, B 1000 reads the balance 2 / 1 / 4;
+    /// clipped photosites are left out of the means and counted; a centre
+    /// near the edge pulls the window inside the crop.
+    #[test]
+    fn card_balance_reads_the_card() {
+        let (w, h) = (64usize, 48usize);
+        let phase = BayerPhase::RGGB;
+        let mut raw = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                raw[y * w + x] = match phase.color_at(x, y) {
+                    Color::R => 2000,
+                    Color::G => 4000,
+                    Color::B => 1000,
+                };
+            }
+        }
+        // One burnt-out green site inside the window.
+        raw[20 * w + 21] = 4095;
+        let f = frame(w, h, SensorKind::Bayer(phase), 4095.0, Rect { x: 0, y: 0, w, h }, raw);
+        let p = IngestParams::default();
+        let r = card_balance(&f, &p, (24, 24), 8).unwrap();
+        assert_eq!(r.window, Rect { x: 16, y: 16, w: 16, h: 16 });
+        assert_eq!((r.total, r.clipped, r.counted), (256, 1, 255));
+        assert!((r.wb[0] - 2.0).abs() < 1e-9 && r.wb[1] == 1.0 && (r.wb[2] - 4.0).abs() < 1e-9, "{:?}", r.wb);
+        assert!((r.mean[1] - 4000.0 / 4095.0).abs() < 1e-9);
+
+        let edge = card_balance(&f, &p, (1, 1), 8).unwrap();
+        assert_eq!(edge.window, Rect { x: 0, y: 0, w: 16, h: 16 });
+
+        let mono = frame(w, h, SensorKind::Mono, 4095.0, Rect { x: 0, y: 0, w, h }, vec![100; w * h]);
+        assert!(card_balance(&mono, &p, (24, 24), 8).is_err());
     }
 
     /// White at or below black, a crop outside the frame, or a non-finite
