@@ -29,20 +29,17 @@ The weighting of the three colour responses (the "mix" — panchromatic,
 filter emulation, or a fitted copy of a monochrome sensor) is applied after
 separation and is band-limited, so resolution and grain are those of the
 luminance estimate for every mix. Every output pixel is a fixed-weight
-sum of measured photosites; since 0.15 the pipeline has no computed pixel
-anywhere (the nonlinear last-octave step of 0.11–0.14 is described in §5
-and measured in §8.3 as the record of why it could go). The
-same separation, mixed three times through three taking filters and
+sum of measured photosites; the pipeline has no computed pixel anywhere.
+The same separation, mixed three times through three taking filters and
 printed through one paper, gives a three-colour plate in Prokudin-Gorsky's
 sense: colour without demosaicing, in register by construction, with the
 colour band-limited to the carriers and the drawing that of the negative
-(§8.7). On a
+(§7.5). On a
 24-picture Kodak benchmark re-mosaicked at lens-like sharpness the linear
 default reaches 51.6 dB luminance PSNR against 51.5 dB for the best of
 sixteen demosaicers (DCB, RawTherapee); band-limited at 2× it reaches
 51.8 dB against 49.1 dB; on four Nikon Z f files at the camera's own band
-limit 53.9 dB against 50.7 dB (RCD); with the nonlinear step 52.6, 52.4 and
-53.6 dB. The whole method, including every
+limit 53.9 dB against 50.7 dB (RCD). The whole method, including every
 constant, is given here so that it can be re-implemented without access to
 the source.
 
@@ -69,7 +66,7 @@ so luminance is base band and the only thing that stands between the mosaic
 and a monochrome picture is the chrominance on its carriers. Estimating the
 chrominance well is a problem of two-dimensional low-pass filter design, not
 of interpolation. Mimizan implements exactly that, with four additions that
-the measurements of §8 forced:
+the measurements of §7 forced:
 
 1. the separation runs on *white-balanced* photosites, so that neutral
    subjects put nothing on the carriers and the carriers are free to carry
@@ -85,16 +82,60 @@ the measurements of §8 forced:
    coloured edge both copies carry the chrominance and the ratio tends to
    one half exactly where the leak is largest.
 
-An optional fifth step (§5) leaves the linear world: where the linear
-luminance still carries energy near the carriers, a directional LMMSE
-estimator of the Zhang–Wu family computes the missing samples, and the
-result is blended in with a per-pixel weight that is written to the output.
-
-The remainder of the pipeline — mixing (§6) and encoding (§7) — is
-deliberately simple; the method's claim rests on §§2–5. The colour plate
-(§8.7) adds nothing to the separation: it is the mixing of §6 run three
+The remainder of the pipeline — mixing (§5) and encoding (§6) — is
+deliberately simple; the method's claim rests on §§2–4. The colour plate
+(§7.5) adds nothing to the separation: it is the mixing of §5 run three
 times, which is why it inherits every guarantee of §4.6 and every limit
-of §10.
+of §9.
+
+### 1.1 What is taken and what is built here
+
+§4 rests on two published papers and on work done here; it should be
+clear which is which.
+
+Alleysson, Süsstrunk and Hérault supplied the theory. A CFA picture is one
+scalar signal, luminance plus modulated chrominance; the luminance
+$(R + 2G + B)/4$ is not a choice but the only projection a fixed kernel
+can take at every photosite (their eq. 9); the chrominance sits at the
+Nyquist corners and edges, with less room at the edges than in the
+corners; and every demosaicing artefact is aliasing between the two. Their
+sentence that luminance "is not subject to interpolation" but can be read
+from the mosaic at full resolution is the licence for this method. Their
+own algorithm goes the other way — one fixed low-pass for the luminance,
+the remainder interpolated as chrominance — and is a demosaicer.
+
+Dubois supplied the lever. He wrote the model in the compact form of §2.2
+and saw that $C_2$ is present twice, at $(0.5, 0)$ and $(0, 0.5)$, and
+that luminance leaks into one copy at a time. From that he built two
+estimators: asymmetric filters that take the vertical band of $C_2$ from
+one copy and the horizontal band from the other, and an adaptive weight
+$w = e_y / (e_x + e_y)$ from local energies of the CFA signal near the
+carriers. $C_1$ he filtered once, fixed; the luminance he took as the
+mosaic minus the remodulated chrominance. His algorithm too reconstructs
+RGB.
+
+What is built here began as a narrower question — keep $\hat L$ and stop —
+and most of §4 followed from it, usually after a measurement had shown
+the previous version wrong. The separation runs on white-balanced
+photosites (§3.5), so a grey subject puts nothing on the carriers; neither
+paper needed that, both work on balanced test images. Dubois' two
+estimators are run as one: the elongated bands of the first under the
+weight of the second, with the energy taken from the filtered copies
+themselves rather than from band-passes on the mosaic, and $C_1$ made
+directional with the same weight (§4.3). The coherence test (§4.4) turns
+his observation around: if a leak can only reach one copy, then whatever
+the two copies share in the ring outside the narrow band is chrominance,
+and the band can be opened there — that is the step that returns the
+detail the elongated bands had given up. The structure tensor of the
+chroma-free base band (§4.3) answers the case the energy ratio cannot,
+where the chrominance itself is strong, and the opening of the clean
+copy's ring rests on it. The kernels, the fused demodulation, the
+deterministic arithmetic, the mixing rule of §5 with its colour gate, the
+file formats and the plate are the engineering around that core. The
+first draft (`docs/whitepaper_v1.pdf`) had the decomposition, a block
+mask over a full FFT and a POCS loop; the mask is Appendix A, the loop is
+gone, and the estimator of §4.3–4.4 is what the measurements of §7 left
+standing.
 
 ---
 
@@ -161,8 +202,8 @@ $s_x + s_y$ places *two copies* of $C_2$, at $(0.5, 0)$ (the $s_x$ copy,
 sampled on a lattice of pitch 2, so chrominance is physically band-limited
 to $|f| \le 0.25$ c/px around its carrier. Luminance occupies the whole
 plane; whatever of it lies within the chroma pass bands is irrecoverably
-mixed with chrominance in the linear picture — that overlap is the only
-information loss of the method and the subject of §4.3–4.4 and §5.
+mixed with chrominance — that overlap is the only information loss of the
+method and the subject of §4.3–4.4.
 
 ### 2.4 Scope
 
@@ -197,7 +238,7 @@ A photosite is saturated if $\mathrm{raw} \ge \mathrm{white}\,(1 -
 mask is dilated by 2 px (the same-phase neighbours share the estimation
 error). Saturated photosites keep their clipped value in the picture; they
 are excluded from every statistic and fit and marked 255 in the mask sidecar
-(§7.2). Saturated *green* photosites also close the colour gate of §6.5;
+(§6.2). Saturated *green* photosites also close the colour gate of §5.5;
 their count is `saturated_green` in the report.
 
 ### 3.3 Noise model
@@ -247,7 +288,7 @@ L$ — and the whole luminance spectrum sits as a copy on every carrier; any
 adaptive stage then has to call everything chrominance and is useless. With
 balance the carriers of neutral subjects are empty and the directional
 estimator of §4.3 can leave luminance alone (Siemens star MTF10 0.405 →
-0.451, the true value). All of §§4–6 operate on balanced channels.
+0.451, the true value). All of §§4–5 operate on balanced channels.
 
 ---
 
@@ -299,9 +340,13 @@ Two kernel sets are used:
 | Set | $f_c$ | $\Delta f$ | $A$ | $\beta$ | $N$ |
 |---|---|---|---|---|---|
 | fixed estimator (4.2) | 0.15 | 0.05 | 60 dB | 5.65 | 73 |
-| chroma core (Appendix A) | 0.05 | 0.05 | 60 dB | 5.65 | 37 |
+| chroma core (Appendix A), designed at half resolution | 0.10 (= 0.05 at full resolution) | 0.10 (= 0.05) | 60 dB | 5.65 | 37 |
 | directional estimator (4.3–4.4) | 0.15 / 0.30 / 0.25 | 0.15 | 40 dB | 3.40 | 15 |
 | base band of the tensor (4.3) | 0.30 | 0.15 | 40 dB | 3.40 | 15 |
+
+(The core kernel runs on the 2× decimated chroma estimate, so its 37 taps
+at half resolution are the 73 taps a 0.05 / 0.05 design would have at full
+resolution.)
 
 The separable product has a *square* pass band ($|f_x| < f_c$ and
 $|f_y| < f_c$). For $f_c = 0.15$ the corners lie at 0.21 c/px, inside the
@@ -322,7 +367,7 @@ This is the baseline of Alleysson et al. in space-domain form (the carriers
 are fixed, so the "full FFT" of the original idea is a convolution with a
 fixed kernel: faster, deterministic, identical up to rounding). It is kept as
 an option and as the reference that the tests compare against. Its defect,
-measured in §8, is that it averages the two $C_2$ copies although luminance
+measured in §7, is that it averages the two $C_2$ copies although luminance
 only ever leaks into one of them, and that it cannot widen the chroma band
 along the carrier where the only neighbour is the other chroma component.
 
@@ -359,7 +404,9 @@ chrominance is in both, the excess is luminance.
 **Base-band orientation.** The energy ratio fails where the chrominance
 itself is strong: both copies carry it, $w_H \to 0.5$, and the contaminated
 copy gets half the weight exactly at a coloured edge, where the leak is
-largest. Measured with the 0.11 estimator on the lens-like set (§8.5): a
+largest. Measured with the estimator *without the tensor* — energy weight
+and coherence ring alone, `tensor_power` = `ring_tensor` = 0,
+`DuboisParams::without_tensor()` in the code — on the lens-like set (§7.3): a
 neutral copy of each picture separates at 57.3 dB, a flat-luminance copy
 with the picture's chrominance at 61.2 dB, the picture itself at 50.2 dB —
 5.6 dB below what the sum of the two error powers would give (55.8 dB);
@@ -382,12 +429,12 @@ $$ w_H = \frac{e_b\, t^{\beta}}{e_a\, (1-t)^{\beta} + e_b\, t^{\beta}}, \qquad \
 
 (0.5 where the denominator is $\le 10^{-18}$). Where the base band is flat
 the factor is 1 on both sides and Dubois' weight is unchanged; on a neutral
-picture and on a flat-luminance picture the figures of §8.5 move by less
+picture and on a flat-luminance picture the figures of §7.3 move by less
 than 0.1 dB (57.30 → 57.33, 61.19 → 61.13), the gain is the interaction
 case only. Second differences
 were chosen over first (+0.1 dB) because they weight the upper half of the
-base band, where the leak originates; `tensor_power` = 0 reproduces the
-0.11 estimator. The same weight picks the
+base band, where the leak originates; `tensor_power` = 0 leaves Dubois'
+weight alone. The same weight picks the
 orientation of the $C_1$ band:
 
 $$ \hat C_2 = w_H\, \hat C_{2a} + (1 - w_H)\, \hat C_{2b}, \qquad
@@ -412,7 +459,8 @@ edge under flat luminance separates the same with and without the tensor
 to within 2·10⁻³ (`flat_luminance_ignores_the_tensor`); a coloured
 horizontal line pattern at 0.38 c/px, where both copies carry strong
 chrominance and the leak sits in copy b, separates with under 70 % of the
-0.11 error (`oriented_colour_edges_gain_from_the_tensor`).
+error of the estimator without the tensor
+(`oriented_colour_edges_gain_from_the_tensor`).
 
 ### 4.4 The coherence ring
 
@@ -447,7 +495,8 @@ $$ \hat C_1 := \hat C_1 + \kappa\,\big(\mathrm{LP}_{r,x}\mathrm{LP}_{r,y}(\varep
 condition (same overlap argument as above), 0.20 lies inside the transition
 band of the narrow filter and measures nothing. `ring_wide` = 0 switches the
 step off, together with the clean copy's ring below; with `tensor_power` =
-0 as well it reproduces the 0.2.0 result.
+0 as well what remains is Dubois' energy weight on the elongated bands
+(the second column of §7.2).
 
 **The clean copy's ring.** At an oriented coloured edge the contaminated
 copy's ring carries leak, $\kappa$ drops, and the clean copy loses chroma
@@ -465,7 +514,7 @@ $\hat C_1$ with $w_H \kappa_a + (1 - w_H) \kappa_b$. This step is a trade:
 on flat-luminance pictures it changes nothing, on neutral pictures it costs
 1.2 dB (a neutral oriented edge is never perfectly one-dimensional, and the
 opened ring takes some luminance with it); on the pictures the coloured
-edges outweigh that in every condition of §8.2. $\gamma$ swept 0.3–2:
+edges outweigh that in every condition of §7.2. $\gamma$ swept 0.3–2:
 lens-like peaks at 0.5, the band-limited and real conditions keep rising to
 0.7 by 0.05–0.1 dB, 1 and 2 lose on lens-like (−0.3, −1.0).
 
@@ -485,7 +534,7 @@ lens-like peaks at 0.5, the band-limited and real conditions keep rising to
 | `ring_c1` | true | open $C_1$ with $\kappa$ too |
 | `tensor_band` | 0.30 c/px | square band of the base band the tensor reads |
 | `tensor_sigma` | 2 px | Gaussian window of the tensor |
-| `tensor_power` | 0.5 | exponent $\beta$ of the orientation in $w_H$; 0 = the 0.11 weight |
+| `tensor_power` | 0.5 | exponent $\beta$ of the orientation in $w_H$; 0 = Dubois' weight alone |
 | `ring_tensor` | 0.5 | $\gamma$ of the clean copy's ring opening; 0 = off |
 
 Cost on a 24.4-MP file (Ryzen 7 5700U, 16 threads, f64): separation 2.7 s
@@ -495,7 +544,7 @@ one separable low-pass of the mosaic, the two squared second differences
 and two Gaussian passes. Peak nine full f64 planes including the mosaic
 (1.8 GB), eight without the tensor: the two wide copies of the coherence
 step are convolved a second time where the bands are opened rather than
-held across the step (0.15.1; the same bits, 1.5 % of the time).
+held across the step (the same bits, 1.5 % of the time).
 
 ### 4.6 What the linear path guarantees
 
@@ -519,103 +568,9 @@ measured estimates, and where the base band is flat it is silent. Hence:
 
 ---
 
-## 5. The nonlinear last-octave step of 0.11–0.14 (removed in 0.15)
+## 5. Mixing
 
-This section is the record of a step the program no longer has. 0.11 ran
-it by default; 0.12 turned it off once the linear path came within
-0.35 dB of it on lens-like material, 0.13 dB at 2× and 0.31 dB on the
-binned Z f files, and 2 dB above it at the camera's own band limit (§8.3).
-On the tensor estimator it was still worth 0.5–1.0 dB on those conditions
-and cost 0.3 dB at the band limit; what it was decisive for was
-pixel-sharp synthetic material, which no camera produces. 0.15 removed
-it: a pixel that passed through it was computed from a model of the
-picture, and the one claim the method makes — every pixel a measured sum —
-held only with the switch off. The code (`reconstruct.rs`) is in the
-history of the repository up to v0.14.0; the description stays here so the
-numbers of §8.3 and §8.4 can be read.
-
-Where luminance lies near the carriers, no linear filter can separate it
-from chrominance. Demosaicers resolve this with an assumption — colour
-differences $G - R$, $G - B$ are locally smooth — and a per-pixel direction
-decision. This step did the same, but only where the linear estimate
-still carried energy near the carriers, and it wrote per pixel how much
-of the result was computed rather than measured.
-
-### 5.1 Estimator (Zhang & Wu 2005, written from the paper)
-
-Working domain $m^{1/\gamma}$ with $\gamma = 2.2$ — the one decisive
-difference to the literature, which demosaics 8-bit sRGB pictures and never
-had to notice: in linear light colour differences are not constant across
-an edge; in a compressed domain they nearly are (1× subset 36.6 → 42.2 dB,
-real binned 37.5 → 38.5 dB).
-
-Directional estimate of the missing channel $X$ along $x$ (and likewise
-along $y$), at every pixel, with $O$ the channel present at that pixel:
-
-$$ \hat X(x) = (0.5 + A)\,\big(X(x-1) + X(x+1)\big) - A\,\big(X(x-3) + X(x+3)\big)
-   + \mathrm{LAP}\,\big(2\,O(x) - O(x-2) - O(x+2)\big), $$
-$$ A = 0.0625, \qquad \mathrm{LAP} = 0.125 \qquad (\text{Hamilton–Adams would be } A = 0,\ \mathrm{LAP} = 0.25). $$
-
-Colour-difference signals $d_h = G - X$ along the row and $d_v$ along the
-column (at G sites $G - \hat X$, at R/B sites $\hat G - X$). Per line, LMMSE
-with a smoothing prior:
-
-$$ s = d * \tfrac{1}{128}[4\ 9\ 15\ 23\ 26\ 23\ 15\ 9\ 4], \qquad
-   v_s = \mathrm{Var}_{\pm 4}(s), \qquad v_n = \mathrm{Mean}_{\pm 4}\big((d - s)^2\big), $$
-$$ \hat d = s + \frac{v_s}{v_s + v_n}\,(d - s), \qquad e = \frac{v_s\, v_n}{v_s + v_n}. $$
-
-Fusion at the R/B sites with $\mu = 0.01$:
-
-$$ w_h = \frac{1}{e_h + 10^{-12} + \mu\, \hat d_h^{\,2}}, \qquad w_v \text{ likewise}, \qquad
-   \hat G = X + \frac{w_h\, \hat d_h + w_v\, \hat d_v}{w_h + w_v}. $$
-
-$\mu$ is the tie-breaker: where both directions are self-consistent (a
-neutral Nyquist pattern, zero error both ways) the one with less
-chrominance wins (test `neutral_nyquist_lines_are_exact`). $R - G$ and
-$B - G$: at the opposite site the mean of the four diagonal differences,
-at G sites the mean of the two neighbours that carry the channel. Decode
-with $(\cdot)^\gamma$, then
-
-$$ L_n = \frac{R + 2G + B}{4}, \qquad C_{1,n} = \frac{2G - R - B}{4}, \qquad C_{2,n} = \frac{R - B}{4}. $$
-
-### 5.2 Detector and blend
-
-The linear luminance $\hat L$ of §4 is demodulated by the three carriers
-and low-passed with a Gaussian $G_\sigma$, $\sigma = 2$ px; the summed
-squared amplitudes are compared with the noise variance in the same band:
-
-$$ r = \frac{\sum_{c \in \{\varepsilon s_x s_y,\ a s_x,\ b s_y\}} \big(G_\sigma * (c\, \hat L)\big)^2}
-            {\sigma^2(\hat L)\, \|G_\sigma\|_2^2}, \qquad
-   \|G_\sigma\|_2^2 = \Big(\sum_i g_i^2\Big)^2 \text{ for the separable 2-D kernel}, $$
-
-$$ \beta = \mathrm{clamp}\!\left( \frac{r - \mathrm{lo}}{\mathrm{hi} - \mathrm{lo}},\ 0,\ 1 \right), \qquad \mathrm{lo} = 20,\ \mathrm{hi} = 80, $$
-
-$$ \hat L := \hat L + \beta\,(L_n - \hat L), \qquad \hat C_1, \hat C_2 \text{ likewise}, \qquad
-   \mathrm{mask\_max} := 0.8 + 0.19\,\beta . $$
-
-Where the linear separation was clean, only noise remained near the
-carriers ($r \approx 1$) and $\beta = 0$: the pixel stayed measured. The
-sidecar (§7.2) carried 204 = measured, 252 = fully computed, linear in
-between, and the description recorded `reconstruct: true` and `computed`
-(mean $\beta$). Negatives written by 0.11–0.14 with the step on still
-carry those fields; `print` does not read them.
-
-Rejected by measurement (§8.4): a detector on the difference of the two
-luminance estimates, on the local gradient, or as a scale-free share of
-carrier-band in local AC energy; a 2-D error statistic over neighbouring
-lines; colour-difference smoothing as a refinement; longer directional
-filters by 1-D demodulation. The detector itself is not optional: on
-band-limited content with real noise the nonlinear estimate alone is 6 dB
-worse than §4 (the smooth prior takes band-limited chroma for noise); with
-the detector the condition is unchanged within 0.01 dB.
-
-Cost: +2.2 s on 24.4 MP, four more planes at the peak.
-
----
-
-## 6. Mixing
-
-### 6.1 Weights
+### 5.1 Weights
 
 Three weights $w_R, w_G, w_B \ge 0$, $\sum w = 1$, on *balanced* channels;
 default $0.25 / 0.50 / 0.25$. From the inverse of §2.2,
@@ -627,10 +582,11 @@ exactly; every other weight needs the (band-limited, ≤ 0.15–0.30 c/px)
 chrominance, so the edge resolution and the pixel-to-pixel noise remain
 those of $\hat L$ for every mix and a filter adds only band-limited chroma
 noise (measured on the Z f: 19–21 % σ on smooth areas for the red filter,
-pixel-to-pixel noise unchanged). The "matrix" variant takes $w$ as the Y
-row of the camera's `cam_to_xyz`, divided per channel by $k_c$, normalised.
+pixel-to-pixel noise unchanged). There is no derived weight set: the
+weights are the default, a camera file's fitted triple (§5.4), or three
+given numbers; the camera's colour matrix enters only the plate (§7.5).
 
-### 6.2 Weight spaces
+### 5.2 Weight spaces
 
 The formula consumes weights on balanced channels. A monochrome camera has a
 fixed spectral response and knows no balance; its emulation is a fixed
@@ -646,7 +602,7 @@ tungsten: balanced-space weights jump from 0.171/0.489/0.340 to
 0.297/0.550/0.153 because the as-shot multipliers are folded in; raw-space
 weights stay at 0.284/0.404/0.312 vs 0.302/0.444/0.254.)
 
-### 6.3 Contrast filters
+### 5.3 Contrast filters
 
 A colour filter in front of a monochrome sensor is a spectral weighting
 before the sum — exactly what the mix does. With channel transmissions
@@ -667,7 +623,7 @@ channel bands, not measurements:
 | green-58 | 58 | 0.10 | 1.00 | 0.10 |
 | blue-47 | 47 | 0.03 | 0.25 | 1.00 |
 
-### 6.4 Fitting the weights to a monochrome reference
+### 5.4 Fitting the weights to a monochrome reference
 
 Colour chart as RAW and as the reference camera's JPEG (sRGB decoded to
 linear) or a list of values. Per patch, balanced means $(R_i, G_i, B_i)$
@@ -678,7 +634,7 @@ deterministic, no local minima. Pass: RMSE ≤ 5 % of the mean reference
 brightness. The result is converted to raw space with the multipliers of the
 calibration shot and written to the camera file.
 
-### 6.5 The colour gate at saturation (0.15.6)
+### 5.5 The colour gate at saturation
 
 The balance of §3.5 sets where each channel clips: a saturated photosite
 of colour $c$ reads $k_c$, with $k_G = 1$ and $k_R, k_B$ above it (1.6 to
@@ -686,9 +642,9 @@ of colour $c$ reads $k_c$, with $k_G = 1$ and $k_R, k_B$ above it (1.6 to
 separation as $(k_R, 1, k_B)$: a chrominance $\hat C_1 = (2 - k_R - k_B)/4
 < 0$ that no scene had, false in the same direction, towards magenta,
 whatever the scene was. Any mix with $w_G \ne w_R + w_B$ shows it, and the
-plate of §8.7 shows it most, since the camera matrix's negative
+plate of §7.5 shows it most, since the camera matrix's negative
 coefficients send the green plate below paper white while red and blue go
-over it (pink highlights, 0.13 to 0.15.5).
+over it (pink highlights).
 
 Let $S_G$ be the set of saturated green photosites (§3.2), $D_2$ the
 dilation by 2 px, and $W_7(x)$ the $15 \times 15$ window around $x$, the
@@ -696,7 +652,7 @@ support of the chrominance low-pass of §4.5. The gate is
 
 $$ g(x) = \begin{cases} 0 & x \in D_2(S_G) \\[2pt] 1 - \dfrac{|W_7(x) \cap D_2(S_G)|}{|W_7(x)|} & \text{otherwise} \end{cases} $$
 
-and the chrominance handed to §6.1 is $g\,\hat C_1'$, $g\,\hat C_2'$. The
+and the chrominance handed to §5.1 is $g\,\hat C_1'$, $g\,\hat C_2'$. The
 luminance $\hat L$ is estimated with the full chrominance subtracted and
 is not touched, so the native mix is unchanged to the bit; every other
 mix, and each of the three plates, takes $\hat L$ alone where the gate is
@@ -708,9 +664,9 @@ every machine; it is stored as 8 bits per pixel. Nothing is reconstructed.
 
 ---
 
-## 7. The negative
+## 6. The negative
 
-### 7.1 File
+### 6.1 File
 
 16-bit TIFF, one channel, `PhotometricInterpretation = BlackIsZero`,
 $\mathrm{value} = \mathrm{round}(\mathrm{clamp}(\mathrm{out}, 0, 1)\cdot 65535)$.
@@ -725,21 +681,19 @@ from the top, in sensor orientation, with a `plate` object in the JSON
 (frame order, frame height, filter set, the three weight triples); the
 mask sidecar is one frame for all three.
 
-### 7.2 Mask sidecar
+### 6.2 Mask sidecar
 
 `<name>.mask.tif`, 8 bit. In the default path it is 204 everywhere
 (= threshold 0.8, "sharpening allowed": the carriers are suppressed by the
 low-pass in every block) and 255 at dilated saturated photosites. The
-print stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$. (Negatives
-of 0.11–0.14 with the removed step on carry
-$\mathrm{round}(255\,(0.8 + 0.19\,\beta))$ there; the gate reads them the
-same way.)
+print stage sharpens only where $0.8 \le \mathrm{mask} < 1.0$; any value
+in that range, from any version of the sidecar, is read as "allowed".
 
-### 7.3 The linear DNG (0.16)
+### 6.3 The linear DNG
 
 For a converter other than Mimizan's print stage, the plate of the bare
 channels (`PlateWeights::channels()`: $\hat L + $ its band-limited
-chrominance on each balanced channel, §6.1) is written as a DNG 1.4 with
+chrominance on each balanced channel, §5.1) is written as a DNG 1.4 with
 `PhotometricInterpretation = LinearRaw` (34892), three 16-bit samples per
 pixel, uncompressed, one IFD. Each channel is divided by its balance
 multiplier $k_c$ before quantisation, so the samples are in the camera's
@@ -753,9 +707,9 @@ profile it has for that camera. Orientation and crop are applied to the
 pixels (a permutation and a window; nothing is resampled) and the file
 carries orientation 1. `ImageDescription` holds the negative's JSON with
 the plate object. The monochrome counterpart of this export is the
-negative TIFF of §7.1 framed the same way, with its mask sidecar.
+negative TIFF of §6.1 framed the same way, with its mask sidecar.
 
-### 7.4 Output stage (for completeness)
+### 6.4 Output stage (for completeness)
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
 carries as JSON): mix → orientation → crop window (whole pixels of the
@@ -764,7 +718,8 @@ step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
 sheet (with a size, the file is that sheet turned the picture's way, the
 picture fitted into what the black edge and the paper border leave and
 centred, the border being the least paper; without one, the picture's
-pixels plus the rings) → [deconvolution →] USM → file. Resizing is separable in
+pixels plus the rings) → [deconvolution →] USM → peak → one quantisation →
+file. Resizing is separable in
 f64. The convolution kernels are stretched by the scale factor when
 shrinking; the kernel is a parameter (B-spline default, Lanczos-3,
 Mitchell, Catmull-Rom, or area). Area is the overlap of the pixel
@@ -792,12 +747,14 @@ $\sigma = k\,s$ print pixels, $s$ the long-side scale and $k$ fitted per
 kernel to the 10–90 % ramp of a step (Lanczos-3 0.281, Catmull–Rom 0.275,
 Mitchell 0.330, B-spline 0.515; area is 0, a hold rather than a fitted
 ramp). USM is
-$x + a(x - G_\sigma \ast x)$, masked as in 7.2; Richardson–Lucy inverts
+$x + a(x - G_\sigma \ast x)$, masked as in 6.2; Richardson–Lucy inverts
 that same Gaussian, 1–10 passes, every pixel, before the USM. At native
 size, when shrinking, and for an area enlargement, $\sigma = 0$ and that
 pass is a copy. *Peak*, the desktop's sharpening, is a high-pass on the
-print after the paper, $x + a\,(x - G_r \ast x)$ with $r$ in print pixels
-(0.3–8) and $a$ up to 4, both in the recipe. The desktop measures them
+print after the paper, $x + a\,(x - G_r \ast x)$; the recipe stores $r$ in
+pixels of the negative (0.3–8) and $a$ up to 4, and the print applies
+$r \cdot s$ with $s$ the long-side scale, so the radius on the sheet may
+exceed 8. The desktop measures them
 once on the native-size print: short edge profiles across the picture,
 the soft ones dropped, the sharpest tenth averaged, and the smallest
 $(r, a)$ that bring that edge to MTF50 = 0.35 c/px without the contrast at
@@ -818,21 +775,18 @@ and the print is one file. None of this is part of the method's claim.
 
 ---
 
-## 8. Evaluation
+## 7. Evaluation
 
-### 8.1 Benchmark
+### 7.1 Benchmark
 
 Kodak set (24 pictures). 8-bit sRGB → linear → RGGB mosaic → 16 bit. The
 same samples go to Mimizan (`separate`, native mix) and, as a minimal CFA
 DNG (ColorMatrix1 = XYZ→sRGB, AsShotNeutral 1,1,1), to libraw 0.21 (VNG,
 PPG, AHD, DCB, DHT, AAHD) and RawTherapee 5.11 (fast, VNG4, AHD, EAHD, HPHD,
 DCB, LMMSE, IGV, AMaZE, RCD); bilinear is computed in-house. The tables
-below name the best of these sixteen per condition. (The tables of the
-0.10 and 0.11 versions of this text compared against five of them —
-bilinear, AHD, DHT, AMaZE and RCD — and named RCD or AMaZE as the best;
-against all sixteen the best is DCB (RawTherapee) in the lens-like and 2×
-conditions and LMMSE (RawTherapee) on pixel-sharp material, 0.9, 0.25 and
-2.4 dB above the earlier figures.) Their RGB is reduced
+below name the best of these sixteen per condition: DCB (RawTherapee) in
+the lens-like and 2× conditions, LMMSE (RawTherapee) on pixel-sharp
+material, RCD on the real files. Their RGB is reduced
 with $(R + 2G + B)/4$. Ground truth is the same luminance of the linear
 source. PSNR on sRGB-encoded 0..255 values, 16-px border excluded. Converter
 chains were verified on a smooth synthetic picture (every method ≥ 59 dB:
@@ -846,11 +800,15 @@ RGB pixel, the 3024×2016 result is the truth and is re-mosaicked with the
 camera's noise model, at 1× (twice as sharp as the camera saw it) and
 upscaled 2× ("soft", the camera's own band limit).
 
-### 8.2 Linear path
+### 7.2 Linear path
 
-Mean luminance PSNR (dB):
+Mean luminance PSNR (dB). The columns are the three stages of §4.3–4.4,
+each reachable with the parameters of §4.5: the energy weight on the
+elongated bands alone (`ring_wide` = 0, `tensor_power` = `ring_tensor` =
+0), plus the coherence ring (`DuboisParams::without_tensor()`), plus the
+base-band tensor (the default):
 
-| Condition | fixed (4.2) | Dubois 0.2.0 (4.3) | + ring (4.4), 0.11 | **+ tensor (4.3–4.4), default** | best of 16 demosaicers |
+| Condition | fixed (4.2) | Dubois weight (4.3) | + ring (4.4), no tensor | **+ tensor (4.3–4.4), default** | best of 16 demosaicers |
 |---|---|---|---|---|---|
 | pixel-sharp (24) | 34.60 | 36.45 | 36.55 | **37.29** | LMMSE (RT) 43.09, AMaZE 40.72 |
 | lens-like σ 0.75 (24) | 43.95 | – | 50.21 | **51.59** | DCB (RT) 51.47, RCD 50.59 |
@@ -858,12 +816,13 @@ Mean luminance PSNR (dB):
 | Z f binned (4) | 37.22 | 40.29 | 40.38 | **41.36** | RCD 42.81, DCB (RT) 42.64 |
 | Z f binned, ×2 (4) | 42.61 | 48.16 | 51.92 | **53.94** | RCD 50.66, DCB (libraw) 50.51 |
 
-Per picture: lens-like, every picture gains over 0.11 (0.5 to 2.9 dB) and
-9 of 24 are at or above the best of the sixteen demosaicers (0.11: 5),
-the largest gaps are kodim19, the fence (−2.4 dB), and kodim08 (−2.1); at
-2× all 24 are above every demosaicer (0.11: 21), the smallest margin
-0.5 dB; on the real files at the camera's own band limit all four are
-above RCD (+2.4, +3.0, +4.3, +3.3 dB; 0.11: three of four). The binned real
+Per picture: lens-like, every picture gains from the tensor (0.5 to
+2.9 dB) and 9 of 24 are at or above the best of the sixteen demosaicers
+(without the tensor: 5), the largest gaps are kodim19, the fence
+(−2.4 dB), and kodim08 (−2.1); at 2× all 24 are above every demosaicer
+(without the tensor: 21), the smallest margin 0.5 dB; on the real files at
+the camera's own band limit all four are above RCD (+2.4, +3.0, +4.3,
++3.3 dB; without the tensor: three of four). The binned real
 files at twice the camera's sharpness behave like the pixel-sharp set,
 0.5–1.9 dB behind RCD.
 
@@ -879,64 +838,18 @@ $\hat L$, demodulate, subtract the estimated leak from the copies,
 re-weight): −1 dB at 2×, none at 1×. Noise-energy subtraction in the
 weights: no effect in any condition.
 
-### 8.3 With the removed nonlinear step (0.11–0.14)
-
-Measured on 0.14, the last version with the step. The **linear default**
-column is what 0.15 ships.
-
-| Condition | 0.11 + reconstruct (the old default) | **linear default** | + reconstruct | computed share | best of 16 | at or above the best |
-|---|---|---|---|---|---|---|
-| pixel-sharp (24) | 42.04 | **37.29** | 42.13 | 50 % | LMMSE (RT) 43.09 | 0 → 2 of 24 |
-| lens-like σ 0.75 (24) | 51.93 | **51.59** | 52.55 | 12 % | DCB (RT) 51.47 | 9 → 23 of 24 |
-| band-limited 2× (24) | 51.96 | **51.83** | 52.36 | 5 % | DCB (RT) 49.13 | 24 → 24 of 24 |
-| Z f binned (4) | 41.67 | **41.36** | 41.98 | 11 % | RCD 42.81 | 0 → 0 of 4 |
-| Z f binned, ×2 (4) | 51.91 | **53.94** | 53.62 | 0.7 % | RCD 50.66 | 4 → 4 of 4 |
-
-$\beta = 0$ reproduces the linear default bit for bit. The first column
-is what the desktop program of 0.11 wrote: its estimator with the step on.
-The linear path of 0.12 is within 0.35 dB of it on every realistic
-condition and 2 dB above it at the camera's own band limit, which is why
-the step is off by default since 0.12. With the 0.11 estimator the step
-was worth 1.3–5.5 dB; with the tensor it is worth 0.5–1.0 dB on the
-realistic conditions and costs 0.3 dB at the band limit, where it is
-nearly inactive (0.7 %) and its estimator only adds error. On the real files at
-twice the camera's sharpness the method stays below RCD even with
-$\beta = 1$ everywhere (0.11 subset: 38.52 vs 39.49): on real noise the
-estimator, not the detector, is the limit. Pixel-sharp is the one condition
-where the step is decisive, and even there LMMSE (RawTherapee), which is
-built from the same Zhang–Wu estimator, stays 1 dB ahead. That table is
-the case for removing it: on every condition a camera can produce the
-linear path is ahead of every demosaicer or within the noise of the step,
-and the step's only clear win is on material no lens delivers.
-
-### 8.4 Design sweep for the removed nonlinear step (subset, 0.11–0.14)
-
-| Variant | 1× | 2× | raw | soft | lens |
-|---|---|---|---|---|---|
-| linear default | 34.59 | 47.56 | 36.66 | 48.57 | 49.84 |
-| nonlinear everywhere, linear domain | 36.57 | 44.06 | 36.99 | 41.24 | 46.36 |
-| nonlinear everywhere, domain $^{1/2.2}$ | 42.17 | 49.04 | 38.17 | 41.33 | 51.12 |
-| — same, $A$ 0.0625, LAP 0.125 | 41.94 | 49.64 | 38.52 | 42.35 | 52.16 |
-| hybrid, residue detector 100/400 | 39.56 | 49.53 | 38.09 | 48.60 | 51.19 |
-| **hybrid, residue detector 20/80** | **40.67** | **49.85** | 38.46 | **48.56** | 52.13 |
-| hybrid, residue detector 10/40 | 41.08 | 49.86 | **38.54** | 48.30 | **52.40** |
-| hybrid, share detector 0.001/0.005 | 37.53 | 47.58 | 37.61 | 48.54 | 50.36 |
-| best demosaicer on the subset | AMaZE 38.44 | RCD 47.02 | RCD 39.49 | – | AMaZE 51.22 |
-
-20/80 was chosen over 10/40 for the soft condition, the only one where the
-nonlinear step can only lose.
-
-### 8.5 Design sweep for the base-band tensor (0.12)
+### 7.3 Design sweep for the base-band tensor
 
 Mean luminance PSNR of the linear path, lens-like / band-limited 2×,
-against the 0.11 estimator at 50.21 / 50.80. The two decompositions used
+against the estimator without the tensor at 50.21 / 50.80. The two
+decompositions used
 above: *neutral* replaces every picture by its luminance (every error is
 leak), *flat* sets the luminance to 0.5 and keeps the picture's
 chrominance (every error is chrominance the estimate missed).
 
 | Variant | lens | 2× | neutral (lens) | flat (lens) |
 |---|---|---|---|---|
-| 0.11 (energy weight, coherence ring) | 50.21 | 50.80 | 57.30 | 61.19 |
+| without the tensor (energy weight, coherence ring) | 50.21 | 50.80 | 57.30 | 61.19 |
 | tensor in $w_H$, $\beta$ 0.5, band 0.30, $\sigma_t$ 2, second differences | 51.40 | 51.43 | 57.33 | 61.13 |
 | — $\beta$ 0.3 / 0.7 / 1.0 / 2.0 | 50.91 / 51.04 / 50.92 / 50.46 | 51.33 / 51.31 / 51.16 / 50.74 | | |
 | — band 0.10 / 0.15 / 0.25 / 0.35 | 50.88 / 51.04 / 51.17 / 51.19 | 51.31 / 51.37 / 51.41 / 51.41 | | |
@@ -950,7 +863,7 @@ Rejected, all measured against the same baseline:
 - *Leak-power weights.* The shared part $S = G_\sigma * (\hat C_{2a,n}
   \hat C_{2b,n})$ of the square narrow copies as the chrominance, $n = e -
   S$ as the leak, $w_H = n_B / (n_A + n_B)$: 47.7 / 48.3. Regularised with
-  $n + \lambda S$: $\lambda$ 0.1 49.8, 0.3 50.1, never above 0.11. The
+  $n + \lambda S$: $\lambda$ 0.1 49.8, 0.3 50.1, never above the baseline. The
   shared-part estimate is too noisy in a 3-px window; Dubois' dilution by
   the common chrominance is a regulariser, not a defect. The same with the
   energies of the elongated extensions only ($\hat C_{2a} - \hat C_{2a,n}$):
@@ -979,7 +892,7 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
 51.6 sits between the 0.20 and 0.25 square bands while keeping its
 0.15 c/px width towards the luminance.
 
-### 8.6 Other measurements
+### 7.4 Other measurements
 
 - Siemens star on the Z f: MTF10 0.405 c/px separating on raw levels,
   0.451 on balanced levels (= the true value of the chart). The star
@@ -987,20 +900,21 @@ chrominance low-passed, no leak at all), lens-like: 45.3 dB at 0.15 c/px,
   relative to the chart's own low-frequency contrast, not absolute MTF.
 - Weighting does not change resolution or pixel-to-pixel noise; a filter
   adds band-limited chroma noise only (red filter 19–21 % σ on smooth areas).
-- Synthetic bench (`measure synth --size 1024`, RMSE/σ, 0.12 default):
+- Synthetic bench (`measure synth --size 1024`, RMSE/σ, default):
   star 3.96 (MTF10 0.447), zone plate 10.53, edge 0.91, patches 2.62,
-  wedge 0.94, colour fabric 0.82 (2.76 before the coherence ring). Against
-  0.11 (3.77, 10.05, 0.90, 2.87, 0.96, 0.86) the two neutral Nyquist
-  targets pay for the clean copy's ring, as §4.4 says, and the coloured
-  targets gain.
-- Determinism: results are bit-identical between 16 and 3 threads
+  wedge 0.94, colour fabric 0.82 (2.76 without the coherence ring). Against
+  the estimator without the tensor (3.77, 10.05, 0.90, 2.87, 0.96, 0.86)
+  the two neutral Nyquist targets pay for the clean copy's ring, as §4.4
+  says, and the coloured targets gain.
+- Determinism: results are bit-identical between the machine's full
+  thread pool (16 on the test machine) and a pool of 3 threads
   (`separation_is_deterministic_across_thread_counts`).
 
 ---
 
-### 8.7 The three-colour plate (0.13)
+### 7.5 The three-colour plate
 
-The mixing rule of §6 gives, for the pure weights (1,0,0), (0,1,0) and
+The mixing rule of §5 gives, for the pure weights (1,0,0), (0,1,0) and
 (0,0,1), the three colour separations themselves:
 
 ```
@@ -1019,11 +933,10 @@ negative, and the colour resolves to the carriers' band limit, about
 0.25 c/px, like the red layer of a tripack film.
 
 CPSNR on sRGB-encoded values, Kodak set, `bench plate`, channels filters,
-against the best of the sixteen demosaicers of §8.1 (in brackets the
-removed step of §5, measured on 0.14): pixel-sharp 33.5 (38.3) dB against
-LMMSE 39.4, 0 (1) of 24 ahead; behind a lens (σ 0.75 px) 45.0 (46.5)
-against RCD 46.2 and LMMSE 46.2, 0 (7) of 24 ahead; at twice the sampling
-47.2 (47.5) against RCD 45.4, 4 (19) of 24 ahead. The plate's green is
+against the best of the sixteen demosaicers of §7.1: pixel-sharp 33.5 dB
+against LMMSE 39.4, 0 of 24 ahead; behind a lens (σ 0.75 px) 45.0 against
+RCD 46.2 and LMMSE 46.2, 0 of 24 ahead; at twice the sampling 47.2 against
+RCD 45.4, 4 of 24 ahead. The plate's green is
 its strongest channel in every condition, 3–5 dB above its own red and
 blue, and behind a lens and at twice the sampling it is above every
 demosaicer's green (by 0.3 and 3.4 dB): it is
@@ -1031,7 +944,7 @@ demosaicer's green (by 0.3 and 3.4 dB): it is
 balance gain is largest. Method, file format and limits are in
 `docs/PLATE.md`.
 
-## 9. Implementation notes
+## 8. Implementation notes
 
 - All arithmetic in f64; the mosaic and all estimates are full planes.
 - Convolutions sum their taps in fixed index order $t = 0 \dots N-1$; 16
@@ -1050,7 +963,7 @@ balance gain is largest. Method, file format and limits are in
   range (identical result, no per-pixel sort).
 - Allocator: mimalloc (glibc returns 200-MB blocks to the kernel at once and
   every new plane paid its page faults again).
-- The plate (§8.7) is three calls of the mixing step of §6 on one
+- The plate (§7.5) is three calls of the mixing step of §5 on one
   separation, nothing in the separation changes. The taking filters are
   three weight triples on the balanced channels (`plate.rs`): `camera`
   inverts `xyz_to_cam · rgb_to_xyz` after normalising each row so every
@@ -1081,28 +994,28 @@ balance gain is largest. Method, file format and limits are in
   (`ViewParams.plate`): the fitted view, the 100 % view and the print box
   carry an RGB buffer next to the grey one and go through the same tone
   table; the print histogram stays the monochrome mix's, with the three
-  channels as outlines over it. Since 0.14 the plate is the desktop's
+  channels as outlines over it. The plate is the desktop's
   second process, switched in the toolbar: the taking filters and the
   primaries stand in the Enlarger where the mix stands, the lamps are two
   sliders under the paper's exposures, and the strip shows slides. Plate
   and lamps are part of the development the history undoes; the recipe
   beside the RAW carries them (`plate`) and the mix (`mix`), and `negative
   --recipe` and `print --recipe` read the same file.
-- Without `--plate` nothing changes: the same file and recipe give the
-  bytes of 0.12.0 (the monochrome tests are unchanged; only the metadata
-  now carries `xyz_to_cam` where the file has one).
+- Without `--plate` the plate code is not entered: the monochrome
+  negative is the one mix of §5, and the only trace of the colour matrix
+  is the `xyz_to_cam` entry in the metadata where the file has one.
 
 ---
 
-## 10. Limitations
+## 9. Limitations
 
 - The information loss of the linear path is the luminance inside the chroma
   pass bands; it shows as a faint periodic residue on achromatic Nyquist
   texture. The directional estimator, the coherence ring and the base-band
-  tensor shrink that region; §5 fills it with an assumption and says so per
-  pixel. On neutral copies of the lens-like set §5 is still 2.3 dB ahead
-  of the linear path (58.4 against 56.1 dB): that is the luminance inside
-  the chroma bands, which no linear filter returns.
+  tensor shrink that region; what remains inside the chroma bands no
+  linear filter returns, and the method does not fill it with a model of
+  the picture, as a demosaicer's colour-difference prior would at the
+  price of computed pixels.
 - On real sensor noise at the sensor's pixel count the method is 0.5–1.9 dB
   behind the best demosaicer (RCD) in luminance PSNR. The gap closes at the
   camera's own band limit (lens plus AA/pixel aperture), which is the
@@ -1117,17 +1030,16 @@ balance gain is largest. Method, file format and limits are in
   their band limit, about 0.25 c/px: half as fine as the drawing. On a
   print that is the red layer of a tripack film; on a pixel-sharp chart it
   costs 1–6 dB CPSNR against the edge-directed demosaicers, which place
-  colour at the pixel (§8.7). The gap closes behind a lens and reverses at
+  colour at the pixel (§7.5). The gap closes behind a lens and reverses at
   twice the sampling.
 - The Ĉ1 leak on diagonal colour alternation at 3–4 px period, which the
   monochrome negative showed as grey beads, is false colour on the plate.
-  Same cause; the removed step of §5 reduced it, at the price of computed
-  pixels.
+  Same cause, same answer: nothing is reconstructed there.
 - The chrominance carries low-frequency colour noise (19–21 % σ for the
-  red filter on the Z f, §6.1), colour mottle like dye clouds. No noise
+  red filter on the Z f, §5.1), colour mottle like dye clouds. No noise
   reduction, as a matter of principle; the plate's chroma noise has not
   been measured yet.
-- Where a green photosite is burnt out the plate has no colour (§6.5): a
+- Where a green photosite is burnt out the plate has no colour (§5.5): a
   burnt-out neutral goes to paper white in all three, a subject that burns
   out green alone prints grey, and real colour within seven pixels of a
   burnt-out highlight is reduced by the share of its support that was
@@ -1147,14 +1059,10 @@ balance gain is largest. Method, file format and limits are in
   Image Processing 14(4), 2005.
 - E. Dubois, "Frequency-domain methods for demosaicking of Bayer-sampled
   color images", IEEE Signal Processing Letters 12(12), 2005.
-- L. Zhang, X. Wu, "Color demosaicking via directional linear minimum mean
-  square-error estimation", IEEE Trans. Image Processing 14(12), 2005.
 - J. F. Kaiser, "Nonrecursive digital filter design using the I0-sinh window
   function", ISCAS 1974 (the $\beta$ and $N$ formulas of §4.1).
 - W. H. Richardson, "Bayesian-based iterative method of image restoration",
   JOSA 62(1), 1972; L. B. Lucy, Astron. J. 79, 1974.
-- Liu, Yang, Chen, "Frequency Enhancement for Image Demosaicking",
-  arXiv:2503.15800 (as a bound only; no network in this method).
 - D. Bojovic, `docs/whitepaper_v1.pdf` (the original idea). Where this text
   and the code disagree, the code and its tests are right.
 
@@ -1196,7 +1104,13 @@ outermost block centres). Each chroma estimate is split into core (low-pass
 at 0.05 c/px, computed at half resolution) and band:
 
 $$ \hat C_k' = g_k \hat C_k + (1 - g_k)\, \mathrm{Core}(\hat C_k), \qquad
-   g_1 = 1 - M_1, \quad \rho_a = 1 - M_{2a}, \quad \rho_b = 1 - M_{2b}, $$
+   g_1 = 1 - M_1, \quad g_{2a} = g_{2b} = \max(\rho_a, \rho_b), \qquad
+   \rho_a = 1 - M_{2a}, \quad \rho_b = 1 - M_{2b}, $$
+
+(both $C_2$ copies are opened with the *same* gain, the larger of the two,
+so that the copy the other one vouches for is not narrowed; $\rho_a, \rho_b$
+then weight the combination:)
+
 $$ \hat C_2' = \frac{\rho_a \hat C_{2a}' + \rho_b \hat C_{2b}'}{\rho_a + \rho_b} \ (\rho_a + \rho_b > 10^{-9}), \quad
    \text{else } \tfrac12 (\hat C_{2a}' + \hat C_{2b}'), $$
 
@@ -1231,20 +1145,18 @@ input:  raw CFA array, black/white levels, CFA phase (ε, a, b), as-shot WB
 8.  C2 := wH·C2a + (1−wH)·C2b;  C1 := wH·C1H + (1−wH)·C1V
     C1 += (wH·κa + (1−wH)·κb)·(LPr²(ε·sx·sy·m) − C1)
 9.  L := m − ε·sx·sy·C1 − (a·sx + b·sy)·C2                    §4.3
-10. (0.11–0.14 only, removed) β from the carrier residue of L;
-    Zhang–Wu LMMSE in m^(1/2.2); L, C1, C2 += β·(nonlinear − linear)   §5
-11. out := L + (wG − wR − wB)·C1 + 2·(wR − wB)·C2              §6
-12. TIFF 16 bit linear grey + JSON description; mask sidecar   §7
+10. out := L + (wG − wR − wB)·C1 + 2·(wR − wB)·C2              §5
+11. TIFF 16 bit linear grey + JSON description; mask sidecar   §6
 
-plate (--plate [camera|wratten|channels]):                     §8.7
-13. W := filter rows w_R, w_G, w_B (camera: row-normalised
+plate (--plate [camera|wratten|channels]):                     §7.5
+12. W := filter rows w_R, w_G, w_B (camera: row-normalised
     (xyz_to_cam · rgb_to_xyz)⁻¹; wratten: Wratten 25/58/47 × emulsion (camera file's weights, else
     native);
     channels: identity)
-14. plate_c := step 11 with w := W_c, for c = R, G, B
-15. TIFF 16 bit linear grey, frames stacked B, G, R from the top,
+13. plate_c := step 10 with w := W_c, for c = R, G, B
+14. TIFF 16 bit linear grey, frames stacked B, G, R from the top,
     `plate` object in the JSON (order, frame height, filters, W)
-16. print: steps of the monochrome print ×3, same layout/crop/paper/
+15. print: steps of the monochrome print ×3, same layout/crop/paper/
     exposures; place_R += lamp_R, place_B += lamp_B; peak radius from the
     monochrome mix; 16-bit RGB TIFF/JPEG, matrix/TRC profile (Adobe RGB
     1998 default, sRGB on request)
@@ -1254,7 +1166,7 @@ Every constant in this recipe is a default of the published code and can be
 checked against `crates/mimizan-core/src/{filter,dubois,mix}.rs`,
 for the plate `{plate,print,icc}.rs`, and their tests.
 
-The colour benchmark of §8.7 is `mimizan bench plate` (pixel-sharp),
+The colour benchmark of §7.5 is `mimizan bench plate` (pixel-sharp),
 `mimizan bench plate --blur 0.75` (behind a lens) and
 `mimizan bench plate --scale 2` (twice the sampling); each run scores the
 plate against the demosaiced RGB of libraw and RawTherapee 5.11;
