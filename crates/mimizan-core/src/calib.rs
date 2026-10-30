@@ -159,7 +159,8 @@ impl CameraFile {
 
 /// A resource directory such as `cameras` or `look`: the path as given when it
 /// exists, otherwise the same name next to the executable, in
-/// `../share/mimizan/` (Debian package) or two levels up (`target/release`).
+/// `../Resources` (Mac app bundle), `../share/mimizan/` (Debian package)
+/// or two levels up (`target/release`).
 pub fn resolve_dir(dir: &Path) -> PathBuf {
     if dir.is_dir() || dir.is_absolute() {
         return dir.to_path_buf();
@@ -167,7 +168,9 @@ pub fn resolve_dir(dir: &Path) -> PathBuf {
     let Some(name) = dir.file_name() else { return dir.to_path_buf() };
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bin) = exe.parent() {
-            for base in [bin.to_path_buf(), bin.join("../share/mimizan"), bin.join("../..")] {
+            for base in
+                [bin.to_path_buf(), bin.join("../Resources"), bin.join("../share/mimizan"), bin.join("../..")]
+            {
                 let p = base.join(name);
                 if p.is_dir() {
                     return p;

@@ -3,12 +3,14 @@
 #
 #   Mimizan Lab.app/Contents/MacOS/mimizan-gui   what a double click starts
 #   Mimizan Lab.app/Contents/MacOS/mimizan       the command line
-#   Mimizan Lab.app/Contents/MacOS/cameras
-#   Mimizan Lab.app/Contents/MacOS/look
+#   Mimizan Lab.app/Contents/Resources/cameras
+#   Mimizan Lab.app/Contents/Resources/look
 #   Mimizan Lab.app/Contents/Resources/AppIcon.icns
 #
-# The programs look for cameras and look next to themselves. A double click
-# on the bundle does not open Terminal. The icon is the letter M.
+# cameras and look sit in Resources. MacOS holds only the two programs, which
+# is what a store signature accepts. The programs look next to themselves,
+# then in ../Resources. A double click on the bundle does not open Terminal.
+# The icon is the letter M.
 #
 # Usage: dist/assemble_macos_app.sh <mimizan> <mimizan-gui> <dest.app> <version>
 #
@@ -34,10 +36,11 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 rm -rf "$DEST"
 MACOS="$DEST/Contents/MacOS"
-mkdir -p "$MACOS" "$DEST/Contents"
+RESOURCES="$DEST/Contents/Resources"
+mkdir -p "$MACOS" "$RESOURCES"
 cp "$CLI" "$GUI" "$MACOS/"
 chmod 755 "$MACOS/mimizan" "$MACOS/mimizan-gui"
-cp -R "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$MACOS/"
+cp -R "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$RESOURCES/"
 
 cat > "$DEST/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -94,8 +97,10 @@ rm -rf "$(dirname "$ICONSET")"
 
 test -x "$MACOS/mimizan-gui"
 test -x "$MACOS/mimizan"
-test -f "$MACOS/cameras/nikon_z_f.json"
-test -f "$MACOS/look/neutral.json"
+test ! -e "$MACOS/cameras"
+test ! -e "$MACOS/look"
+test -f "$RESOURCES/cameras/nikon_z_f.json"
+test -f "$RESOURCES/look/neutral.json"
 test -s "$DEST/Contents/Resources/AppIcon.icns"
 test "$(plutil -extract CFBundleIconFile raw "$DEST/Contents/Info.plist")" = "AppIcon"
 echo "==> $DEST"

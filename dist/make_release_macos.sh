@@ -7,7 +7,7 @@
 #     README.md, LICENSE
 #
 # The two programs link only the frameworks that ship with macOS.
-# cameras/ and look/ sit beside them inside Contents/MacOS.
+# cameras/ and look/ sit in Contents/Resources. MacOS holds the two programs.
 #
 # Usage:  dist/make_release_macos.sh [--skip-build]
 
