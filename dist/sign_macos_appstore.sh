@@ -4,6 +4,7 @@
 # The unsigned zip from dist/make_release_macos.sh is a different bundle and
 # stays unsigned. This one embeds the store profile and the sandbox
 # entitlements, so it only sees folders the user picked in the system dialog.
+# It ships the window only. The command line stays in the unsigned zip.
 #
 # Run on macOS after the dist-profile build. The programs are taken from
 # target/dist. Passwords and files come from the environment, never from
@@ -92,6 +93,12 @@ plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP/Contents/Info.plis
 # The unsigned zip keeps the 11.0 written by assemble_macos_app.sh.
 plutil -replace LSMinimumSystemVersion -string "12.0" "$APP/Contents/Info.plist"
 cp "$MAC_APPSTORE_PROFILE" "$APP/Contents/embedded.provisionprofile"
+# Drop the command line after the shared layout step. A second executable
+# signed with the app identifier has no profile of its own, and TestFlight
+# warns about that. The window does not call it.
+rm -f "$APP/Contents/MacOS/mimizan"
+test ! -e "$APP/Contents/MacOS/mimizan"
+test -x "$APP/Contents/MacOS/mimizan-gui"
 # The profile arrives mode 600. productbuild would ship it readable by root
 # only, and Apple rejects that (90255). The rest of the bundle is opened the
 # same way, in case the runner umask was tight.
@@ -100,7 +107,6 @@ chmod -R u+rwX,go+rX "$APP"
 sign() {
     codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$DIST_ID" "$1"
 }
-sign "$APP/Contents/MacOS/mimizan"
 sign "$APP/Contents/MacOS/mimizan-gui"
 sign "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
