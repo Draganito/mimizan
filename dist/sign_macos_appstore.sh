@@ -88,7 +88,14 @@ echo "==> pkg: $INSTALLER_ID"
 APP="$STAGE/Mimizan Lab.app"
 "$PROJECT_DIR/dist/assemble_macos_app.sh" "$CLI" "$GUI" "$APP" "$VERSION"
 plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP/Contents/Info.plist"
+# An arm64-only store build is accepted only when the minimum system is 12.
+# The unsigned zip keeps the 11.0 written by assemble_macos_app.sh.
+plutil -replace LSMinimumSystemVersion -string "12.0" "$APP/Contents/Info.plist"
 cp "$MAC_APPSTORE_PROFILE" "$APP/Contents/embedded.provisionprofile"
+# The profile arrives mode 600. productbuild would ship it readable by root
+# only, and Apple rejects that (90255). The rest of the bundle is opened the
+# same way, in case the runner umask was tight.
+chmod -R u+rwX,go+rX "$APP"
 
 sign() {
     codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$DIST_ID" "$1"
