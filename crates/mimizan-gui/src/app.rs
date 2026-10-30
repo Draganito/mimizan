@@ -538,6 +538,10 @@ pub struct App {
     crop_drag: Option<CropDrag>,
 
     dialog: FileDialog,
+    /// The folder the Mac sandbox is allowed to read. Held for the whole
+    /// time that folder (and its subfolders) stay open.
+    #[cfg(target_os = "macos")]
+    folder_grant: Option<mimizan_mac::FolderGrant>,
     /// What the open save dialog will write when a name is picked.
     export_kind: ExportKind,
     cameras_dir: PathBuf,
@@ -701,6 +705,8 @@ impl App {
                 dialog.config_mut().opening_mode = OpeningMode::AlwaysInitialDir;
                 dialog
             },
+            #[cfg(target_os = "macos")]
+            folder_grant: None,
             cameras_dir,
             recipe_baseline: Recipe::on_paper(),
             pending_leave: None,
@@ -709,16 +715,12 @@ impl App {
             screenshot_state: 0,
         };
         match initial {
-            Some(p) if p.is_dir() => app.set_folder(&p),
-            Some(p) => app.open(p),
-            None => {
-                // The strip is the only way in: the last folder, else the
-                // pictures folder, else home.
-                let last = persisted.folder.filter(|f| f.is_dir());
-                if let Some(f) = last.or_else(start_folder) {
-                    app.set_folder(&f);
-                }
+            Some(p) if p.is_dir() => {
+                app.hold_grant(&p);
+                app.set_folder(&p);
             }
+            Some(p) => app.open(p),
+            None => app.open_remembered(&persisted),
         }
         app
     }
@@ -736,8 +738,68 @@ impl App {
             plate_filters: Some(self.plate_last.filters),
             plate_space: Some(self.plate_last.space),
             ruler: Some(self.ruler),
+            folder_bookmark: self.saved_bookmark(),
         }
         .save();
+    }
+
+    /// The sandbox grant, when this process is inside one. A Mac build that
+    /// is not sandboxed keeps the last path and the pictures folder.
+    fn open_remembered(&mut self, persisted: &Persisted) {
+        #[cfg(target_os = "macos")]
+        if sandboxed() {
+            if let Some(bytes) = persisted.folder_bookmark.as_deref() {
+                if let Some(grant) = mimizan_mac::restore(bytes) {
+                    let root = grant.path().to_path_buf();
+                    let open = persisted.folder.clone().filter(|f| f.starts_with(&root)).unwrap_or(root);
+                    self.folder_grant = Some(grant);
+                    self.set_folder(&open);
+                }
+            }
+            return;
+        }
+        let last = persisted.folder.clone().filter(|f| f.is_dir());
+        if let Some(f) = last.or_else(start_folder) {
+            self.set_folder(&f);
+        }
+    }
+
+    fn saved_bookmark(&self) -> Option<Vec<u8>> {
+        #[cfg(target_os = "macos")]
+        {
+            self.folder_grant.as_ref().and_then(|g| g.bookmark().map(|b| b.to_vec()))
+        }
+        #[cfg(not(target_os = "macos"))]
+        None
+    }
+
+    /// The folder the sandbox grant covers. Absent outside a sandbox, so
+    /// every breadcrumb stays a button.
+    fn grant_root(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        if sandboxed() {
+            return self.folder_grant.as_ref().map(|g| g.path().to_path_buf());
+        }
+        None
+    }
+
+    /// Keep a dropped or launched folder when the system will bookmark it.
+    fn hold_grant(&mut self, path: &Path) {
+        #[cfg(target_os = "macos")]
+        if let Some(grant) = mimizan_mac::adopt(path) {
+            self.folder_grant = Some(grant);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = path;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn choose_folder(&mut self) {
+        let Some(grant) = mimizan_mac::pick_folder() else { return };
+        let path = grant.path().to_path_buf();
+        self.folder_grant = Some(grant);
+        self.set_folder(&path);
+        self.show_strip = true;
     }
 
     /// The process shown and switched: the edit's with a file open, the
@@ -1471,11 +1533,15 @@ impl App {
             .as_ref()
             .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
             .unwrap_or_else(|| "mimizan".into());
+        let name = format!("{stem}.tif");
+        self.export_kind = ExportKind::Print;
+        if self.save_with_panel(&name) {
+            return;
+        }
         if let Some(dir) = self.export_directory() {
             self.dialog.config_mut().initial_directory = dir;
         }
-        self.dialog.config_mut().default_file_name = format!("{stem}.tif");
-        self.export_kind = ExportKind::Print;
+        self.dialog.config_mut().default_file_name = name;
         self.dialog.save_file();
     }
 
@@ -1490,10 +1556,60 @@ impl App {
         if let Some(dir) = self.export_directory() {
             self.dialog.config_mut().initial_directory = dir;
         }
-        self.dialog.config_mut().default_file_name =
-            if self.linear_is_dng() { format!("{stem}.dng") } else { format!("{stem}.negative.tif") };
+        let name = if self.linear_is_dng() { format!("{stem}.dng") } else { format!("{stem}.negative.tif") };
         self.export_kind = ExportKind::Linear;
+        if self.save_with_panel(&name) {
+            return;
+        }
+        self.dialog.config_mut().default_file_name = name;
         self.dialog.save_file();
+    }
+
+    /// The sandboxed Mac build writes through the system save dialog, which
+    /// is the grant for that file. Anywhere else the egui dialog stays.
+    /// `true` means the system dialog already ran (including a cancel).
+    fn save_with_panel(&mut self, name: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        if sandboxed() {
+            if let Some(path) = mimizan_mac::pick_save(self.export_directory().as_deref(), name) {
+                self.export_to(path);
+            }
+            return true;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = name;
+        false
+    }
+
+    fn export_to(&mut self, path: PathBuf) {
+        let Some(s) = &self.session else { return };
+        match self.export_kind {
+            ExportKind::Print => {
+                let path = with_ext(path, "tif");
+                self.busy = Some("exporting".into());
+                self.heavy.send(Job::Export {
+                    session: Arc::clone(s),
+                    weights: self.weights(),
+                    plate: self.plate_view(),
+                    recipe: self.print_recipe(),
+                    path,
+                    orientation: self.export_orientation(),
+                });
+            }
+            ExportKind::Linear => {
+                let plate = self.linear_is_dng();
+                let path = with_ext(path, if plate { "dng" } else { "tif" });
+                self.busy = Some("exporting".into());
+                self.heavy.send(Job::ExportLinear {
+                    session: Arc::clone(s),
+                    weights: self.weights(),
+                    plate,
+                    crop: self.print_recipe().crop,
+                    path,
+                    orientation: self.export_orientation(),
+                });
+            }
+        }
     }
 
     /// The linear export is a DNG in the plate process of a Bayer file.
@@ -1896,6 +2012,7 @@ impl App {
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if let Some(p) = dropped.into_iter().next() {
             if p.is_dir() {
+                self.hold_grant(&p);
                 self.set_folder(&p);
                 self.show_strip = true;
             } else if self.busy.is_none() {
@@ -2136,34 +2253,7 @@ impl App {
     fn handle_dialog(&mut self, ctx: &egui::Context) {
         self.dialog.update(ctx);
         let Some(path) = self.dialog.take_picked() else { return };
-        let Some(s) = &self.session else { return };
-        match self.export_kind {
-            ExportKind::Print => {
-                let path = with_ext(path, "tif");
-                self.busy = Some("exporting".into());
-                self.heavy.send(Job::Export {
-                    session: Arc::clone(s),
-                    weights: self.weights(),
-                    plate: self.plate_view(),
-                    recipe: self.print_recipe(),
-                    path,
-                    orientation: self.export_orientation(),
-                });
-            }
-            ExportKind::Linear => {
-                let plate = self.linear_is_dng();
-                let path = with_ext(path, if plate { "dng" } else { "tif" });
-                self.busy = Some("exporting".into());
-                self.heavy.send(Job::ExportLinear {
-                    session: Arc::clone(s),
-                    weights: self.weights(),
-                    plate,
-                    crop: self.print_recipe().crop,
-                    path,
-                    orientation: self.export_orientation(),
-                });
-            }
-        }
+        self.export_to(path);
     }
 
     /// Three always-visible groups. The windows sit on the left, the picture
@@ -4217,6 +4307,21 @@ fn without_verbatim_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// `APP_SANDBOX_CONTAINER_ID` is set only inside an App Sandbox. The
+/// unsigned Mac zip does not set it, so that build keeps the old folders.
+fn sandboxed() -> bool {
+    std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some()
+}
+
+/// A breadcrumb step can be opened when it sits inside the sandbox grant.
+/// With no grant, a sandboxed build only keeps the current step.
+fn crumb_is_open(sandboxed: bool, root: Option<&Path>, anc: &Path, last: bool) -> bool {
+    match root {
+        Some(root) => anc.starts_with(root),
+        None => !sandboxed || last,
+    }
+}
+
 /// One step of the folder breadcrumb. A directory keeps its name. The root
 /// is `/` on Unix and `C:` on Windows.
 fn crumb_label(path: &Path) -> String {
@@ -4393,14 +4498,29 @@ impl App {
     fn strip_bar(&mut self, ui: &mut egui::Ui) {
         let mut go_to: Option<PathBuf> = None;
         let mut rescan = false;
+        #[cfg(target_os = "macos")]
+        let mut choose = false;
+        #[cfg(not(target_os = "macos"))]
+        let choose = false;
+        let grant_root = self.grant_root();
         ui.horizontal(|ui| {
+            #[cfg(target_os = "macos")]
+            if ui.small_button("Open").on_hover_text("Choose a folder of negatives").clicked() {
+                choose = true;
+            }
             match &self.folder {
                 None => {
-                    ui.label(RichText::new("No folder. Drop a folder or a RAW file on the window.").weak());
+                    let text = if sandboxed() {
+                        "No folder. Open a folder, or drop one on the window."
+                    } else {
+                        "No folder. Drop a folder or a RAW file on the window."
+                    };
+                    ui.label(RichText::new(text).weak());
                 }
                 Some(f) => {
                     // Breadcrumb: every ancestor is a button. The root is `/`
-                    // on Unix and the drive (`C:`) on Windows.
+                    // on Unix and the drive (`C:`) on Windows. Above a sandbox
+                    // grant the steps stay visible and are not buttons.
                     let comps: Vec<PathBuf> = f.path.ancestors().map(Path::to_path_buf).collect();
                     for anc in comps.iter().rev() {
                         let name = crumb_label(anc);
@@ -4408,9 +4528,14 @@ impl App {
                             continue;
                         }
                         let last = anc == &f.path;
-                        let text = if last { RichText::new(name).strong() } else { RichText::new(name) };
-                        if ui.add(egui::Button::new(text).frame(false)).clicked() && !last {
-                            go_to = Some(anc.clone());
+                        let allowed = crumb_is_open(sandboxed(), grant_root.as_deref(), anc, last);
+                        if !allowed {
+                            ui.label(RichText::new(name).weak());
+                        } else {
+                            let text = if last { RichText::new(name).strong() } else { RichText::new(name) };
+                            if ui.add(egui::Button::new(text).frame(false)).clicked() && !last {
+                                go_to = Some(anc.clone());
+                            }
                         }
                         if !last {
                             ui.label(RichText::new("›").weak());
@@ -4480,7 +4605,10 @@ impl App {
                 ui.label(RichText::new("sort").weak());
             });
         });
-        if let Some(p) = go_to {
+        if choose {
+            #[cfg(target_os = "macos")]
+            self.choose_folder();
+        } else if let Some(p) = go_to {
             self.set_folder(&p);
         } else if rescan {
             if let Some(p) = self.folder.as_ref().map(|f| f.path.clone()) {
@@ -5868,5 +5996,25 @@ mod dock_tests {
         let (back, pan) = hold_magnification(1.5, Vec2::new(8.0, 8.0), 0.2, 0.5, old.center(), old.center());
         assert!(picture_is_fitted(back));
         assert_eq!(pan, Vec2::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod crumb_tests {
+    use super::crumb_is_open;
+    use std::path::Path;
+
+    #[test]
+    fn a_sandbox_grant_stops_above_its_folder() {
+        let root = Path::new("negatives");
+        let above = Path::new("other");
+        let here = Path::new("negatives");
+        let below = Path::new("negatives").join("roll");
+        assert!(!crumb_is_open(true, Some(root), above, false));
+        assert!(crumb_is_open(true, Some(root), here, true));
+        assert!(crumb_is_open(true, Some(root), &below, false));
+        assert!(crumb_is_open(false, None, above, false));
+        assert!(!crumb_is_open(true, None, above, false));
+        assert!(crumb_is_open(true, None, here, true));
     }
 }

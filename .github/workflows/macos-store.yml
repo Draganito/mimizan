@@ -1,0 +1,78 @@
+# Signs the desktop darkroom for the Mac App Store. The unsigned zip from
+# the release workflow is a separate build and is not sandboxed.
+#
+# Repository secrets:
+#   MAC_DISTRIBUTION_P12            Apple Distribution certificate, base64 PKCS#12
+#   MAC_DISTRIBUTION_P12_PASSWORD
+#   MAC_INSTALLER_P12               Mac Installer Distribution certificate, base64 PKCS#12
+#   MAC_INSTALLER_P12_PASSWORD
+#   MAC_APPSTORE_PROFILE            Mac App Store provisioning profile, base64
+#   ASC_KEY_ID                      same App Store Connect key as the iPhone upload
+#   ASC_ISSUER_ID
+#   ASC_API_KEY_P8                  the .p8 file, base64
+#
+# The pkg's short version is the program version. App Store Connect has to
+# have that version on the macOS platform before the upload is accepted.
+name: Mac App Store
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  store:
+    name: Sign and upload
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apple silicon
+        run: test "$(uname -m)" = arm64
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: bash dist/make_release_macos.sh
+      - name: Sign the store package
+        env:
+          MAC_DISTRIBUTION_P12: ${{ secrets.MAC_DISTRIBUTION_P12 }}
+          MAC_DISTRIBUTION_P12_PASSWORD: ${{ secrets.MAC_DISTRIBUTION_P12_PASSWORD }}
+          MAC_INSTALLER_P12: ${{ secrets.MAC_INSTALLER_P12 }}
+          MAC_INSTALLER_P12_PASSWORD: ${{ secrets.MAC_INSTALLER_P12_PASSWORD }}
+          MAC_APPSTORE_PROFILE: ${{ secrets.MAC_APPSTORE_PROFILE }}
+          MAC_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/signing"
+          mkdir -p "$dir"
+          chmod 700 "$dir"
+          printf '%s' "$MAC_DISTRIBUTION_P12" | base64 --decode > "$dir/distribution.p12"
+          printf '%s' "$MAC_INSTALLER_P12" | base64 --decode > "$dir/installer.p12"
+          printf '%s' "$MAC_APPSTORE_PROFILE" | base64 --decode > "$dir/profile.provisionprofile"
+          chmod 600 "$dir"/*
+          export MAC_DISTRIBUTION_P12="$dir/distribution.p12"
+          export MAC_INSTALLER_P12="$dir/installer.p12"
+          export MAC_APPSTORE_PROFILE="$dir/profile.provisionprofile"
+          bash dist/sign_macos_appstore.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-appstore
+          path: dist/*-appstore.pkg
+          if-no-files-found: error
+      - name: Upload to App Store Connect
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8: ${{ secrets.ASC_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ASC_KEY_ID:-}" || -z "${ASC_ISSUER_ID:-}" || -z "${ASC_API_KEY_P8:-}" ]]; then
+            echo "App Store Connect API secrets are not on this repository. The signed pkg is the artifact."
+            exit 0
+          fi
+          mkdir -p "$HOME/private_keys"
+          printf '%s' "$ASC_API_KEY_P8" | base64 --decode > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          pkg=$(echo dist/*-appstore.pkg)
+          xcrun altool --upload-app --type macos --file "$pkg" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"

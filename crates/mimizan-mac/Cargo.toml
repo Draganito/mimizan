@@ -1,0 +1,26 @@
+[package]
+name = "mimizan-mac"
+description = "macOS folder grants for the sandboxed darkroom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+# Only the Mac build talks to AppKit. Linux CI compiles the stub.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSError", "NSString", "NSURL"] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSOpenPanel",
+    "NSPanel",
+    "NSResponder",
+    "NSSavePanel",
+    "NSWindow",
+] }
+
+[lints.clippy]
+all = "warn"

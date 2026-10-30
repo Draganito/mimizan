@@ -555,6 +555,10 @@ pub struct Persisted {
     pub plate_space: Option<PlateSpace>,
     /// The Print window's ruler. `None` means metric.
     pub ruler: Option<Ruler>,
+    /// Security-scoped bookmark for the folder opened on macOS. Absent on
+    /// Linux and Windows, and on a Mac build that is not sandboxed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder_bookmark: Option<Vec<u8>>,
 }
 
 /// `$XDG_CONFIG_HOME/mimizan/gui.json`, `%APPDATA%/mimizan/gui.json`, or

@@ -38,6 +38,7 @@ winit = { version = "0.30", default-features = false, features = ["wayland-csd-a
 
 [target.'cfg(target_os = "macos")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+mimizan-mac = { path = "../mimizan-mac" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }

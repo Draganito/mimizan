@@ -11,6 +11,10 @@
 # on the bundle does not open Terminal. The icon is the letter M.
 #
 # Usage: dist/assemble_macos_app.sh <mimizan> <mimizan-gui> <dest.app> <version>
+#
+# This bundle is not sandboxed. The Mac App Store build is signed with
+# dist/macos-entitlements.plist; that build only sees folders the user
+# picked in the system dialog.
 
 set -euo pipefail
 
@@ -60,8 +64,12 @@ cat > "$DEST/Contents/Info.plist" <<EOF
 	<string>6.0</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.photography</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>
 EOF
