@@ -459,10 +459,12 @@ pub struct PrintSource<'a> {
 ///
 /// With a size, the sheet is that size, turned to the picture's
 /// orientation; the picture is fitted into what the rings leave of it and
-/// centred, the black edge lies directly around the picture, and every
-/// other pixel is paper. Where the sheet's ratio is not the picture's,
-/// the paper is wider than `border_px` on two sides: the border is the
-/// least paper, the sheet is the sheet. Without a size, the sheet is the
+/// centred. The black edge lies directly around the picture. With a white
+/// border, every other pixel is paper, and that paper is wider than
+/// `border_px` on two sides where a uniform inset does not fill the sheet:
+/// the border is the least paper, the sheet is the sheet. With no white
+/// border the black edge is that whole margin, so the strip beyond
+/// `black_px` is black and not paper. Without a size, the sheet is the
 /// picture's pixels plus the rings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layout {
@@ -744,9 +746,17 @@ fn loupe_geom(lay: &Layout, sharpen: Sharpen, nx: f64, ny: f64, view: usize, pea
     }
 }
 
-/// The black edge's rectangle on the sheet, `(x0, y0, x1, y1)`: the picture
-/// plus `black_px` on every side, cut at the sheet's edges.
+/// The black edge's rectangle on the sheet, `(x0, y0, x1, y1)`.
+///
+/// With a white border it is the picture plus `black_px` on every side,
+/// cut at the sheet. With no white border it is the whole sheet: a uniform
+/// pixel inset does not fill a sheet that is not square, and the strip
+/// beyond `black_px` is the black edge, not paper. The picture is painted
+/// over it afterwards.
 fn black_rect(lay: &Layout) -> (usize, usize, usize, usize) {
+    if lay.border_px == 0 {
+        return (0, 0, lay.out_w, lay.out_h);
+    }
     (
         lay.picture_x.saturating_sub(lay.black_px),
         lay.picture_y.saturating_sub(lay.black_px),
@@ -1057,7 +1067,10 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         );
     }
     if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) {
-        if lay.picture_x > lay.black_px + lay.border_px || lay.picture_y > lay.black_px + lay.border_px {
+        // Only a white border leaves paper. With none, that strip is the black edge.
+        if lay.border_px > 0
+            && (lay.picture_x > lay.black_px + lay.border_px || lay.picture_y > lay.black_px + lay.border_px)
+        {
             info!(
                 "sheet {}x{} px, picture at {},{}: the ratio leaves more paper than the border",
                 lay.out_w, lay.out_h, lay.picture_x, lay.picture_y
@@ -1656,6 +1669,65 @@ mod tests {
         let bare_out = render_planes(&src, &PrintParams { recipe: bare, ..Default::default() });
         assert!((out.plane.at(10, 10) - bare_out.plane.at(0, 0)).abs() < 1e-12);
         assert!(out.plane.data.iter().all(|v| *v < 1.0));
+    }
+
+    /// A sheet of the picture's shape still leaves a strip beyond a uniform
+    /// inset, because the hole's ratio is no longer the picture's. With no
+    /// white border that strip is black. With both rings it stays paper,
+    /// and the black edge stays the asked width against the picture. The
+    /// picture does not move. The 1:1 box reads the same black.
+    #[test]
+    fn black_alone_fills_the_margin_the_inset_leaves() {
+        let (w, h) = (40, 50);
+        let plane = Plane::from_vec(w, h, vec![0.5; w * h]);
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "flat".into(), description: None };
+        let sheet = PrintSize::Physical { width_in: 80.0 / 100.0, height_in: 100.0 / 100.0 };
+        let black = PrintParams {
+            recipe: Recipe {
+                size: Some(sheet),
+                dpi: 100.0,
+                border_mm: 0.0,
+                black_mm: 2.54,
+                ..Recipe::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(black.recipe.black_px(), 10);
+        let lay = layout(w, h, 1, &black);
+        // Inner box 60×80, picture 60×75 at (10, 12): 10 px of black on the
+        // sides, 12 and 13 above and below. The two and three beyond the
+        // asked black used to be paper.
+        assert_eq!((lay.image_w, lay.image_h, lay.picture_x, lay.picture_y), (60, 75, 10, 12));
+        assert_eq!((lay.out_w, lay.out_h, lay.border_px, lay.black_px), (80, 100, 0, 10));
+        let out = render_planes(&src, &black);
+        assert_eq!(out.plane.at(0, 0), 0.0);
+        assert_eq!(out.plane.at(0, 1), 0.0);
+        assert_eq!(out.plane.at(40, 97), 0.0);
+        assert_eq!(out.plane.at(40, 99), 0.0);
+        assert_eq!(out.plane.at(9, 50), 0.0);
+        let grey = 0.5f64.powf(1.0 / 2.2);
+        assert!((out.plane.at(10, 12) - grey).abs() < 1e-12);
+        assert!((out.plane.at(69, 86) - grey).abs() < 1e-12);
+        let window = PlaneWindow { plane: &plane, origin_x: 0, origin_y: 0, full_w: w, full_h: h };
+        let boxed = sharpen_window(window, None, &black, 0.0, 0.0, 32).unwrap();
+        assert_eq!(boxed.at(0, 0), 0.0);
+        // Both rings: the strip beyond the white border stays paper, and the
+        // black edge stays 5 px against the picture.
+        let both = PrintParams {
+            recipe: Recipe { border_mm: 2.54, black_mm: 1.27, ..black.recipe.clone() },
+            ..Default::default()
+        };
+        assert_eq!((both.recipe.border_px(), both.recipe.black_px()), (10, 5));
+        let lay = layout(w, h, 1, &both);
+        assert_eq!((lay.image_w, lay.image_h, lay.picture_x, lay.picture_y), (50, 63, 15, 18));
+        let out = render_planes(&src, &both);
+        assert_eq!(out.plane.at(40, 0), 1.0);
+        assert_eq!(out.plane.at(40, 2), 1.0);
+        assert_eq!(out.plane.at(40, 13), 0.0);
+        assert_eq!(out.plane.at(40, 17), 0.0);
+        assert!((out.plane.at(15, 18) - grey).abs() < 1e-12);
+        assert_eq!(out.plane.at(40, 99), 1.0);
     }
 
     /// The centimetre picture stays the size that was asked. Black and white

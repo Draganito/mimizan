@@ -1905,7 +1905,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-cli"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-core"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "criterion",
  "image",
@@ -1939,7 +1939,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-gui"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1961,7 +1961,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-mac"
-version = "0.16.4"
+version = "0.16.5"
 dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",

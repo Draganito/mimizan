@@ -298,6 +298,19 @@ struct Rings {
     black: u8,
 }
 
+/// How far the black edge is painted, in sheet pixels, before the stage
+/// cuts it to the sheet. With no white border that is the whole margin:
+/// a uniform inset leaves a strip beyond `black_px` on a sheet that is
+/// not square, and that strip is black. With a white border it is the
+/// asked `black_px`; the strip beyond it stays paper.
+fn stage_black_px(border_px: usize, black_px: usize, margin_x: usize, margin_y: usize) -> usize {
+    if border_px == 0 && black_px > 0 {
+        margin_x.max(margin_y)
+    } else {
+        black_px
+    }
+}
+
 impl Rings {
     /// The black edge as painted: cut where it would leave the sheet.
     fn black_shown(&self) -> Vec2 {
@@ -1304,7 +1317,7 @@ impl App {
         let scale = tw as f32 / l.image_w.max(1) as f32;
         let tone = self.edit.recipe.curve.compile();
         Rings {
-            black_tex: l.black_px as f32 * scale,
+            black_tex: stage_black_px(l.border_px, l.black_px, l.picture_x, l.picture_y) as f32 * scale,
             frame_x_tex: l.picture_x as f32 * scale,
             frame_y_tex: l.picture_y as f32 * scale,
             white: (tone.white().clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -5685,9 +5698,19 @@ mod path_tests {
 mod crop_drag_tests {
     use super::{
         dress_to_hold, hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving,
-        tile_must_wait, CropHit, PaperFormat, Rings, StageDress,
+        stage_black_px, tile_must_wait, CropHit, PaperFormat, Rings, StageDress,
     };
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
+
+    #[test]
+    fn black_alone_paints_the_whole_margin() {
+        // 196 asked, margins 196 and 244: the long side is painted to the sheet.
+        assert_eq!(stage_black_px(0, 196, 196, 244), 244);
+        let rings = Rings { black_tex: 244.0, frame_x_tex: 196.0, frame_y_tex: 244.0, ..Rings::default() };
+        assert_eq!(rings.black_shown(), egui::Vec2::new(196.0, 244.0));
+        // Inside a white border the asked ring stays, and the strip beyond it is paper.
+        assert_eq!(stage_black_px(207, 196, 403, 451), 196);
+    }
 
     #[test]
     fn the_rings_on_the_stage_stay_with_its_picture() {
