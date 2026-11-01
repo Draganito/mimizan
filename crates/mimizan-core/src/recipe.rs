@@ -604,7 +604,7 @@ mod tests {
         let old: Recipe = serde_json::from_str(&bare).unwrap();
         assert_eq!(
             old.plate,
-            Some(PlateRecipe { filters: PlateFilters::Camera, space: PlateSpace::AdobeRgb, lamps: [0.0; 2] })
+            Some(PlateRecipe { filters: PlateFilters::Camera, space: PlateSpace::Srgb, lamps: [0.0; 2] })
         );
         // Out of range is refused.
         let hot = Recipe { plate: Some(PlateRecipe { lamps: [3.0, 0.0], ..r.plate.unwrap() }), ..r.clone() };

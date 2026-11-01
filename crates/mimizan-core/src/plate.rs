@@ -72,17 +72,18 @@ impl PlateFilters {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlateSpace {
+    /// sRGB primaries (with the paper's gamma 2.2, not the sRGB curve).
+    /// The standard: a gallery shows the file as it is.
+    #[default]
+    Srgb,
     /// Adobe RGB (1998): its transfer curve is exactly the gamma 2.2 of
     /// the paper's encoding, and its gamut holds the saturated filter
     /// primaries better than sRGB.
-    #[default]
     AdobeRgb,
-    /// sRGB primaries (with the paper's gamma 2.2, not the sRGB curve).
-    Srgb,
 }
 
 impl PlateSpace {
-    pub const ALL: [PlateSpace; 2] = [PlateSpace::AdobeRgb, PlateSpace::Srgb];
+    pub const ALL: [PlateSpace; 2] = [PlateSpace::Srgb, PlateSpace::AdobeRgb];
 
     pub fn name(self) -> &'static str {
         match self {
