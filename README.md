@@ -133,6 +133,8 @@ cargo build --release
 
 The same paper is on the phone: [Mimizan Lab Mobile](https://github.com/Draganito/mimizan-lab-mobile) on Android and on iOS (TestFlight).
 
+A short handbook for the window and the phone, in German: [docs/HANDBUCH.md](docs/HANDBUCH.md).
+
 Free software, GPL-3.0-or-later.
 
 ## Privacy
