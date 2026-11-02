@@ -15,7 +15,13 @@ No account. No network. The pictures stay on your computer.
 
 - [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.6/mimizan_0.16.6-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.6-1_amd64.deb`
 - [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.6/mimizan-0.16.6-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.6/mimizan-0.16.6-aarch64-macos.zip) — open `Mimizan Lab.app` (first launch: right-click, Open). Or the Mac App Store / TestFlight.
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.6/mimizan-0.16.6-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+
+```bash
+xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
+```
+
+Then open the app (right-click, Open). The Mac App Store and TestFlight builds are signed and do not need this.
 
 **Phone**
 
