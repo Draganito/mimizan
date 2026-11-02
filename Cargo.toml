@@ -29,6 +29,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 criterion = "0.7"
 
+# winit 0.30.13 imports `CGSSetWindowBackgroundBlurRadius` on every macOS
+# build. Apple's App Store scan rejects the binary for that private symbol
+# (guideline 2.5.1), even when the window never asks for blur. eframe 0.36
+# still depends on 0.30; 0.31 gates the call behind `private-apple-apis`.
+# This is 0.30.13 with the import removed:
+# https://github.com/Draganito/winit/tree/v0.30.13-no-private-apis
+[patch.crates-io]
+winit = { git = "https://github.com/Draganito/winit", rev = "27870fbc228ac2efecb5a054142af33239dafcd9" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

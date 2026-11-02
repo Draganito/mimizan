@@ -25,6 +25,16 @@ for bin in "$@"; do
                 ;;
         esac
     done < <(otool -L "$bin" | tail -n +2)
+
+    # Apple's App Store scan (guideline 2.5.1) rejects any binary that
+    # *imports* these private CoreGraphics symbols, whether they are
+    # called or not. winit 0.30.13 imported them; the crates-io patch
+    # in Cargo.toml removes the import. This is the check that the
+    # store package is not shipping them again.
+    if nm -u "$bin" | grep -E '_CGS(SetWindowBackgroundBlurRadius|MainConnectionID)'; then
+        echo "ERROR: $bin imports a private CGS symbol (App Store 2.5.1)"
+        fail=1
+    fi
 done
 
 exit "$fail"
