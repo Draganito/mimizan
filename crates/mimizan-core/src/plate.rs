@@ -554,6 +554,14 @@ mod tests {
         let jpg = dir.join("print.jpg");
         crate::print::write(&out, &jpg, &p).unwrap();
         assert!(std::fs::metadata(&jpg).unwrap().len() > 0);
+
+        // A budget below the plate's figure refuses before any print plane
+        // is made; the figure itself is the plate's, not the grey print's.
+        let need = crate::print::plate_memory_estimate(w, h, 1, &p);
+        assert!(need > crate::print::memory_estimate(w, h, 1, &p));
+        let err = render_within(&path, &p, Some(need - 1)).err().expect("refused");
+        assert!(err.to_string().contains("would hold about"), "{err}");
+        assert!(render_within(&path, &p, Some(need)).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

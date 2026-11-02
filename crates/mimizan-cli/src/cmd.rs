@@ -149,7 +149,7 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
 
     // Past the machine's whole memory the separation ends in the OOM
     // killer, not in an error; below it, it is only slow.
-    let need = pipeline::develop_memory(frame.width, frame.height, frame.kind);
+    let need = pipeline::develop_memory_of(&frame);
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
     if sys.total_memory() > 0 && need > sys.total_memory() {
@@ -212,7 +212,7 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         params.plate =
             Some(PlateParams { filters: parse_plate_filters(f)?, space: parse_plate_space(&a.plate_space)? });
     }
-    if params.plate.is_some() && a.weights.is_some() {
+    if (params.plate.is_some() || a.dng) && a.weights.is_some() {
         warn!(
             "--weights is the mix of one negative; the plate's emulsion is the camera file's response or \
              the native one, so it has no effect here"
@@ -223,13 +223,24 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     let recipe_crop = a
         .recipe
         .as_ref()
-        .map(|p| mimizan_core::recipe::Recipe::load(p).map(|r| r.crop))
+        .map(|p| {
+            mimizan_core::recipe::Recipe::load(p)
+                .map(|r| r.crop)
+                .with_context(|| format!("recipe file {}", p.display()))
+        })
         .transpose()?
         .flatten();
     if a.dng {
         if frame.kind == SensorKind::Mono {
             bail!(
                 "a linear DNG is the colour plate of a Bayer sensor; this file is monochrome, write the TIFF"
+            );
+        }
+        // Said before the development, which takes seconds; the DNG writer
+        // asks the same question of the frame afterwards.
+        if frame.xyz_to_cam.is_none() {
+            bail!(
+                "the file carries no colour matrix, so no DNG can name the camera's colour; write the TIFF"
             );
         }
         if a.filter.is_some() {

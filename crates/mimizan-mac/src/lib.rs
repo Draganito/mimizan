@@ -22,7 +22,7 @@ mod tests {
     #[test]
     fn other_systems_decline() {
         assert!(pick_folder().is_none());
-        assert!(pick_save(None, "print.tif").is_none());
+        assert!(pick_save(None, "print.tif", &["tif", "tiff"]).is_none());
         assert!(restore(&[1, 2, 3]).is_none());
         assert!(adopt(std::path::Path::new("/tmp")).is_none());
     }

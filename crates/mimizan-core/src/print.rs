@@ -155,8 +155,9 @@ pub struct PrintInfo {
     /// Black edge in pixels on each side, directly around the picture.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub black_px: usize,
-    /// The picture's top-left corner on the sheet, pixels. Omitted when
-    /// the picture is the whole file.
+    /// The picture's top-left corner on the sheet, pixels. Each coordinate
+    /// is omitted when it is zero, so a picture that is the whole file has
+    /// neither.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub picture_x: usize,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
@@ -353,7 +354,11 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
         neg.bits,
         neg.orientation
     );
-    let need = memory_estimate(fw, fh, neg.orientation, p) * if frames.is_some() { 3 } else { 1 };
+    let need = if frames.is_some() {
+        plate_memory_estimate(fw, fh, neg.orientation, p)
+    } else {
+        memory_estimate(fw, fh, neg.orientation, p)
+    };
     info!("print holds about {} at its widest", memory_text(need));
     if let Some(limit) = budget {
         if need > limit {
@@ -547,8 +552,10 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let (image_w, image_h, out_w, out_h) = match r.size {
         Some(sz) => {
             let (bw, bh) = sz.pixels(r.dpi);
-            // The sheet the picture's way, as `fit_dims` turns its box.
-            let (bw, bh) = if (w > h) != (bw > bh) { (bh, bw) } else { (bw, bh) };
+            // The sheet the picture's way, as `fit_dims` turns its box. A
+            // square picture has no way and a square sheet no turn: both
+            // stay as given.
+            let (bw, bh) = if w != h && bw != bh && (w > h) != (bw > bh) { (bh, bw) } else { (bw, bh) };
             // A frame wider than the paper leaves one pixel of picture.
             let (iw, ih) = fit_dims(w, h, bw.saturating_sub(frame2).max(1), bh.saturating_sub(frame2).max(1));
             (iw, ih, bw.max(iw), bh.max(ih))
@@ -582,9 +589,12 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
 /// Bytes `render_planes` holds at its widest point for a negative of `w×h`
 /// (before orientation): the live f64 planes of the stage that keeps the
 /// most, plus the 16-bit copy the writer makes. The source plane the
-/// caller already owns is not counted. A guide for refusing an export the
-/// machine cannot hold, good to about a fifth; the allocator and the order
-/// in which planes drop are what it does not see.
+/// caller already owns is not counted. When the recipe sharpens, the mask
+/// walks beside the picture through every stage and lies on a sheet of
+/// its own from the framing to the end, so those stages hold two sheets;
+/// the sheet may be far larger than the picture. A guide for refusing an
+/// export the machine cannot hold, good to about a fifth; the allocator
+/// and the order in which planes drop are what it does not see.
 pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
     let r = &p.recipe;
     let lay = layout(w, h, orientation, p);
@@ -604,20 +614,42 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     let resize =
         if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
     // The picture and the sheet it is copied into; a sheet that is the
-    // picture needs no copy.
-    let frame = if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) { m * picture + sheet } else { 0.0 };
+    // picture needs no copy. The mask follows: its sheet is made while the
+    // picture's sheet is already there and the mask is still a picture.
+    let frame = if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) { m * sheet + picture } else { 0.0 };
     // Picture cut out, blur scratch, blur, result; Richardson–Lucy keeps
-    // estimate, blurred, ratio and correction as well.
-    let peak = if r.peak.applies() { sheet + 4.0 * picture } else { 0.0 };
+    // estimate, blurred, ratio and correction as well. The mask's sheet
+    // stays beside the picture's through both.
+    let peak = if r.peak.applies() { m * sheet + 4.0 * picture } else { 0.0 };
     let sharpen = if p.sharpens() && lay.resample_sigma_px > 0.0 {
         let planes = if r.sharpen.deconv_passes() > 0 { 7.0 } else { 5.0 };
-        sheet + planes * picture
+        m * sheet + planes * picture
     } else {
         0.0
     };
     let widest = [orient, resize, frame, peak, sharpen].into_iter().fold(0.0, f64::max);
     let bytes = 8.0 * widest + 2.0 * sheet;
     bytes.min(u64::MAX as f64) as u64
+}
+
+/// Bytes a plate print holds at its widest point, for frames of `w×h`
+/// (before orientation): what `render_plate` really keeps. The three
+/// positives are printed one after the other, so beside one pass at
+/// [`memory_estimate`] lie the two finished sheets and the three source
+/// frames the caller holds for the whole run. The writer then has the
+/// three f64 sheets and their interleaved 16-bit copy, which is the wider
+/// point when the picture is small on its sheet. The CLI and the GUI both
+/// judge a plate export by this figure.
+pub fn plate_memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
+    let lay = layout(w, h, orientation, p);
+    let sheet_px = (lay.out_w as u64).saturating_mul(lay.out_h as u64);
+    let frame = (w as u64).saturating_mul(h as u64).saturating_mul(8);
+    let render = memory_estimate(w, h, orientation, p)
+        .saturating_add(sheet_px.saturating_mul(2 * 8))
+        .saturating_add(frame.saturating_mul(3));
+    // Three sheets of f64 and three 16-bit samples a pixel: 24 + 6 bytes.
+    let write = sheet_px.saturating_mul(3 * 8 + 3 * 2);
+    render.max(write)
 }
 
 /// Bytes as a short figure: `640 MB`, `27.3 GB`.
@@ -1250,6 +1282,76 @@ mod tests {
         assert!(small < 24_000_000 * 8 * 4, "{small}");
         assert_eq!(memory_text(640_000_000), "640 MB");
         assert_eq!(memory_text(27_300_000_000), "27.3 GB");
+    }
+
+    /// A small picture on a large sheet with a masked USM: the mask lies
+    /// on a sheet of its own from the framing on, so the widest stage holds
+    /// two sheets, and the estimate says so.
+    #[test]
+    fn memory_estimate_counts_the_masks_sheet() {
+        // 60x40 px enlarged to 300x200 on a 3000x2000 sheet at 100 dpi:
+        // the sheet is 100 times the picture.
+        let mut recipe = Recipe::on_paper();
+        recipe.size = Some(PrintSize::Physical { width_in: 30.0, height_in: 20.0 });
+        recipe.dpi = 100.0;
+        recipe.border_mm = 9.0 * 25.4;
+        recipe.sharpen = Sharpen::Usm { amount: 1.0 };
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(60, 40, 1, &p);
+        assert_eq!((lay.image_w, lay.image_h, lay.out_w, lay.out_h), (300, 200, 3000, 2000));
+        let sheet = (lay.out_w * lay.out_h) as f64;
+        let need = memory_estimate(60, 40, 1, &p) as f64;
+        // Two f64 sheets plus the 16-bit copy, with the pictures on top.
+        assert!(need >= 8.0 * 2.0 * sheet + 2.0 * sheet, "{need} vs sheet {sheet}");
+        assert!(need < 8.0 * 2.5 * sheet + 2.0 * sheet, "{need} vs sheet {sheet}");
+        // Without sharpening one sheet is held.
+        let mut quiet = p.clone();
+        quiet.recipe.sharpen = Sharpen::Off;
+        let one = memory_estimate(60, 40, 1, &quiet) as f64;
+        assert!(one >= 8.0 * sheet + 2.0 * sheet && one < 8.0 * 1.5 * sheet + 2.0 * sheet, "{one}");
+    }
+
+    /// A plate holds the two finished sheets and the three source frames
+    /// beside one pass; a small picture on a large sheet is bounded by
+    /// the writer's three sheets and their 16-bit copy.
+    #[test]
+    fn plate_memory_estimate_holds_the_other_two_sheets() {
+        let p = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let (w, h) = (6000usize, 4000usize);
+        let one = memory_estimate(w, h, 1, &p);
+        let plate = plate_memory_estimate(w, h, 1, &p);
+        let frame = (w * h * 8) as u64;
+        // Native size: the sheet is the frame.
+        assert_eq!(plate, one + 2 * frame + 3 * frame);
+        let mut big = p.clone();
+        big.recipe.size = Some(PrintSize::Physical { width_in: 30.0, height_in: 20.0 });
+        big.recipe.dpi = 100.0;
+        big.recipe.border_mm = 9.0 * 25.4;
+        let lay = layout(60, 40, 1, &big);
+        let sheet_px = (lay.out_w * lay.out_h) as u64;
+        assert_eq!(plate_memory_estimate(60, 40, 1, &big), sheet_px * 30);
+    }
+
+    /// A square picture has no way to turn the sheet: a landscape sheet
+    /// stays landscape, a portrait one portrait, and the file is the sheet
+    /// as given.
+    #[test]
+    fn a_square_picture_keeps_the_sheet_as_given() {
+        let landscape = sized(PrintSize::Physical { width_in: 4.0, height_in: 3.0 });
+        let lay = layout(500, 500, 1, &landscape);
+        assert_eq!((lay.out_w, lay.out_h), (1200, 900));
+        assert_eq!((lay.image_w, lay.image_h), (900, 900));
+        assert_eq!((lay.picture_x, lay.picture_y), (150, 0));
+        let portrait = sized(PrintSize::Physical { width_in: 3.0, height_in: 4.0 });
+        let lay = layout(500, 500, 1, &portrait);
+        assert_eq!((lay.out_w, lay.out_h), (900, 1200));
+        assert_eq!((lay.picture_x, lay.picture_y), (0, 150));
+        // A square sheet is not turned for anyone.
+        let square = sized(PrintSize::Physical { width_in: 4.0, height_in: 4.0 });
+        assert_eq!(layout(600, 400, 1, &square).out_w, 1200);
+        assert_eq!(layout(400, 600, 1, &square).out_h, 1200);
+        // A sheet of a different ratio still turns the picture's way.
+        assert_eq!(layout(600, 400, 1, &portrait).out_w, 1200);
     }
 
     #[test]

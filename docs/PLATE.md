@@ -99,11 +99,12 @@ the same paper and the same two exposures. Grey therefore stays grey at
 every density (no crossover, by construction, which film never had), and
 saturated colours run towards white in the shoulder and darker in the toe,
 the slide look. The three positives become the three channels of a 16-bit
-RGB TIFF (or JPEG) whose primaries are the projection filters: Adobe RGB
-(1998) by default, since its transfer curve is exactly the gamma 2.2 of the
-paper's encoding and its gamut holds the saturated primaries; sRGB
-primaries on request. The embedded profile is a matrix/TRC profile with the
-D50-adapted colorants. `--lamp R,B` adds stops of exposure to the red and
+RGB TIFF (or JPEG) whose primaries are the projection filters: sRGB by
+default (the standard: a gallery shows the file as it is), or Adobe RGB
+(1998) on request, whose transfer curve is exactly the gamma
+2.2 of the paper's encoding and whose gamut holds the saturated primaries
+better. The embedded profile is a matrix/TRC profile with the D50-adapted
+colorants. `--lamp R,B` adds stops of exposure to the red and
 blue positive, the lamps of the projector; it is the only colour control.
 
 ```bash

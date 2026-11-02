@@ -9,11 +9,24 @@ use std::path::Path;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 use tiff::tags::Tag;
 
-/// Our own files, however large: a three-colour plate of a 47-megapixel
-/// camera is 280 MB of samples, over the decoder's 256 MiB default.
+/// Most bytes of samples one of our files can hold: a print of
+/// [`SHEET_MAX_PX`](crate::recipe::SHEET_MAX_PX) samples with three 16-bit
+/// channels, six gigabytes. A three-colour plate of a 47-megapixel camera
+/// is 280 MB, over the decoder's 256 MiB default, so the default would
+/// refuse our own files; a file that claims more than this is not ours,
+/// and is refused with an error instead of an allocation the machine
+/// cannot make.
+const SAMPLE_BYTES_MAX: usize = crate::recipe::SHEET_MAX_PX.saturating_mul(3 * 2);
+
+/// Open with limits sized for the largest file the program writes. The
+/// IFD limit stays at the decoder's default: our descriptions are a few
+/// kilobytes of JSON.
 fn open(path: &Path) -> Result<Decoder<BufReader<File>>> {
     let f = BufReader::new(File::open(path)?);
-    Ok(Decoder::new(f)?.with_limits(Limits::unlimited()))
+    let mut limits = Limits::default();
+    limits.decoding_buffer_size = SAMPLE_BYTES_MAX;
+    limits.intermediate_buffer_size = SAMPLE_BYTES_MAX;
+    Ok(Decoder::new(f)?.with_limits(limits))
 }
 
 /// A grey TIFF as read: pixels, description, and the two tags the print

@@ -26,7 +26,7 @@ pub fn pick_folder() -> Option<FolderGrant> {
     None
 }
 
-pub fn pick_save(_directory: Option<&Path>, _file_name: &str) -> Option<PathBuf> {
+pub fn pick_save(_directory: Option<&Path>, _file_name: &str, _extensions: &[&str]) -> Option<PathBuf> {
     None
 }
 

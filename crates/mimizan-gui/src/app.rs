@@ -9,8 +9,8 @@ use crate::edit::{Edit, History};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::session::{DetailAsk, DevelopParams, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
-    available_memory, develop_memory, Event, Heavy, Job, Loupe, LoupeRequest, LoupeResult, PeakMeasure,
-    PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
+    available_memory, develop_memory, develop_memory_of_size, memory_fits, Event, Heavy, Job, Loupe,
+    LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
 };
 use crate::zone_bar::zone_bar;
 use egui::{
@@ -22,13 +22,6 @@ use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{memory_estimate, memory_text, peak_print_radius, PrintSize, LAMP_LIMIT};
-
-/// Which side of the sheet the user typed. The other follows the picture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SheetSide {
-    Width,
-    Height,
-}
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
@@ -36,6 +29,13 @@ use mimizan_core::tone::Tone;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Which side of the sheet the user typed. The other follows the picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SheetSide {
+    Width,
+    Height,
+}
 
 /// US darkroom paper, as a ratio. The long side follows the picture until
 /// the ratio is turned.
@@ -331,6 +331,16 @@ struct StageDress {
     cross: Option<[f64; 2]>,
 }
 
+/// What is kept of a session let go for room: enough for the recipe
+/// question and the sidecar's name while the picture is still on the
+/// stage and the edit is still its edit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Released {
+    path: PathBuf,
+    /// A monochrome sensor: the recipe file carries no mix and no plate.
+    mono: bool,
+}
+
 /// The taking filters resolved for one session, one plate choice and one
 /// base mix, so the resolution runs when those change, not every frame.
 struct PlateResolved {
@@ -353,10 +363,85 @@ fn space_name(space: PlateSpace) -> &'static str {
 }
 
 /// Whether a development of `need` bytes must have the current session's
-/// memory first: it does not fit in `available` with a third to spare.
-/// Unknown free memory (0) never releases anything.
+/// memory first: it does not fit in `available` with the worker's headroom
+/// to spare. `available` is what is free now, with the current session's
+/// planes already taken out of it, so the session's own size is not added
+/// to `need`. Unknown free memory (0) never releases anything.
 fn must_make_room(need: u64, available: u64) -> bool {
-    available != 0 && need as f64 > available as f64 / 1.3
+    !memory_fits(need, available)
+}
+
+/// A sheet of whole pixels at `dpi`, in inches as the recipe holds it.
+fn sheet_px(bw: f64, bh: f64, dpi: f64) -> PrintSize {
+    PrintSize::Physical { width_in: bw / dpi, height_in: bh / dpi }
+}
+
+/// The sheet that is a `uw`×`uh` picture plus `frame` pixels of rings on
+/// every side, at `dpi`. `layout` gives these pixels back exactly. Absent
+/// without a picture or a dpi.
+fn sheet_of_pixels_at(uw: usize, uh: usize, frame: usize, dpi: f64) -> Option<PrintSize> {
+    if uw == 0 || uh == 0 || dpi <= 0.0 {
+        return None;
+    }
+    Some(sheet_px((uw + 2 * frame) as f64, (uh + 2 * frame) as f64, dpi))
+}
+
+/// The sheet whose `side` is `typed` centimetres, to the nearest pixel at
+/// `dpi`; the other side follows the picture's proportion, so the sheet
+/// is always the crop's shape. Absent without a picture or a dpi.
+fn sheet_for_side(uw: usize, uh: usize, dpi: f64, typed_cm: f64, side: SheetSide) -> Option<PrintSize> {
+    if uw == 0 || uh == 0 || dpi <= 0.0 {
+        return None;
+    }
+    let typed_px = (typed_cm / 2.54 * dpi).round().max(1.0);
+    let (bw, bh) = match side {
+        SheetSide::Width => (typed_px, (typed_px * uh as f64 / uw as f64).round().max(1.0)),
+        SheetSide::Height => ((typed_px * uw as f64 / uh as f64).round().max(1.0), typed_px),
+    };
+    Some(sheet_px(bw, bh, dpi))
+}
+
+/// `sheet` in the proportion of a `uw`×`uh` picture, its long side held:
+/// the long side goes where the picture's long side is, the short side is
+/// that times the picture's ratio. Absent without a picture or a dpi.
+fn sheet_following(sheet: PrintSize, uw: usize, uh: usize, dpi: f64) -> Option<PrintSize> {
+    let PrintSize::Physical { width_in, height_in } = sheet;
+    if uw == 0 || uh == 0 || dpi <= 0.0 {
+        return None;
+    }
+    let long_px = (width_in.max(height_in) * dpi).round().max(1.0);
+    let short_px = (long_px * uw.min(uh) as f64 / uw.max(uh) as f64).round().max(1.0);
+    let (bw, bh) = if uw >= uh { (long_px, short_px) } else { (short_px, long_px) };
+    Some(sheet_px(bw, bh, dpi))
+}
+
+/// `sheet` with the pixels it had at `dpi_before` kept at `dpi`: the px
+/// ruler's rule when the dpi moves.
+fn sheet_keeping_pixels(sheet: PrintSize, dpi_before: f64, dpi: f64) -> PrintSize {
+    let (bw, bh) = sheet.pixels(dpi_before);
+    sheet_px(bw as f64, bh as f64, dpi)
+}
+
+/// Millimetres that are `px` whole pixels at `dpi`; `Recipe::mm_px`
+/// rounds them back to `px`.
+fn mm_of_pixels(px: usize, dpi: f64) -> f64 {
+    px as f64 / dpi * 25.4
+}
+
+/// Whether a development that landed is another file than the edit's:
+/// the session held, else the one let go for room (`make_room`), else
+/// nothing was open. The same file developed again keeps its edit and
+/// its history.
+fn opened_is_fresh(held: Option<&Path>, released: Option<&Path>, opened: &Path) -> bool {
+    held.or(released).is_none_or(|before| before != opened)
+}
+
+/// Bytes the development of the file about to open will hold: from its
+/// size when the strip has read it, else the current session's own, the
+/// next file being most often from the same camera. Nothing to go by
+/// without either.
+fn opening_memory(target: Option<(usize, usize)>, current: Option<u64>) -> Option<u64> {
+    target.map(|(w, h)| develop_memory_of_size(w, h)).or(current)
 }
 
 /// The print box has a newer exposure than the picture on screen.
@@ -383,10 +468,11 @@ pub struct App {
     preview: Preview,
     thumbs: Thumbs,
     session: Option<Arc<Session>>,
-    /// Path of a session let go to make room for the development under
-    /// way (`make_room`). The picture stays on screen as its texture; the
-    /// result decides whether it was the same file.
-    released: Option<PathBuf>,
+    /// A session let go to make room for the development under way
+    /// (`make_room`). The picture stays on screen as its texture, and the
+    /// recipe is still its recipe until the result lands; the result
+    /// decides whether it was the same file.
+    released: Option<Released>,
     /// "Apply" was pressed: the re-development starts with the next frame.
     redevelop: Option<DevelopParams>,
 
@@ -987,14 +1073,7 @@ impl App {
     /// back exactly. Absent until a file is open.
     fn sheet_of_pixels(&self, frame: usize) -> Option<PrintSize> {
         let (uw, uh) = self.picture_size();
-        let dpi = self.edit.recipe.dpi;
-        if uw == 0 || uh == 0 || dpi <= 0.0 {
-            return None;
-        }
-        Some(PrintSize::Physical {
-            width_in: (uw + 2 * frame) as f64 / dpi,
-            height_in: (uh + 2 * frame) as f64 / dpi,
-        })
+        sheet_of_pixels_at(uw, uh, frame, self.edit.recipe.dpi)
     }
 
     /// 1:1: the sheet is the picture's pixels, no border, no black edge, no
@@ -1041,20 +1120,13 @@ impl App {
     /// sides. Then show the sheet the file has.
     fn apply_sheet(&mut self, side: SheetSide) {
         let (uw, uh) = self.picture_size();
-        let dpi = self.edit.recipe.dpi;
-        if uw == 0 || uh == 0 || dpi <= 0.0 {
-            return;
-        }
         let typed = match side {
             SheetSide::Width => self.sheet_cm[0],
             SheetSide::Height => self.sheet_cm[1],
         };
-        let typed_px = (typed / 2.54 * dpi).round().max(1.0);
-        let (bw, bh) = match side {
-            SheetSide::Width => (typed_px, (typed_px * uh as f64 / uw as f64).round().max(1.0)),
-            SheetSide::Height => ((typed_px * uw as f64 / uh as f64).round().max(1.0), typed_px),
-        };
-        self.edit.recipe.size = Some(PrintSize::Physical { width_in: bw / dpi, height_in: bh / dpi });
+        if let Some(sheet) = sheet_for_side(uw, uh, self.edit.recipe.dpi, typed, side) {
+            self.edit.recipe.size = Some(sheet);
+        }
         self.show_sheet();
     }
 
@@ -1070,12 +1142,10 @@ impl App {
         }
         if self.ruler == Ruler::Pixels {
             let (border_px, black_px) = rings_before;
-            self.edit.recipe.border_mm = border_px as f64 / dpi * 25.4;
-            self.edit.recipe.black_mm = black_px as f64 / dpi * 25.4;
+            self.edit.recipe.border_mm = mm_of_pixels(border_px, dpi);
+            self.edit.recipe.black_mm = mm_of_pixels(black_px, dpi);
             if let Some(sheet) = self.edit.recipe.size {
-                let (bw, bh) = sheet.pixels(dpi_before);
-                self.edit.recipe.size =
-                    Some(PrintSize::Physical { width_in: bw as f64 / dpi, height_in: bh as f64 / dpi });
+                self.edit.recipe.size = Some(sheet_keeping_pixels(sheet, dpi_before, dpi));
             }
         }
         self.show_sheet();
@@ -1336,6 +1406,14 @@ impl App {
         self.held_dress.unwrap_or_else(|| self.dress())
     }
 
+    /// Whether the texture on the stage is this session's picture: no
+    /// dress is held over a previous file's pixels, and the preview that
+    /// was shown last came from this session.
+    fn stage_shows_session(&self) -> bool {
+        let Some(s) = &self.session else { return false };
+        self.held_dress.is_none() && self.shown_picture.as_ref().is_some_and(|p| p.session == s.id)
+    }
+
     /// Another file is about to take the edit while this one's picture
     /// stays on the stage: keep its dress until the new picture lands. A
     /// third file opened before that keeps the dress already held; the
@@ -1444,15 +1522,10 @@ impl App {
     /// times the picture's ratio.
     fn sheet_follows_crop(&mut self) {
         let (uw, uh) = self.picture_size();
-        let dpi = self.edit.recipe.dpi;
-        let Some(PrintSize::Physical { width_in, height_in }) = self.edit.recipe.size else { return };
-        if uw == 0 || uh == 0 || dpi <= 0.0 {
-            return;
+        let Some(sheet) = self.edit.recipe.size else { return };
+        if let Some(followed) = sheet_following(sheet, uw, uh, self.edit.recipe.dpi) {
+            self.edit.recipe.size = Some(followed);
         }
-        let long_px = (width_in.max(height_in) * dpi).round().max(1.0);
-        let short_px = (long_px * uw.min(uh) as f64 / uw.max(uh) as f64).round().max(1.0);
-        let (bw, bh) = if uw >= uh { (long_px, short_px) } else { (short_px, long_px) };
-        self.edit.recipe.size = Some(PrintSize::Physical { width_in: bw / dpi, height_in: bh / dpi });
         self.show_sheet();
     }
 
@@ -1584,8 +1657,11 @@ impl App {
     fn save_with_panel(&mut self, name: &str) -> bool {
         #[cfg(target_os = "macos")]
         if sandboxed() {
-            if let Some(path) = mimizan_mac::pick_save(self.export_directory().as_deref(), name) {
-                self.export_to(path);
+            // The panel appends the extension itself, so the path it hands
+            // back is written as it is: the grant is for that path alone.
+            let extensions = export_extensions(self.export_kind, self.linear_is_dng());
+            if let Some(path) = mimizan_mac::pick_save(self.export_directory().as_deref(), name, extensions) {
+                self.export_to(path, true);
             }
             return true;
         }
@@ -1594,11 +1670,28 @@ impl App {
         false
     }
 
-    fn export_to(&mut self, path: PathBuf) {
+    /// Start the export to `path`. `granted` is a path from the system
+    /// save panel: it is written as it is, extension and all, because the
+    /// sandbox allows that file and no other. The egui dialog's path gets
+    /// the extension it may lack.
+    fn export_to(&mut self, path: PathBuf, granted: bool) {
+        if self.session.is_none() {
+            return;
+        }
+        // The linear negative writes its mask beside it, a file no dialog
+        // named. The sandbox allows that only inside the folder grant.
+        if self.export_kind == ExportKind::Linear && !self.linear_is_dng() && !self.may_write_beside(&path) {
+            self.log(format!(
+                "the mask beside {} may not be written there: the program has no right to that folder, \
+                 only to the file named. Save inside the folder opened through Open for the mask",
+                path.display()
+            ));
+        }
+        let extensions = export_extensions(self.export_kind, self.linear_is_dng());
+        let path = if granted { path } else { with_ext(path, extensions) };
         let Some(s) = &self.session else { return };
         match self.export_kind {
             ExportKind::Print => {
-                let path = with_ext(path, "tif");
                 self.busy = Some("exporting".into());
                 self.heavy.send(Job::Export {
                     session: Arc::clone(s),
@@ -1611,7 +1704,6 @@ impl App {
             }
             ExportKind::Linear => {
                 let plate = self.linear_is_dng();
-                let path = with_ext(path, if plate { "dng" } else { "tif" });
                 self.busy = Some("exporting".into());
                 self.heavy.send(Job::ExportLinear {
                     session: Arc::clone(s),
@@ -1659,7 +1751,17 @@ impl App {
             }
         }
         self.current_path = Some(path.clone());
-        self.make_room();
+        // The size the strip read for this file, when it has.
+        let target = self
+            .folder
+            .as_ref()
+            .and_then(|f| f.entries.iter().find(|e| e.path == path))
+            .and_then(|e| e.meta.as_ref())
+            .map(|m| (m.width, m.height));
+        let current = self.session.as_ref().map(|s| develop_memory(&s.frame));
+        if let Some(need) = opening_memory(target, current) {
+            self.make_room(need);
+        }
         self.heavy.send(Job::Open {
             path,
             develop: self.develop_params(),
@@ -1667,27 +1769,66 @@ impl App {
         });
     }
 
-    /// Let the session go before a development when the two would not fit
-    /// in free memory together. The next file is most often from the same
-    /// camera, so the measure is this session's own development; the
-    /// worker checks the real frame once it is decoded. The picture stays
-    /// on screen as its texture until the new one arrives; the `Opened`
+    /// Let the session go before a development of `need` bytes when that
+    /// would not fit in the free memory beside it. The worker checks the
+    /// real frame once it is decoded, and sends the job back if it still
+    /// does not fit (`Event::Refused`). The picture stays on screen as its
+    /// texture, dressed as it was, until the new one arrives; the `Opened`
     /// event finds the path in `released`.
-    fn make_room(&mut self) {
-        let Some(s) = self.session.as_ref() else { return };
-        let (need, path) = (develop_memory(&s.frame), s.path.clone());
+    fn make_room(&mut self, need: u64) {
+        if self.session.is_none() {
+            return;
+        }
         let available = available_memory();
         if !must_make_room(need, available) {
             return;
         }
-        let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-        self.log(format!(
-            "{name} let go to make room: a development holds about {}, {} is free",
+        self.release_session(format!(
+            "to make room: a development holds about {}, {} is free",
             memory_text(need),
             memory_text(available)
         ));
-        self.released = Some(path);
+    }
+
+    /// Drop the session so its planes are freed, keeping its picture on
+    /// the stage with the rings and the crosshair it has now. `why`
+    /// completes "<file> let go ". A peak measurement still running holds
+    /// a clone of the session until it ends, so the memory is not back
+    /// before that; the log says so instead of claiming it.
+    fn release_session(&mut self, why: String) {
+        let Some(s) = self.session.as_ref() else { return };
+        let (path, mono) = (s.path.clone(), s.is_mono());
+        let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        if self.peak_measure.is_some() {
+            self.log(format!(
+                "{name} let go {why}; the sharpening measurement still holds it until it finishes"
+            ));
+        } else {
+            self.log(format!("{name} let go {why}"));
+        }
+        // The dress first, while the session can still measure the rings.
+        self.hold_dress();
+        self.released = Some(Released { path, mono });
         self.session = None;
+    }
+
+    /// The file the edit belongs to: the session's, or the one let go for
+    /// room while its development is under way.
+    fn developed_path(&self) -> Option<&Path> {
+        match (&self.session, &self.released) {
+            (Some(s), _) => Some(&s.path),
+            (None, Some(r)) => Some(&r.path),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether the file the edit belongs to is a monochrome sensor.
+    fn developed_is_mono(&self) -> bool {
+        match (&self.session, &self.released) {
+            (Some(s), _) => s.is_mono(),
+            (None, Some(r)) => r.mono,
+            (None, None) => false,
+        }
     }
 
     /// The re-development "Apply" asked for, sent now that no panel holds
@@ -1698,8 +1839,43 @@ impl App {
             self.busy = None;
             return;
         };
-        self.make_room();
+        let need = develop_memory(&source.frame);
+        self.make_room(need);
         self.heavy.send(Job::Redevelop { source, develop });
+    }
+
+    /// The worker could not hold the development. With the session still
+    /// here its planes are what stands in the way: let it go and send the
+    /// job once more. Already gone, there is nothing left to free, and the
+    /// message is the answer.
+    fn retry_refused(&mut self, job: Box<Job>, message: String) {
+        if self.session.is_some() && job.developed_path().is_some() {
+            self.release_session("after the worker refused: ".to_string() + &message);
+            let name = job
+                .developed_path()
+                .and_then(|p| p.file_name())
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.busy = Some(format!("opening {name} again"));
+            self.heavy.send(*job);
+            return;
+        }
+        // Nothing of this program's is left to free.
+        self.log(format!("error: {message}. Close other programs and open it again"));
+        self.busy = None;
+        self.picture_gone_if_released();
+        self.current_path = self.session.as_ref().map(|s| s.path.clone());
+    }
+
+    /// A picture let go for room is gone with its texture once the job it
+    /// made room for has failed.
+    fn picture_gone_if_released(&mut self) {
+        if self.released.take().is_some() {
+            self.texture = None;
+            self.detail_texture = None;
+            self.detail_rect = None;
+            self.held_dress = None;
+        }
     }
 
     /// Controls back to the session's defaults; the negative stays. A new
@@ -1718,6 +1894,9 @@ impl App {
         self.set_edit(e);
         if fresh {
             self.history = History::new(self.edit.clone());
+            // A pipette armed on the previous file is not meant for this one.
+            self.pick_card = false;
+            self.card_status = None;
         }
         // The baseline stays the recipe the file was opened with. Reset is a
         // different development, so closing or opening another file still asks.
@@ -1741,9 +1920,9 @@ impl App {
 
     /// Recipe file next to the RAW: `<name>.recipe.json`.
     fn recipe_sidecar(&self) -> Option<PathBuf> {
-        let s = self.session.as_ref()?;
-        let stem = s.path.file_stem()?.to_string_lossy().to_string();
-        Some(s.path.with_file_name(format!("{stem}.recipe.json")))
+        let path = self.developed_path()?;
+        let stem = path.file_stem()?.to_string_lossy().to_string();
+        Some(path.with_file_name(format!("{stem}.recipe.json")))
     }
 
     /// Read a recipe file into the edit. The sharpening mode stays off (the
@@ -1781,7 +1960,7 @@ impl App {
 
     /// The recipe as the file beside the RAW gets it: print, mix, plate.
     fn recipe_for_file(&self) -> Recipe {
-        let bayer = self.session.as_ref().is_some_and(|s| !s.is_mono());
+        let bayer = self.developed_path().is_some() && !self.developed_is_mono();
         self.edit.recipe_for_file(bayer)
     }
 
@@ -1794,13 +1973,40 @@ impl App {
                     self.recipe_baseline = r;
                 }
             }
+            // The last log line is on the toolbar: a refused write says
+            // where and why, not only that it failed. On a sandboxed Mac
+            // a RAW dropped or opened on its own brings no right to its
+            // folder; the Open button does.
+            Err(mimizan_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                self.log(format!(
+                    "recipe not saved: no permission to write in {}{}",
+                    path.parent().unwrap_or(path).display(),
+                    if sandboxed() { " (open the folder through Open to allow it)" } else { "" }
+                ));
+            }
             Err(e) => self.log(format!("recipe not saved: {e}")),
         }
     }
 
+    /// Whether the program may write beside the file: inside the sandbox
+    /// only within the folder grant; elsewhere always, as far as this can
+    /// tell without trying.
+    fn may_write_beside(&self, path: &Path) -> bool {
+        match self.grant_root() {
+            Some(root) => path.starts_with(&root),
+            None => !sandboxed(),
+        }
+    }
+
+    /// A session let go for room still has its recipe on the edit, so the
+    /// question is asked for it as for one that is held.
     fn should_ask_to_save(&self) -> bool {
         self.screenshot_to.is_none()
-            && recipe_needs_saving(self.session.is_some(), &self.recipe_for_file(), &self.recipe_baseline)
+            && recipe_needs_saving(
+                self.developed_path().is_some(),
+                &self.recipe_for_file(),
+                &self.recipe_baseline,
+            )
     }
 
     /// The window was asked to close. A changed recipe stays until the
@@ -1854,12 +2060,22 @@ impl App {
             Leave::Open(_) => "before opening another negative",
         };
         let mut choice = None;
+        // Inside the sandbox a RAW that came on its own has no folder the
+        // program may write in: the button says so instead of failing.
+        let writable = self.recipe_sidecar().is_some_and(|p| self.may_write_beside(&p));
         egui::Modal::new(egui::Id::new("save_recipe")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.label(format!("Save the recipe next to the RAW {when}?"));
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if ui
+                    .add_enabled(writable, egui::Button::new("Save"))
+                    .on_disabled_hover_text(
+                        "The program may not write in this file's folder. Open the folder through \
+                         Open, then save.",
+                    )
+                    .clicked()
+                {
                     choice = Some(SaveChoice::Save);
                 }
                 if ui.button("Don't save").clicked() {
@@ -1883,8 +2099,12 @@ impl App {
             match ev {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
-                    let before = self.session.as_ref().map(|old| old.path.clone()).or(self.released.take());
-                    let fresh = before.is_none_or(|old| old != s.path);
+                    let released = self.released.take();
+                    let fresh = opened_is_fresh(
+                        self.session.as_ref().map(|old| old.path.as_path()),
+                        released.as_ref().map(|r| r.path.as_path()),
+                        &s.path,
+                    );
                     if fresh {
                         // Before the session and the edit are the new file's:
                         // the rings are measured against the old session's size.
@@ -1967,18 +2187,14 @@ impl App {
                     self.log(format!("wrote {} ({width}x{height}) in {ms} ms", tiff.display()));
                     self.busy = None;
                 }
+                Event::Refused { job, message } => self.retry_refused(job, message),
                 Event::Failed(e) => {
                     self.log(format!("error: {e}"));
                     self.busy = None;
                     // A failed open leaves the previous picture on the stage;
                     // the strip must point at that one, not at the failure.
                     // A picture let go for room is gone with its texture.
-                    if self.released.take().is_some() {
-                        self.texture = None;
-                        self.detail_texture = None;
-                        self.detail_rect = None;
-                        self.held_dress = None;
-                    }
+                    self.picture_gone_if_released();
                     self.current_path = self.session.as_ref().map(|s| s.path.clone());
                 }
             }
@@ -2266,7 +2482,7 @@ impl App {
     fn handle_dialog(&mut self, ctx: &egui::Context) {
         self.dialog.update(ctx);
         let Some(path) = self.dialog.take_picked() else { return };
-        self.export_to(path);
+        self.export_to(path, false);
     }
 
     /// Three always-visible groups. The windows sit on the left, the picture
@@ -3354,7 +3570,7 @@ impl App {
         // the file is still that.
         let has_file = self.session.is_some();
         let one_to_one_now = self.is_one_to_one();
-        let one_to_one = ui
+        let (one_to_one, ruler_changed) = ui
             .horizontal(|ui| {
                 print_field_label(ui, "size");
                 let one = ui
@@ -3368,20 +3584,32 @@ impl App {
                 // The ruler, at the right of the same row: the unit every
                 // length below is shown and typed in. The recipe keeps inches
                 // and millimetres whichever is chosen.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for r in Ruler::ALL.iter().rev() {
-                        ui.selectable_value(&mut self.ruler, *r, r.name()).on_hover_text(match r {
-                            Ruler::Metric => {
-                                "Centimetres for the sheet, millimetres for the border and the black edge"
-                            }
-                            Ruler::Imperial => "Inches",
-                            Ruler::Pixels => "Pixels of the file, at the dpi below",
-                        });
-                    }
-                });
-                one
+                let ruler_changed = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut changed = false;
+                        for r in Ruler::ALL.iter().rev() {
+                            let response = ui
+                                .selectable_value(&mut self.ruler, *r, r.name())
+                                .on_hover_text(match r {
+                                Ruler::Metric => {
+                                    "Centimetres for the sheet, millimetres for the border and the black edge"
+                                }
+                                Ruler::Imperial => "Inches",
+                                Ruler::Pixels => "Pixels of the file, at the dpi below",
+                            });
+                            changed |= response.changed();
+                        }
+                        changed
+                    })
+                    .inner;
+                (one, ruler_changed)
             })
             .inner;
+        if ruler_changed {
+            // The ruler is a setting of the program, not of the recipe: it
+            // is written down as soon as it is switched.
+            self.persist();
+        }
         if one_to_one {
             self.set_one_to_one();
         }
@@ -3533,16 +3761,13 @@ impl App {
             return None;
         }
         let params = mimizan_core::print::PrintParams { recipe: self.print_recipe(), ..Default::default() };
-        let one = memory_estimate(w, h, 1, &params);
         if self.plate_view().is_none() {
-            return Some(one);
+            return Some(memory_estimate(w, h, 1, &params));
         }
         // A plate holds its three mixed planes while one of them is
-        // printed, and the finished positives beside the third.
-        let lay = mimizan_core::print::layout(w, h, 1, &params);
-        let plane = (w as u64).saturating_mul(h as u64).saturating_mul(8);
-        let sheet = (lay.out_w as u64).saturating_mul(lay.out_h as u64).saturating_mul(8);
-        Some(one.saturating_add(plane.saturating_mul(2)).saturating_add(sheet.saturating_mul(2)))
+        // printed, and the finished positives beside the third: the same
+        // figure the command refuses by.
+        Some(mimizan_core::print::plate_memory_estimate(w, h, 1, &params))
     }
 
     /// Whether the export may start. A print that fits in free memory
@@ -3756,17 +3981,26 @@ impl App {
                  it as a RAW of this camera; the colour is band-limited to the carriers under the full \
                  luminance."
             )
-        } else if s.is_mono() {
-            format!(
-                "Writes the negative for another program, no print{rot}{crop}:\n\
-                 <name>.tif  {w} x {h} px, 16 bit linear grey, the mask beside it as <name>.mask.tif"
-            )
         } else {
-            format!(
-                "Writes the mixed negative for another program, no print{rot}{crop}:\n\
-                 <name>.tif  {w} x {h} px, 16 bit linear grey (the mix as it stands, weights in the \
-                 description), the mask beside it as <name>.mask.tif"
-            )
+            // The mask is a second file no dialog names; the sandbox writes
+            // it only inside the folder grant.
+            let mask = if sandboxed() {
+                " (inside the folder opened through Open; elsewhere the sandbox allows only the file named)"
+            } else {
+                ""
+            };
+            if s.is_mono() {
+                format!(
+                    "Writes the negative for another program, no print{rot}{crop}:\n\
+                     <name>.tif  {w} x {h} px, 16 bit linear grey, the mask beside it as <name>.mask.tif{mask}"
+                )
+            } else {
+                format!(
+                    "Writes the mixed negative for another program, no print{rot}{crop}:\n\
+                     <name>.tif  {w} x {h} px, 16 bit linear grey (the mix as it stands, weights in the \
+                     description), the mask beside it as <name>.mask.tif{mask}"
+                )
+            }
         }
     }
 
@@ -4101,11 +4335,14 @@ impl App {
             self.show_strip = false;
         }
         // A grey card is read where the picture is clicked while `card` is
-        // armed. Esc puts the pipette down.
+        // armed. Esc puts the pipette down. A click lands only while the
+        // pixels on the stage are the session's: between a file opening
+        // and its first preview the stage still shows the previous one,
+        // and the spot clicked there is not a spot of the new negative.
         if self.pick_card {
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.pick_card = false;
-            } else if clicked_on_picture {
+            } else if clicked_on_picture && self.stage_shows_session() {
                 if let Some(ptr) = response.interact_pointer_pos() {
                     let nx = ((ptr.x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64;
                     let ny = ((ptr.y - rect.top()) / rect.height()).clamp(0.0, 1.0) as f64;
@@ -4434,13 +4671,25 @@ fn start_folder() -> Option<PathBuf> {
         .filter(|p| p.is_dir())
 }
 
-fn with_ext(p: PathBuf, ext: &str) -> PathBuf {
-    let alias = ext == "tif";
-    if p.extension().is_some_and(|e| e.eq_ignore_ascii_case(ext) || (alias && e.eq_ignore_ascii_case("tiff")))
-    {
+/// The file extensions an export may carry: the first is the one given
+/// to a name that has none, the rest are accepted as they are. The print
+/// and the linear negative are TIFFs under either spelling; the linear
+/// plate is a DNG and nothing else.
+fn export_extensions(kind: ExportKind, dng: bool) -> &'static [&'static str] {
+    match (kind, dng) {
+        (ExportKind::Linear, true) => &["dng"],
+        _ => &["tif", "tiff"],
+    }
+}
+
+/// `p` with one of `allowed` as its extension: kept when it has one of
+/// them already (in any case), else given the first.
+fn with_ext(p: PathBuf, allowed: &[&str]) -> PathBuf {
+    let Some(first) = allowed.first() else { return p };
+    if p.extension().is_some_and(|e| allowed.iter().any(|a| e.eq_ignore_ascii_case(a))) {
         p
     } else {
-        p.with_extension(ext)
+        p.with_extension(first)
     }
 }
 
@@ -5238,11 +5487,9 @@ fn panel_heading(ui: &mut egui::Ui, title: &str) -> bool {
     hide
 }
 
-/// Left column of the print dock. Wide enough for the longest word, so
-/// dpi, border and resample start their numbers on the same line.
 /// What a length field holds underneath: the recipe's centimetres (the
 /// picture) or millimetres (the rings).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Base {
     Cm,
     Mm,
@@ -5254,6 +5501,17 @@ impl Base {
             Base::Cm => 2.54,
             Base::Mm => 25.4,
         }
+    }
+}
+
+/// Shown = held × factor: from a length held in `base` to the ruler's
+/// unit, through `dpi` for pixels. Dividing by it takes a typed length
+/// back; a dpi below 1 counts as 1, so the factor is never 0.
+fn ruler_factor(ruler: Ruler, base: Base, dpi: f64) -> f64 {
+    match ruler {
+        Ruler::Metric => 1.0,
+        Ruler::Imperial => 1.0 / base.per_inch(),
+        Ruler::Pixels => dpi.max(1.0) / base.per_inch(),
     }
 }
 
@@ -5270,11 +5528,7 @@ fn length_field(
     range: std::ops::RangeInclusive<f64>,
     enabled: bool,
 ) -> egui::Response {
-    let k = match ruler {
-        Ruler::Metric => 1.0,
-        Ruler::Imperial => 1.0 / base.per_inch(),
-        Ruler::Pixels => dpi.max(1.0) / base.per_inch(),
-    };
+    let k = ruler_factor(ruler, base, dpi);
     let (decimals, speed, suffix) = match (ruler, base) {
         (Ruler::Metric, Base::Cm) => (1, 0.1, " cm"),
         (Ruler::Metric, Base::Mm) => (1, 0.2, " mm"),
@@ -5304,6 +5558,8 @@ fn length_field(
     response
 }
 
+/// Left column of the print dock. Wide enough for the longest word, so
+/// dpi, border and resample start their numbers on the same line.
 fn print_field_label(ui: &mut egui::Ui, text: &str) {
     let font = egui::TextStyle::Body.resolve(ui.style());
     let width = ui.painter().layout_no_wrap("resample".to_owned(), font.clone(), Color32::WHITE).size().x;
@@ -5659,7 +5915,9 @@ impl App {
 
 #[cfg(test)]
 mod path_tests {
-    use super::{crumb_label, toolbar_gaps, without_verbatim_prefix};
+    use super::{
+        crumb_label, export_extensions, toolbar_gaps, with_ext, without_verbatim_prefix, ExportKind,
+    };
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -5692,15 +5950,153 @@ mod path_tests {
     fn a_narrow_bar_keeps_a_short_gap() {
         assert_eq!(toolbar_gaps(400.0, 300.0, 340.0, 150.0), (8.0, 8.0));
     }
+
+    #[test]
+    fn an_export_name_gets_its_kind_of_extension() {
+        let tiff = export_extensions(ExportKind::Print, false);
+        let negative = export_extensions(ExportKind::Linear, false);
+        let dng = export_extensions(ExportKind::Linear, true);
+        // Either spelling of TIFF stands, in any case; a name without one
+        // gets the first; a DNG accepts no TIFF and a TIFF no DNG.
+        assert_eq!(with_ext(PathBuf::from("print.TIFF"), tiff), PathBuf::from("print.TIFF"));
+        assert_eq!(with_ext(PathBuf::from("print.tif"), tiff), PathBuf::from("print.tif"));
+        assert_eq!(with_ext(PathBuf::from("print"), tiff), PathBuf::from("print.tif"));
+        assert_eq!(with_ext(PathBuf::from("print.dng"), tiff), PathBuf::from("print.tif"));
+        assert_eq!(with_ext(PathBuf::from("neg.tiff"), negative), PathBuf::from("neg.tiff"));
+        assert_eq!(with_ext(PathBuf::from("plate.tiff"), dng), PathBuf::from("plate.dng"));
+        assert_eq!(with_ext(PathBuf::from("plate.DNG"), dng), PathBuf::from("plate.DNG"));
+        assert_eq!(with_ext(PathBuf::from("plate"), dng), PathBuf::from("plate.dng"));
+        // The first of each list is what the save panel appends.
+        assert_eq!((tiff[0], negative[0], dng[0]), ("tif", "tif", "dng"));
+    }
+}
+
+#[cfg(test)]
+mod sheet_tests {
+    use super::{
+        mm_of_pixels, ruler_factor, sheet_following, sheet_for_side, sheet_keeping_pixels,
+        sheet_of_pixels_at, Base, SheetSide,
+    };
+    use crate::browser::Ruler;
+    use mimizan_core::print::PrintSize;
+    use mimizan_core::recipe::Recipe;
+
+    fn px(sheet: PrintSize, dpi: f64) -> (usize, usize) {
+        sheet.pixels(dpi)
+    }
+
+    /// 1:1 is a fixed point: the sheet made of the picture's pixels gives
+    /// those pixels back at every dpi the field allows, with and without
+    /// a ring taken from inside.
+    #[test]
+    fn the_sheet_of_the_pixels_is_the_pixels() {
+        for &(uw, uh) in &[(6048usize, 4032usize), (4032, 6048), (1, 1), (6001, 3999), (9504, 6336)] {
+            for dpi in [36.0, 72.0, 150.0, 254.0, 300.0, 299.7, 600.0, 1200.0] {
+                let sheet = sheet_of_pixels_at(uw, uh, 0, dpi).unwrap();
+                assert_eq!(px(sheet, dpi), (uw, uh), "{uw}x{uh} at {dpi}");
+                let framed = sheet_of_pixels_at(uw, uh, 207, dpi).unwrap();
+                assert_eq!(px(framed, dpi), (uw + 414, uh + 414), "{uw}x{uh} at {dpi} framed");
+            }
+        }
+        assert_eq!(sheet_of_pixels_at(0, 4032, 0, 300.0), None);
+        assert_eq!(sheet_of_pixels_at(6048, 4032, 0, 0.0), None);
+    }
+
+    /// Type one side: that side is exact to the pixel, the other is in the
+    /// picture's proportion, and the fields read back what was typed.
+    #[test]
+    fn a_typed_side_stands_and_the_other_follows_the_picture() {
+        let (uw, uh, dpi) = (6048usize, 4032usize, 300.0);
+        let wide = sheet_for_side(uw, uh, dpi, 30.0, SheetSide::Width).unwrap();
+        let (bw, bh) = px(wide, dpi);
+        assert_eq!(bw, (30.0 / 2.54 * 300.0_f64).round() as usize);
+        assert_eq!(bh, (bw as f64 * 4032.0 / 6048.0).round() as usize);
+        // The centimetres the file then shows round to the typed figure.
+        assert!(((bw as f64 / dpi * 2.54) - 30.0).abs() < 0.01);
+        let tall = sheet_for_side(uw, uh, dpi, 30.0, SheetSide::Height).unwrap();
+        let (bw, bh) = px(tall, dpi);
+        assert_eq!(bh, (30.0 / 2.54 * 300.0_f64).round() as usize);
+        assert_eq!(bw, (bh as f64 * 6048.0 / 4032.0).round() as usize);
+        // A portrait picture gets a portrait sheet.
+        let portrait = sheet_for_side(uh, uw, dpi, 30.0, SheetSide::Width).unwrap();
+        let (bw, bh) = px(portrait, dpi);
+        assert!(bh > bw);
+        // Nothing to type against.
+        assert_eq!(sheet_for_side(0, 0, dpi, 30.0, SheetSide::Width), None);
+        assert_eq!(sheet_for_side(uw, uh, 0.0, 30.0, SheetSide::Width), None);
+    }
+
+    /// A new crop keeps the sheet's long side and takes the crop's shape,
+    /// the long side where the picture's long side is.
+    #[test]
+    fn the_sheet_follows_the_crop_by_its_long_side() {
+        let dpi = 300.0;
+        let sheet = sheet_for_side(6048, 4032, dpi, 40.0, SheetSide::Width).unwrap();
+        let (long, _) = px(sheet, dpi);
+        // A square crop: both sides the long side.
+        assert_eq!(px(sheet_following(sheet, 3000, 3000, dpi).unwrap(), dpi), (long, long));
+        // A portrait crop: the long side moves to the height.
+        let (bw, bh) = px(sheet_following(sheet, 3000, 4000, dpi).unwrap(), dpi);
+        assert_eq!(bh, long);
+        assert_eq!(bw, (long as f64 * 3000.0 / 4000.0).round() as usize);
+        // A landscape crop keeps it on the width.
+        let (bw, bh) = px(sheet_following(sheet, 4000, 3000, dpi).unwrap(), dpi);
+        assert_eq!(bw, long);
+        assert_eq!(bh, (long as f64 * 3000.0 / 4000.0).round() as usize);
+        assert_eq!(sheet_following(sheet, 0, 3000, dpi), None);
+    }
+
+    /// With the px ruler a dpi change keeps the pixels: the sheet's and the
+    /// rings', the latter through the recipe's own rounding.
+    #[test]
+    fn the_px_ruler_keeps_the_pixels_when_the_dpi_moves() {
+        let sheet = sheet_for_side(6048, 4032, 300.0, 30.0, SheetSide::Width).unwrap();
+        let before = px(sheet, 300.0);
+        for dpi in [36.0, 72.0, 240.0, 360.0, 1200.0] {
+            assert_eq!(px(sheet_keeping_pixels(sheet, 300.0, dpi), dpi), before, "{dpi}");
+            for ring in [0usize, 1, 59, 207, 1181] {
+                let r = Recipe { dpi, border_mm: mm_of_pixels(ring, dpi), ..Recipe::on_paper() };
+                assert_eq!(r.border_px(), ring, "{ring} px at {dpi}");
+            }
+        }
+    }
+
+    /// Shown = held × factor; typed ÷ factor is held again, so a value
+    /// shown in any unit comes back as it was, to the pixel for px.
+    #[test]
+    fn a_length_round_trips_through_every_ruler() {
+        let dpi = 300.0;
+        for (base, held) in [(Base::Cm, 30.0), (Base::Cm, 29.997), (Base::Mm, 5.0), (Base::Mm, 17.526)] {
+            for ruler in Ruler::ALL {
+                let k = ruler_factor(ruler, base, dpi);
+                let shown = held * k;
+                assert!((shown / k - held).abs() < 1e-9, "{ruler:?} {base:?}: {held} -> {shown}");
+            }
+        }
+        // The factors themselves: centimetres to inches, to pixels; the
+        // same for millimetres.
+        assert_eq!(ruler_factor(Ruler::Metric, Base::Cm, dpi), 1.0);
+        assert!((ruler_factor(Ruler::Imperial, Base::Cm, dpi) - 1.0 / 2.54).abs() < 1e-12);
+        assert!((ruler_factor(Ruler::Pixels, Base::Cm, dpi) - 300.0 / 2.54).abs() < 1e-12);
+        assert!((ruler_factor(Ruler::Imperial, Base::Mm, dpi) - 1.0 / 25.4).abs() < 1e-12);
+        assert!((ruler_factor(Ruler::Pixels, Base::Mm, dpi) - 300.0 / 25.4).abs() < 1e-12);
+        // 30 cm at 300 dpi shows as 3543 px and 11.81 in.
+        assert_eq!((30.0 * ruler_factor(Ruler::Pixels, Base::Cm, dpi)).round(), 3543.0);
+        assert!(((30.0 * ruler_factor(Ruler::Imperial, Base::Cm, dpi)) - 11.811).abs() < 1e-3);
+        // A dpi under 1 does not make a factor of 0.
+        assert!(ruler_factor(Ruler::Pixels, Base::Cm, 0.0) > 0.0);
+    }
 }
 
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        dress_to_hold, hit_crop, moved_crop, must_make_room, picture_terms, recipe_needs_saving,
-        stage_black_px, tile_must_wait, CropHit, PaperFormat, Rings, StageDress,
+        dress_to_hold, hit_crop, moved_crop, must_make_room, opened_is_fresh, opening_memory, picture_terms,
+        recipe_needs_saving, stage_black_px, tile_must_wait, CropHit, PaperFormat, Rings, StageDress,
     };
+    use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
+    use std::path::Path;
 
     #[test]
     fn black_alone_paints_the_whole_margin() {
@@ -5743,6 +6139,36 @@ mod crop_drag_tests {
         assert!(must_make_room(need, 2_000_000_000));
         assert!(!must_make_room(need, 6_000_000_000));
         assert!(!must_make_room(need, 0));
+        // The same rule the worker refuses by, from the same figure.
+        assert_eq!(must_make_room(need, 2_000_000_000), !memory_fits(need, 2_000_000_000));
+        assert!(memory_fits(1_000, (1_000.0 * MEMORY_HEADROOM) as u64 + 1));
+        assert!(!memory_fits(1_000, (1_000.0 * MEMORY_HEADROOM) as u64 - 1));
+    }
+
+    #[test]
+    fn the_room_is_measured_for_the_file_that_opens() {
+        // The strip knows the next file is 61 MP: that is the need, not the
+        // 24 MP picture on the stage. Without the strip's size the session's
+        // own stands in; without either there is nothing to go by.
+        let small = develop_memory_of_size(6048, 4032);
+        let big = opening_memory(Some((9504, 6336)), Some(small)).unwrap();
+        assert!(big > small * 2, "{big} vs {small}");
+        assert_eq!(opening_memory(None, Some(small)), Some(small));
+        assert_eq!(opening_memory(None, None), None);
+    }
+
+    #[test]
+    fn a_development_is_fresh_when_it_is_another_file() {
+        let a = Path::new("a.nef");
+        let b = Path::new("b.nef");
+        // The session held decides; the same file developed again is not fresh.
+        assert!(!opened_is_fresh(Some(a), None, a));
+        assert!(opened_is_fresh(Some(a), None, b));
+        // Let go for room, the released file stands for the session.
+        assert!(!opened_is_fresh(None, Some(a), a));
+        assert!(opened_is_fresh(None, Some(a), b));
+        // Nothing open: every file is fresh.
+        assert!(opened_is_fresh(None, None, a));
     }
 
     #[test]

@@ -60,11 +60,15 @@ pub struct IngestParams {
     pub sat_margin: f64,
     /// Radius, in pixels, the saturation mask grows by.
     pub sat_dilate: usize,
-    /// Half-width, in pixels, of the chrominance low-pass of the
-    /// separation (`dubois`: 0.15 c/px, transition 0.15, 40 dB → 15 taps).
-    /// The colour gate falls off over it: a pixel whose chrominance support
-    /// reaches into burnt-out green photosites gets that share of its
-    /// colour taken away ([`Mosaic::chroma_gate`]).
+    /// Half-width, in pixels, of the chrominance low-pass the colour gate
+    /// is sized for: the narrow band of the default `dubois` separation
+    /// (0.15 c/px, transition 0.15, 40 dB → 15 taps). The gate falls off
+    /// over it: a pixel whose chrominance support reaches into burnt-out
+    /// green photosites gets that share of its colour taken away
+    /// ([`Mosaic::chroma_gate`]). The `off` and `adaptive` modes low-pass
+    /// with a longer kernel (0.05 transition, 60 dB, 73 taps), so
+    /// there the gate opens inside the real support; the value is not
+    /// adjusted to the mode.
     pub colour_reach: usize,
     /// A sample this many sigma outside its same-colour neighbours is a defect.
     pub defect_sigma: f64,
@@ -305,8 +309,10 @@ pub struct CardReading {
 /// photosites of a window of the frame, the same rule as `gray_world` on
 /// the card alone. `centre` is in frame coordinates; the window is
 /// `2·half` wide and high and is pulled inside the frame's crop. A
-/// monochrome sensor, an empty window, or a window with no usable
-/// photosite of a colour is an error.
+/// monochrome sensor, a crop outside the frame, a white level not above
+/// black, an empty window, a window with no usable photosite of a colour,
+/// or a card at black is an error, as in [`ingest`]: never a panic or an
+/// infinite multiplier.
 pub fn card_balance(
     frame: &RawFrame,
     p: &IngestParams,
@@ -317,7 +323,9 @@ pub fn card_balance(
         return Err(crate::Error::Invalid("a grey card needs a Bayer sensor".into()));
     };
     let crop = even_crop(frame.crop);
-    if crop.w < 2 || crop.h < 2 || frame.data.len() != frame.width * frame.height {
+    check_crop(frame, crop)?;
+    check_levels(frame)?;
+    if crop.w < 2 || crop.h < 2 {
         return Err(crate::Error::Invalid("the frame has no usable area".into()));
     }
     let side = (2 * half).max(2).min(crop.w).min(crop.h);
@@ -386,17 +394,10 @@ pub fn even_crop(c: Rect) -> Rect {
     r
 }
 
-/// Crop, normalise to `[0, 1]` between black and white, mask saturation,
-/// repair defects, and balance the channels. The crop must lie inside the
-/// frame and every white level must be above its black level; a frame that
-/// does not is an error, not a panic.
-pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
-    // A Bayer crop with an odd origin would move the phase. A monochrome
-    // sensor has no phase, so every pixel of the file's crop stays.
-    let crop = match frame.kind {
-        SensorKind::Bayer(_) => even_crop(frame.crop),
-        SensorKind::Mono => frame.crop,
-    };
+/// The crop lies inside the frame, covers at least one pixel, and the
+/// frame holds its samples. Every reader of `frame.data` through a crop
+/// asks this first, so a bad crop is an error, not an index out of range.
+fn check_crop(frame: &RawFrame, crop: Rect) -> crate::Result<()> {
     let (w, h) = (crop.w, crop.h);
     let fits = w > 0
         && h > 0
@@ -409,6 +410,13 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             w, h, crop.x, crop.y, frame.width, frame.height
         )));
     }
+    Ok(())
+}
+
+/// Every white level is finite and above every black level, so the
+/// normalisation `(raw − black) / (white − black)` is finite and positive
+/// for a sample above black.
+fn check_levels(frame: &RawFrame) -> crate::Result<()> {
     let levels_ok = frame.black_tile.iter().all(|b| b.is_finite())
         && frame.white_rgb.iter().all(|wl| wl.is_finite())
         && frame.black_tile.iter().all(|b| frame.white_rgb.iter().all(|wl| wl > b));
@@ -418,6 +426,23 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             frame.white_rgb, frame.black_tile
         )));
     }
+    Ok(())
+}
+
+/// Crop, normalise to `[0, 1]` between black and white, mask saturation,
+/// repair defects, and balance the channels. The crop must lie inside the
+/// frame and every white level must be above its black level; a frame that
+/// does not is an error, not a panic.
+pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
+    // A Bayer crop with an odd origin would move the phase. A monochrome
+    // sensor has no phase, so every pixel of the file's crop stays.
+    let crop = match frame.kind {
+        SensorKind::Bayer(_) => even_crop(frame.crop),
+        SensorKind::Mono => frame.crop,
+    };
+    let (w, h) = (crop.w, crop.h);
+    check_crop(frame, crop)?;
+    check_levels(frame)?;
     let phase = match frame.kind {
         SensorKind::Bayer(ph) => Some(ph.shifted(crop.x, crop.y)),
         SensorKind::Mono => None,
@@ -791,6 +816,33 @@ mod tests {
 
         let mono = frame(w, h, SensorKind::Mono, 4095.0, Rect { x: 0, y: 0, w, h }, vec![100; w * h]);
         assert!(card_balance(&mono, &p, (24, 24), 8).is_err());
+    }
+
+    /// What a card cannot be: a window whose photosites of one colour are
+    /// all burnt out, a card at black, a crop outside the frame, a white
+    /// level at black. Each is an error, none a panic or an infinite
+    /// multiplier.
+    #[test]
+    fn card_balance_refuses_what_it_cannot_read() {
+        let (w, h) = (32usize, 32usize);
+        let phase = BayerPhase::RGGB;
+        let full = Rect { x: 0, y: 0, w, h };
+        let p = IngestParams::default();
+        let refused = |white: f64, crop: Rect, raw: Vec<u16>, says: &str| {
+            let f = frame(w, h, SensorKind::Bayer(phase), white, crop, raw);
+            let err = card_balance(&f, &p, (16, 16), 8).expect_err(says);
+            assert!(err.to_string().contains(says), "{err}");
+        };
+        // Every red photosite at white: no unsaturated red in any window.
+        let raw: Vec<u16> =
+            (0..w * h).map(|i| if phase.color_at(i % w, i / w) == Color::R { 4095 } else { 1000 }).collect();
+        refused(4095.0, full, raw, "no unsaturated photosite");
+        // A card at the black level has no ratio.
+        refused(4095.0, full, vec![0; w * h], "black");
+        // A crop past the frame's edge is refused before any sample is read.
+        refused(4095.0, Rect { x: 0, y: 0, w: w + 2, h }, vec![1000; w * h], "does not fit");
+        // White at black: the normalisation would be infinite.
+        refused(0.0, full, vec![1000; w * h], "not above black");
     }
 
     /// White at or below black, a crop outside the frame, or a non-finite

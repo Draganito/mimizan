@@ -274,19 +274,36 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
         .collect())
 }
 
-/// Bytes a development of a `w×h` frame holds at its widest point. Bayer:
-/// the Dubois estimate at its peak, nine f64 planes (`dubois::estimate`),
-/// over the 16-bit frame and the saturation map. Mono: the normalised
-/// plane beside the measured one, over the same two. A guide for refusing
-/// a file the machine cannot hold, measured to about a tenth; what it does
-/// not see is the allocator and whatever else the process has open.
-pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind) -> u64 {
-    let px = w as u64 * h as u64;
-    let planes = match kind {
-        crate::decode::SensorKind::Bayer(_) => 9,
-        crate::decode::SensorKind::Mono => 2,
+/// Bytes a development of `frame` holds at its widest point. Bayer: the
+/// Dubois estimate at its peak, nine f64 planes (`dubois::estimate`), over
+/// the frame as decoded (two bytes a sample, four for a float file), the
+/// saturation map and the colour gate, a byte each. Mono: the normalised
+/// plane beside the measured one, over the frame and the saturation map.
+/// A guide for refusing a file the machine cannot hold, measured to about
+/// a tenth; what it does not see is the allocator and whatever else the
+/// process has open.
+pub fn develop_memory_of(frame: &RawFrame) -> u64 {
+    let sample = match frame.data {
+        crate::decode::RawData::Integer(_) => 2,
+        crate::decode::RawData::Float(_) => 4,
     };
-    px * (planes * 8 + 2 + 1)
+    develop_memory_for(frame.width, frame.height, frame.kind, sample)
+}
+
+/// [`develop_memory_of`] for a frame of `w×h` with 16-bit samples, the
+/// common case: the figure before the file is decoded, or for a caller
+/// that holds the size and not the frame.
+pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind) -> u64 {
+    develop_memory_for(w, h, kind, 2)
+}
+
+fn develop_memory_for(w: usize, h: usize, kind: crate::decode::SensorKind, sample: u64) -> u64 {
+    let px = w as u64 * h as u64;
+    let (planes, maps) = match kind {
+        crate::decode::SensorKind::Bayer(_) => (9, 2),
+        crate::decode::SensorKind::Mono => (2, 1),
+    };
+    px * (planes * 8 + sample + maps)
 }
 
 #[cfg(test)]
@@ -302,6 +319,101 @@ mod tests {
         assert!((1.8e9..2.0e9).contains(&(bayer as f64)), "{bayer}");
         let mono = develop_memory(6048, 4032, crate::decode::SensorKind::Mono);
         assert!(mono * 3 < bayer, "{mono} vs {bayer}");
+        // A float file holds two more bytes a sample; an integer one is
+        // the figure above.
+        let (w, h) = (6048usize, 4032usize);
+        let frame = |data: crate::decode::RawData| RawFrame {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 14,
+            kind: crate::decode::SensorKind::Bayer(crate::cfa::BayerPhase::RGGB),
+            black_tile: [0.0; 4],
+            white_rgb: [1.0; 3],
+            crop: crate::decode::Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data,
+        };
+        let integer = frame(crate::decode::RawData::Integer(Vec::new()));
+        assert_eq!(develop_memory_of(&integer), bayer);
+        let float = frame(crate::decode::RawData::Float(Vec::new()));
+        assert_eq!(develop_memory_of(&float), bayer + 2 * (w * h) as u64);
+    }
+
+    /// The mix is one negative's filter and does not reach the plate: the
+    /// same frame developed as a Wratten plate under two different
+    /// `weights` is the same plate to the bit, while the monochrome
+    /// negative under those weights is not.
+    #[test]
+    fn the_plate_does_not_see_the_mix() {
+        use crate::cfa::{BayerPhase, Color};
+        use crate::decode::{RawData, Rect, SensorKind};
+        use crate::ingest::WhiteBalance;
+        use crate::plate::{PlateFilters, PlateParams, PlateSpace};
+
+        let (w, h) = (96usize, 96usize);
+        let phase = BayerPhase::RGGB;
+        // A neutral field with a warm square in it.
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let warm = (30..66).contains(&x) && (30..66).contains(&y);
+                match (phase.color_at(x, y), warm) {
+                    (Color::R, false) => 200,
+                    (Color::G, false) => 400,
+                    (Color::B, false) => 300,
+                    (Color::R, true) => 500,
+                    (Color::G, true) => 400,
+                    (Color::B, true) => 150,
+                }
+            })
+            .collect();
+        let frame = RawFrame {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 12,
+            kind: SensorKind::Bayer(phase),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let develop = |weights: Weights, plate: Option<PlateParams>| {
+            let mut p = NegativeParams::default();
+            p.ingest.wb = WhiteBalance::Manual([2.0, 1.0, 4.0 / 3.0]);
+            p.weights = weights;
+            p.plate = plate;
+            negative_from_frame(&frame, &p, 0).unwrap()
+        };
+        let native = Weights::default();
+        let red = Weights { r: 0.7, g: 0.2, b: 0.1 };
+        let wratten = Some(PlateParams { filters: PlateFilters::Wratten, space: PlateSpace::Srgb });
+        let a = develop(native, wratten);
+        let b = develop(red, wratten);
+        assert_eq!(a.plane.data, b.plane.data, "the plate under two mixes");
+        assert_eq!(a.info.plate, b.info.plate);
+        // The monochrome negative does see the mix.
+        let m1 = develop(native, None);
+        let m2 = develop(red, None);
+        assert_ne!(m1.plane.data, m2.plane.data);
+        // Without a camera file the emulsion is the native one.
+        assert_eq!(plate_base(None, [2.0, 1.0, 1.5]), Weights::default());
     }
 
     #[test]

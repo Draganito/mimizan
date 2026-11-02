@@ -109,8 +109,8 @@ enum Cmd {
         /// three frames stacked, blue, green, red; `print` makes it a colour print.
         #[arg(long, value_name = "FILTERS", num_args = 0..=1, default_missing_value = "camera")]
         plate: Option<String>,
-        /// Primaries the plate is projected through: adobe-rgb (default) | srgb
-        #[arg(long, value_name = "SPACE", default_value = "adobe-rgb")]
+        /// Primaries the plate is projected through: srgb (default) | adobe-rgb
+        #[arg(long, value_name = "SPACE", default_value = "srgb")]
         plate_space: String,
         /// Recipe JSON as the desktop writes it next to the RAW: its mix and
         /// its plate (process, filters, primaries) develop this negative.

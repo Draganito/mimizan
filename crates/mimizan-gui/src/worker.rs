@@ -21,6 +21,8 @@ use crate::session::{
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
+use mimizan_core::cfa::BayerPhase;
+use mimizan_core::decode::SensorKind;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
@@ -81,8 +83,23 @@ pub enum Event {
     Opened(Arc<Session>),
     /// An `Export` finished.
     Exported { tiff: PathBuf, width: usize, height: usize, ms: u128 },
+    /// The development would not fit in free memory and was not started.
+    /// The job comes back so the UI can let the picture it holds go and
+    /// send it once more; `message` is for the log when it cannot.
+    Refused { job: Box<Job>, message: String },
     /// The job failed or panicked; the text is for the log.
     Failed(String),
+}
+
+impl Job {
+    /// The file an `Open` or `Redevelop` is about; none for an export.
+    pub fn developed_path(&self) -> Option<&Path> {
+        match self {
+            Job::Open { path, .. } => Some(path),
+            Job::Redevelop { source, .. } => Some(&source.path),
+            Job::Export { .. } | Job::ExportLinear { .. } => None,
+        }
+    }
 }
 
 /// Handle to the `Heavy` thread; restarted if it ever dies.
@@ -158,12 +175,23 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
         ctx.request_repaint();
     };
     match job {
-        Job::Open { path, develop, cameras_dir } => {
-            open(&path, develop, &cameras_dir, &status).map(|s| Event::Opened(Arc::new(s)))
-        }
-        Job::Redevelop { source, develop } => {
-            redevelop(source, develop, &status).map(|s| Event::Opened(Arc::new(s)))
-        }
+        Job::Open { path, develop, cameras_dir } => match open(&path, develop, &cameras_dir, &status) {
+            Ok(s) => Ok(Event::Opened(Arc::new(s))),
+            // The decoded frame is gone with the error; the UI decodes it
+            // again once it has made room.
+            Err(e) if e.is::<Refused>() => Ok(Event::Refused {
+                job: Box::new(Job::Open { path, develop, cameras_dir }),
+                message: format!("{e:#}"),
+            }),
+            Err(e) => Err(e),
+        },
+        Job::Redevelop { source, develop } => match check_memory(&source.path, &source.frame) {
+            Ok(()) => redevelop(source, develop, &status).map(|s| Event::Opened(Arc::new(s))),
+            Err(e) => Ok(Event::Refused {
+                job: Box::new(Job::Redevelop { source, develop }),
+                message: format!("{e:#}"),
+            }),
+        },
         Job::Export { session, weights, plate, recipe, path, orientation } => match plate {
             Some(plate) => export_plate(&session, weights, &plate, recipe, &path, orientation, &status),
             None => export(&session, weights, recipe, &path, orientation, &status),
@@ -204,26 +232,59 @@ pub fn available_memory() -> u64 {
 
 /// Bytes the development of this frame holds at its peak.
 pub fn develop_memory(frame: &mimizan_core::decode::RawFrame) -> u64 {
-    pipeline::develop_memory(frame.width, frame.height, frame.kind)
+    pipeline::develop_memory_of(frame)
 }
+
+/// The peak of a development of a `width`×`height` file that is not
+/// decoded yet, so its sensor kind is unknown: the Bayer figure, which
+/// is the larger. The strip's thumbnail metadata gives the size.
+pub fn develop_memory_of_size(width: usize, height: usize) -> u64 {
+    pipeline::develop_memory(width, height, SensorKind::Bayer(BayerPhase::RGGB))
+}
+
+/// How much of the free memory a development may take: a third is kept
+/// over, for the allocator and whatever else the process has open. The
+/// same figure decides when the UI lets the current picture go and when
+/// the worker refuses to start.
+pub const MEMORY_HEADROOM: f64 = 1.3;
+
+/// Whether `need` bytes fit in `available` with [`MEMORY_HEADROOM`] to
+/// spare. Unknown free memory (0) fits everything: there is nothing to
+/// measure against.
+pub fn memory_fits(need: u64, available: u64) -> bool {
+    available == 0 || need as f64 <= available as f64 / MEMORY_HEADROOM
+}
+
+/// A development the machine cannot hold, refused before it started.
+#[derive(Debug)]
+pub struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Refuse a development the machine cannot hold. Past the free memory it
 /// ends in the OOM killer or a frozen machine, not in an error, and the
-/// panic catcher sees nothing of it.
+/// panic catcher sees nothing of it. The UI lets the picture it holds go
+/// and sends the job again; the message states the figures, and the UI
+/// adds what to do when that was not enough.
 fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame) -> Result<()> {
     let (need, available) = (develop_memory(frame), available_memory());
-    if available == 0 || need <= available {
+    if memory_fits(need, available) {
         return Ok(());
     }
     let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-    anyhow::bail!(
-        "{name} not developed: {}x{} would hold about {} while separating, {} is free. Close other \
-         programs or other pictures and open it again",
+    Err(anyhow::Error::new(Refused(format!(
+        "{name} not developed: {}x{} would hold about {} while separating, {} is free",
         frame.width,
         frame.height,
         pr::memory_text(need),
         pr::memory_text(available)
-    )
+    ))))
 }
 
 fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
@@ -247,8 +308,9 @@ fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn
     develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)
 }
 
+/// The memory was checked by the caller, which still has the job to send
+/// back when it does not fit.
 fn redevelop(r: Redevelop, develop: DevelopParams, status: &dyn Fn(String)) -> Result<Session> {
-    check_memory(&r.path, &r.frame)?;
     develop_frame(r.path, r.frame, r.decode_ms, r.camera_file, r.camera_file_path, develop, status)
 }
 

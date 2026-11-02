@@ -52,9 +52,19 @@ STAGE=$(mktemp -d)
 KEYCHAIN="$STAGE/appstore.keychain-db"
 KEYCHAIN_PASSWORD=$(openssl rand -base64 24)
 OLD_KEYCHAIN=$(security default-keychain | sed 's/^ *"//;s/" *$//')
+# The user's search list as it was, one keychain a line; put back on exit,
+# or a developer's Mac would be left with only its login keychain listed.
+OLD_SEARCH_LIST=()
+while IFS= read -r line; do
+    OLD_SEARCH_LIST+=("$line")
+done < <(security list-keychains -d user | sed 's/^ *"//;s/" *$//')
+if [[ -z "${OLD_SEARCH_LIST[*]+x}" ]]; then
+    OLD_SEARCH_LIST=("$OLD_KEYCHAIN")
+fi
 
 cleanup() {
     security default-keychain -s "$OLD_KEYCHAIN" >/dev/null 2>&1 || true
+    security list-keychains -d user -s "${OLD_SEARCH_LIST[@]}" >/dev/null 2>&1 || true
     security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
     rm -rf "$STAGE"
 }
@@ -64,7 +74,9 @@ security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 security set-keychain-settings -lut 3600 "$KEYCHAIN"
 security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
 security default-keychain -s "$KEYCHAIN"
-security list-keychains -d user -s "$KEYCHAIN" "$OLD_KEYCHAIN"
+# The build keychain in front of the user's own list, so `codesign` finds
+# the identities and the rest stays reachable.
+security list-keychains -d user -s "$KEYCHAIN" "${OLD_SEARCH_LIST[@]}"
 
 import_p12() {
     security import "$1" -k "$KEYCHAIN" -P "$2" -A -t cert -f pkcs12 \

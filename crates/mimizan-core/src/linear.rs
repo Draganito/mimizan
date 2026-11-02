@@ -4,9 +4,13 @@
 //! a photographer who wants the separation, no demosaicing, but their own
 //! converter on top: no paper, no lamps, no border.
 //!
-//! * The monochrome negative is the linear 16-bit grey TIFF the command
-//!   writes, upright and cut to the crop, with its mask sidecar beside
-//!   it. `mimizan print` prints it; any editor opens it as linear grey.
+//! * The monochrome negative is a linear 16-bit grey TIFF with its mask
+//!   sidecar beside it, the same samples and description as the file
+//!   `mimizan negative` writes. The command keeps the sensor frame and
+//!   records the orientation in the tag; [`write_negative`] (the GUI's
+//!   export) applies the orientation to the pixels and cuts to the
+//!   recipe's crop, so the file is the picture as the window showed it.
+//!   `mimizan print` prints either; any editor opens it as linear grey.
 //! * The plate goes out as a **linear DNG**: the three balanced channels
 //!   of the separation with the white balance undone, three samples per
 //!   pixel, `PhotometricInterpretation = LinearRaw`, the camera's colour
@@ -98,14 +102,22 @@ fn rational(v: f64) -> Rational {
     Rational { n: (v.max(0.0) * f64::from(DENOM)).round() as u32, d: DENOM as u32 }
 }
 
-/// TIFF asks every value to start on a word boundary; the encoder writes
-/// them back to back. An ASCII value of even length (with its NUL) keeps
-/// the next one aligned, so odd strings get one trailing space.
-fn even(s: &str) -> Cow<'_, str> {
-    if (s.len() + 1).is_multiple_of(2) {
+/// A TIFF ASCII value as the encoder accepts it and the directory needs
+/// it. The `tiff` crate refuses any byte outside ASCII and any NUL, so a
+/// camera name with an accent would fail the whole export: those bytes
+/// become `?` and NULs are dropped. TIFF then asks every value to start
+/// on a word boundary and the encoder writes them back to back, so a
+/// value of odd length (with its NUL) gets one trailing space.
+fn ascii_even(s: &str) -> Cow<'_, str> {
+    let clean = if s.is_ascii() && !s.bytes().any(|b| b == 0) {
         Cow::Borrowed(s)
     } else {
-        Cow::Owned(format!("{s} "))
+        Cow::Owned(s.chars().filter(|&c| c != '\0').map(|c| if c.is_ascii() { c } else { '?' }).collect())
+    };
+    if (clean.len() + 1).is_multiple_of(2) {
+        clean
+    } else {
+        Cow::Owned(format!("{clean} "))
     }
 }
 
@@ -251,16 +263,16 @@ pub fn write_dng(
         d.write_tag(Tag::NewSubfileType, 0u32)?;
         d.write_tag(Tag::PlanarConfiguration, 1u16)?;
         d.write_tag(Tag::Orientation, 1u16)?;
-        d.write_tag(Tag::Make, &*even(meta.make))?;
-        d.write_tag(Tag::Model, &*even(meta.model))?;
-        d.write_tag(Tag::ImageDescription, &*even(meta.description))?;
-        d.write_tag(Tag::Software, &*even(concat!("mimizan ", env!("CARGO_PKG_VERSION"))))?;
+        d.write_tag(Tag::Make, &*ascii_even(meta.make))?;
+        d.write_tag(Tag::Model, &*ascii_even(meta.model))?;
+        d.write_tag(Tag::ImageDescription, &*ascii_even(meta.description))?;
+        d.write_tag(Tag::Software, &*ascii_even(concat!("mimizan ", env!("CARGO_PKG_VERSION"))))?;
         // DNGVersion, DNGBackwardVersion.
         d.write_tag(Tag::Unknown(50706), &[1u8, 4, 0, 0][..])?;
         d.write_tag(Tag::Unknown(50707), &[1u8, 1, 0, 0][..])?;
         // UniqueCameraModel.
         let unique = format!("{} {}", meta.make.trim(), meta.model.trim());
-        d.write_tag(Tag::Unknown(50708), &*even(unique.trim()))?;
+        d.write_tag(Tag::Unknown(50708), &*ascii_even(unique.trim()))?;
         // BlackLevel, WhiteLevel: one per sample.
         d.write_tag(Tag::Unknown(50714), &[0u32, 0, 0][..])?;
         d.write_tag(Tag::Unknown(50717), &[65535u32, 65535, 65535][..])?;
@@ -309,9 +321,10 @@ mod tests {
         let g = ramp(w, h, 1.0);
         let b = ramp(w, h, 1.5);
         let m = [[0.7, 0.2, 0.1], [-0.3, 1.1, 0.2], [0.05, -0.1, 0.9]];
+        // The model carries an accent and a NUL: the tag takes neither.
         let meta = DngMeta {
             make: "Mimizan",
-            model: "Test",
+            model: "Zé Test\0",
             xyz_to_cam: m,
             illuminant: Some(21),
             wb,
@@ -332,12 +345,30 @@ mod tests {
         let u32_at = |b: &[u8], o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
         let ifd = u32_at(&bytes, 4) as usize;
         let n = u16_at(&bytes, ifd) as usize;
-        let photometric = (0..n)
-            .map(|i| ifd + 2 + 12 * i)
-            .find(|&e| u16_at(&bytes, e) == 262)
-            .expect("PhotometricInterpretation present");
+        let entries: Vec<usize> = (0..n).map(|i| ifd + 2 + 12 * i).collect();
+        let photometric =
+            *entries.iter().find(|&&e| u16_at(&bytes, e) == 262).expect("PhotometricInterpretation present");
         assert_eq!(u16_at(&bytes, photometric + 2), 3, "SHORT");
         assert_eq!(u16_at(&bytes, photometric + 8), LINEAR_RAW);
+        // Every value that does not fit the entry lies at an even offset:
+        // the odd ASCII strings (the description, the software) were
+        // padded, so nothing after them is misaligned.
+        let mut out_of_line = 0;
+        for &e in &entries {
+            let size = match u16_at(&bytes, e + 2) {
+                1 | 2 | 6 | 7 => 1,
+                3 | 8 => 2,
+                4 | 9 | 11 => 4,
+                5 | 10 | 12 => 8,
+                t => panic!("tag {} has type {t}", u16_at(&bytes, e)),
+            };
+            if size * u32_at(&bytes, e + 4) as usize > 4 {
+                let offset = u32_at(&bytes, e + 8);
+                assert_eq!(offset % 2, 0, "tag {} at {offset}", u16_at(&bytes, e));
+                out_of_line += 1;
+            }
+        }
+        assert!(out_of_line >= 5, "{out_of_line} values out of line");
         bytes[photometric + 8..photometric + 10].copy_from_slice(&2u16.to_ne_bytes());
 
         let mut dec = Decoder::new(std::io::Cursor::new(bytes)).unwrap();
@@ -369,8 +400,14 @@ mod tests {
         assert_eq!(neutral.len(), 3);
         assert!((neutral[0] - 0.5).abs() < 1e-6 && (neutral[1] - 1.0).abs() < 1e-6);
         assert!((neutral[2] - 1.0 / 1.5).abs() < 1e-6, "{neutral:?}");
-        // Trailing space pads an odd string to a word boundary; readers trim it.
-        assert_eq!(dec.get_tag_ascii_string(Tag::Unknown(50708)).unwrap().trim_end(), "Mimizan Test");
+        // Trailing space pads an odd string to a word boundary; readers trim
+        // it. The accent became `?`, the NUL is gone.
+        assert_eq!(dec.get_tag_ascii_string(Tag::Model).unwrap(), "Z? Test");
+        assert_eq!(dec.get_tag_ascii_string(Tag::Unknown(50708)).unwrap().trim_end(), "Mimizan Z? Test");
+        assert_eq!(dec.get_tag_ascii_string(Tag::ImageDescription).unwrap(), "{} ");
+        assert_eq!(ascii_even("abc"), "abc");
+        assert_eq!(ascii_even("ab"), "ab ");
+        assert_eq!(ascii_even("a\0é"), "a? ");
 
         let DecodingResult::U16(px) = dec.read_image().unwrap() else { panic!("not u16") };
         assert_eq!(px.len(), 3 * 4 * 3);

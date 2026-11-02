@@ -501,8 +501,6 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
 // ---------------------------------------------------------------------------
 // Settings that survive a restart
 
-/// `gui.json`. Every field has a default, so a file from an older or newer
-/// version still loads.
 /// The ruler of the Print window: what its lengths are shown and typed
 /// in. The recipe keeps inches and millimetres whatever the ruler says.
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,6 +528,8 @@ impl Ruler {
     }
 }
 
+/// `gui.json`. Every field has a default, so a file from an older or newer
+/// version still loads.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Persisted {
