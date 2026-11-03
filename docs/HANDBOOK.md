@@ -93,10 +93,8 @@ On. The roll at the bottom right lists every frame. Delete it there,
 not in the gallery.
 
 **Too dark?** Sand, snow and a bright window make every camera print
-dark. Under the finder: *EV* to the right for a lighter shot, or
-*Balance the zone* on, which puts the middle of every picture on the
-grey card. Nothing is lost either way: the frame is on the roll, open
-it and drag the strip.
+dark. Nothing is lost: the frame is on the roll, open it and drag the
+strip to the right. That is the whole correction, and it is exact.
 
 ## In short
 
@@ -105,7 +103,7 @@ it and drag the strip.
 | Open a picture | Drop a RAW on the window |
 | Lighter / darker | Drag the strip under *soft* and *hard* |
 | Back to the base print (phone) | Double-tap the strip |
-| Phone prints too dark | *EV* right, or *Balance the zone* on |
+| Phone prints too dark | Open it from the roll, strip to the right |
 | More contrast | *hard* to the right, or *soft* to the left |
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
