@@ -84,11 +84,19 @@ print; on the iPhone it is the camera picture.
 2. **Development.** *Mono* or *Plate*. The filters sit under them.
    *soft* and *hard* are the same two lights as on the computer.
    The strip under them is the zone: left is darker, right is lighter.
+   A double tap on the strip is the base print again.
 3. **Export** writes a JPEG, a TIFF, or the linear negative for the
    desktop.
 
-A tap sets focus. Flash: Off / Auto / On. The roll at the bottom right
-lists every frame. Delete it there, not in the gallery.
+A tap sets focus and metering; hold to clear it. Flash: Off / Auto /
+On. The roll at the bottom right lists every frame. Delete it there,
+not in the gallery.
+
+**Too dark?** Sand, snow and a bright window make every camera print
+dark. Under the finder: *EV* to the right for a lighter shot, or
+*Balance the zone* on, which puts the middle of every picture on the
+grey card. Nothing is lost either way: the frame is on the roll, open
+it and drag the strip.
 
 ## In short
 
@@ -96,6 +104,8 @@ lists every frame. Delete it there, not in the gallery.
 | --- | --- |
 | Open a picture | Drop a RAW on the window |
 | Lighter / darker | Drag the strip under *soft* and *hard* |
+| Back to the base print (phone) | Double-tap the strip |
+| Phone prints too dark | *EV* right, or *Balance the zone* on |
 | More contrast | *hard* to the right, or *soft* to the left |
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
