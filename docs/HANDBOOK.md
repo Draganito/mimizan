@@ -94,7 +94,11 @@ not in the gallery.
 
 **Too dark?** Sand, snow and a bright window make every camera print
 dark. Nothing is lost: the frame is on the roll, open it and drag the
-strip to the right. That is the whole correction, and it is exact.
+strip to the right. That is the whole correction, and it is exact. On
+Android the same strip sits under the finder, and the finder is the
+paper: drag it before the shot and you see the print you will get. It
+stays where you leave it, and the number in amber beside the exposure
+says so; a double tap puts it back.
 
 ## In short
 
@@ -104,6 +108,7 @@ strip to the right. That is the whole correction, and it is exact.
 | Lighter / darker | Drag the strip under *soft* and *hard* |
 | Back to the base print (phone) | Double-tap the strip |
 | Phone prints too dark | Open it from the roll, strip to the right |
+| Darker or lighter before the shot (Android) | Drag the strip under the finder |
 | More contrast | *hard* to the right, or *soft* to the left |
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
