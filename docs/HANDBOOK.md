@@ -71,8 +71,9 @@ RGB TIFF, sRGB by default.
 
 ## On the phone
 
-The same paper. The finder is different: on Android it is already the
-print; on the iPhone it is the camera picture.
+The same paper. The finder is different: on Android, and on an iPhone
+with Apple Log (15 Pro and later Pro), it is already the print; on the
+other iPhones and the iPad it is the camera picture.
 
 <p align="center">
   <img src="handbook/finder.png" alt="The finder on the phone" width="270">
@@ -94,9 +95,10 @@ not in the gallery.
 
 **Too dark?** Sand, snow and a bright window make every camera print
 dark. Nothing is lost: the frame is on the roll, open it and drag the
-strip to the right. That is the whole correction, and it is exact. On
-Android the same strip sits under the finder, and the finder is the
-paper: drag it before the shot and you see the print you will get. It
+strip to the right. That is the whole correction, and it is exact. Where
+the finder is the paper (Android, the Pro iPhones with Apple Log) the
+same strip sits under the finder: drag it before the shot and you see
+the print you will get. It
 stays where you leave it, and the number in amber beside the exposure
 says so; a double tap puts it back.
 
@@ -108,7 +110,7 @@ says so; a double tap puts it back.
 | Lighter / darker | Drag the strip under *soft* and *hard* |
 | Back to the base print (phone) | Double-tap the strip |
 | Phone prints too dark | Open it from the roll, strip to the right |
-| Darker or lighter before the shot (Android) | Drag the strip under the finder |
+| Darker or lighter before the shot (Android, Pro iPhone) | Drag the strip under the finder |
 | More contrast | *hard* to the right, or *soft* to the left |
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
