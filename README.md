@@ -4,6 +4,8 @@ A darkroom for the digital negative, with two processes.
 
 You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process.
 
+**To my knowledge, the first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
+
 **Monochrome.** The negative is printed the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one. A measured Ilford Multigrade, no hidden curve.
 
 **Plate.** The same separation is mixed three times, through three taking filters, into three plates, and the three are printed together through the same paper and the same two exposures into one colour file: Prokudin-Gorsky's three-colour process on the Bayer mosaic. Two lamps, red and blue, are the only colour control.
