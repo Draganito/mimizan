@@ -22,17 +22,17 @@ It is for analog photographers and fine-art printers who decide the print on the
 >
 > Dragan Bojovic
 
+**Not a filter that looks like film. A darkroom.** Presets paint a look over a finished photo. Mimizan Lab develops a real negative on real paper. Nothing is pretended, because nothing has to be.
+
 **Never invents a pixel.** Every other converter guesses two of three colours per pixel. Mimizan Lab reads the sensor the way analogue television read its signal: luminance and colour separated, nothing interpolated, nothing made up.
 
 **A negative, not a file.** Your photo is a real negative in linear light. You develop it, you don't edit it.
 
 **Black and white like film.** Measured variable-contrast paper, soft and hard light mixed like an enlarger. Highlights roll off the way silver does.
 
-**Colour like slide film.** Three separate colour plates printed together. Saturated, deep, alive. Two lamps are the only colour control.
+**Colour the way it was first photographed.** Three separate colour plates printed together. Saturated, deep, alive. Two lamps are the only colour control.
 
 **Sharp without the halo.** The measured sharpening stops before the edge becomes a line.
-
-**Not a filter. A pipeline.** The look isn't applied afterwards. It's what happens when light goes through paper.
 
 **Printed like a sheet.** Centimetres and dpi, a border and a film edge. The file is a print, not a screen picture.
 
@@ -40,7 +40,7 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 **One paper, two darkrooms.** The phone's negative opens here and prints through the same paper.
 
-**No cloud. No AI. No account.** Everything happens on your computer. Nothing leaves it.
+**Your pictures are yours.** No cloud. No AI. No account. Everything happens on your computer. Nothing leaves it.
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
