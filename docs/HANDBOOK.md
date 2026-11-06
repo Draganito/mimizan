@@ -88,7 +88,8 @@ meanwhile.
 1. **The shutter.** A RAW lands on the roll. *JPEG* writes a picture at
    once, where the finder is the paper. *Developer* opens the
    development. *Raw* only keeps the frame.
-2. **Development.** *Mono* or *Plate*. The filters sit under them.
+2. **Development.** *Mono* or *Color*, the phone's word for the plate.
+   The filters sit under them.
    The grade is one slider, without a number, for the two lights of
    the computer: left is softer, right is harder, the middle is grade 2. The strip under it is
    the zone: left is darker, right is lighter. A double tap on the
@@ -123,7 +124,7 @@ it back, and the strip is white again.
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
 | Save | *Export* on the computer or on the phone |
-| Colour | *Plate* |
+| Colour | *Plate*; on the phone, *Color* |
 
 Nothing else is in the program. No curve, no local mask, no account.
 If the picture holds on this paper, it is a picture.
