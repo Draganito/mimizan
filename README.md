@@ -4,7 +4,7 @@ A darkroom for the digital negative, with two processes.
 
 You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process.
 
-**To my knowledge, the first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
+**The first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
 
 **Monochrome.** The negative is printed the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one. A measured Ilford Multigrade, no hidden curve.
 
@@ -21,6 +21,26 @@ It is for analog photographers and fine-art printers who decide the print on the
 > Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Nothing is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
 >
 > Dragan Bojovic
+
+**Never invents a pixel.** Every other converter guesses two of three colours per pixel. Mimizan Lab reads the sensor the way analogue television read its signal: luminance and colour separated, nothing interpolated, nothing made up.
+
+**A negative, not a file.** Your photo is a real negative in linear light. You develop it, you don't edit it.
+
+**Black and white like film.** Measured variable-contrast paper, soft and hard light mixed like an enlarger. Highlights roll off the way silver does.
+
+**Colour like slide film.** Three separate colour plates printed together. Saturated, deep, alive. Two lamps are the only colour control.
+
+**Sharp without the halo.** The measured sharpening stops before the edge becomes a line.
+
+**Not a filter. A pipeline.** The look isn't applied afterwards. It's what happens when light goes through paper.
+
+**Printed like a sheet.** Centimetres and dpi, a border and a film edge. The file is a print, not a screen picture.
+
+**Draws finer than any demosaicer.** Where your lenses really resolve, nothing in the grey was guessed.
+
+**One paper, two darkrooms.** The phone's negative opens here and prints through the same paper.
+
+**No cloud. No AI. No account.** Everything happens on your computer. Nothing leaves it.
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
