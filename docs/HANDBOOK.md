@@ -86,9 +86,11 @@ meanwhile.
 1. **The shutter.** A RAW lands on the roll. *JPEG* writes a picture at
    once. *Developer* opens the development. *Raw* only keeps the frame.
 2. **Development.** *Mono* or *Plate*. The filters sit under them.
-   *soft* and *hard* are the same two lights as on the computer.
-   The strip under them is the zone: left is darker, right is lighter.
-   A double tap on the strip is the base print again.
+   *grade* is one slider for the two lights of the computer: left is
+   softer, right is harder, zero is grade 2. The strip under it is
+   the zone: left is darker, right is lighter. A double tap on the
+   strip is the base print again. Behind the two sit the same *soft*
+   and *hard* as on the computer; the print is the same.
 3. **Export** writes a JPEG, a TIFF, or the linear negative for the
    desktop.
 
@@ -110,11 +112,11 @@ says so; a double tap puts it back.
 | You want | You do |
 | --- | --- |
 | Open a picture | Drop a RAW on the window |
-| Lighter / darker | Drag the strip under *soft* and *hard* |
+| Lighter / darker | Drag the strip under *soft* and *hard* (on the phone, under *grade*) |
 | Back to the base print (phone) | Double-tap the strip |
 | Phone prints too dark | Open it from the roll, strip to the right |
 | Darker or lighter before the shot (Android, Pro iPhone) | Drag the strip under the finder |
-| More contrast | *hard* to the right, or *soft* to the left |
+| More contrast | *hard* to the right, or *soft* to the left; on the phone, *grade* to the right |
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
 | Save | *Export* on the computer or on the phone |
