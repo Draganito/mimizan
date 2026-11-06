@@ -73,8 +73,10 @@ RGB TIFF, sRGB by default.
 
 The same paper. The finder is different: on Android, and on an iPhone
 with Apple Log (15 Pro and later Pro), it is already the print; on the
-other iPhones and the iPad it is the camera picture. On the Pro iPhones
-the shutter takes about a second: the camera has to leave the log
+other iPhones and the iPad it is the camera picture, and there the
+paper is set in the developer, on the picture: no grade and no strip
+under a finder that would not answer, and a shot is *Developer* or
+*Raw*. On the Pro iPhones the shutter takes about a second: the camera has to leave the log
 stream for the RAW and come back, and the finder holds its last frame
 meanwhile.
 
@@ -84,7 +86,8 @@ meanwhile.
 </p>
 
 1. **The shutter.** A RAW lands on the roll. *JPEG* writes a picture at
-   once. *Developer* opens the development. *Raw* only keeps the frame.
+   once, where the finder is the paper. *Developer* opens the
+   development. *Raw* only keeps the frame.
 2. **Development.** *Mono* or *Plate*. The filters sit under them.
    The grade is one slider, without a number, for the two lights of
    the computer: left is softer, right is harder, the middle is grade 2. The strip under it is
