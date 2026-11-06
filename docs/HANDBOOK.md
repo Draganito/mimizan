@@ -86,8 +86,8 @@ meanwhile.
 1. **The shutter.** A RAW lands on the roll. *JPEG* writes a picture at
    once. *Developer* opens the development. *Raw* only keeps the frame.
 2. **Development.** *Mono* or *Plate*. The filters sit under them.
-   *grade* is one slider for the two lights of the computer: left is
-   softer, right is harder, zero is grade 2. The strip under it is
+   The grade is one slider, without a number, for the two lights of
+   the computer: left is softer, right is harder, the middle is grade 2. The strip under it is
    the zone: left is darker, right is lighter. A double tap on the
    strip is the base print again. Behind the two sit the same *soft*
    and *hard* as on the computer; the print is the same.
@@ -104,8 +104,8 @@ strip to the right. That is the whole correction, and it is exact. Where
 the finder is the paper (Android, the Pro iPhones with Apple Log) the
 same strip sits under the finder: drag it before the shot and you see
 the print you will get. It
-stays where you leave it, and the number in amber beside the exposure
-says so; a double tap puts it back.
+stays where you leave it, and the amber mark beside the exposure says
+so; a double tap puts it back.
 
 ## In short
 
