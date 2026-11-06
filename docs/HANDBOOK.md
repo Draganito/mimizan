@@ -112,11 +112,11 @@ so; a double tap puts it back.
 | You want | You do |
 | --- | --- |
 | Open a picture | Drop a RAW on the window |
-| Lighter / darker | Drag the strip under *soft* and *hard* (on the phone, under *grade*) |
+| Lighter / darker | Drag the strip under *soft* and *hard* (on the phone, under the grade slider) |
 | Back to the base print (phone) | Double-tap the strip |
 | Phone prints too dark | Open it from the roll, strip to the right |
 | Darker or lighter before the shot (Android, Pro iPhone) | Drag the strip under the finder |
-| More contrast | *hard* to the right, or *soft* to the left; on the phone, *grade* to the right |
+| More contrast | *hard* to the right, or *soft* to the left; on the phone, the grade slider to the right |
 | Less contrast | the other way |
 | Crop | *Crop* → format → *Apply* |
 | Save | *Export* on the computer or on the phone |
