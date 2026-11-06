@@ -104,8 +104,8 @@ strip to the right. That is the whole correction, and it is exact. Where
 the finder is the paper (Android, the Pro iPhones with Apple Log) the
 same strip sits under the finder: drag it before the shot and you see
 the print you will get. It
-stays where you leave it, and the amber mark beside the exposure says
-so; a double tap puts it back.
+stays where you leave it, and turns amber to say so; a double tap puts
+it back, and the strip is white again.
 
 ## In short
 
