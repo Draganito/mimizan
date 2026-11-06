@@ -73,7 +73,10 @@ RGB TIFF, sRGB by default.
 
 The same paper. The finder is different: on Android, and on an iPhone
 with Apple Log (15 Pro and later Pro), it is already the print; on the
-other iPhones and the iPad it is the camera picture.
+other iPhones and the iPad it is the camera picture. On the Pro iPhones
+the shutter takes about a second: the camera has to leave the log
+stream for the RAW and come back, and the finder holds its last frame
+meanwhile.
 
 <p align="center">
   <img src="handbook/finder.png" alt="The finder on the phone" width="270">
