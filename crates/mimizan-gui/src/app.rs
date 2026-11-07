@@ -2968,7 +2968,17 @@ impl App {
              plate with its taking filters. The switch is in the toolbar (P); the filters and the \
              lamps are in the Enlarger, the primaries in Print.",
         );
-        let Some(p) = self.edit.plate else { return text };
+        let Some(p) = self.edit.plate else {
+            // The monochrome mix: R + G + B = 1 on the balanced channels.
+            let w = self.weights();
+            let raw = w.balanced_to_raw(s.wb());
+            text.push_str(&format!(
+                "\n\nThe mix on the balanced channels: R {:.3} G {:.3} B {:.3}; on the sensor \
+                 channels before white balance R {:.3} G {:.3} B {:.3}.",
+                w.r, w.g, w.b, raw.r, raw.g, raw.b
+            ));
+            return text;
+        };
         if p.filters == PlateFilters::Wratten {
             // The emulsion behind the glass is a fact of the file, not a choice.
             match s.camera_file_path.as_ref().and_then(|f| f.file_name()) {
@@ -3245,32 +3255,6 @@ impl App {
         }
     }
 
-    /// The same mix by hand: R and B on the balanced channels, G what remains.
-    fn weights_row(&mut self, ui: &mut egui::Ui) {
-        let cur = self.weights();
-        let (mut r, mut b) = (cur.r, cur.b);
-        ui.label(RichText::new("R").weak());
-        if ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed() {
-            self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
-        }
-        ui.label(RichText::new("B").weak());
-        if ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed() {
-            self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
-        }
-        let w = self.weights();
-        let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
-        let raw = w.balanced_to_raw(wb);
-        ui.label(RichText::new(format!("G {:.3}", w.g)).weak()).on_hover_text(format!(
-            "R + G + B = 1 on the balanced channels.\nOn the sensor channels before white balance: \
-             R {:.3} G {:.3} B {:.3}",
-            raw.r, raw.g, raw.b
-        ));
-    }
-
-    /// Bottom window, step 2: everything that exposes the print: the mix
-    /// (the filter), placing and the two paper exposures (the grade).
-    ///
-    /// The controls keep the width they need. A narrower glass clips them;
     /// nothing wraps, nothing shrinks, and this window does not scroll.
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
         let visible = ui.available_width().max(0.0);
@@ -3305,11 +3289,6 @@ impl App {
             }
         } else {
             self.mix_strip(ui, width);
-        }
-        if !mono && !plate {
-            // The same mix by hand, the one row of numbers the enlarger keeps.
-            ui.add_space(2.0);
-            ui.horizontal(|ui| self.weights_row(ui));
         }
         ui.add_space(6.0);
         let Some(split) = self.edit.recipe.curve.as_paper().cloned() else {
@@ -5250,24 +5229,13 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
     let body = egui::TextStyle::Body.resolve(ui.style());
     let paint =
         |text: &str| ui.painter().layout_no_wrap(text.to_owned(), body.clone(), Color32::WHITE).size().x;
-    let gap = ui.spacing().item_spacing.x;
-    let value = drag_value_width(ui);
     let grade = paint("≈ grade 00 · 00.0 stops of scene");
-    let weights = paint("R") + gap + value + gap + paint("B") + gap + value + gap + paint("G 0.000");
     let strip = filter_strip::min_width(ui, &MIX_LABELS);
-    grade.max(weights).max(strip)
+    grade.max(strip)
 }
 
 /// The fields of the monochrome mix, for the width they need.
 const MIX_LABELS: [&str; 8] = ["Native", "Pan", "Y8", "YG11", "O16", "R25", "G58", "B47"];
-
-/// Width of a weight's number (0.000) in the button font, plus its padding.
-fn drag_value_width(ui: &egui::Ui) -> f32 {
-    let font = egui::TextStyle::Button.resolve(ui.style());
-    let text = ui.painter().layout_no_wrap("0.000".to_owned(), font, egui::Color32::WHITE).size().x;
-    let padded = text + ui.spacing().button_padding.x * 2.0 + 2.0;
-    padded.max(ui.spacing().interact_size.x)
-}
 
 /// One lamp, the width of the paper. The lamp's letter sits in the handle,
 /// amber off zero; the stops are the hover. A double click is zero, and a
