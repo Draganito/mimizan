@@ -3333,7 +3333,7 @@ impl App {
         .on_hover_text(
             "The single filter grade this pair of exposures equals (by its ISO range), and the scene \
              stops between the paper's first tone and its near-black. The two exposures themselves \
-             are in the strip's hover text.",
+             are in the recipe file.",
         );
         if self.plate_view().is_some() {
             self.lamp_sliders(ui, width);
@@ -3359,22 +3359,8 @@ impl App {
     fn lamp_sliders(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.add_space(6.0);
         let [mut red, mut blue] = self.edit.lamps;
-        lamp_slider(
-            ui,
-            width,
-            "R",
-            &mut red,
-            "The red lamp. More red warms the whole print; less cools it. A grey card stays grey \
-             only at zero. Double click: zero, and back.",
-        );
-        lamp_slider(
-            ui,
-            width,
-            "B",
-            &mut blue,
-            "The blue lamp. More blue cools the print; less turns it towards yellow. Double click: \
-             zero, and back.",
-        );
+        lamp_slider(ui, width, "R", &mut red);
+        lamp_slider(ui, width, "B", &mut blue);
         let lamps = [red.clamp(-LAMP_LIMIT, LAMP_LIMIT), blue.clamp(-LAMP_LIMIT, LAMP_LIMIT)];
         if lamps != self.edit.lamps {
             self.edit.lamps = lamps;
@@ -5238,10 +5224,10 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
 const MIX_LABELS: [&str; 8] = ["Native", "Pan", "Y8", "YG11", "O16", "R25", "G58", "B47"];
 
 /// One lamp, the width of the paper. The lamp's letter sits in the handle,
-/// amber off zero; the stops are the hover. A double click is zero, and a
-/// second one the value it left. Arrow keys step a twelfth while it has
+/// amber off zero; no words. A double click is zero, and a second one the
+/// value it left. Arrow keys step a twelfth while it has
 /// the focus.
-fn lamp_slider(ui: &mut egui::Ui, width: f32, mark: &str, v: &mut f64, hint: &str) {
+fn lamp_slider(ui: &mut egui::Ui, width: f32, mark: &str, v: &mut f64) {
     let thickness = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, thickness), Sense::click_and_drag());
     let handle = lamp_handle_size(ui, thickness);
@@ -5278,7 +5264,6 @@ fn lamp_slider(ui: &mut egui::Ui, width: f32, mark: &str, v: &mut f64, hint: &st
     if ui.is_rect_visible(rect) {
         paint_lamp_slider(ui, rect, handle, *v, mark, &response);
     }
-    response.on_hover_text(format!("{hint}\n{v:+.2} stops"));
 }
 
 fn lamp_mark_font() -> egui::FontId {

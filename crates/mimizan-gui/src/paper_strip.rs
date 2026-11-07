@@ -8,7 +8,8 @@
 //! as one more or less second under the enlarger. The wheel over the strip
 //! is the grade: hard light against soft, with the mean exposure fixed,
 //! one twelfth of a stop per notch. A double click is the base print, and
-//! a second one brings the pair back.
+//! a second one brings the pair back. The strip says nothing in words:
+//! the pair it stands for is in the recipe file.
 //!
 //! Nothing here touches the paper's arithmetic: the pair the strip hands
 //! back is the same two numbers the two sliders used to set, on the same
@@ -150,27 +151,6 @@ pub fn paper_strip(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
         let frame =
             if off { Stroke::new(2.0, AMBER) } else { Stroke::new(1.0, Color32::from_white_alpha(90)) };
         painter.rect_stroke(rect, 4.0, frame, egui::StrokeKind::Inside);
-    }
-
-    // The zone under the pointer, as the hover text: a zone is the stop
-    // around its centre, so the card's stop is Zone V from −½ to +½.
-    if let Some(p) = response.hover_pos().filter(|p| rect.contains(*p)) {
-        let frac = f64::from((p.x - rect.left()) / rect.width().max(1.0));
-        let stops = frac * ZONES - ZONES / 2.0;
-        let k = ((stops.round() + 5.0).max(0.0) as usize).min(zone::ZONES - 1);
-        let l = linear_at(frac);
-        let curve = split.curve();
-        let over = if zone::GRAY_CARD * stops.exp2() > 1.0 { ", over the clip" } else { "" };
-        response.on_hover_text(format!(
-            "Zone {}: prints at {:.3} (density {:.2}){over}\n\
-             soft {:+.2} · hard {:+.2} stops of time from the base print\n\
-             drag: both exposures · wheel: the grade · double click: the base print, and back",
-            zone::numeral(k),
-            curve.eval(l),
-            curve.density(l),
-            split.soft,
-            split.hard,
-        ));
     }
 }
 
@@ -320,20 +300,6 @@ mod tests {
         assert!(close(h - s, 2.0 / 12.0));
         assert!(close(s, -1.0 / 12.0) && close(h, 1.0 / 12.0));
         assert!(close(with_contrast(0.0, 0.0, f64::NAN, LIMIT).1, 0.0));
-    }
-
-    #[test]
-    fn the_zone_under_the_pointer_is_the_stop_round_its_centre() {
-        let zone_at = |frac: f64| {
-            let stops = frac * ZONES - ZONES / 2.0;
-            ((stops.round() + 5.0).max(0.0) as usize).min(zone::ZONES - 1)
-        };
-        assert_eq!(zone_at(0.5), 5);
-        assert_eq!(zone_at(0.46), 5);
-        assert_eq!(zone_at(0.54), 5);
-        assert_eq!(zone_at(0.44), 4);
-        assert_eq!(zone_at(0.0), 0);
-        assert_eq!(zone_at(1.0), 10);
     }
 
     #[test]

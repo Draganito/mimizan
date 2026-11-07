@@ -13,9 +13,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.9/mimizan_0.16.9-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.9-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.9/mimizan-0.16.9-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.9/mimizan-0.16.9-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.10/mimizan_0.16.10-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.10-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.10/mimizan-0.16.10-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.10/mimizan-0.16.10-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -55,8 +55,8 @@ most of the time. *Apply* develops again when you have changed something.
 
 The line under the strip names the grade the pair equals. The pair
 itself, *soft* (filter 00) and *hard* (filter 5) in stops, is in the
-strip's hover text. Zero on both is about grade 2; the frame is amber
-whenever you are away from it.
+recipe file next to the RAW. Zero on both is about grade 2; the frame
+is amber whenever you are away from it.
 
 **Print** (right) is the sheet.
 
