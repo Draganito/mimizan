@@ -8,14 +8,15 @@ use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::filter_strip::{self, filter_ink, filter_short, filter_strip, Field};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
-use crate::paper_strip::{paper_strip, AMBER};
+use crate::lamp_bar::{lamp_bar, Lamp};
+use crate::paper_strip::paper_strip;
 use crate::session::{DetailAsk, DevelopParams, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
     available_memory, develop_memory, develop_memory_of_size, memory_fits, Event, Heavy, Job, Loupe,
     LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
 };
 use egui::{
-    Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
+    Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
 use egui_file_dialog::{FileDialog, OpeningMode};
 use mimizan_core::ingest::WhiteBalance;
@@ -3336,7 +3337,7 @@ impl App {
              are in the recipe file.",
         );
         if self.plate_view().is_some() {
-            self.lamp_sliders(ui, width);
+            self.lamp_bars(ui, width);
         }
         if self.edit.recipe.place != 0.0 {
             ui.horizontal(|ui| {
@@ -3353,14 +3354,13 @@ impl App {
 
     /// The projector's lamps, under the paper: stops added to the red and
     /// the blue positive. Green is the reference and has none. The only
-    /// colour control a plate has. Each is a slider the width of the
-    /// paper; a double click puts that lamp back to zero, and a second
-    /// one brings it back.
-    fn lamp_sliders(&mut self, ui: &mut egui::Ui, width: f32) {
+    /// colour control a plate has: two bars the width of the paper.
+    fn lamp_bars(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.add_space(6.0);
         let [mut red, mut blue] = self.edit.lamps;
-        lamp_slider(ui, width, "R", &mut red);
-        lamp_slider(ui, width, "B", &mut blue);
+        lamp_bar(ui, Lamp::Red, &mut red, width);
+        ui.add_space(4.0);
+        lamp_bar(ui, Lamp::Blue, &mut blue, width);
         let lamps = [red.clamp(-LAMP_LIMIT, LAMP_LIMIT), blue.clamp(-LAMP_LIMIT, LAMP_LIMIT)];
         if lamps != self.edit.lamps {
             self.edit.lamps = lamps;
@@ -5204,11 +5204,6 @@ struct Docks {
 
 /// Width of the side panels, points.
 const PANEL_W: f32 = 318.0;
-/// Reach of the lamp sliders, stops either way (`print::LAMP_LIMIT`).
-const LAMP_STOPS: f64 = LAMP_LIMIT;
-/// Twelfth of a stop, the step of a lamp handle.
-const LAMP_STEP: f64 = 1.0 / 12.0;
-
 /// Width the enlarger controls are drawn at. The glass may be narrower
 /// and then clips them. Nothing in the enlarger wraps to fit.
 fn enlarger_content_width(ui: &egui::Ui) -> f32 {
@@ -5222,108 +5217,6 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
 
 /// The fields of the monochrome mix, for the width they need.
 const MIX_LABELS: [&str; 8] = ["Native", "Pan", "Y8", "YG11", "O16", "R25", "G58", "B47"];
-
-/// One lamp, the width of the paper. The lamp's letter sits in the handle,
-/// amber off zero; no words. A double click is zero, and a second one the
-/// value it left. Arrow keys step a twelfth while it has
-/// the focus.
-fn lamp_slider(ui: &mut egui::Ui, width: f32, mark: &str, v: &mut f64) {
-    let thickness = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, thickness), Sense::click_and_drag());
-    let handle = lamp_handle_size(ui, thickness);
-    let remembered = response.id.with("remembered");
-    if response.double_clicked() {
-        if *v != 0.0 {
-            ui.data_mut(|d| d.insert_temp::<f64>(remembered, *v));
-            *v = 0.0;
-        } else if let Some(r) = ui.data(|d| d.get_temp::<f64>(remembered)) {
-            *v = r;
-        }
-    } else if let Some(pos) = response.interact_pointer_pos() {
-        *v = lamp_stops_from_pointer(rect.left(), rect.width(), handle.x, pos.x);
-    }
-    if response.has_focus() {
-        ui.memory_mut(|m| {
-            m.set_focus_lock_filter(
-                response.id,
-                egui::EventFilter { horizontal_arrows: true, ..Default::default() },
-            );
-        });
-        let step = ui.input(|i| {
-            i.num_presses(egui::Key::ArrowRight) as i32 - i.num_presses(egui::Key::ArrowLeft) as i32
-        });
-        if step != 0 {
-            *v = (*v + f64::from(step) * LAMP_STEP).clamp(-LAMP_STOPS, LAMP_STOPS);
-        }
-    }
-    if response.dragged() {
-        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-    } else if response.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::Grab);
-    }
-    if ui.is_rect_visible(rect) {
-        paint_lamp_slider(ui, rect, handle, *v, mark, &response);
-    }
-}
-
-fn lamp_mark_font() -> egui::FontId {
-    egui::FontId::proportional(12.0)
-}
-
-/// Width for a two-letter mark, so every handle travels the same distance.
-fn lamp_handle_size(ui: &egui::Ui, row_h: f32) -> Vec2 {
-    let text = ui.painter().layout_no_wrap("00".to_owned(), lamp_mark_font(), Color32::WHITE).size().x;
-    let w = text + 12.0;
-    let h = (row_h - 2.0).clamp(12.0, row_h);
-    Vec2::new(w, h)
-}
-
-fn lamp_handle_left(rail_left: f32, rail_w: f32, handle_w: f32, stops: f64) -> f32 {
-    let t = ((stops + LAMP_STOPS) / (2.0 * LAMP_STOPS)).clamp(0.0, 1.0);
-    let travel = (rail_w - handle_w).max(0.0);
-    rail_left + (t as f32) * travel
-}
-
-fn lamp_stops_from_pointer(rail_left: f32, rail_w: f32, handle_w: f32, x: f32) -> f64 {
-    let travel = (rail_w - handle_w).max(1.0);
-    let t = ((x - handle_w * 0.5 - rail_left) / travel).clamp(0.0, 1.0);
-    let raw = -LAMP_STOPS + (t as f64) * (2.0 * LAMP_STOPS);
-    ((raw / LAMP_STEP).round() * LAMP_STEP).clamp(-LAMP_STOPS, LAMP_STOPS)
-}
-
-fn paint_lamp_slider(
-    ui: &egui::Ui,
-    rect: Rect,
-    handle: Vec2,
-    stops: f64,
-    mark: &str,
-    response: &egui::Response,
-) {
-    let visuals = ui.style().interact(response);
-    let inactive = &ui.visuals().widgets.inactive;
-    let rail_h = ui.spacing().slider_rail_height;
-    let rail = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), rail_h));
-    let painter = ui.painter();
-    painter.rect_filled(rail, inactive.corner_radius, inactive.bg_fill);
-    // The zero, a tick under the rail, so the eye has the reference.
-    let zero_x = lamp_handle_left(rect.left(), rect.width(), handle.x, 0.0) + handle.x * 0.5;
-    painter.line_segment(
-        [Pos2::new(zero_x, rail.bottom()), Pos2::new(zero_x, rect.bottom())],
-        Stroke::new(1.0, ui.visuals().weak_text_color()),
-    );
-    let left = lamp_handle_left(rect.left(), rect.width(), handle.x, stops);
-    let knob = Rect::from_min_size(Pos2::new(left, rect.center().y - handle.y * 0.5), handle)
-        .expand(visuals.expansion);
-    // Off zero the lamp says so, as the paper strip does.
-    let off = stops.abs() >= LAMP_STEP / 2.0;
-    let (fill, stroke, ink) = if off {
-        (AMBER, Stroke::new(1.0, AMBER), Color32::from_rgb(28, 18, 6))
-    } else {
-        (visuals.bg_fill, visuals.fg_stroke, visuals.fg_stroke.color)
-    };
-    painter.rect(knob, visuals.corner_radius, fill, stroke, egui::StrokeKind::Inside);
-    painter.text(knob.center(), egui::Align2::CENTER_CENTER, mark, lamp_mark_font(), ink);
-}
 
 /// Gap between the stage edge and a panel.
 const PANEL_GAP: f32 = 12.0;
@@ -6142,9 +6035,8 @@ mod crop_drag_tests {
 #[cfg(test)]
 mod dock_tests {
     use super::{
-        docks_cross, hold_magnification, lamp_handle_left, lamp_stops_from_pointer, opening_moved,
-        pan_bounds, pan_limit, picture_is_fitted, place_docks, sheet_rect, strip_closes, DOCK_MIN_H,
-        ENLARGER_MIN_W, LAMP_STOPS, PANEL_GAP, PANEL_W,
+        docks_cross, hold_magnification, opening_moved, pan_bounds, pan_limit, picture_is_fitted,
+        place_docks, sheet_rect, strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, PANEL_GAP, PANEL_W,
     };
     use egui::{Pos2, Rect, Vec2};
 
@@ -6228,18 +6120,6 @@ mod dock_tests {
         assert!(strip_closes(true, false, true));
         assert!(!strip_closes(true, false, false));
         assert!(!strip_closes(false, true, true));
-    }
-
-    #[test]
-    fn the_lamp_handle_sits_on_the_stops() {
-        let (left, rail, handle) = (10.0, 200.0, 28.0);
-        assert!((lamp_handle_left(left, rail, handle, -LAMP_STOPS) - left).abs() < 0.01);
-        let mid = lamp_handle_left(left, rail, handle, 0.0);
-        assert!((mid - (left + (rail - handle) / 2.0)).abs() < 0.01);
-        let end = lamp_handle_left(left, rail, handle, LAMP_STOPS);
-        assert!((end + handle - (left + rail)).abs() < 0.01);
-        assert!(lamp_stops_from_pointer(left, rail, handle, left + rail / 2.0).abs() < 1e-9);
-        assert!((lamp_stops_from_pointer(left, rail, handle, left + handle / 2.0) + LAMP_STOPS).abs() < 1e-9);
     }
 
     #[test]

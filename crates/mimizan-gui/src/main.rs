@@ -16,6 +16,7 @@ mod cpu;
 mod edit;
 mod filter_strip;
 mod histogram;
+mod lamp_bar;
 mod paper_strip;
 mod session;
 mod worker;
