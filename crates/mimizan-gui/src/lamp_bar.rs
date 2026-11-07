@@ -1,30 +1,25 @@
 //! The lamp bars: the projector's red and blue lamp, each a bar the width
-//! of the paper and about half the strip's height. The bar is the grey
-//! card under that lamp, from the lamp turned down on the left (the card
-//! towards cyan, or towards yellow) through neutral in the middle to the
-//! lamp turned up on the right; the mark at the middle is zero, the
-//! handle stands on the stops the lamp is at, and the tone under the
-//! handle is the tone the print gets. A click or a drag puts the handle
-//! there; the wheel is a twelfth a notch; a double click is zero, and a
-//! second one brings the lamp back. The frame is amber off zero, as the
-//! paper strip's is. No words.
+//! of the paper and about half the strip's height. The bar is dark and
+//! says nothing: the mark at the middle is zero, the handle stands on
+//! the stops the lamp is at, the letter at the left edge, in the lamp's
+//! colour, says which lamp. What the lamp does to the colour is in the
+//! picture. A click or a drag puts the handle there; the wheel is a
+//! twelfth a notch; a double click is zero, and a second one brings the
+//! lamp back. The frame is amber off zero, as the paper strip's is.
 //!
 //! The value is the same `lamps[k]` the two sliders set, on the twelfth
 //! grid inside ±`LAMP_LIMIT`; nothing behind the bar changes.
 
 use crate::paper_strip::AMBER;
 use egui::{
-    pos2, vec2, Align2, Color32, CursorIcon, Event, FontId, MouseWheelUnit, Rect, Sense, Shape, Stroke, Ui,
+    pos2, vec2, Align2, Color32, CursorIcon, Event, FontId, MouseWheelUnit, Sense, Shape, Stroke, Ui,
 };
 use mimizan_core::print::LAMP_LIMIT;
-use mimizan_core::zone;
 
 /// Height of a bar, points.
 const BAR_H: f32 = 20.0;
 /// Twelfth of a stop, the step of the wheel and the arrow keys.
 const STEP: f64 = 1.0 / 12.0;
-/// Slices the wedge is drawn in.
-const SAMPLES: usize = 96;
 /// Points of trackpad scroll that count as one notch of a wheel.
 const WHEEL_POINTS: f32 = 50.0;
 
@@ -43,15 +38,11 @@ impl Lamp {
         }
     }
 
-    /// The grey card under this lamp at `stops`, encoded with the paper's
-    /// gamma: the one channel moved, the other two the card.
-    fn card(self, stops: f64) -> Color32 {
-        let g = zone::GRAY_CARD;
-        let lit = (g * stops.exp2()).min(1.0);
-        let enc = |l: f64| (l.clamp(0.0, 1.0).powf(1.0 / zone::GAMMA) * 255.0).round() as u8;
+    /// The lamp's colour, for its letter: the glasses' red and blue.
+    fn ink(self) -> Color32 {
         match self {
-            Lamp::Red => Color32::from_rgb(enc(lit), enc(g), enc(g)),
-            Lamp::Blue => Color32::from_rgb(enc(g), enc(g), enc(lit)),
+            Lamp::Red => Color32::from_rgb(255, 82, 66),
+            Lamp::Blue => Color32::from_rgb(102, 148, 255),
         }
     }
 }
@@ -128,21 +119,14 @@ pub fn lamp_bar(ui: &mut Ui, lamp: Lamp, v: &mut f64, width: f32) {
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
         let off = v.abs() >= STEP / 2.0;
-        // The wedge: the card under the lamp, from turned down to turned up.
-        let w = rect.width() / SAMPLES as f32;
-        for i in 0..SAMPLES {
-            let stops = stops_at((i as f64 + 0.5) / SAMPLES as f64);
-            let slice =
-                Rect::from_min_size(pos2(rect.left() + i as f32 * w, rect.top()), vec2(w + 0.5, BAR_H));
-            painter.rect_filled(slice, 0.0, lamp.card(stops));
-        }
-        // The lamp's letter, at the left edge, on the dark end of the wedge.
+        painter.rect_filled(rect, 3.0, ui.visuals().widgets.inactive.bg_fill);
+        // The lamp's letter, at the left edge, in the lamp's colour.
         painter.text(
-            pos2(rect.left() + 7.0, rect.center().y),
+            pos2(rect.left() + 8.0, rect.center().y),
             Align2::CENTER_CENTER,
             lamp.mark(),
             FontId::proportional(11.0),
-            Color32::from_white_alpha(200),
+            lamp.ink(),
         );
         // Zero: the mark at the middle, never moving.
         let mx = rect.center().x;
@@ -187,15 +171,5 @@ mod tests {
             let s = f64::from(k) / 12.0;
             assert!((snap(stops_at((s / LAMP_LIMIT + 1.0) / 2.0)) - s).abs() < 1e-9, "{s}");
         }
-    }
-
-    #[test]
-    fn the_card_is_neutral_at_zero_and_moves_one_channel() {
-        let r0 = Lamp::Red.card(0.0);
-        assert_eq!((r0.r(), r0.g(), r0.b()), (r0.g(), r0.g(), r0.g()));
-        let up = Lamp::Red.card(1.0);
-        assert!(up.r() > up.g() && up.g() == r0.g() && up.b() == r0.b());
-        let down = Lamp::Blue.card(-1.0);
-        assert!(down.b() < down.g() && down.r() == r0.r());
     }
 }

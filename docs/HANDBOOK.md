@@ -13,9 +13,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.11/mimizan_0.16.11-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.11-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.11/mimizan-0.16.11-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.11/mimizan-0.16.11-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.12/mimizan_0.16.12-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.12-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.12/mimizan-0.16.12-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.12/mimizan-0.16.12-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -72,9 +72,9 @@ The recipe sits as a small file next to the RAW and comes back when you
 open it again.
 
 **Colour (Plate).** *Plate* at the top. Three plates, the same paper,
-two lamps, red and blue, as two bars under the strip: each is the grey
-card under its lamp, neutral at the mark in the middle. Click or drag,
-wheel for a twelfth, double click for zero and back. Green is the
+two lamps, red and blue, as two bars under the strip, R and B at their
+left edge, zero at the mark in the middle. Click or drag, wheel for a
+twelfth, double click for zero and back. Green is the
 reference. The taking filters are Camera, Wratten or Channels. The
 export is an RGB TIFF, sRGB by default; the primaries are in *Print*,
 on the file line.

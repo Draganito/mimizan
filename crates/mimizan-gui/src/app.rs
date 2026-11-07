@@ -20,7 +20,7 @@ use egui::{
 };
 use egui_file_dialog::{FileDialog, OpeningMode};
 use mimizan_core::ingest::WhiteBalance;
-use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
+use mimizan_core::mix::{ColorFilter, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{memory_estimate, memory_text, peak_print_radius, PrintSize, LAMP_LIMIT};
@@ -2975,7 +2975,9 @@ impl App {
             let raw = w.balanced_to_raw(s.wb());
             text.push_str(&format!(
                 "\n\nThe mix on the balanced channels: R {:.3} G {:.3} B {:.3}; on the sensor \
-                 channels before white balance R {:.3} G {:.3} B {:.3}.",
+                 channels before white balance R {:.3} G {:.3} B {:.3}. A Wratten glass is an \
+                 approximation from typical filter curves, not a measured fit; resolution and grain \
+                 are unchanged, only band-limited chroma noise is added.",
                 w.r, w.g, w.b, raw.r, raw.g, raw.b
             ));
             return text;
@@ -3041,21 +3043,14 @@ impl App {
             .map(|f| {
                 let hover = match f {
                     PlateFilters::Camera if !has_matrix => {
-                        "The camera's colour matrix towards the primaries, inverted: the colorimetric set, \
-                         as a RAW converter applies it. This file carries no matrix, so the channels stand in."
+                        "The camera's colour matrix, as a RAW converter applies it: this file carries none."
                     }
-                    PlateFilters::Camera => {
-                        "The camera's colour matrix towards the primaries, inverted: the colorimetric set, \
-                         as a RAW converter applies it. Weights go negative off the diagonal."
-                    }
+                    PlateFilters::Camera => "The camera's colour matrix, as a RAW converter applies it.",
                     PlateFilters::Wratten => {
-                        "Wratten 25, 58 and 47 in front of the mix, crosstalk included: the softer palette \
-                         of the historical glass. Follows the mix beside it."
+                        "Wratten 25, 58 and 47 in front of the panchromatic emulsion: the softer palette of \
+                         the historical glass."
                     }
-                    PlateFilters::Channels => {
-                        "The balanced channels as they are, straight into R, G and B. What the Library of \
-                         Congress does with the scanned plates."
-                    }
+                    PlateFilters::Channels => "The sensor's channels as they are, straight into R, G and B.",
                 };
                 Field::new(capitalise(f.name()), Color32::WHITE, hover)
                     .dimmed(f == PlateFilters::Camera && !has_matrix)
@@ -3168,16 +3163,8 @@ impl App {
         let cam = self.session.as_ref().and_then(|s| {
             s.camera_file.as_ref().map(|c| (s.default_weights(), c.weights(), c.weights_space))
         });
-        let cam_path = self
-            .session
-            .as_ref()
-            .and_then(|s| s.camera_file_path.as_ref())
-            .and_then(|p| p.file_name())
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_default();
         // Filters sit in front of the calibrated response; native without a file.
         let base = cam.map(|c| c.0).unwrap_or_default();
-        let base_name = if cam.is_some() { "Panchromatic" } else { "Native" };
         let current = self.weights();
         let same = |a: &Weights, b: &Weights| (a.r - b.r).abs() < 5e-4 && (a.b - b.b).abs() < 5e-4;
         let mut fields: Vec<Field> = Vec::with_capacity(MIX_LABELS.len());
@@ -3188,27 +3175,19 @@ impl App {
         fields.push(Field::new(
             MIX_LABELS[0],
             Color32::WHITE,
-            "¼ ½ ¼: exactly the Bayer luminance, no chroma mixed in",
+            "¼ ½ ¼: the Bayer luminance, no colour weighed in.",
         ));
         targets.push(Some(native));
         if same(&current, &native) {
             selected = Some(0);
         }
         match cam {
-            Some((w, stored, space)) => {
-                let hover = match space {
-                    WeightSpace::Raw => format!(
-                        "Panchromatic: calibrated against the monochrome reference sensor ({cam_path}).\n\
-                         raw channels R {:.3} G {:.3} B {:.3}; for this balance R {:.3} G {:.3} B {:.3}",
-                        stored.r, stored.g, stored.b, w.r, w.g, w.b
-                    ),
-                    WeightSpace::Balanced => format!(
-                        "Panchromatic: calibrated against the monochrome reference sensor ({cam_path}).\n\
-                         R {:.3} G {:.3} B {:.3} (balanced)",
-                        w.r, w.g, w.b
-                    ),
-                };
-                fields.push(Field::new(MIX_LABELS[1], Color32::WHITE, hover));
+            Some((w, _, _)) => {
+                fields.push(Field::new(
+                    MIX_LABELS[1],
+                    Color32::WHITE,
+                    "The panchromatic response, calibrated for this sensor.",
+                ));
                 targets.push(Some(w));
                 if same(&current, &w) {
                     selected = Some(1);
@@ -3219,8 +3198,7 @@ impl App {
                     Field::new(
                         MIX_LABELS[1],
                         Color32::WHITE,
-                        "Panchromatic: the mix calibrated for this sensor against the monochrome reference. \
-                         No camera file is loaded for this one, so Native stands in.",
+                        "The panchromatic response, calibrated for the sensor: no camera file for this one.",
                     )
                     .dimmed(true),
                 );
@@ -3229,21 +3207,7 @@ impl App {
         }
         for f in ColorFilter::ALL.into_iter().filter(|f| *f != ColorFilter::None) {
             let w = base.filtered(f);
-            let t = f.transmission();
-            let hover = format!(
-                "≈ Wratten {} ({}): {}\ntransmission R {:.2} G {:.2} B {:.2} in front of {base_name}\n→ R {:.3} G {:.3} B {:.3}\n\
-                 Approximation from typical filter curves, not a measured fit. Resolution and grain unchanged; \
-                 only band-limited chroma noise is added.",
-                f.wratten().unwrap_or(0),
-                f.colour(),
-                f.effect(),
-                t[0],
-                t[1],
-                t[2],
-                w.r,
-                w.g,
-                w.b
-            );
+            let hover = format!("Wratten {}, {}: {}.", f.wratten().unwrap_or(0), f.colour(), f.effect());
             fields.push(Field::new(filter_short(f), filter_ink(f), hover));
             targets.push(Some(w));
             if same(&current, &w) {
