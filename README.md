@@ -14,8 +14,6 @@ The switch between the two is in the toolbar, and the whole darkroom follows it:
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
 
-![Dragan Bojovic, a plate printed with Mimizan Lab: Nikon Z f, Micro-Nikkor 60 mm, Wratten filters, Multigrade soft −1.26 hard +0.33, a 5.7 cm sheet with a 3.5 mm white border and a 0.1 mm film edge, 676 × 676 pixels at 300 dpi, shown 1:1 inside a one-pixel line that is not part of the print](docs/dragan.jpg)
-
 > Lift the colour off. Print what remains.
 >
 > Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Nothing is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
@@ -44,7 +42,7 @@ It is for analog photographers and fine-art printers who decide the print on the
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
-![Mimizan Lab in the plate process: the negative on the left, the colour print in the middle at 21 %, the Enlarger below with the taking filters, the paper strip and the two lamps, the sheet and its 1:1 box with the measured sharpening on the right](docs/gui.jpg)
+![Mimizan Lab in the plate process: Dragan Bojovic with the Nikon Z f, the negative on the left, the colour print in the middle at 35 %, the Enlarger below with the taking filters, the paper strip and the two lamps, the sheet and its 1:1 box with the measured sharpening on the right](docs/gui.jpg)
 
 ## The negative
 

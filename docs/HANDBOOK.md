@@ -7,8 +7,6 @@ plates in colour, the same paper.
 
 No account. No network. The pictures stay on your computer.
 
-![A print from Mimizan Lab](dragan.jpg)
-
 ## Get it
 
 **Computer**
