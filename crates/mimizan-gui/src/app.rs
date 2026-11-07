@@ -6,13 +6,14 @@
 use crate::browser::{self, home_dir, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
+use crate::filter_strip::{self, filter_ink, filter_short, filter_strip, Field};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
+use crate::paper_strip::{paper_strip, AMBER};
 use crate::session::{DetailAsk, DevelopParams, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
 use crate::worker::{
     available_memory, develop_memory, develop_memory_of_size, memory_fits, Event, Heavy, Job, Loupe,
     LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
 };
-use crate::zone_bar::zone_bar;
 use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
@@ -2981,25 +2982,24 @@ impl App {
         }
     }
 
-    /// The plate's taking filters and primaries, in the Enlarger where the
+    /// The plate's taking filters as the row over the paper, where the
     /// monochrome mix stands: the same decision, the filter in front of
-    /// the paper. The Wratten set follows the mix, so the mix stays with it.
-    fn plate_filters_row(&mut self, ui: &mut egui::Ui, s: &Session) {
+    /// the paper. Camera without a matrix in the file is shown, not
+    /// offered: the channels would be taken.
+    fn plate_filter_strip(&mut self, ui: &mut egui::Ui, s: &Session, width: f32) {
         let Some(mut params) = self.edit.plate else { return };
-        ui.label(RichText::new("filters").weak()).on_hover_text(
-            "The three taking filters: three weight triples on the balanced channels, each summing to \
-             one, so grey gives three equal plates. Every plate is the one separation mixed again; \
-             nothing is demosaiced.",
-        );
-        egui::ComboBox::from_id_salt("plate-filters").selected_text(params.filters.name()).show_ui(
-            ui,
-            |ui| {
-                for f in PlateFilters::ALL {
-                    let hover = match f {
+        let has_matrix = s.has_colour_matrix();
+        let fields: Vec<Field> = PlateFilters::ALL
+            .into_iter()
+            .map(|f| {
+                let hover = match f {
+                    PlateFilters::Camera if !has_matrix => {
+                        "The camera's colour matrix towards the primaries, inverted: the colorimetric set, \
+                         as a RAW converter applies it. This file carries no matrix, so the channels stand in."
+                    }
                     PlateFilters::Camera => {
                         "The camera's colour matrix towards the primaries, inverted: the colorimetric set, \
-                         as a RAW converter applies it. Weights go negative off the diagonal. Without a \
-                         matrix in the file the channels are taken."
+                         as a RAW converter applies it. Weights go negative off the diagonal."
                     }
                     PlateFilters::Wratten => {
                         "Wratten 25, 58 and 47 in front of the mix, crosstalk included: the softer palette \
@@ -3010,10 +3010,23 @@ impl App {
                          Congress does with the scanned plates."
                     }
                 };
-                    ui.selectable_value(&mut params.filters, f, f.name()).on_hover_text(hover);
-                }
-            },
-        );
+                Field::new(capitalise(f.name()), Color32::WHITE, hover)
+                    .dimmed(f == PlateFilters::Camera && !has_matrix)
+            })
+            .collect();
+        let selected = PlateFilters::ALL.iter().position(|f| *f == params.filters);
+        if let Some(k) = filter_strip(ui, "plate-strip", &fields, selected, width) {
+            params.filters = PlateFilters::ALL[k];
+        }
+        if self.edit.plate != Some(params) {
+            self.edit.plate = Some(params);
+        }
+    }
+
+    /// Under the plate's filters: the primaries, the emulsion behind the
+    /// Wratten glass, and the weights the filters resolve to.
+    fn plate_details_row(&mut self, ui: &mut egui::Ui, s: &Session) {
+        let Some(mut params) = self.edit.plate else { return };
         ui.label(RichText::new("primaries").weak())
             .on_hover_text("The projection filters, and the profile of the file.");
         egui::ComboBox::from_id_salt("plate-space").selected_text(space_name(params.space)).show_ui(ui, |ui| {
@@ -3166,10 +3179,10 @@ impl App {
         ui.separator();
     }
 
-    /// The mix as one drop-down: Native, Panchromatic (the camera file) and
-    /// the classic filters in front of it; "custom" while the sliders stand
-    /// elsewhere. Each entry keeps its explanation as hover text.
-    fn mix_combo(&mut self, ui: &mut egui::Ui) {
+    /// The mix as one row over the paper: Native, Pan (the camera file) and
+    /// the classic glasses in front of it, each field its explanation as
+    /// hover text; no field lit while the weights stand elsewhere.
+    fn mix_strip(&mut self, ui: &mut egui::Ui, width: f32) {
         let cam = self.session.as_ref().and_then(|s| {
             s.camera_file.as_ref().map(|c| (s.default_weights(), c.weights(), c.weights_space))
         });
@@ -3185,73 +3198,102 @@ impl App {
         let base_name = if cam.is_some() { "Panchromatic" } else { "Native" };
         let current = self.weights();
         let same = |a: &Weights, b: &Weights| (a.r - b.r).abs() < 5e-4 && (a.b - b.b).abs() < 5e-4;
-        let mut pick: Option<Weights> = None;
-        // Name of the preset the sliders stand on.
-        let mut selected = "custom".to_string();
+        let mut fields: Vec<Field> = Vec::with_capacity(MIX_LABELS.len());
+        let mut targets: Vec<Option<Weights>> = Vec::with_capacity(MIX_LABELS.len());
+        // The field the weights stand on, if any; a later one wins a tie.
+        let mut selected: Option<usize> = None;
         let native = Weights::default();
+        fields.push(Field::new(
+            MIX_LABELS[0],
+            Color32::WHITE,
+            "¼ ½ ¼: exactly the Bayer luminance, no chroma mixed in",
+        ));
+        targets.push(Some(native));
         if same(&current, &native) {
-            selected = "Native".into();
+            selected = Some(0);
         }
-        if let Some((w, _, _)) = cam {
-            if same(&current, &w) {
-                selected = "Panchromatic".into();
-            }
-        }
-        for f in ColorFilter::ALL.into_iter().filter(|f| *f != ColorFilter::None) {
-            if same(&current, &base.filtered(f)) {
-                selected = format!("{} {}", capitalise(f.colour()), f.wratten().unwrap_or(0));
-            }
-        }
-        egui::ComboBox::from_id_salt("mix-combo").selected_text(selected).width(118.0).show_ui(ui, |ui| {
-            if ui
-                .selectable_label(same(&current, &native), "Native")
-                .on_hover_text("¼ ½ ¼: exactly the Bayer luminance, no chroma mixed in")
-                .clicked()
-            {
-                pick = Some(native);
-            }
-            if let Some((w, stored, space)) = cam {
+        match cam {
+            Some((w, stored, space)) => {
                 let hover = match space {
                     WeightSpace::Raw => format!(
-                        "Calibrated against the monochrome reference sensor ({cam_path}).\n\
+                        "Panchromatic: calibrated against the monochrome reference sensor ({cam_path}).\n\
                          raw channels R {:.3} G {:.3} B {:.3}; for this balance R {:.3} G {:.3} B {:.3}",
                         stored.r, stored.g, stored.b, w.r, w.g, w.b
                     ),
                     WeightSpace::Balanced => format!(
-                        "Calibrated against the monochrome reference sensor ({cam_path}).\nR {:.3} G {:.3} B {:.3} (balanced)",
+                        "Panchromatic: calibrated against the monochrome reference sensor ({cam_path}).\n\
+                         R {:.3} G {:.3} B {:.3} (balanced)",
                         w.r, w.g, w.b
                     ),
                 };
-                if ui.selectable_label(same(&current, &w), "Panchromatic").on_hover_text(hover).clicked() {
-                    pick = Some(w);
+                fields.push(Field::new(MIX_LABELS[1], Color32::WHITE, hover));
+                targets.push(Some(w));
+                if same(&current, &w) {
+                    selected = Some(1);
                 }
             }
-            for f in ColorFilter::ALL.into_iter().filter(|f| *f != ColorFilter::None) {
-                let w = base.filtered(f);
-                let t = f.transmission();
-                let label = format!("{} {}", capitalise(f.colour()), f.wratten().unwrap_or(0));
-                let hover = format!(
-                    "≈ Wratten {} ({}): {}\ntransmission R {:.2} G {:.2} B {:.2} in front of {base_name}\n→ R {:.3} G {:.3} B {:.3}\n\
-                     Approximation from typical filter curves, not a measured fit. Resolution and grain unchanged; \
-                     only band-limited chroma noise is added.",
-                    f.wratten().unwrap_or(0),
-                    f.colour(),
-                    f.effect(),
-                    t[0],
-                    t[1],
-                    t[2],
-                    w.r,
-                    w.g,
-                    w.b
+            None => {
+                fields.push(
+                    Field::new(
+                        MIX_LABELS[1],
+                        Color32::WHITE,
+                        "Panchromatic: the mix calibrated for this sensor against the monochrome reference. \
+                         No camera file is loaded for this one, so Native stands in.",
+                    )
+                    .dimmed(true),
                 );
-                if ui.selectable_label(same(&current, &w), label).on_hover_text(hover).clicked() {
-                    pick = Some(w);
-                }
+                targets.push(None);
             }
-        });
-        if let Some(w) = pick {
+        }
+        for f in ColorFilter::ALL.into_iter().filter(|f| *f != ColorFilter::None) {
+            let w = base.filtered(f);
+            let t = f.transmission();
+            let hover = format!(
+                "≈ Wratten {} ({}): {}\ntransmission R {:.2} G {:.2} B {:.2} in front of {base_name}\n→ R {:.3} G {:.3} B {:.3}\n\
+                 Approximation from typical filter curves, not a measured fit. Resolution and grain unchanged; \
+                 only band-limited chroma noise is added.",
+                f.wratten().unwrap_or(0),
+                f.colour(),
+                f.effect(),
+                t[0],
+                t[1],
+                t[2],
+                w.r,
+                w.g,
+                w.b
+            );
+            fields.push(Field::new(filter_short(f), filter_ink(f), hover));
+            targets.push(Some(w));
+            if same(&current, &w) {
+                selected = Some(fields.len() - 1);
+            }
+        }
+        debug_assert_eq!(fields.len(), MIX_LABELS.len());
+        if let Some(w) = filter_strip(ui, "mix-strip", &fields, selected, width).and_then(|k| targets[k]) {
             self.set_weights(w);
         }
+    }
+
+    /// The same mix by hand: R and B on the balanced channels, G what remains.
+    fn weights_row(&mut self, ui: &mut egui::Ui) {
+        let cur = self.weights();
+        let (mut r, mut b) = (cur.r, cur.b);
+        ui.label(RichText::new("R").weak());
+        if ui.add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed() {
+            self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
+        }
+        ui.label(RichText::new("B").weak());
+        if ui.add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.002).fixed_decimals(3)).changed() {
+            self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
+        }
+        let w = self.weights();
+        let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
+        let raw = w.balanced_to_raw(wb);
+        ui.label(RichText::new(format!("G {:.3}", w.g)).weak()).on_hover_text(format!(
+            "R + G + B = 1 on the balanced channels.\nOn the sensor channels before white balance: \
+             R {:.3} G {:.3} B {:.3}",
+            raw.r, raw.g, raw.b
+        ));
     }
 
     /// Bottom window, step 2: everything that exposes the print: the mix
@@ -3277,44 +3319,30 @@ impl App {
         ui.advance_cursor_after_rect(used);
     }
 
-    /// Mix as one row, placing, the bar, the grades and the paper's ends.
+    /// The filter as one row, what it leaves to say, the paper strip, the
+    /// pair it stands for and the paper's ends.
     fn zones_column(&mut self, ui: &mut egui::Ui, width: f32) {
         let mono = self.session.as_ref().is_some_and(|s| s.is_mono());
         let plate = !mono && self.edit.plate.is_some();
+        let session = self.session.clone();
+        // The filter, the width of the paper under it.
+        if mono {
+            ui.label(RichText::new("The sensor has no colour filter. This is the measurement.").weak());
+        } else if plate {
+            if let Some(s) = &session {
+                self.plate_filter_strip(ui, s, width);
+            }
+        } else {
+            self.mix_strip(ui, width);
+        }
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
-            if mono {
-                ui.label(RichText::new("The sensor has no colour filter. This is the measurement.").weak());
-            } else if plate {
-                if let Some(s) = self.session.clone() {
-                    self.plate_filters_row(ui, &s);
+            if plate {
+                if let Some(s) = &session {
+                    self.plate_details_row(ui, s);
                 }
-            } else {
-                ui.label(RichText::new("mix").weak());
-                self.mix_combo(ui);
-                let cur = self.weights();
-                let (mut r, mut b) = (cur.r, cur.b);
-                ui.label(RichText::new("R").weak());
-                if ui
-                    .add(egui::DragValue::new(&mut r).range(0.0..=1.0).speed(0.002).fixed_decimals(3))
-                    .changed()
-                {
-                    self.set_weights(Weights { r, g: 0.0, b: cur.b.min(1.0 - r) });
-                }
-                ui.label(RichText::new("B").weak());
-                if ui
-                    .add(egui::DragValue::new(&mut b).range(0.0..=1.0).speed(0.002).fixed_decimals(3))
-                    .changed()
-                {
-                    self.set_weights(Weights { r: cur.r.min(1.0 - b), g: 0.0, b });
-                }
-                let w = self.weights();
-                let wb = self.session.as_ref().map(|s| s.wb()).unwrap_or([1.0; 3]);
-                let raw = w.balanced_to_raw(wb);
-                ui.label(RichText::new(format!("G {:.3}", w.g)).weak()).on_hover_text(format!(
-                    "R + G + B = 1 on the balanced channels.\nOn the sensor channels before white balance: \
-                 R {:.3} G {:.3} B {:.3}",
-                    raw.r, raw.g, raw.b
-                ));
+            } else if !mono {
+                self.weights_row(ui);
             }
             // Stays in this row, so the window does not grow when the exposures
             // leave the base. Right edge of the glass, not of the unclipped row.
@@ -3359,37 +3387,23 @@ impl App {
             return;
         };
         let mut split = split;
-        zone_bar(ui, &mut split, width);
-        ui.add_space(4.0);
-        // One rail width for both exposures, taken before either slider is
-        // built. The number sits beside the rail; sizing the rail to the whole
-        // row lets that number widen the column, and the slider below then
-        // puts its zero further right. The reservation is the widest reading,
-        // so the rail stays put as the number changes.
-        let value_w = exposure_value_width(ui);
-        let gap = ui.spacing().item_spacing.x;
-        let rail = exposure_rail_width(width, value_w, gap);
-        exposure_slider(
-            ui,
-            rail,
-            "00",
-            &mut split.soft,
-            "Filter 00, the soft exposure, in stops of time from the base print. More soft light \
-             greys the highlights and hardly touches the shadows: the highlights' exposure.",
-        );
-        exposure_slider(
-            ui,
-            rail,
-            "5",
-            &mut split.hard,
-            "Filter 5, the hard exposure, in stops of time from the base print. More hard light \
-             deepens the shadows and the mid tones with them, the highlights stay: the shadows' \
-             exposure.",
-        );
+        paper_strip(ui, &mut split, width);
         if self.edit.recipe.curve.as_paper() != Some(&split) {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }
+        ui.add_space(4.0);
         let curve = split.curve();
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!("soft {:+.2} · hard {:+.2} stops", split.soft, split.hard)).weak(),
+            )
+            .wrap_mode(egui::TextWrapMode::Extend),
+        )
+        .on_hover_text(
+            "The two exposures the strip stands for, in stops of time from the base print: filter 00, \
+             the soft light, places the highlights; filter 5, the hard light, places the shadows. A drag \
+             on the strip moves both; the wheel moves them apart or together, the grade.",
+        );
         ui.add(
             egui::Label::new(
                 RichText::new(format!(
@@ -3407,13 +3421,17 @@ impl App {
              stops between the paper's first tone and its near-black, and where Zone V lands.",
         );
         if self.plate_view().is_some() {
+            // The lamps keep their sliders: one rail width, the number beside it.
+            let value_w = exposure_value_width(ui);
+            let gap = ui.spacing().item_spacing.x;
+            let rail = exposure_rail_width(width, value_w, gap);
             self.lamp_sliders(ui, rail);
         }
         if self.edit.recipe.place != 0.0 {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("place {:+.2}", self.edit.recipe.place)).weak().small())
                     .on_hover_text(
-                        "A placing from the recipe, in scene stops; the bar moves both exposures instead.",
+                        "A placing from the recipe, in scene stops; the strip moves both exposures instead.",
                     );
                 if ui.small_button("0").on_hover_text("Drop the placing").clicked() {
                     self.edit.recipe.place = 0.0;
@@ -3473,7 +3491,7 @@ impl App {
         };
         let mut button = egui::Button::new(label).small();
         if !at_base {
-            button = button.fill(Color32::from_rgb(255, 170, 60));
+            button = button.fill(AMBER);
         }
         if ui
             .add_enabled(!at_base, button)
@@ -5302,13 +5320,13 @@ struct Docks {
 
 /// Width of the side panels, points.
 const PANEL_W: f32 = 318.0;
-/// Reach of the exposure sliders, stops of time either way (the recipe
-/// allows `paper::STOP_LIMIT`; beyond two stops the print is all black or
-/// all grey).
-const SLIDER_STOPS: f64 = 2.0;
-/// Twelfth of a stop, the step of an exposure handle.
+/// Reach of the lamp sliders, stops either way (`print::LAMP_LIMIT`). The
+/// paper's two exposures are the strip now; the sliders stay for the
+/// plate's lamps.
+const SLIDER_STOPS: f64 = LAMP_LIMIT;
+/// Twelfth of a stop, the step of a slider handle.
 const EXPOSURE_STEP: f64 = 1.0 / 12.0;
-/// Rail the two exposures keep. A wider enlarger may lengthen it.
+/// Rail the lamp sliders keep. A wider enlarger may lengthen it.
 /// A narrower one clips the row; the rail does not shrink.
 const EXPOSURE_RAIL: f32 = 168.0;
 
@@ -5321,22 +5339,15 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
     let gap = ui.spacing().item_spacing.x;
     let value = exposure_value_width(ui);
     let grade = paint("≈ grade 00 · 00.0 stops of scene · grey card prints at 0.00");
+    // The lamps' sliders.
     let slider = EXPOSURE_RAIL + gap + value;
-    let mix = paint("mix")
-        + gap
-        + 118.0
-        + gap
-        + paint("R")
-        + gap
-        + value
-        + gap
-        + paint("B")
-        + gap
-        + value
-        + gap
-        + paint("G 0.000");
-    grade.max(slider).max(mix)
+    let weights = paint("R") + gap + value + gap + paint("B") + gap + value + gap + paint("G 0.000");
+    let strip = filter_strip::min_width(ui, &MIX_LABELS);
+    grade.max(slider).max(weights).max(strip)
 }
+
+/// The fields of the monochrome mix, for the width they need.
+const MIX_LABELS: [&str; 8] = ["Native", "Pan", "Y8", "YG11", "O16", "R25", "G58", "B47"];
 
 /// Width of the number beside an exposure slider: the widest reading the
 /// range can show, in the button font the slider uses, plus its padding.

@@ -14,10 +14,11 @@ mod app;
 mod browser;
 mod cpu;
 mod edit;
+mod filter_strip;
 mod histogram;
+mod paper_strip;
 mod session;
 mod worker;
-mod zone_bar;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
