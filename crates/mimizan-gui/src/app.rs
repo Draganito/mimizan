@@ -15,7 +15,7 @@ use crate::worker::{
     LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
 };
 use egui::{
-    Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
+    Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2,
 };
 use egui_file_dialog::{FileDialog, OpeningMode};
 use mimizan_core::ingest::WhiteBalance;
@@ -27,7 +27,6 @@ use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
 use mimizan_core::tone::Tone;
-use mimizan_core::zone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -2800,11 +2799,7 @@ impl App {
             val(ui, format!("R {:.3}  B {:.3} ({})", info.wb[0], info.wb[2], info.report.wb_source));
             ui.end_row();
             ui.label("process");
-            val(ui, self.process_label(&s)).on_hover_text(
-                "The process this file is developed in: the monochrome negative, or the three-colour \
-                 plate with its taking filters and primaries. The switch is in the toolbar (P); the \
-                 filters and the lamps are in the Enlarger.",
-            );
+            val(ui, self.process_label(&s)).on_hover_text(self.process_hover(&s));
             ui.end_row();
             let px = n.plane.data.len() as f64;
             ui.label("saturated");
@@ -2964,6 +2959,47 @@ impl App {
     /// projection primaries, and the three weight rows they come to. A
     /// re-mix, not a re-development: the separation stays.
     /// What the Negative window says the file is developed in.
+    /// What the process line explains: for a plate, the weights the
+    /// taking filters resolve to on the balanced channels, and the
+    /// emulsion behind the Wratten glass.
+    fn process_hover(&self, s: &Session) -> String {
+        let mut text = String::from(
+            "The process this file is developed in: the monochrome negative, or the three-colour \
+             plate with its taking filters. The switch is in the toolbar (P); the filters and the \
+             lamps are in the Enlarger, the primaries in Print.",
+        );
+        let Some(p) = self.edit.plate else { return text };
+        if p.filters == PlateFilters::Wratten {
+            // The emulsion behind the glass is a fact of the file, not a choice.
+            match s.camera_file_path.as_ref().and_then(|f| f.file_name()) {
+                Some(f) => text.push_str(&format!(
+                    "\n\nBehind Wratten 25, 58 and 47: the panchromatic response calibrated for this \
+                     sensor ({}). It sets how much the three plates overlap.",
+                    f.to_string_lossy()
+                )),
+                None => text.push_str(
+                    "\n\nBehind Wratten 25, 58 and 47: the native 0.25 / 0.50 / 0.25, red and blue equally \
+                     sensitive, as no camera file calibrates this sensor. It sets how much the three \
+                     plates overlap.",
+                ),
+            }
+        }
+        match self.plate_resolved.as_ref().map(|r| &r.weights) {
+            Some(Ok(w)) => {
+                text.push_str("\n\nThe three taking filters on the balanced channels R G B:");
+                for (n, r) in ["red", "green", "blue"].iter().zip(w.rows.iter()) {
+                    text.push_str(&format!("\n{n:<6} {:+.3} {:+.3} {:+.3}", r[0], r[1], r[2]));
+                }
+                if p.filters == PlateFilters::Camera && !s.has_colour_matrix() {
+                    text.push_str("\nNo matrix in this file: the channels are taken.");
+                }
+            }
+            Some(Err(e)) => text.push_str(&format!("\n\nNo plate: {e}")),
+            None => {}
+        }
+        text
+    }
+
     fn process_label(&self, s: &Session) -> String {
         if s.is_mono() {
             return "monochrome (the sensor)".into();
@@ -3020,71 +3056,6 @@ impl App {
         }
         if self.edit.plate != Some(params) {
             self.edit.plate = Some(params);
-        }
-    }
-
-    /// Under the plate's filters: the primaries, the emulsion behind the
-    /// Wratten glass, and the weights the filters resolve to.
-    fn plate_details_row(&mut self, ui: &mut egui::Ui, s: &Session) {
-        let Some(mut params) = self.edit.plate else { return };
-        ui.label(RichText::new("primaries").weak())
-            .on_hover_text("The projection filters, and the profile of the file.");
-        egui::ComboBox::from_id_salt("plate-space").selected_text(space_name(params.space)).show_ui(ui, |ui| {
-            ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB").on_hover_text(
-                "Adobe RGB (1998): its curve is exactly the paper's gamma 2.2 and its gamut holds the \
-                 saturated primaries. The file carries the profile.",
-            );
-            ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
-                "sRGB primaries with the paper's gamma 2.2 (not the sRGB curve). The file carries the profile.",
-            );
-        });
-        if self.edit.plate != Some(params) {
-            self.edit.plate = Some(params);
-        }
-        if params.filters == PlateFilters::Wratten {
-            // The emulsion behind the glass is a fact of the file, not a
-            // choice: the camera file's calibrated response, or the native.
-            let (name, hover) = match s.camera_file_path.as_ref().and_then(|p| p.file_name()) {
-                Some(f) => (
-                    "Panchromatic",
-                    format!(
-                        "The emulsion behind Wratten 25, 58 and 47: the panchromatic response calibrated \
-                         for this sensor ({}). It sets how much the three plates overlap.",
-                        f.to_string_lossy()
-                    ),
-                ),
-                None => (
-                    "Native",
-                    "The emulsion behind Wratten 25, 58 and 47: the native 0.25 / 0.50 / 0.25, red and \
-                     blue equally sensitive, as no camera file calibrates this sensor. It sets how much \
-                     the three plates overlap."
-                        .to_string(),
-                ),
-            };
-            ui.label(RichText::new("behind").weak());
-            ui.label(RichText::new(name).weak()).on_hover_text(hover);
-        }
-        match self.plate_resolved.as_ref().map(|r| &r.weights) {
-            Some(Ok(w)) => {
-                let rows: Vec<String> = ["red", "green", "blue"]
-                    .iter()
-                    .zip(w.rows.iter())
-                    .map(|(n, r)| format!("{n:<6} {:+.3} {:+.3} {:+.3}", r[0], r[1], r[2]))
-                    .collect();
-                let note = if params.filters == PlateFilters::Camera && !s.has_colour_matrix() {
-                    "no matrix in this file: the channels are taken"
-                } else {
-                    "weights"
-                };
-                ui.label(RichText::new(note).weak().small()).on_hover_text(format!(
-                    "The three taking filters on the balanced channels R G B:\n{}",
-                    rows.join("\n")
-                ));
-            }
-            Some(Err(e)) => {
-                ui.label(RichText::new(format!("no plate: {e}")).small().color(ui.visuals().error_fg_color));
-            }
-            None => {}
         }
     }
 
@@ -3335,35 +3306,11 @@ impl App {
         } else {
             self.mix_strip(ui, width);
         }
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            if plate {
-                if let Some(s) = &session {
-                    self.plate_details_row(ui, s);
-                }
-            } else if !mono {
-                self.weights_row(ui);
-            }
-            // Stays in this row, so the window does not grow when the exposures
-            // leave the base. Right edge of the glass, not of the unclipped row.
-            if self.edit.recipe.curve.as_paper().is_some() {
-                let at_base =
-                    self.edit.recipe.curve.as_paper().is_some_and(|s| s.soft == 0.0 && s.hard == 0.0);
-                let mut slot = ui.available_rect_before_wrap();
-                let edge = ui.clip_rect().right();
-                if edge > slot.left() {
-                    slot.set_right(edge.min(slot.right()));
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .max_rect(slot)
-                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                        |ui| {
-                            self.base_button(ui, at_base);
-                        },
-                    );
-                }
-            }
-        });
+        if !mono && !plate {
+            // The same mix by hand, the one row of numbers the enlarger keeps.
+            ui.add_space(2.0);
+            ui.horizontal(|ui| self.weights_row(ui));
+        }
         ui.add_space(6.0);
         let Some(split) = self.edit.recipe.curve.as_paper().cloned() else {
             // A look from a file or an older recipe: no paper to expose.
@@ -3395,37 +3342,22 @@ impl App {
         let curve = split.curve();
         ui.add(
             egui::Label::new(
-                RichText::new(format!("soft {:+.2} · hard {:+.2} stops", split.soft, split.hard)).weak(),
-            )
-            .wrap_mode(egui::TextWrapMode::Extend),
-        )
-        .on_hover_text(
-            "The two exposures the strip stands for, in stops of time from the base print: filter 00, \
-             the soft light, places the highlights; filter 5, the hard light, places the shadows. A drag \
-             on the strip moves both; the wheel moves them apart or together, the grade.",
-        );
-        ui.add(
-            egui::Label::new(
                 RichText::new(format!(
-                    "≈ grade {} · {:.1} stops of scene · grey card prints at {:.2}",
+                    "≈ grade {} · {:.1} stops of scene",
                     paper::grade_label(curve.grade()),
                     curve.scene_range_stops(),
-                    curve.eval(zone::GRAY_CARD)
                 ))
                 .weak(),
             )
             .wrap_mode(egui::TextWrapMode::Extend),
         )
         .on_hover_text(
-            "The single filter grade this pair of exposures equals (by its ISO range), the scene \
-             stops between the paper's first tone and its near-black, and where Zone V lands.",
+            "The single filter grade this pair of exposures equals (by its ISO range), and the scene \
+             stops between the paper's first tone and its near-black. The two exposures themselves \
+             are in the strip's hover text.",
         );
         if self.plate_view().is_some() {
-            // The lamps keep their sliders: one rail width, the number beside it.
-            let value_w = exposure_value_width(ui);
-            let gap = ui.spacing().item_spacing.x;
-            let rail = exposure_rail_width(width, value_w, gap);
-            self.lamp_sliders(ui, rail);
+            self.lamp_sliders(ui, width);
         }
         if self.edit.recipe.place != 0.0 {
             ui.horizontal(|ui| {
@@ -3440,65 +3372,33 @@ impl App {
         }
     }
 
-    /// The projector's lamps, under the paper's two exposures: stops added
-    /// to the red and the blue positive. Green is the reference and has
-    /// none. The only colour control a plate has.
-    fn lamp_sliders(&mut self, ui: &mut egui::Ui, rail: f32) {
+    /// The projector's lamps, under the paper: stops added to the red and
+    /// the blue positive. Green is the reference and has none. The only
+    /// colour control a plate has. Each is a slider the width of the
+    /// paper; a double click puts that lamp back to zero, and a second
+    /// one brings it back.
+    fn lamp_sliders(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("lamps").weak()).on_hover_text(
-                "Prokudin-Gorsky's projector had three lamps and the register of the side lenses, \
-                 nothing else. These are the red and the blue lamp, in stops of exposure added to \
-                 that positive; the green one is the reference. Grey stays grey at zero.",
-            );
-            let off = self.edit.lamps == [0.0; 2];
-            if ui
-                .add_enabled(!off, egui::Button::new(RichText::new("0")).small())
-                .on_hover_text("Both lamps back to zero")
-                .clicked()
-            {
-                self.edit.lamps = [0.0; 2];
-            }
-        });
         let [mut red, mut blue] = self.edit.lamps;
-        exposure_slider(
+        lamp_slider(
             ui,
-            rail,
+            width,
             "R",
             &mut red,
-            "The red lamp, in stops. More red warms the whole print; less cools it. \
-             A grey card stays grey only at zero.",
+            "The red lamp. More red warms the whole print; less cools it. A grey card stays grey \
+             only at zero. Double click: zero, and back.",
         );
-        exposure_slider(
+        lamp_slider(
             ui,
-            rail,
+            width,
             "B",
             &mut blue,
-            "The blue lamp, in stops. More blue cools the print; less turns it towards yellow.",
+            "The blue lamp. More blue cools the print; less turns it towards yellow. Double click: \
+             zero, and back.",
         );
         let lamps = [red.clamp(-LAMP_LIMIT, LAMP_LIMIT), blue.clamp(-LAMP_LIMIT, LAMP_LIMIT)];
         if lamps != self.edit.lamps {
             self.edit.lamps = lamps;
-        }
-    }
-
-    /// Grey and quiet at the base exposure, orange when a click returns there.
-    fn base_button(&mut self, ui: &mut egui::Ui, at_base: bool) {
-        let label = if at_base {
-            RichText::new("base")
-        } else {
-            RichText::new("base").color(Color32::from_rgb(28, 18, 6))
-        };
-        let mut button = egui::Button::new(label).small();
-        if !at_base {
-            button = button.fill(AMBER);
-        }
-        if ui
-            .add_enabled(!at_base, button)
-            .on_hover_text(if at_base { "The base exposure" } else { "Back to the base exposure" })
-            .clicked()
-        {
-            self.edit.recipe.curve = Tone::paper();
         }
     }
 
@@ -3567,18 +3467,37 @@ impl App {
         // The file the export writes, first: it is the process's.
         ui.horizontal(|ui| {
             print_field_label(ui, "file");
-            let (text, tip) = match self.plate_view() {
-                Some(p) => (
-                    format!("16-bit RGB TIFF · {}", space_name(p.space)),
-                    "The three positives as the channels of one RGB file, with a matrix/TRC profile of \
-                     these primaries and the paper's gamma 2.2.",
-                ),
-                None => (
-                    "16-bit grey TIFF · gamma 2.2".to_string(),
-                    "The sheet as one grey channel with a gamma 2.2 profile.",
-                ),
-            };
-            ui.label(RichText::new(text).weak()).on_hover_text(tip);
+            match self.edit.plate {
+                Some(mut params) => {
+                    ui.label(RichText::new("16-bit RGB TIFF ·").weak()).on_hover_text(
+                        "The three positives as the channels of one RGB file, with a matrix/TRC profile \
+                         of the primaries beside and the paper's gamma 2.2.",
+                    );
+                    // The primaries the plates are projected through: the file's profile.
+                    egui::ComboBox::from_id_salt("plate-space")
+                        .selected_text(space_name(params.space))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB")
+                                .on_hover_text(
+                                    "Adobe RGB (1998): its curve is exactly the paper's gamma 2.2 and its \
+                                     gamut holds the saturated primaries. The file carries the profile.",
+                                );
+                            ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
+                                "sRGB primaries with the paper's gamma 2.2 (not the sRGB curve). The file \
+                                 carries the profile.",
+                            );
+                        })
+                        .response
+                        .on_hover_text("The projection primaries, and the profile of the file.");
+                    if self.edit.plate != Some(params) {
+                        self.edit.plate = Some(params);
+                    }
+                }
+                None => {
+                    ui.label(RichText::new("16-bit grey TIFF · gamma 2.2").weak())
+                        .on_hover_text("The sheet as one grey channel with a gamma 2.2 profile.");
+                }
+            }
         });
         // One rule for the sheet: the fields are the sheet in the printer,
         // always in the crop's proportion. Type one side and the other
@@ -5320,15 +5239,10 @@ struct Docks {
 
 /// Width of the side panels, points.
 const PANEL_W: f32 = 318.0;
-/// Reach of the lamp sliders, stops either way (`print::LAMP_LIMIT`). The
-/// paper's two exposures are the strip now; the sliders stay for the
-/// plate's lamps.
-const SLIDER_STOPS: f64 = LAMP_LIMIT;
-/// Twelfth of a stop, the step of a slider handle.
-const EXPOSURE_STEP: f64 = 1.0 / 12.0;
-/// Rail the lamp sliders keep. A wider enlarger may lengthen it.
-/// A narrower one clips the row; the rail does not shrink.
-const EXPOSURE_RAIL: f32 = 168.0;
+/// Reach of the lamp sliders, stops either way (`print::LAMP_LIMIT`).
+const LAMP_STOPS: f64 = LAMP_LIMIT;
+/// Twelfth of a stop, the step of a lamp handle.
+const LAMP_STEP: f64 = 1.0 / 12.0;
 
 /// Width the enlarger controls are drawn at. The glass may be narrower
 /// and then clips them. Nothing in the enlarger wraps to fit.
@@ -5337,108 +5251,94 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
     let paint =
         |text: &str| ui.painter().layout_no_wrap(text.to_owned(), body.clone(), Color32::WHITE).size().x;
     let gap = ui.spacing().item_spacing.x;
-    let value = exposure_value_width(ui);
-    let grade = paint("≈ grade 00 · 00.0 stops of scene · grey card prints at 0.00");
-    // The lamps' sliders.
-    let slider = EXPOSURE_RAIL + gap + value;
+    let value = drag_value_width(ui);
+    let grade = paint("≈ grade 00 · 00.0 stops of scene");
     let weights = paint("R") + gap + value + gap + paint("B") + gap + value + gap + paint("G 0.000");
     let strip = filter_strip::min_width(ui, &MIX_LABELS);
-    grade.max(slider).max(weights).max(strip)
+    grade.max(weights).max(strip)
 }
 
 /// The fields of the monochrome mix, for the width they need.
 const MIX_LABELS: [&str; 8] = ["Native", "Pan", "Y8", "YG11", "O16", "R25", "G58", "B47"];
 
-/// Width of the number beside an exposure slider: the widest reading the
-/// range can show, in the button font the slider uses, plus its padding.
-/// A little extra keeps the button stroke inside the row.
-fn exposure_value_width(ui: &egui::Ui) -> f32 {
+/// Width of a weight's number (0.000) in the button font, plus its padding.
+fn drag_value_width(ui: &egui::Ui) -> f32 {
     let font = egui::TextStyle::Button.resolve(ui.style());
-    let text =
-        ui.painter().layout_no_wrap(format!("-{SLIDER_STOPS:.2} stops"), font, egui::Color32::WHITE).size().x;
+    let text = ui.painter().layout_no_wrap("0.000".to_owned(), font, egui::Color32::WHITE).size().x;
     let padded = text + ui.spacing().button_padding.x * 2.0 + 2.0;
     padded.max(ui.spacing().interact_size.x)
 }
 
-/// Rail shared by the two exposure sliders. `value` is the number's width,
-/// `gap` the space between rail and number. Below [`EXPOSURE_RAIL`] the
-/// row is clipped instead of the rail being shortened.
-fn exposure_rail_width(row: f32, value: f32, gap: f32) -> f32 {
-    (row - value - gap).max(EXPOSURE_RAIL)
+/// One lamp, the width of the paper. The lamp's letter sits in the handle,
+/// amber off zero; the stops are the hover. A double click is zero, and a
+/// second one the value it left. Arrow keys step a twelfth while it has
+/// the focus.
+fn lamp_slider(ui: &mut egui::Ui, width: f32, mark: &str, v: &mut f64, hint: &str) {
+    let thickness = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, thickness), Sense::click_and_drag());
+    let handle = lamp_handle_size(ui, thickness);
+    let remembered = response.id.with("remembered");
+    if response.double_clicked() {
+        if *v != 0.0 {
+            ui.data_mut(|d| d.insert_temp::<f64>(remembered, *v));
+            *v = 0.0;
+        } else if let Some(r) = ui.data(|d| d.get_temp::<f64>(remembered)) {
+            *v = r;
+        }
+    } else if let Some(pos) = response.interact_pointer_pos() {
+        *v = lamp_stops_from_pointer(rect.left(), rect.width(), handle.x, pos.x);
+    }
+    if response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                response.id,
+                egui::EventFilter { horizontal_arrows: true, ..Default::default() },
+            );
+        });
+        let step = ui.input(|i| {
+            i.num_presses(egui::Key::ArrowRight) as i32 - i.num_presses(egui::Key::ArrowLeft) as i32
+        });
+        if step != 0 {
+            *v = (*v + f64::from(step) * LAMP_STEP).clamp(-LAMP_STOPS, LAMP_STOPS);
+        }
+    }
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+    } else if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::Grab);
+    }
+    if ui.is_rect_visible(rect) {
+        paint_lamp_slider(ui, rect, handle, *v, mark, &response);
+    }
+    response.on_hover_text(format!("{hint}\n{v:+.2} stops"));
 }
 
-/// One exposure. The filter number sits in the handle; the stops sit beside the rail.
-fn exposure_slider(ui: &mut egui::Ui, rail: f32, mark: &str, v: &mut f64, hint: &str) {
-    let row = ui.horizontal(|ui| {
-        let thickness = ui.text_style_height(&egui::TextStyle::Body).max(ui.spacing().interact_size.y);
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(rail, thickness), Sense::click_and_drag());
-        let handle = exposure_handle_size(ui, thickness);
-        if response.has_focus() {
-            ui.memory_mut(|m| {
-                m.set_focus_lock_filter(
-                    response.id,
-                    egui::EventFilter { horizontal_arrows: true, ..Default::default() },
-                );
-            });
-            let step = ui.input(|i| {
-                i.num_presses(egui::Key::ArrowRight) as i32 - i.num_presses(egui::Key::ArrowLeft) as i32
-            });
-            if step != 0 {
-                *v = (*v + f64::from(step) * EXPOSURE_STEP).clamp(-SLIDER_STOPS, SLIDER_STOPS);
-            }
-        }
-        if let Some(pos) = response.interact_pointer_pos() {
-            *v = exposure_stops_from_pointer(rect.left(), rect.width(), handle.x, pos.x);
-        }
-        if response.dragged() {
-            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-        } else if response.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::Grab);
-        }
-        if ui.is_rect_visible(rect) {
-            paint_exposure_slider(ui, rect, handle, *v, mark, &response);
-        }
-        let stepping =
-            ui.input(|i| i.num_presses(egui::Key::ArrowUp) > 0 || i.num_presses(egui::Key::ArrowDown) > 0);
-        let speed = if stepping { EXPOSURE_STEP } else { (2.0 * SLIDER_STOPS) / f64::from(rail.max(1.0)) };
-        ui.add(
-            egui::DragValue::new(v)
-                .range(-SLIDER_STOPS..=SLIDER_STOPS)
-                .clamp_existing_to_range(false)
-                .speed(speed)
-                .fixed_decimals(2)
-                .suffix(" stops"),
-        );
-    });
-    row.response.on_hover_text(hint);
-}
-
-fn exposure_mark_font() -> egui::FontId {
+fn lamp_mark_font() -> egui::FontId {
     egui::FontId::proportional(12.0)
 }
 
-/// Width for the wider mark, "00", so both handles travel the same distance.
-fn exposure_handle_size(ui: &egui::Ui, row_h: f32) -> Vec2 {
-    let text = ui.painter().layout_no_wrap("00".to_owned(), exposure_mark_font(), Color32::WHITE).size().x;
+/// Width for a two-letter mark, so every handle travels the same distance.
+fn lamp_handle_size(ui: &egui::Ui, row_h: f32) -> Vec2 {
+    let text = ui.painter().layout_no_wrap("00".to_owned(), lamp_mark_font(), Color32::WHITE).size().x;
     let w = text + 12.0;
     let h = (row_h - 2.0).clamp(12.0, row_h);
     Vec2::new(w, h)
 }
 
-fn exposure_handle_left(rail_left: f32, rail_w: f32, handle_w: f32, stops: f64) -> f32 {
-    let t = ((stops + SLIDER_STOPS) / (2.0 * SLIDER_STOPS)).clamp(0.0, 1.0);
+fn lamp_handle_left(rail_left: f32, rail_w: f32, handle_w: f32, stops: f64) -> f32 {
+    let t = ((stops + LAMP_STOPS) / (2.0 * LAMP_STOPS)).clamp(0.0, 1.0);
     let travel = (rail_w - handle_w).max(0.0);
     rail_left + (t as f32) * travel
 }
 
-fn exposure_stops_from_pointer(rail_left: f32, rail_w: f32, handle_w: f32, x: f32) -> f64 {
+fn lamp_stops_from_pointer(rail_left: f32, rail_w: f32, handle_w: f32, x: f32) -> f64 {
     let travel = (rail_w - handle_w).max(1.0);
     let t = ((x - handle_w * 0.5 - rail_left) / travel).clamp(0.0, 1.0);
-    let raw = -SLIDER_STOPS + (t as f64) * (2.0 * SLIDER_STOPS);
-    ((raw / EXPOSURE_STEP).round() * EXPOSURE_STEP).clamp(-SLIDER_STOPS, SLIDER_STOPS)
+    let raw = -LAMP_STOPS + (t as f64) * (2.0 * LAMP_STOPS);
+    ((raw / LAMP_STEP).round() * LAMP_STEP).clamp(-LAMP_STOPS, LAMP_STOPS)
 }
 
-fn paint_exposure_slider(
+fn paint_lamp_slider(
     ui: &egui::Ui,
     rect: Rect,
     handle: Vec2,
@@ -5452,17 +5352,24 @@ fn paint_exposure_slider(
     let rail = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), rail_h));
     let painter = ui.painter();
     painter.rect_filled(rail, inactive.corner_radius, inactive.bg_fill);
-    let left = exposure_handle_left(rect.left(), rect.width(), handle.x, stops);
+    // The zero, a tick under the rail, so the eye has the reference.
+    let zero_x = lamp_handle_left(rect.left(), rect.width(), handle.x, 0.0) + handle.x * 0.5;
+    painter.line_segment(
+        [Pos2::new(zero_x, rail.bottom()), Pos2::new(zero_x, rect.bottom())],
+        Stroke::new(1.0, ui.visuals().weak_text_color()),
+    );
+    let left = lamp_handle_left(rect.left(), rect.width(), handle.x, stops);
     let knob = Rect::from_min_size(Pos2::new(left, rect.center().y - handle.y * 0.5), handle)
         .expand(visuals.expansion);
-    painter.rect(knob, visuals.corner_radius, visuals.bg_fill, visuals.fg_stroke, egui::StrokeKind::Inside);
-    painter.text(
-        knob.center(),
-        egui::Align2::CENTER_CENTER,
-        mark,
-        exposure_mark_font(),
-        visuals.fg_stroke.color,
-    );
+    // Off zero the lamp says so, as the paper strip does.
+    let off = stops.abs() >= LAMP_STEP / 2.0;
+    let (fill, stroke, ink) = if off {
+        (AMBER, Stroke::new(1.0, AMBER), Color32::from_rgb(28, 18, 6))
+    } else {
+        (visuals.bg_fill, visuals.fg_stroke, visuals.fg_stroke.color)
+    };
+    painter.rect(knob, visuals.corner_radius, fill, stroke, egui::StrokeKind::Inside);
+    painter.text(knob.center(), egui::Align2::CENTER_CENTER, mark, lamp_mark_font(), ink);
 }
 
 /// Gap between the stage edge and a panel.
@@ -6282,9 +6189,9 @@ mod crop_drag_tests {
 #[cfg(test)]
 mod dock_tests {
     use super::{
-        docks_cross, exposure_handle_left, exposure_rail_width, exposure_stops_from_pointer,
-        hold_magnification, opening_moved, pan_bounds, pan_limit, picture_is_fitted, place_docks, sheet_rect,
-        strip_closes, DOCK_MIN_H, ENLARGER_MIN_W, EXPOSURE_RAIL, PANEL_GAP, PANEL_W, SLIDER_STOPS,
+        docks_cross, hold_magnification, lamp_handle_left, lamp_stops_from_pointer, opening_moved,
+        pan_bounds, pan_limit, picture_is_fitted, place_docks, sheet_rect, strip_closes, DOCK_MIN_H,
+        ENLARGER_MIN_W, LAMP_STOPS, PANEL_GAP, PANEL_W,
     };
     use egui::{Pos2, Rect, Vec2};
 
@@ -6371,27 +6278,15 @@ mod dock_tests {
     }
 
     #[test]
-    fn the_two_exposure_rails_share_one_width() {
-        let wide = exposure_rail_width(400.0, 100.0, 8.0);
-        assert!((wide - 292.0).abs() < 0.01);
-        assert_eq!(exposure_rail_width(400.0, 100.0, 8.0), wide);
-        assert_eq!(exposure_rail_width(40.0, 100.0, 8.0), EXPOSURE_RAIL);
-        assert_eq!(exposure_rail_width(80.0, 100.0, 8.0), EXPOSURE_RAIL);
-    }
-
-    #[test]
-    fn the_exposure_handle_sits_on_the_stops() {
+    fn the_lamp_handle_sits_on_the_stops() {
         let (left, rail, handle) = (10.0, 200.0, 28.0);
-        assert!((exposure_handle_left(left, rail, handle, -SLIDER_STOPS) - left).abs() < 0.01);
-        let mid = exposure_handle_left(left, rail, handle, 0.0);
+        assert!((lamp_handle_left(left, rail, handle, -LAMP_STOPS) - left).abs() < 0.01);
+        let mid = lamp_handle_left(left, rail, handle, 0.0);
         assert!((mid - (left + (rail - handle) / 2.0)).abs() < 0.01);
-        let end = exposure_handle_left(left, rail, handle, SLIDER_STOPS);
+        let end = lamp_handle_left(left, rail, handle, LAMP_STOPS);
         assert!((end + handle - (left + rail)).abs() < 0.01);
-        assert!(exposure_stops_from_pointer(left, rail, handle, left + rail / 2.0).abs() < 1e-9);
-        assert!(
-            (exposure_stops_from_pointer(left, rail, handle, left + handle / 2.0) + SLIDER_STOPS).abs()
-                < 1e-9
-        );
+        assert!(lamp_stops_from_pointer(left, rail, handle, left + rail / 2.0).abs() < 1e-9);
+        assert!((lamp_stops_from_pointer(left, rail, handle, left + handle / 2.0) + LAMP_STOPS).abs() < 1e-9);
     }
 
     #[test]

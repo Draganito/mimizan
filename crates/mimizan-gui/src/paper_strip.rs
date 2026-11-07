@@ -163,10 +163,13 @@ pub fn paper_strip(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
         let over = if zone::GRAY_CARD * stops.exp2() > 1.0 { ", over the clip" } else { "" };
         response.on_hover_text(format!(
             "Zone {}: prints at {:.3} (density {:.2}){over}\n\
-             drag: both exposures · wheel: the grade · double click: the base print",
+             soft {:+.2} · hard {:+.2} stops of time from the base print\n\
+             drag: both exposures · wheel: the grade · double click: the base print, and back",
             zone::numeral(k),
             curve.eval(l),
             curve.density(l),
+            split.soft,
+            split.hard,
         ));
     }
 }

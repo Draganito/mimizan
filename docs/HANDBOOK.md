@@ -13,9 +13,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.7/mimizan_0.16.7-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.7-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.7/mimizan-0.16.7-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.7/mimizan-0.16.7-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.8/mimizan_0.16.8-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.8-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.8/mimizan-0.16.8-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.8/mimizan-0.16.8-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -53,9 +53,10 @@ most of the time. *Apply* develops again when you have changed something.
    The exposure stays.
 5. Double click: the base print. Double click again: back where you were.
 
-The line under the strip names the pair, *soft* (filter 00) and *hard*
-(filter 5) in stops. Zero on both is about grade 2. *base* goes back
-there.
+The line under the strip names the grade the pair equals. The pair
+itself, *soft* (filter 00) and *hard* (filter 5) in stops, is in the
+strip's hover text. Zero on both is about grade 2; the frame is amber
+whenever you are away from it.
 
 **Print** (right) is the sheet.
 
@@ -71,9 +72,10 @@ The recipe sits as a small file next to the RAW and comes back when you
 open it again.
 
 **Colour (Plate).** *Plate* at the top. Three plates, the same paper,
-two lamps, red and blue, under the exposures. Green is the reference.
-The taking filters are Camera, Wratten or Channels. The export is an
-RGB TIFF, sRGB by default.
+two lamps, red and blue, under the strip. Green is the reference.
+Double click a lamp: zero, and back. The taking filters are Camera,
+Wratten or Channels. The export is an RGB TIFF, sRGB by default; the
+primaries are in *Print*, on the file line.
 
 ## On the phone
 
