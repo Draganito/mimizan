@@ -220,14 +220,14 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     }
     // The DNG is the channels plate, nothing else: the converter does the
     // colour. The recipe's crop still applies.
-    // The DNG is framed as the recipe says: its straighten, with its
-    // kernel, and its crop on the straightened frame.
+    // The DNG is framed as the recipe says: its straighten and its crop
+    // on the straightened frame.
     let recipe_framing = a
         .recipe
         .as_ref()
         .map(|p| {
             mimizan_core::recipe::Recipe::load(p)
-                .map(|r| (r.angle, r.resample, r.crop))
+                .map(|r| (r.angle, r.crop))
                 .with_context(|| format!("recipe file {}", p.display()))
         })
         .transpose()?;
@@ -274,8 +274,8 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         let meta = mimizan_core::linear::DngMeta::of(&frame, neg.info.wb, &desc)
             .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
         let framing = match recipe_framing {
-            Some((angle, kernel, crop)) => {
-                mimizan_core::linear::Framing { orientation: neg.orientation, angle, kernel, crop }
+            Some((angle, crop)) => {
+                mimizan_core::linear::Framing { orientation: neg.orientation, angle, crop }
             }
             None => mimizan_core::linear::Framing::upright(neg.orientation),
         };

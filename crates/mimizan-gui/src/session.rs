@@ -23,7 +23,7 @@ use mimizan_core::resize::{
     fit_dims, resize, resize_rect, source_coverage, PixelRect, PlaneWindow, ResampleKernel,
 };
 use mimizan_core::separate::{MaskMode, Separation};
-use mimizan_core::straighten::{self, Affine};
+use mimizan_core::straighten::{self, Affine, STRAIGHTEN_KERNEL};
 use mimizan_core::tone::{Tone, ToneMap};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -343,9 +343,6 @@ pub struct ViewParams {
     /// positive. The picture is then the frame (`straighten::frame_size`),
     /// and `crop` lies in it. Zero turns nothing.
     pub angle: f64,
-    /// The kernel the straighten resamples with where the view is 1:1
-    /// (the recipe's), so the 1:1 view is the export.
-    pub kernel: ResampleKernel,
     /// Window on the file-upright frame. `None` is the whole frame.
     /// The preview turns it with `rotation` before cutting.
     pub crop: Option<CropRect>,
@@ -715,7 +712,7 @@ impl DetailSource<'_> {
                     plane.data.par_iter().map(|&x| (x.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
                 );
             }
-            let [plane] = g.warped(rect, v.kernel, |sensor| {
+            let [plane] = g.warped(rect, STRAIGHTEN_KERNEL, |sensor| {
                 Some([mixed_upright(sep, &v.weights, sensor, orientation)?])
             })?;
             return Some(display_bytes(&plane, v.place, table));
@@ -743,7 +740,7 @@ impl DetailSource<'_> {
     fn plate_dense(&self, plate: &PlateView, rect: DetailRect) -> Option<[Plane; 3]> {
         let Self { sep, g, .. } = *self;
         if g.map.is_some() {
-            return g.warped(rect, self.v.kernel, |sensor| {
+            return g.warped(rect, STRAIGHTEN_KERNEL, |sensor| {
                 plate_upright(sep, &plate.weights, sensor, g.orientation)
             });
         }
@@ -878,8 +875,9 @@ fn measured_gray(
                 })?;
                 return Some(plane.data.par_iter().map(|&p| to_u8(p)).collect());
             }
-            let [plane] =
-                g.warped(rect, v.kernel, |sensor| Some([orient(&crop(&n.plane, sensor)?, orientation)]))?;
+            let [plane] = g.warped(rect, STRAIGHTEN_KERNEL, |sensor| {
+                Some([orient(&crop(&n.plane, sensor)?, orientation)])
+            })?;
             return Some(display_bytes(&plane, v.place, table));
         }
         if v.show_mask {
@@ -1012,8 +1010,9 @@ pub fn render_print_detail(
     let map = straighten::print_map(full_w, full_h, recipe.angle, recipe.crop, lay.image_w, lay.image_h);
     let (ox, oy, sw, sh) =
         if turned { (0, 0, full_w, full_h) } else { source_window(full_w, full_h, recipe.crop) };
+    let kernel = if turned { straighten::kernel_for(&map, recipe.resample) } else { recipe.resample };
     let (x0, y0, x1, y1) = if turned {
-        straighten::footprint(&map, recipe.resample, pix, full_w, full_h)
+        straighten::footprint(&map, kernel, pix, full_w, full_h)
     } else {
         source_coverage(sw, sh, lay.image_w, lay.image_h, recipe.resample, pix)
     };
@@ -1027,7 +1026,7 @@ pub fn render_print_detail(
     let enlarge = |plane: &Plane| {
         let window = PlaneWindow { plane, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
         let out = if turned {
-            straighten::warp(window, &map, recipe.resample, pix)
+            straighten::warp(window, &map, kernel, pix)
         } else {
             resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix)
         };
@@ -1909,14 +1908,11 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
     }
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.histograms(s, v, table);
-    // Turn, straighten, then cut the window, on the small planes. The fit
-    // copy is drawn with Catmull-Rom whatever the recipe says: it shows
-    // the geometry, and the recipe's kernel is seen where it matters, in
-    // the 1:1 tiles and the print box. The default B-spline would soften
-    // a copy that is already small.
+    // Turn, straighten, then cut the window, on the small planes, with
+    // the turn's own kernel, as the 1:1 tiles and the linear exports.
     let shown = |plane: Plane| -> Plane {
         let turned = orient(&plane, rotated(1, v.rotation));
-        let turned = straighten::straighten(&turned, v.angle, ResampleKernel::CatmullRom);
+        let turned = straighten::straighten(&turned, v.angle, STRAIGHTEN_KERNEL);
         match v.crop {
             Some(c) => {
                 let (fw, fh) = s.frame_size(v.angle);
@@ -2339,7 +2335,6 @@ mod histogram_tests {
             show_mask: false,
             rotation: 0,
             angle: 0.0,
-            kernel: ResampleKernel::default(),
             crop: None,
             plate: None,
         };
@@ -2357,7 +2352,7 @@ mod histogram_tests {
         // upright negative warped with the recipe's kernel, as the export
         // writes them. The fit copy has the frame's size and proportion.
         let angle = 4.0;
-        let turned = ViewParams { angle, kernel: ResampleKernel::CatmullRom, ..view.clone() };
+        let turned = ViewParams { angle, ..view.clone() };
         let (fw, fh) = straighten::frame_size(w, h, angle);
         assert!(fw < w && fh < h);
         let detail = render_detail(
@@ -2368,7 +2363,7 @@ mod histogram_tests {
             Some(&a),
         )
         .unwrap();
-        let expected = straighten::straighten(&session.negative.plane, angle, ResampleKernel::CatmullRom);
+        let expected = straighten::straighten(&session.negative.plane, angle, STRAIGHTEN_KERNEL);
         assert_eq!((expected.width, expected.height), (fw, fh));
         assert_eq!(detail.gray, display_bytes(&expected, 0.0, &table));
         let preview = render_preview(&session, &turned, &mut cache, &table);
@@ -2453,7 +2448,6 @@ mod histogram_tests {
             show_mask: false,
             rotation: 1,
             angle: 0.0,
-            kernel: ResampleKernel::default(),
             crop: None,
             plate: Some(plate),
         };

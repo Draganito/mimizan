@@ -24,8 +24,9 @@
 //! Orientation, straighten and crop are applied to the pixels, as the
 //! recipe says ([`Framing`]): a 90° turn is a permutation, a crop a
 //! window, neither resamples. The straighten does, once, with the
-//! recipe's kernel, the way the print does; a recipe without one leaves
-//! every sample as measured. The files carry orientation 1.
+//! turn's kernel ([`STRAIGHTEN_KERNEL`]), as a 1:1 print does; a recipe
+//! without one leaves every sample as measured. The files carry
+//! orientation 1.
 
 use crate::decode::RawFrame;
 use crate::error::{Error, Result};
@@ -34,6 +35,7 @@ use crate::plane::Plane;
 use crate::print::{orient, window_plane, MASK_KERNEL};
 use crate::recipe::CropRect;
 use crate::resize::ResampleKernel;
+use crate::straighten::STRAIGHTEN_KERNEL;
 use crate::tiffout::{write_gray16, write_gray8, TiffMeta};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -162,16 +164,15 @@ pub struct Written {
 }
 
 /// How the picture is framed on its way out: the TIFF orientation (the
-/// file's plus the user's 90° turns), the recipe's straighten and its
-/// kernel, and the crop on the straightened frame.
+/// file's plus the user's 90° turns), the recipe's straighten, and the
+/// crop on the straightened frame. The straighten is a turn alone, no
+/// size step, so it resamples with [`STRAIGHTEN_KERNEL`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Framing {
     /// TIFF orientation to apply, 1..=8.
     pub orientation: u16,
     /// The straighten, degrees clockwise; zero turns nothing.
     pub angle: f64,
-    /// The kernel the straighten resamples with (the recipe's).
-    pub kernel: ResampleKernel,
     /// Window on the straightened frame.
     pub crop: Option<CropRect>,
 }
@@ -179,7 +180,7 @@ pub struct Framing {
 impl Framing {
     /// Upright by `orientation`, nothing else.
     pub fn upright(orientation: u16) -> Self {
-        Self { orientation, angle: 0.0, kernel: ResampleKernel::default(), crop: None }
+        Self { orientation, angle: 0.0, crop: None }
     }
 
     /// Upright, cut to `crop`, no straighten.
@@ -219,7 +220,7 @@ pub fn write_negative(
     framing: &Framing,
     description: &str,
 ) -> Result<Written> {
-    let out = framed(plane, framing, framing.kernel);
+    let out = framed(plane, framing, STRAIGHTEN_KERNEL);
     write_gray16(path, &out, &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None })?;
     if let Some(m) = mask {
         if (m.width, m.height) != (plane.width, plane.height) {
@@ -278,7 +279,7 @@ pub fn write_dng(
     let mut data: Vec<u16> = Vec::new();
     let (mut width, mut height) = (0usize, 0usize);
     for (c, plane) in balanced.iter().enumerate() {
-        let f = framed(plane, framing, framing.kernel);
+        let f = framed(plane, framing, STRAIGHTEN_KERNEL);
         if c == 0 {
             width = f.width;
             height = f.height;
@@ -453,7 +454,7 @@ mod tests {
         assert_eq!(px.len(), 3 * 4 * 3);
         // The same frame, computed here: the three ramps are 2:1:1.5 of one
         // picture, so unbalanced they are equal, and equal to the green.
-        let want = framed(&g, &framing, framing.kernel);
+        let want = framed(&g, &framing, STRAIGHTEN_KERNEL);
         for (i, p) in px.chunks(3).enumerate() {
             let q = (want.data[i].clamp(0.0, 1.0) * 65535.0).round() as u16;
             assert_eq!(p, &[q, q, q], "pixel {i}");
@@ -514,7 +515,7 @@ mod tests {
         assert_eq!(got, Written { width: 3, height: 4 });
         let read = crate::tiffin::read_gray(&path).unwrap();
         assert_eq!((read.plane.width, read.plane.height, read.orientation), (3, 4, 1));
-        let want = framed(&plane, &framing, framing.kernel);
+        let want = framed(&plane, &framing, STRAIGHTEN_KERNEL);
         for (a, b) in read.plane.data.iter().zip(&want.data) {
             assert!((a - b).abs() < 1.0 / 65535.0, "{a} vs {b}");
         }
@@ -536,7 +537,7 @@ mod tests {
         let mask = Plane::from_vec(w, h, vec![1.0; w * h]);
         let path = tmp("neg_turned.tif");
         let crop = Some(CropRect { x: 4, y: 3, w: 30, h: 20 });
-        let framing = Framing { orientation: 6, angle: -4.0, kernel: ResampleKernel::BSpline, crop };
+        let framing = Framing { orientation: 6, angle: -4.0, crop };
         let (fw, fh) = crate::straighten::frame_size(h, w, -4.0);
         assert!(fw < h && fh < w, "{fw}x{fh}");
         assert_eq!(framing.size(w, h), (30, 20));

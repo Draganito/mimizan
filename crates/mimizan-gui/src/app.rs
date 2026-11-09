@@ -1297,7 +1297,6 @@ impl App {
             show_mask: self.show_mask,
             rotation: self.edit.rotation,
             angle: self.view_angle(),
-            kernel: r.resample,
             // While the easel is up the whole negative is shown.
             crop: if self.crop_open { None } else { r.crop },
             plate: self.plate_view(),
@@ -1894,7 +1893,6 @@ impl App {
                     framing: mimizan_core::linear::Framing {
                         orientation: self.export_orientation(),
                         angle: recipe.angle,
-                        kernel: recipe.resample,
                         crop: recipe.crop,
                     },
                     path,

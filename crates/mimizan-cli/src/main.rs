@@ -172,7 +172,8 @@ enum Cmd {
         /// Straighten: turn the picture by this many degrees, clockwise
         /// positive, within ±45, and keep the largest window of its own
         /// proportion; the recipe's crop lies in that window. One
-        /// resampling with --resample's kernel, together with the size.
+        /// resampling together with the size: --resample's kernel when
+        /// there is a size step, Catmull-Rom for a turn alone.
         #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
         angle: Option<f64>,
         /// Output resolution, dots per inch (default from the recipe, 360)

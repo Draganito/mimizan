@@ -23,6 +23,31 @@ use rayon::prelude::*;
 /// by 90° instead.
 pub const ANGLE_LIMIT: f64 = 45.0;
 
+/// The kernel a turn without a size step resamples with. Measured
+/// against a scene rendered at eight times the negative's resolution
+/// (the truth for a level sensor) and on a real negative turned there and
+/// back: the B-spline the print defaults to keeps half of the fine
+/// detail's energy at scale 1 and a fifth less grain; Catmull-Rom has
+/// the lowest total error at the usual 0.5–5° (0.0163 against 0.0276 for
+/// the B-spline, RMSE on [0,1]), keeps 85–93 % of the detail, and
+/// overshoots a hard highlight by under 1 %. Lanczos3 keeps 94–98 % but
+/// overshoots by 2–4 %; Mitchell keeps 71–83 %; area aliases. At 1:1 the
+/// picture was never resampled before, so the kernel nearest to that is
+/// the one the turn takes.
+pub const STRAIGHTEN_KERNEL: ResampleKernel = ResampleKernel::CatmullRom;
+
+/// The kernel the one warp through `map` uses for the picture: the
+/// recipe's `resample` when the map has a size step, [`STRAIGHTEN_KERNEL`]
+/// when it is a turn alone (both scales one). The mask keeps its own.
+pub fn kernel_for(map: &Affine, resample: ResampleKernel) -> ResampleKernel {
+    let (sx, sy) = map.scales();
+    if (sx - 1.0).abs() < 1e-6 && (sy - 1.0).abs() < 1e-6 {
+        STRAIGHTEN_KERNEL
+    } else {
+        resample
+    }
+}
+
 /// `true` when `angle` asks for a turn at all. Angles below a thousandth
 /// of a degree are zero: on a 10 000-pixel side that is less than a tenth
 /// of a pixel at the corner.
@@ -544,6 +569,24 @@ mod tests {
         let cut = crate::print::window_plane(&src, CropRect { x: 40, y: 40, w: 10, h: 10 });
         let window = PlaneWindow { plane: &cut, origin_x: 40, origin_y: 40, full_w: 100, full_h: 100 };
         assert!(warp(window, &m, ResampleKernel::BSpline, PixelRect { x: 0, y: 0, w: 50, h: 50 }).is_err());
+    }
+
+    /// A turn alone takes the straighten's kernel whatever the recipe
+    /// says; a turn with a size step takes the recipe's.
+    #[test]
+    fn the_turn_alone_has_its_own_kernel() {
+        let (w, h) = (4032usize, 6048usize);
+        let (fw, fh) = frame_size(w, h, -2.5);
+        let one_to_one = print_map(w, h, -2.5, None, fw, fh);
+        assert_eq!(kernel_for(&one_to_one, ResampleKernel::BSpline), STRAIGHTEN_KERNEL);
+        assert_eq!(kernel_for(&one_to_one, ResampleKernel::Lanczos3), STRAIGHTEN_KERNEL);
+        let crop = crate::recipe::CropRect { x: 100, y: 200, w: 3000, h: 4000 };
+        let cut = print_map(w, h, -2.5, Some(crop), 3000, 4000);
+        assert_eq!(kernel_for(&cut, ResampleKernel::BSpline), STRAIGHTEN_KERNEL);
+        let reduced = print_map(w, h, -2.5, Some(crop), 1500, 2000);
+        assert_eq!(kernel_for(&reduced, ResampleKernel::BSpline), ResampleKernel::BSpline);
+        let enlarged = print_map(w, h, -2.5, None, fw * 2, fh * 2);
+        assert_eq!(kernel_for(&enlarged, ResampleKernel::Lanczos3), ResampleKernel::Lanczos3);
     }
 
     #[test]

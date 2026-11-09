@@ -829,7 +829,8 @@ pub fn loupe_source_rect(
         // negative: its footprint, with the kernel's reach.
         let map =
             crate::straighten::print_map(full_w, full_h, p.recipe.angle, p.recipe.crop, g.image_w, g.image_h);
-        let (x0, y0, x1, y1) = crate::straighten::footprint(&map, p.recipe.resample, rect, full_w, full_h);
+        let kernel = crate::straighten::kernel_for(&map, p.recipe.resample);
+        let (x0, y0, x1, y1) = crate::straighten::footprint(&map, kernel, rect, full_w, full_h);
         if p.recipe.sharpen.usm_amount() > 0.0 {
             let (mx0, my0, mx1, my1) = crate::straighten::footprint(&map, MASK_KERNEL, rect, full_w, full_h);
             return (x0.min(mx0), y0.min(my0), x1.max(mx1), y1.max(my1));
@@ -894,7 +895,9 @@ pub fn sharpen_window(
     };
     if g.pic_w > 0 && g.pic_h > 0 {
         let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
-        let mut picture = resample(linear, p.recipe.resample, pic)?;
+        let kernel =
+            if turned { crate::straighten::kernel_for(&map, p.recipe.resample) } else { p.recipe.resample };
+        let mut picture = resample(linear, kernel, pic)?;
         crate::tone::render(&mut picture, p.recipe.place, &tone);
         let ox = g.pic_x + g.off_x - g.tile_x;
         let oy = g.pic_y + g.off_y - g.tile_y;
@@ -1093,13 +1096,14 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         let (uw, uh) = (plane.width, plane.height);
         let (fw, fh) = crate::straighten::frame_size(uw, uh, r.angle);
         let map = crate::straighten::print_map(uw, uh, r.angle, r.crop, tw, th);
+        let kernel = crate::straighten::kernel_for(&map, r.resample);
         info!(
             "straighten {:+.3}°: frame {fw}x{fh} of {uw}x{uh}, window {:?} -> {tw}x{th} in one pass ({})",
             r.angle,
             source_window(fw, fh, r.crop),
-            r.resample.name()
+            kernel.name()
         );
-        plane = crate::straighten::warp_plane(&plane, &map, tw, th, r.resample);
+        plane = crate::straighten::warp_plane(&plane, &map, tw, th, kernel);
         if let Some(m) = mask.take() {
             mask = Some(crate::straighten::warp_plane(&m, &map, tw, th, MASK_KERNEL));
         }
