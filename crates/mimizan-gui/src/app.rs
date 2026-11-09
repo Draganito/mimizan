@@ -2112,6 +2112,12 @@ impl App {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.close_crop();
+        // The easel's own state goes with the development: the draft
+        // straighten and the chosen sheet, so the toolbar says what the
+        // picture is.
+        self.angle_draft = 0.0;
+        self.crop_format = PaperFormat::R8x10;
+        self.crop_turned = false;
     }
 
     /// Recipe file next to the RAW: `<name>.recipe.json`.
@@ -2819,7 +2825,9 @@ impl App {
                 self.line_drag = None;
                 self.crop_drag = None;
             }
-            let mut angle = self.angle_draft;
+            // The draft while the easel is up; the recipe's angle when it is
+            // down, so the field never shows a turn the picture has not got.
+            let mut angle = self.view_angle();
             if ui
                 .add(
                     egui::DragValue::new(&mut angle)
@@ -2834,7 +2842,7 @@ impl App {
                 self.set_draft_angle(angle);
             }
             if ui
-                .add_enabled(self.angle_draft != 0.0, egui::Button::new("0°"))
+                .add_enabled(self.view_angle() != 0.0, egui::Button::new("0°"))
                 .on_hover_text("No straighten: the whole negative is the frame again.")
                 .clicked()
             {
