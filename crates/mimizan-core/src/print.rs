@@ -543,7 +543,9 @@ pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
 pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let r = &p.recipe;
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
-    // The fit and the enlargement are measured from the crop window.
+    // The straighten leaves the frame; the crop is a window on that. The
+    // fit and the enlargement are measured from the crop window.
+    let (w, h) = crate::straighten::frame_size(w, h, r.angle);
     let (_, _, w, h) = source_window(w, h, r.crop);
     let white = r.border_px();
     let black = r.black_px();
@@ -599,20 +601,27 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     let r = &p.recipe;
     let lay = layout(w, h, orientation, p);
     let (fw, fh) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
-    let (_, _, cw, ch) = source_window(fw, fh, r.crop);
     let full = fw as f64 * fh as f64;
-    let n = cw as f64 * ch as f64;
     let picture = lay.image_w as f64 * lay.image_h as f64;
     let sheet = lay.out_w as f64 * lay.out_h as f64;
     // The mask walks beside the picture through orient, crop, resize and
     // the frame, doubling those stages.
     let m = if p.sharpens() { 2.0 } else { 1.0 };
-    // Orientation copy, then the crop window beside it.
-    let orient = m * (full + n);
-    // Separable resize: source, the smaller intermediate, destination.
-    let mid = (ch as f64 * lay.image_w as f64).min(cw as f64 * lay.image_h as f64);
-    let resize =
-        if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
+    let (orient, resize) = if crate::straighten::turns(r.angle) {
+        // The straighten reads the oriented plane and writes the picture
+        // in one pass: no crop window, no intermediate.
+        (m * full, m * (full + picture))
+    } else {
+        let (_, _, cw, ch) = source_window(fw, fh, r.crop);
+        let n = cw as f64 * ch as f64;
+        // Orientation copy, then the crop window beside it.
+        let orient = m * (full + n);
+        // Separable resize: source, the smaller intermediate, destination.
+        let mid = (ch as f64 * lay.image_w as f64).min(cw as f64 * lay.image_h as f64);
+        let resize =
+            if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
+        (orient, resize)
+    };
     // The picture and the sheet it is copied into; a sheet that is the
     // picture needs no copy. The mask follows: its sheet is made while the
     // picture's sheet is already there and the mask is still a picture.
@@ -809,16 +818,26 @@ pub fn loupe_source_rect(
     ny: f64,
     view: usize,
 ) -> (usize, usize, usize, usize) {
-    let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
     let lay = layout(full_w, full_h, 1, p);
     let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe, lay.enlargement));
     if g.pic_w == 0 || g.pic_h == 0 {
         return (0, 0, 0, 0);
     }
-    let span = |kernel| {
-        let rect = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
-        crate::resize::source_coverage(sw, sh, g.image_w, g.image_h, kernel, rect)
-    };
+    let rect = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
+    if crate::straighten::turns(p.recipe.angle) {
+        // Through the turn, the box reads a tilted patch of the upright
+        // negative: its footprint, with the kernel's reach.
+        let map =
+            crate::straighten::print_map(full_w, full_h, p.recipe.angle, p.recipe.crop, g.image_w, g.image_h);
+        let (x0, y0, x1, y1) = crate::straighten::footprint(&map, p.recipe.resample, rect, full_w, full_h);
+        if p.recipe.sharpen.usm_amount() > 0.0 {
+            let (mx0, my0, mx1, my1) = crate::straighten::footprint(&map, MASK_KERNEL, rect, full_w, full_h);
+            return (x0.min(mx0), y0.min(my0), x1.max(mx1), y1.max(my1));
+        }
+        return (x0, y0, x1, y1);
+    }
+    let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
+    let span = |kernel| crate::resize::source_coverage(sw, sh, g.image_w, g.image_h, kernel, rect);
     let (x0, y0, x1, y1) = span(p.recipe.resample);
     let (x0, y0, x1, y1) = if p.recipe.sharpen.usm_amount() > 0.0 {
         let (mx0, my0, mx1, my1) = span(MASK_KERNEL);
@@ -848,8 +867,9 @@ pub fn sharpen_window(
     ny: f64,
     view: usize,
 ) -> crate::Result<Plane> {
-    let (ox, oy, sw, sh) = source_window(linear.full_w, linear.full_h, p.recipe.crop);
-    let lay = layout(linear.full_w, linear.full_h, 1, p);
+    let (full_w, full_h) = (linear.full_w, linear.full_h);
+    let (ox, oy, sw, sh) = source_window(full_w, full_h, p.recipe.crop);
+    let lay = layout(full_w, full_h, 1, p);
     let g = loupe_geom(&lay, p.recipe.sharpen, nx, ny, view, peak_halo_px(&p.recipe, lay.enlargement));
     let tone = p.recipe.curve.compile();
     let white = tone.white();
@@ -858,13 +878,23 @@ pub fn sharpen_window(
         paint_sheet_rect(&mut tile, g.tile_x, g.tile_y, black_rect(&lay), tone.eval(0.0));
     }
     let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
-    // The plane window is in full-image coordinates. The resize maps the
-    // crop, so its coordinate system is the window.
-    let linear = window_frame(linear, ox, oy, sw, sh);
-    let mask = mask.map(|m| window_frame(m, ox, oy, sw, sh));
+    // With a turn, the picture pixels are read back through the window
+    // and the turn into the upright negative, as `render_planes` does;
+    // the plane window stays in upright coordinates. Without one, the
+    // resize maps the crop, so its coordinate system is the window.
+    let turned = crate::straighten::turns(p.recipe.angle);
+    let map =
+        crate::straighten::print_map(full_w, full_h, p.recipe.angle, p.recipe.crop, g.image_w, g.image_h);
+    let resample = |src: PlaneWindow<'_>, kernel, pic| -> crate::Result<Plane> {
+        if turned {
+            crate::straighten::warp(src, &map, kernel, pic)
+        } else {
+            resize_rect(window_frame(src, ox, oy, sw, sh), g.image_w, g.image_h, kernel, pic)
+        }
+    };
     if g.pic_w > 0 && g.pic_h > 0 {
         let pic = PixelRect { x: g.pic_x, y: g.pic_y, w: g.pic_w, h: g.pic_h };
-        let mut picture = resize_rect(linear, g.image_w, g.image_h, p.recipe.resample, pic)?;
+        let mut picture = resample(linear, p.recipe.resample, pic)?;
         crate::tone::render(&mut picture, p.recipe.place, &tone);
         let ox = g.pic_x + g.off_x - g.tile_x;
         let oy = g.pic_y + g.off_y - g.tile_y;
@@ -876,7 +906,7 @@ pub fn sharpen_window(
         // resampling it anyway could read off the window.
         if p.recipe.sharpen.usm_amount() > 0.0 {
             if let (Some(m), Some(dst)) = (mask, mask_tile.as_mut()) {
-                let resampled = resize_rect(m, g.image_w, g.image_h, MASK_KERNEL, pic)?;
+                let resampled = resample(m, MASK_KERNEL, pic)?;
                 for y in 0..g.pic_h {
                     dst.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(resampled.row(y));
                 }
@@ -1054,21 +1084,39 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
             mask = Some(orient(m, src.orientation));
         }
     }
-    if let Some(c) = r.crop {
-        let c = c.sanitized(plane.width as u32, plane.height as u32);
-        plane = window_plane(&plane, c);
-        if let Some(m) = mask.take() {
-            mask = Some(window_plane(&m, c));
-        }
-    }
-
     let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
     let (tw, th) = (lay.image_w, lay.image_h);
-    if (tw, th) != (plane.width, plane.height) {
-        info!("resize {}x{} -> {}x{} ({})", plane.width, plane.height, tw, th, r.resample.name());
-        plane = resize_with(&plane, tw, th, r.resample);
+    if crate::straighten::turns(r.angle) {
+        // The straighten, the crop and the size in one resampling: every
+        // print pixel is read back through the window and the turn into
+        // the upright negative, with the print's kernel.
+        let (uw, uh) = (plane.width, plane.height);
+        let (fw, fh) = crate::straighten::frame_size(uw, uh, r.angle);
+        let map = crate::straighten::print_map(uw, uh, r.angle, r.crop, tw, th);
+        info!(
+            "straighten {:+.3}°: frame {fw}x{fh} of {uw}x{uh}, window {:?} -> {tw}x{th} in one pass ({})",
+            r.angle,
+            source_window(fw, fh, r.crop),
+            r.resample.name()
+        );
+        plane = crate::straighten::warp_plane(&plane, &map, tw, th, r.resample);
         if let Some(m) = mask.take() {
-            mask = Some(resize_with(&m, tw, th, MASK_KERNEL));
+            mask = Some(crate::straighten::warp_plane(&m, &map, tw, th, MASK_KERNEL));
+        }
+    } else {
+        if let Some(c) = r.crop {
+            let c = c.sanitized(plane.width as u32, plane.height as u32);
+            plane = window_plane(&plane, c);
+            if let Some(m) = mask.take() {
+                mask = Some(window_plane(&m, c));
+            }
+        }
+        if (tw, th) != (plane.width, plane.height) {
+            info!("resize {}x{} -> {}x{} ({})", plane.width, plane.height, tw, th, r.resample.name());
+            plane = resize_with(&plane, tw, th, r.resample);
+            if let Some(m) = mask.take() {
+                mask = Some(resize_with(&m, tw, th, MASK_KERNEL));
+            }
         }
     }
 
@@ -1387,6 +1435,80 @@ mod tests {
         );
         assert_eq!((via.plane.width, via.plane.height), (2, 2));
         assert_eq!(via.plane.data, direct.plane.data);
+    }
+
+    /// A straightened print is the frame, the crop a window on it, the
+    /// sheet fitted from that window; the mask walks beside it; the box
+    /// reads the same pixels as the whole sheet.
+    #[test]
+    fn straightened_print_is_the_frame_then_the_window() {
+        use crate::recipe::CropRect;
+        use crate::straighten::frame_size;
+        let (w, h) = (120usize, 80usize);
+        let mut full = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                full.set(x, y, 0.2 + 0.6 * ((x as f64 / 17.0).sin() * (y as f64 / 11.0).cos()).abs());
+            }
+        }
+        let mask = Plane::from_vec(w, h, vec![1.0; w * h]);
+        // Orientation 6 turns the plane to 80×120 before the straighten.
+        let (fw, fh) = frame_size(h, w, -4.0);
+        let recipe = Recipe { angle: -4.0, ..Recipe::on_paper() };
+        let p = PrintParams { recipe: recipe.clone(), ..Default::default() };
+        let lay = layout(w, h, 6, &p);
+        assert_eq!((lay.image_w, lay.image_h), (fw, fh));
+        let src = PrintSource {
+            plane: &full,
+            mask: Some(&mask),
+            orientation: 6,
+            name: "t".into(),
+            description: None,
+        };
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (fw, fh));
+        assert!(out.plane.data.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+        assert!(memory_estimate(w, h, 6, &p) > 0);
+
+        // A crop on the frame and a sheet: the window's proportion, fitted.
+        let crop = CropRect { x: 5, y: 7, w: 40, h: 60 };
+        let recipe = Recipe {
+            crop: Some(crop),
+            size: Some(PrintSize::Physical { width_in: 2.0, height_in: 3.0 }),
+            dpi: 100.0,
+            ..recipe
+        };
+        let p = PrintParams { recipe, ..Default::default() };
+        let lay = layout(w, h, 6, &p);
+        assert_eq!((lay.image_w, lay.image_h), (200, 300));
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (200, 300));
+
+        // The loupe through the same map: its box equals the sheet there.
+        let upright = orient(&full, 6);
+        let (x0, y0, x1, y1) = loupe_source_rect(upright.width, upright.height, &p, 0.5, 0.5, 40);
+        assert!(x1 > x0 && y1 > y0);
+        let cut = window_plane(
+            &upright,
+            CropRect { x: x0 as u32, y: y0 as u32, w: (x1 - x0) as u32, h: (y1 - y0) as u32 },
+        );
+        let window = PlaneWindow {
+            plane: &cut,
+            origin_x: x0,
+            origin_y: y0,
+            full_w: upright.width,
+            full_h: upright.height,
+        };
+        let boxed = sharpen_window(window, None, &p, 0.5, 0.5, 40).unwrap();
+        assert_eq!((boxed.width, boxed.height), (40, 40));
+        let g = loupe_geom(&lay, p.recipe.sharpen, 0.5, 0.5, 40, 0);
+        for y in 0..40 {
+            for x in 0..40 {
+                let a = boxed.at(x, y);
+                let b = out.plane.at(g.view_x + x, g.view_y + y);
+                assert!((a - b).abs() < 1e-9, "{x},{y}: {a} vs {b}");
+            }
+        }
     }
 
     #[test]

@@ -220,16 +220,17 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     }
     // The DNG is the channels plate, nothing else: the converter does the
     // colour. The recipe's crop still applies.
-    let recipe_crop = a
+    // The DNG is framed as the recipe says: its straighten, with its
+    // kernel, and its crop on the straightened frame.
+    let recipe_framing = a
         .recipe
         .as_ref()
         .map(|p| {
             mimizan_core::recipe::Recipe::load(p)
-                .map(|r| r.crop)
+                .map(|r| (r.angle, r.resample, r.crop))
                 .with_context(|| format!("recipe file {}", p.display()))
         })
-        .transpose()?
-        .flatten();
+        .transpose()?;
     if a.dng {
         if frame.kind == SensorKind::Mono {
             bail!(
@@ -272,15 +273,26 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         let [r, g, b] = mimizan_core::plate::split(&neg.plane, pi)?;
         let meta = mimizan_core::linear::DngMeta::of(&frame, neg.info.wb, &desc)
             .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
-        let w = mimizan_core::linear::write_dng(&a.out, [&r, &g, &b], neg.orientation, recipe_crop, &meta)?;
+        let framing = match recipe_framing {
+            Some((angle, kernel, crop)) => {
+                mimizan_core::linear::Framing { orientation: neg.orientation, angle, kernel, crop }
+            }
+            None => mimizan_core::linear::Framing::upright(neg.orientation),
+        };
+        let w = mimizan_core::linear::write_dng(&a.out, [&r, &g, &b], &framing, &meta)?;
         info!(
-            "wrote {} ({}x{} linear DNG, {}) in {} ms",
+            "wrote {} ({}x{} linear DNG, {}{}) in {} ms",
             a.out.display(),
             w.width,
             w.height,
-            match recipe_crop {
+            match framing.crop {
                 Some(_) => "the recipe's crop",
                 None => "the whole frame",
+            },
+            if mimizan_core::straighten::turns(framing.angle) {
+                format!(", straightened {:+.2}°", framing.angle)
+            } else {
+                String::new()
             },
             t.elapsed().as_millis()
         );
@@ -333,6 +345,8 @@ pub struct PrintArgs {
     pub resample: Option<String>,
     pub border_mm: Option<f64>,
     pub black_mm: Option<f64>,
+    /// The straighten, degrees clockwise.
+    pub angle: Option<f64>,
     pub dpi: Option<f64>,
     pub usm_amount: Option<f64>,
     pub usm_k: f64,
@@ -402,6 +416,9 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     }
     if let Some(b) = a.black_mm {
         r.black_mm = b;
+    }
+    if let Some(deg) = a.angle {
+        r.angle = deg;
     }
     if let Some(d) = a.dpi {
         r.dpi = d;

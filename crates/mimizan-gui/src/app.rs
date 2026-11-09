@@ -29,6 +29,7 @@ use mimizan_core::print::{memory_estimate, memory_text, peak_print_radius, Print
 use mimizan_core::recipe::{CropCorner, CropRect, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
+use mimizan_core::straighten;
 use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -279,6 +280,7 @@ struct SharedPicture {
     tone: Tone,
     place: f64,
     rotation: u8,
+    angle: f64,
     crop: Option<CropRect>,
     plate: Option<PlateView>,
 }
@@ -637,9 +639,18 @@ pub struct App {
     crop_format: PaperFormat,
     /// The paper ratio stands across the picture's long side.
     crop_turned: bool,
-    /// Draft window, in file-upright pixels (before the user's turns).
+    /// Draft window, in file-upright frame pixels (before the user's
+    /// turns, after the draft straighten).
     crop_draft: CropRect,
     crop_drag: Option<CropDrag>,
+    /// Draft straighten while the easel is up, degrees clockwise. The
+    /// view shows its frame; Apply writes it into the recipe with the crop.
+    angle_draft: f64,
+    /// The straighten mode of the easel: a drag on the picture draws the
+    /// line that is to be level or upright, instead of moving the window.
+    straighten_on: bool,
+    /// The line being drawn, in screen points.
+    line_drag: Option<[Pos2; 2]>,
 
     dialog: FileDialog,
     /// The folder the Mac sandbox is allowed to read. Held for the whole
@@ -802,6 +813,9 @@ impl App {
             crop_turned: false,
             crop_draft: CropRect { x: 0, y: 0, w: 1, h: 1 },
             crop_drag: None,
+            angle_draft: 0.0,
+            straighten_on: false,
+            line_drag: None,
             // A launch from the Store has its working directory in System32.
             // The save dialog always opens on the directory set for this export.
             export_kind: ExportKind::Print,
@@ -1065,7 +1079,13 @@ impl App {
         if e.rotation != self.edit.rotation {
             self.keep_scale = None;
         }
+        let angle_changed = e.recipe.angle != self.edit.recipe.angle;
         self.edit = e;
+        // The draft frame lay in the old angle's frame; the easel is set
+        // up again on the recipe as it now stands.
+        if self.crop_open && angle_changed {
+            self.arm_crop();
+        }
         // A recipe without a sheet (the defaults, or an older file) meant
         // the picture's pixels with the rings added outside. That file,
         // said as a sheet: the same pixels, the same TIFF.
@@ -1212,10 +1232,27 @@ impl App {
         }
         let ux = ox + ((nx * pw as f64) as usize).min(pw - 1);
         let uy = oy + ((ny * ph as f64) as usize).min(ph - 1);
-        // Upright point to the negative plane, then to the frame.
+        // Frame point through the straighten to the upright negative, then
+        // to the negative plane, then to the frame.
         let plane = &s.negative.plane;
+        let orientation = self.export_orientation();
+        let (tw, th) = if matches!(orientation, 5..=8) {
+            (plane.height, plane.width)
+        } else {
+            (plane.width, plane.height)
+        };
+        let angle = self.view_angle();
+        let (ux, uy) = if straighten::turns(angle) {
+            let (u, v) = straighten::frame_to_upright(tw, th, angle).apply(ux as f64 + 0.5, uy as f64 + 0.5);
+            (
+                (u - 0.5).round().clamp(0.0, tw.saturating_sub(1) as f64) as usize,
+                (v - 0.5).round().clamp(0.0, th.saturating_sub(1) as f64) as usize,
+            )
+        } else {
+            (ux, uy)
+        };
         let spot = crate::session::source_rect(
-            self.export_orientation(),
+            orientation,
             plane.width,
             plane.height,
             crate::session::DetailRect { x: ux, y: uy, w: 1, h: 1 },
@@ -1256,6 +1293,8 @@ impl App {
             place: r.place,
             show_mask: self.show_mask,
             rotation: self.edit.rotation,
+            angle: self.view_angle(),
+            kernel: r.resample,
             // While the easel is up the whole negative is shown.
             crop: if self.crop_open { None } else { r.crop },
             plate: self.plate_view(),
@@ -1310,10 +1349,29 @@ impl App {
         mimizan_core::print::rotated(base, self.rotation())
     }
 
-    /// Size of the whole negative, upright, after the user's turns.
-    fn export_size(&self) -> (usize, usize) {
+    /// The straighten the stage shows: the draft while the easel is up,
+    /// the recipe's otherwise.
+    fn view_angle(&self) -> f64 {
+        if self.crop_open {
+            self.angle_draft
+        } else {
+            self.edit.recipe.angle
+        }
+    }
+
+    /// The picture after the straighten by `angle`: the frame of the
+    /// file-upright negative, before the user's turns. The whole negative
+    /// at zero.
+    fn frame_at(&self, angle: f64) -> (u32, u32) {
         let Some(s) = &self.session else { return (0, 0) };
-        let (w, h) = s.upright_size();
+        let (w, h) = s.frame_size(angle);
+        (w as u32, h as u32)
+    }
+
+    /// The frame at `angle`, upright, after the user's turns.
+    fn export_size_at(&self, angle: f64) -> (usize, usize) {
+        let (w, h) = self.frame_at(angle);
+        let (w, h) = (w as usize, h as usize);
         if self.rotation() % 2 == 1 {
             (h, w)
         } else {
@@ -1321,11 +1379,15 @@ impl App {
         }
     }
 
-    /// File-upright size, before the user's turns.
+    /// Size of the whole picture on the stage, upright, after the user's
+    /// turns: the frame at the view's straighten.
+    fn export_size(&self) -> (usize, usize) {
+        self.export_size_at(self.view_angle())
+    }
+
+    /// File-upright frame at the view's straighten, before the user's turns.
     fn file_size(&self) -> (u32, u32) {
-        let Some(s) = &self.session else { return (0, 0) };
-        let (w, h) = s.upright_size();
-        (w as u32, h as u32)
+        self.frame_at(self.view_angle())
     }
 
     /// The recipe the print box uses. While the easel is up the box is the
@@ -1334,6 +1396,7 @@ impl App {
         let mut recipe = self.print_recipe();
         if self.crop_open {
             recipe.crop = None;
+            recipe.angle = self.angle_draft;
         }
         recipe
     }
@@ -1343,8 +1406,8 @@ impl App {
     fn print_recipe(&self) -> Recipe {
         let mut recipe = self.edit.recipe.clone();
         if let Some(c) = recipe.crop {
-            let (fw, fh) = self.file_size();
-            let (uw, uh) = self.export_size();
+            let (fw, fh) = self.frame_at(recipe.angle);
+            let (uw, uh) = self.export_size_at(recipe.angle);
             recipe.crop = Some(c.turned(self.rotation(), fw, fh).sanitized(uw as u32, uh as u32));
         }
         recipe
@@ -1352,7 +1415,7 @@ impl App {
 
     /// The window the print is made from (upright, after the user's turns).
     fn picture_size(&self) -> (usize, usize) {
-        let (w, h) = self.export_size();
+        let (w, h) = self.export_size_at(self.edit.recipe.angle);
         match self.print_recipe().crop {
             Some(c) => (c.w as usize, c.h as usize),
             None => (w, h),
@@ -1371,7 +1434,7 @@ impl App {
 
     /// Output size of the print TIFF (after size step and border).
     fn print_layout(&self) -> Option<mimizan_core::print::Layout> {
-        let (w, h) = self.export_size();
+        let (w, h) = self.export_size_at(self.edit.recipe.angle);
         if w == 0 || h == 0 {
             return None;
         }
@@ -1463,14 +1526,19 @@ impl App {
     fn close_crop(&mut self) {
         self.crop_open = false;
         self.crop_drag = None;
+        self.line_drag = None;
+        self.straighten_on = false;
     }
 
-    /// Crop on: the whole negative, with the committed window or a fresh 8×10.
+    /// Crop on: the whole frame at the recipe's straighten, with the
+    /// committed window or a fresh 8×10.
     fn arm_crop(&mut self) {
-        let (fw, fh) = self.file_size();
+        self.angle_draft = self.edit.recipe.angle;
+        let (fw, fh) = self.frame_at(self.angle_draft);
         if fw == 0 || fh == 0 {
             return;
         }
+        self.line_drag = None;
         if let Some(c) = self.edit.recipe.crop {
             let c = c.sanitized(fw, fh);
             let (format, turned) = PaperFormat::match_window(fw, fh, c.w, c.h);
@@ -1499,12 +1567,15 @@ impl App {
         self.crop_drag = None;
     }
 
+    /// Apply: the straighten and the window go into the recipe together,
+    /// one step of the history.
     fn apply_crop(&mut self) {
         let (fw, fh) = self.file_size();
         if fw == 0 || fh == 0 {
             return;
         }
         let was_one_to_one = self.is_one_to_one();
+        self.edit.recipe.angle = self.angle_draft;
         self.edit.recipe.crop = Some(self.crop_draft.sanitized(fw, fh));
         self.close_crop();
         self.zoom = 1.0;
@@ -1534,6 +1605,41 @@ impl App {
             self.edit.recipe.size = Some(followed);
         }
         self.show_sheet();
+    }
+
+    /// A new draft straighten. The frame changes with it, and the draft
+    /// window follows: the same place and share of the frame, its format
+    /// kept. Whole frame stays whole frame.
+    fn set_draft_angle(&mut self, angle: f64) {
+        if !self.crop_open {
+            return;
+        }
+        let angle = if angle.is_finite() {
+            ((angle * 100.0).round() / 100.0).clamp(-straighten::ANGLE_LIMIT, straighten::ANGLE_LIMIT)
+        } else {
+            0.0
+        };
+        let old = self.file_size();
+        self.angle_draft = angle;
+        let new = self.file_size();
+        if old.0 == 0 || old.1 == 0 || new.0 == 0 || new.1 == 0 {
+            return;
+        }
+        let aspect = self.crop_format.frame(new.0, new.1, self.crop_turned);
+        self.crop_draft = scaled_draft(self.crop_draft, old, new, aspect);
+        self.crop_drag = None;
+        self.loupe_key = None;
+        self.loupe_tex = None;
+    }
+
+    /// The line drawn in straighten mode is let go: the turn that puts it
+    /// level or upright is added to the draft.
+    fn finish_line(&mut self, [a, b]: [Pos2; 2]) {
+        if let Some(delta) = straighten::angle_of_line(a.x as f64, a.y as f64, b.x as f64, b.y as f64) {
+            if a.distance(b) >= 8.0 {
+                self.set_draft_angle(self.angle_draft + delta);
+            }
+        }
     }
 
     /// Draft window in the picture currently on screen, and that picture's size.
@@ -1567,6 +1673,12 @@ impl App {
         if !down_on {
             self.crop_drag = None;
         }
+        if self.straighten_on {
+            self.crop_drag = None;
+            self.line_interact(ui, response, rect);
+            return;
+        }
+        self.line_drag = None;
         let Some((shown, uw, uh)) = self.turned_window() else { return };
         let Some(ptr) = ui.input(|i| i.pointer.latest_pos()) else { return };
         if rect.width() <= 1.0 || rect.height() <= 1.0 || uw == 0 || uh == 0 {
@@ -1590,6 +1702,62 @@ impl App {
             ui.ctx().set_cursor_icon(crop_cursor(drag.hit, true));
         } else if let Some(hit) = hit_crop(px, py, shown, corner_slop, edge_slop) {
             response.clone().on_hover_cursor(crop_cursor(hit, false));
+        }
+    }
+
+    /// Straighten mode: a press on the picture starts the line, the drag
+    /// draws it, the release turns the draft so the line lies level or
+    /// upright.
+    fn line_interact(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect) {
+        let down_on = response.is_pointer_button_down_on();
+        let ptr = ui.input(|i| i.pointer.latest_pos());
+        if down_on && ui.input(|i| i.pointer.primary_pressed()) {
+            let at = ui.input(|i| i.pointer.press_origin()).or(ptr);
+            if let Some(at) = at {
+                if rect.contains(at) {
+                    self.line_drag = Some([at, at]);
+                }
+            }
+        }
+        match (self.line_drag, down_on) {
+            (Some([a, _]), true) => {
+                if let Some(p) = ptr {
+                    self.line_drag = Some([a, p]);
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            }
+            (Some(line), false) => {
+                self.line_drag = None;
+                self.finish_line(line);
+            }
+            (None, _) => {
+                if response.hover_pos().is_some_and(|p| rect.contains(p)) {
+                    ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+                }
+            }
+        }
+    }
+
+    /// The line being drawn in straighten mode.
+    fn paint_line(&self, painter: &egui::Painter) {
+        let Some([a, b]) = self.line_drag else { return };
+        let ink = Color32::from_rgb(255, 210, 60);
+        painter.line_segment([a, b], egui::Stroke::new(1.5, ink));
+        for p in [a, b] {
+            painter.circle_filled(p, 3.5, ink);
+        }
+        if let Some(d) = straighten::angle_of_line(a.x as f64, a.y as f64, b.x as f64, b.y as f64) {
+            if a.distance(b) >= 8.0 {
+                let txt = format!("{:+.1}°", self.angle_draft + d);
+                let galley = painter.layout_no_wrap(txt, egui::FontId::proportional(13.0), ink);
+                let pos = b + Vec2::new(10.0, -galley.size().y / 2.0);
+                painter.rect_filled(
+                    Rect::from_min_size(pos, galley.size()).expand(3.0),
+                    3.0,
+                    Color32::from_black_alpha(150),
+                );
+                painter.galley(pos, galley, ink);
+            }
         }
     }
 
@@ -1712,15 +1880,30 @@ impl App {
             ExportKind::Linear => {
                 let plate = self.linear_is_dng();
                 self.busy = Some("exporting".into());
+                let recipe = self.print_recipe();
                 self.heavy.send(Job::ExportLinear {
                     session: Arc::clone(s),
                     weights: self.weights(),
                     plate,
-                    crop: self.print_recipe().crop,
+                    framing: mimizan_core::linear::Framing {
+                        orientation: self.export_orientation(),
+                        angle: recipe.angle,
+                        kernel: recipe.resample,
+                        crop: recipe.crop,
+                    },
                     path,
-                    orientation: self.export_orientation(),
                 });
             }
+        }
+    }
+
+    /// ", straightened +1.20°" for the hover texts; nothing at zero.
+    fn straighten_text(&self) -> String {
+        let a = self.edit.recipe.angle;
+        if straighten::turns(a) {
+            format!(", straightened {a:+.2}°")
+        } else {
+            String::new()
         }
     }
 
@@ -2344,6 +2527,7 @@ impl App {
             tone: r.curve.clone(),
             place: r.place,
             rotation: self.edit.rotation,
+            angle: self.view_angle(),
             crop: if self.crop_open { None } else { r.crop },
             plate: self.plate_view(),
         })
@@ -2610,9 +2794,52 @@ impl App {
                 .on_hover_text("The sheet, and which way it stands.")
                 .on_disabled_hover_text("The sheet, and which way it stands.");
         });
+        // The straighten: a line drawn on the picture, or a number. The
+        // frame is the largest rectangle of the negative's proportion that
+        // fits inside the turned negative.
+        ui.add_enabled_ui(has && self.crop_open, |ui| {
+            let mut on = self.straighten_on;
+            if ui
+                .toggle_value(&mut on, "Straighten")
+                .on_hover_text(
+                    "Draw a line along something that should be level or upright; the picture turns to \
+                     make it so, and the frame is the largest rectangle that fits inside the turned \
+                     negative. Drags move the window again once this is off.",
+                )
+                .on_disabled_hover_text("Open Crop first. The straighten is applied with the window.")
+                .changed()
+            {
+                self.straighten_on = on;
+                self.line_drag = None;
+                self.crop_drag = None;
+            }
+            let mut angle = self.angle_draft;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut angle)
+                        .range(-straighten::ANGLE_LIMIT..=straighten::ANGLE_LIMIT)
+                        .speed(0.05)
+                        .fixed_decimals(2)
+                        .suffix("°"),
+                )
+                .on_hover_text("The turn, degrees clockwise. Drag, or type; 0 is the negative as it is.")
+                .changed()
+            {
+                self.set_draft_angle(angle);
+            }
+            if ui
+                .add_enabled(self.angle_draft != 0.0, egui::Button::new("0°"))
+                .on_hover_text("No straighten: the whole negative is the frame again.")
+                .clicked()
+            {
+                self.set_draft_angle(0.0);
+            }
+        });
         if ui
             .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
-            .on_hover_text("Keep this window (Enter). The print, the histograms and the export use only it.")
+            .on_hover_text(
+                "Keep this window and straighten (Enter). The print, the histograms and the export use only it.",
+            )
             .clicked()
         {
             self.apply_crop();
@@ -3657,7 +3884,7 @@ impl App {
     /// Bytes the export holds at its widest, from the same layout the
     /// panel shows. Absent until a file is open.
     fn export_memory(&self) -> Option<u64> {
-        let (w, h) = self.export_size();
+        let (w, h) = self.export_size_at(self.edit.recipe.angle);
         if w == 0 || h == 0 {
             return None;
         }
@@ -3824,13 +4051,14 @@ impl App {
             Tone::Paper(s) => format!("paper (soft {:+.2}, hard {:+.2})", s.soft, s.hard),
             Tone::Look(l) => format!("look \"{}\"", l.name),
         };
-        let (uw, uh) = self.export_size();
+        let (uw, uh) = self.picture_size();
         let (ow, oh) = self.print_layout().map(|l| (l.out_w, l.out_h)).unwrap_or((uw, uh));
         let rot = if self.rotation() != 0 {
             format!(", rotated {}°", 90 * self.rotation() as u16)
         } else {
             String::new()
         };
+        let rot = format!("{rot}{}", self.straighten_text());
         let r = &self.edit.recipe;
         let local = if r.place != 0.0 { format!(", place {:+.2}", r.place) } else { String::new() };
         let sharpen = if r.peak.on {
@@ -3881,6 +4109,7 @@ impl App {
         } else {
             String::new()
         };
+        let rot = format!("{rot}{}", self.straighten_text());
         let crop = if self.edit.recipe.crop.is_some() { ", the crop" } else { ", the whole frame" };
         if self.linear_is_dng() {
             format!(
@@ -4228,7 +4457,7 @@ impl App {
             if self.crop_open {
                 self.crop_interact(ui, &response, rect);
             }
-            if response.dragged() && self.crop_drag.is_none() {
+            if response.dragged() && self.crop_drag.is_none() && self.line_drag.is_none() {
                 self.pan = (self.pan + response.drag_delta()).clamp(bounds.0, bounds.1);
                 (rect, _, _, _, _) = place(self.zoom, self.pan);
             }
@@ -4330,6 +4559,7 @@ impl App {
 
         if self.crop_open {
             self.paint_crop(&painter, rect);
+            self.paint_line(&painter);
         }
         // After the sharp tile and the crop shade, or the cross disappears
         // under them once the preview would be upscaled.
@@ -4414,6 +4644,30 @@ fn corner_xy(r: CropRect, corner: CropCorner) -> (i32, i32) {
 
 /// Move or scale `origin` by a pointer delta. A zero delta leaves it where it
 /// was grabbed: the corner follows the movement, it does not jump to the pointer.
+/// The draft window carried from the frame `old` to the frame `new`: the
+/// same share of the frame about the same place, in `aspect`, inside.
+/// A window that was the whole frame is the whole new frame.
+fn scaled_draft(draft: CropRect, old: (u32, u32), new: (u32, u32), aspect: (u32, u32)) -> CropRect {
+    let (ow, oh) = (old.0.max(1) as f64, old.1.max(1) as f64);
+    let (nw, nh) = (new.0.max(1), new.1.max(1));
+    let (aw, ah) = (u64::from(aspect.0.max(1)), u64::from(aspect.1.max(1)));
+    let whole = draft.x == 0 && draft.y == 0 && draft.w >= old.0 && draft.h >= old.1;
+    let max = CropRect::inscribed(nw, nh, aspect.0, aspect.1);
+    if whole {
+        return max;
+    }
+    let kx = f64::from(nw) / ow;
+    let ky = f64::from(nh) / oh;
+    let w = ((f64::from(draft.w) * kx).round() as u32).clamp(1, max.w);
+    let h = ((u64::from(w) * ah / aw) as u32).clamp(1, max.h);
+    let w = ((u64::from(h) * aw / ah) as u32).clamp(1, max.w);
+    let cx = (f64::from(draft.x) + f64::from(draft.w) / 2.0) * kx;
+    let cy = (f64::from(draft.y) + f64::from(draft.h) / 2.0) * ky;
+    let x = (cx - f64::from(w) / 2.0).round().clamp(0.0, f64::from(nw - w)) as u32;
+    let y = (cy - f64::from(h) / 2.0).round().clamp(0.0, f64::from(nh - h)) as u32;
+    CropRect { x, y, w, h }
+}
+
 fn moved_crop(
     origin: CropRect,
     hit: CropHit,
@@ -6222,5 +6476,41 @@ mod crumb_tests {
         assert!(crumb_is_open(false, None, above, false));
         assert!(!crumb_is_open(true, None, above, false));
         assert!(crumb_is_open(true, None, here, true));
+    }
+}
+
+#[cfg(test)]
+mod straighten_tests {
+    use super::scaled_draft;
+    use mimizan_core::recipe::CropRect;
+    use mimizan_core::straighten::frame_size;
+
+    /// The draft follows the frame through a change of the straighten:
+    /// the whole frame stays whole, a window keeps its share and its
+    /// proportion, and nothing leaves the frame.
+    #[test]
+    fn the_draft_follows_the_frame() {
+        let old = (6048u32, 4032u32);
+        let (fw, fh) = frame_size(old.0 as usize, old.1 as usize, 3.0);
+        let new = (fw as u32, fh as u32);
+        assert!(new.0 < old.0 && new.1 < old.1);
+        let whole = CropRect { x: 0, y: 0, w: old.0, h: old.1 };
+        assert_eq!(scaled_draft(whole, old, new, new), CropRect { x: 0, y: 0, w: new.0, h: new.1 });
+        // An 8×10 window in the picture's middle.
+        let win = CropRect::inscribed(old.0, old.1, 10, 8);
+        let moved = scaled_draft(win, old, new, (10, 8));
+        assert!(moved.x + moved.w <= new.0 && moved.y + moved.h <= new.1);
+        assert!((moved.w as f64 / moved.h as f64 - 1.25).abs() < 0.002);
+        let share = moved.h as f64 / new.1 as f64;
+        assert!((share - 1.0).abs() < 0.002, "the window filled the height before, {share}");
+        // A small window in the top left keeps its place.
+        let small = CropRect { x: 100, y: 100, w: 1000, h: 800 };
+        let s = scaled_draft(small, old, new, (10, 8));
+        let k = new.0 as f64 / old.0 as f64;
+        assert!((s.x as f64 - 100.0 * k).abs() <= 2.0);
+        assert!((s.w as f64 - 1000.0 * k).abs() <= 2.0);
+        // And back to zero the whole frame is the whole negative again.
+        let back = scaled_draft(scaled_draft(whole, old, new, new), new, old, old);
+        assert_eq!(back, whole);
     }
 }

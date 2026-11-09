@@ -221,8 +221,17 @@ pub struct Recipe {
     /// Peak high-pass. Absent in older recipes, which stay unsharpened.
     #[serde(default, skip_serializing_if = "Peak::is_unset")]
     pub peak: Peak,
-    /// Window on the upright negative, whole pixels, before the size step.
-    /// `None` is the full frame. Old recipes omit it.
+    /// The straighten: degrees the upright negative is turned about its
+    /// centre, clockwise positive, within ±[`crate::straighten::ANGLE_LIMIT`].
+    /// The picture is then the largest window of the negative's proportion
+    /// inside the turn (`straighten::frame_size`), and `crop` lies in that
+    /// window. Zero, and old recipes that omit it, turn nothing and leave
+    /// the pixels as they are.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub angle: f64,
+    /// Window on the upright negative, whole pixels, before the size step;
+    /// on the straightened frame when `angle` is not zero. `None` is the
+    /// full frame. Old recipes omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<CropRect>,
     /// The monochrome mix on the balanced channels, for a darkroom that
@@ -287,6 +296,7 @@ impl Default for Recipe {
             black_mm: 0.0,
             sharpen: Sharpen::Off,
             peak: Peak::default(),
+            angle: 0.0,
             crop: None,
             mix: None,
             plate: None,
@@ -498,6 +508,13 @@ impl Recipe {
                 )));
             }
         }
+        if !self.angle.is_finite() || self.angle.abs() > crate::straighten::ANGLE_LIMIT {
+            return Err(Error::Invalid(format!(
+                "angle {} not within ±{}°",
+                self.angle,
+                crate::straighten::ANGLE_LIMIT
+            )));
+        }
         if let Some(c) = self.crop {
             if c.w == 0 || c.h == 0 {
                 return Err(Error::Invalid("crop must cover at least one pixel".into()));
@@ -701,6 +718,27 @@ mod tests {
         assert!(Sharpen::Usm { amount: 1.6 }.validate().is_err());
         assert!(!Sharpen::Deconv { passes: 3, usm_amount: 0.0 }.uses_mask());
         assert!(Sharpen::Deconv { passes: 3, usm_amount: 0.3 }.uses_mask());
+    }
+
+    #[test]
+    fn angle_in_the_file_and_within_its_limit() {
+        // Zero is not written: an old reader sees the recipe it knows.
+        let flat = Recipe::on_paper();
+        let json = serde_json::to_string(&flat).unwrap();
+        assert!(!json.contains("angle"), "{json}");
+        // A file without the field reads as zero.
+        let back: Recipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.angle, 0.0);
+        // A turn goes through the file to the bit.
+        let turned = Recipe { angle: -1.7345, ..Recipe::on_paper() };
+        turned.validate().unwrap();
+        let back: Recipe = serde_json::from_str(&serde_json::to_string(&turned).unwrap()).unwrap();
+        assert_eq!(back.angle.to_bits(), turned.angle.to_bits());
+        // Beyond the limit, and not a number: refused.
+        assert!(Recipe { angle: 45.0, ..Recipe::on_paper() }.validate().is_ok());
+        assert!(Recipe { angle: -45.0, ..Recipe::on_paper() }.validate().is_ok());
+        assert!(Recipe { angle: 45.01, ..Recipe::on_paper() }.validate().is_err());
+        assert!(Recipe { angle: f64::NAN, ..Recipe::on_paper() }.validate().is_err());
     }
 
     #[test]

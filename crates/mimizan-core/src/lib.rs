@@ -31,6 +31,7 @@ pub mod print;
 pub mod recipe;
 pub mod resize;
 pub mod separate;
+pub mod straighten;
 pub mod synth;
 pub mod thumb;
 pub mod tiffin;

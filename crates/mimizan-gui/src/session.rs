@@ -16,10 +16,14 @@ use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{
     layout, loupe_source_rect, orient, rotated, sharpen_window, source_window, window_plane, PrintParams,
+    MASK_KERNEL,
 };
 use mimizan_core::recipe::{CropRect, Recipe};
-use mimizan_core::resize::{fit_dims, resize, resize_rect, source_coverage, PixelRect, PlaneWindow};
+use mimizan_core::resize::{
+    fit_dims, resize, resize_rect, source_coverage, PixelRect, PlaneWindow, ResampleKernel,
+};
 use mimizan_core::separate::{MaskMode, Separation};
+use mimizan_core::straighten::{self, Affine};
 use mimizan_core::tone::{Tone, ToneMap};
 use rayon::prelude::*;
 use std::path::PathBuf;
@@ -205,6 +209,13 @@ impl Session {
         }
     }
 
+    /// The frame the crop lies in: the file-upright negative straightened
+    /// by `angle`, before the user's turns. The upright size at zero.
+    pub fn frame_size(&self, angle: f64) -> (usize, usize) {
+        let (w, h) = self.upright_size();
+        straighten::frame_size(w, h, angle)
+    }
+
     /// Weights the camera file suggests for this image's balance, or native.
     pub fn default_weights(&self) -> Weights {
         self.camera_file.as_ref().map(|c| c.weights_balanced(self.negative.info.wb)).unwrap_or_default()
@@ -328,7 +339,14 @@ pub struct ViewParams {
     pub show_mask: bool,
     /// Extra clockwise quarter turns on top of the file's orientation.
     pub rotation: u8,
-    /// Window on the file-upright negative. `None` is the whole frame.
+    /// The straighten: degrees the upright negative is turned, clockwise
+    /// positive. The picture is then the frame (`straighten::frame_size`),
+    /// and `crop` lies in it. Zero turns nothing.
+    pub angle: f64,
+    /// The kernel the straighten resamples with where the view is 1:1
+    /// (the recipe's), so the 1:1 view is the export.
+    pub kernel: ResampleKernel,
+    /// Window on the file-upright frame. `None` is the whole frame.
     /// The preview turns it with `rotation` before cutting.
     pub crop: Option<CropRect>,
     /// Three mixes instead of one: the picture is shown in colour. The
@@ -338,12 +356,116 @@ pub struct ViewParams {
 
 /// The parts of a view the full-resolution histograms depend on (the
 /// orientation is not one of them: a histogram does not turn). The crop
-/// is, because it chooses which grains are counted.
-type HistKey = (Weights, Tone, f64, Option<CropRect>);
+/// and the straighten are, because they choose which grains are counted.
+type HistKey = (Weights, Tone, f64, Option<CropRect>, f64);
 
 impl ViewParams {
     fn hist_key(&self) -> HistKey {
-        (self.weights, self.tone.clone(), self.place, self.crop)
+        (self.weights, self.tone.clone(), self.place, self.crop, self.angle)
+    }
+}
+
+/// Where the view's pixels come from: the sensor plane, the upright
+/// picture after the file's orientation and the user's turns, and the
+/// frame the straighten leaves on it. Every ask of the view is in frame
+/// pixels; a frame pixel is an upright pixel when there is no turn, and a
+/// resampled one through `map` when there is.
+#[derive(Clone, Copy, Debug)]
+struct Geometry {
+    /// The sensor plane.
+    sw: usize,
+    sh: usize,
+    /// The file's orientation plus the user's turns.
+    orientation: u16,
+    /// The upright picture.
+    uw: usize,
+    uh: usize,
+    /// The frame.
+    fw: usize,
+    fh: usize,
+    /// Frame → upright, continuous coordinates; `None` without a turn.
+    map: Option<Affine>,
+}
+
+impl Geometry {
+    fn of(s: &Session, v: &ViewParams) -> Self {
+        let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
+        let orientation = rotated(s.negative.orientation, v.rotation);
+        let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
+        let (fw, fh) = straighten::frame_size(uw, uh, v.angle);
+        let map = straighten::turns(v.angle).then(|| straighten::frame_to_upright(uw, uh, v.angle));
+        Self { sw, sh, orientation, uw, uh, fw, fh, map }
+    }
+
+    /// The crop, turned into this frame and kept inside it; the whole
+    /// frame when there is none. `(x, y, w, h)`.
+    fn window(&self, s: &Session, v: &ViewParams) -> (usize, usize, usize, usize) {
+        match v.crop {
+            Some(c) => {
+                let (fw, fh) = s.frame_size(v.angle);
+                let t = c.turned(v.rotation, fw as u32, fh as u32).sanitized(self.fw as u32, self.fh as u32);
+                (t.x as usize, t.y as usize, t.w as usize, t.h as usize)
+            }
+            None => (0, 0, self.fw, self.fh),
+        }
+    }
+
+    /// The upright pixel under frame sample `(ox, oy)`: itself without a
+    /// turn, the nearest one through the map with.
+    #[inline]
+    fn upright_px(&self, ox: usize, oy: usize) -> (usize, usize) {
+        match &self.map {
+            None => (ox.min(self.uw.saturating_sub(1)), oy.min(self.uh.saturating_sub(1))),
+            Some(m) => {
+                let (u, v) = m.apply(ox as f64 + 0.5, oy as f64 + 0.5);
+                let ux = (u - 0.5).round().clamp(0.0, self.uw.saturating_sub(1) as f64) as usize;
+                let uy = (v - 0.5).round().clamp(0.0, self.uh.saturating_sub(1) as f64) as usize;
+                (ux, uy)
+            }
+        }
+    }
+
+    /// The sensor pixel under frame sample `(ox, oy)`.
+    #[inline]
+    fn sensor_px(&self, ox: usize, oy: usize) -> (usize, usize) {
+        let (ux, uy) = self.upright_px(ox, oy);
+        sensor_xy(self.orientation, self.sw, self.sh, ux, uy)
+    }
+
+    /// Frame pixels `rect` through the turn: the upright footprint the
+    /// kernel reads is mapped to the sensor, `upright_of` gives those
+    /// pixels upright, and the warp resamples them with `kernel`. `None`
+    /// without a turn, or when the source cannot be had.
+    fn warped<const N: usize>(
+        &self,
+        rect: DetailRect,
+        kernel: ResampleKernel,
+        upright_of: impl Fn(DetailRect) -> Option<[Plane; N]>,
+    ) -> Option<[Plane; N]> {
+        let map = self.map.as_ref()?;
+        let pix = PixelRect { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+        let (x0, y0, x1, y1) = straighten::footprint(map, kernel, pix, self.uw, self.uh);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        let up = DetailRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+        let sensor = source_rect(self.orientation, self.sw, self.sh, up);
+        let planes = upright_of(sensor)?;
+        let mut out = Vec::with_capacity(N);
+        for plane in &planes {
+            if (plane.width, plane.height) != (up.w, up.h) {
+                return None;
+            }
+            let window = PlaneWindow { plane, origin_x: x0, origin_y: y0, full_w: self.uw, full_h: self.uh };
+            match straighten::warp(window, map, kernel, pix) {
+                Ok(p) => out.push(p),
+                Err(e) => {
+                    tracing::error!("{e}");
+                    return None;
+                }
+            }
+        }
+        out.try_into().ok()
     }
 }
 
@@ -533,38 +655,25 @@ pub fn render_detail(
     }
     let step = ask.step();
     let sep = s.separation()?;
-    let (sw, sh) = (sep.lum.width, sep.lum.height);
-    let orientation = rotated(s.negative.orientation, v.rotation);
-    let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
-    // A committed crop: the ask is in the window. Shift it onto the full upright.
-    let (x, y, origin) = match v.crop {
-        Some(c) => {
-            let (fw, fh) = s.upright_size();
-            let t = c.turned(v.rotation, fw as u32, fh as u32).sanitized(uw as u32, uh as u32);
-            (
-                ask.x.saturating_add(t.x as usize),
-                ask.y.saturating_add(t.y as usize),
-                (t.x as usize, t.y as usize),
-            )
-        }
-        None => (ask.x, ask.y, (0, 0)),
-    };
-    if x >= uw || y >= uh || ask.w == 0 || ask.h == 0 {
+    let g = Geometry::of(s, v);
+    // A committed crop: the ask is in the window. Shift it onto the frame.
+    let (cx, cy, _, _) = g.window(s, v);
+    let (x, y, origin) = (ask.x.saturating_add(cx), ask.y.saturating_add(cy), (cx, cy));
+    if x >= g.fw || y >= g.fh || ask.w == 0 || ask.h == 0 {
         return None;
     }
-    let w = ask.w.min((uw - x).div_ceil(step));
-    let h = ask.h.min((uh - y).div_ceil(step));
+    let w = ask.w.min((g.fw - x).div_ceil(step));
+    let h = ask.h.min((g.fh - y).div_ceil(step));
     if w == 0 || h == 0 {
         return None;
     }
     let rect = DetailRect { x, y, w, h };
-    let src = DetailSource { s, v, sep, sw, sh, orientation, table, codes };
+    let src = DetailSource { s, v, sep, g, table, codes };
     let gray = if step == 1 { src.dense(rect)? } else { src.grid(x, y, w, h, step) };
     debug_assert_eq!(gray.len(), w * h);
     let rgb = match v.plate.filter(|_| !v.show_mask) {
         Some(plate) => Some(if step == 1 {
-            let sensor = source_rect(orientation, sw, sh, rect);
-            let planes = plate_upright(sep, &plate.weights, sensor, orientation)?;
+            let planes = src.plate_dense(&plate, rect)?;
             display_rgb(&planes, v.place, plate.lamps, table)
         } else {
             src.plate_grid(&plate, x, y, w, h, step)
@@ -585,17 +694,32 @@ struct DetailSource<'a> {
     s: &'a Session,
     v: &'a ViewParams,
     sep: &'a Separation,
-    sw: usize,
-    sh: usize,
-    orientation: u16,
+    g: Geometry,
     table: &'a ToneTable,
     codes: Option<&'a [u16]>,
 }
 
 impl DetailSource<'_> {
-    /// Every file pixel of `rect`; the 1:1 path.
+    /// Every frame pixel of `rect`; the 1:1 path.
     fn dense(&self, rect: DetailRect) -> Option<Vec<u8>> {
-        let Self { s, v, sep, sw, sh, orientation, table, codes } = *self;
+        let Self { s, v, sep, g, table, codes } = *self;
+        let Geometry { sw, sh, orientation, .. } = g;
+        if g.map.is_some() {
+            // Through the turn: the footprint upright, mixed, then warped
+            // with the recipe's kernel, as the export is.
+            if v.show_mask {
+                let [plane] = g.warped(rect, MASK_KERNEL, |sensor| {
+                    Some([orient(&mask_window(&s.negative, sensor)?, orientation)])
+                })?;
+                return Some(
+                    plane.data.par_iter().map(|&x| (x.clamp(0.0, 1.0) * 255.0).round() as u8).collect(),
+                );
+            }
+            let [plane] = g.warped(rect, v.kernel, |sensor| {
+                Some([mixed_upright(sep, &v.weights, sensor, orientation)?])
+            })?;
+            return Some(display_bytes(&plane, v.place, table));
+        }
         if v.show_mask {
             let src = source_rect(orientation, sw, sh, rect);
             let upright = orient(&mask_window(&s.negative, src)?, orientation);
@@ -614,10 +738,25 @@ impl DetailSource<'_> {
         }
     }
 
-    /// One sample every `step` file pixels. Sample `(i, j)` is the file pixel
-    /// `(x + i·step, y + j·step)`, the nearest file pixel of one screen pixel.
+    /// The three plates of every frame pixel of `rect`, upright, by
+    /// output channel.
+    fn plate_dense(&self, plate: &PlateView, rect: DetailRect) -> Option<[Plane; 3]> {
+        let Self { sep, g, .. } = *self;
+        if g.map.is_some() {
+            return g.warped(rect, self.v.kernel, |sensor| {
+                plate_upright(sep, &plate.weights, sensor, g.orientation)
+            });
+        }
+        let sensor = source_rect(g.orientation, g.sw, g.sh, rect);
+        plate_upright(sep, &plate.weights, sensor, g.orientation)
+    }
+
+    /// One sample every `step` frame pixels. Sample `(i, j)` is the frame
+    /// pixel `(x + i·step, y + j·step)`, the nearest file pixel of one
+    /// screen pixel.
     fn grid(&self, x: usize, y: usize, w: usize, h: usize, step: usize) -> Vec<u8> {
-        let Self { s, v, sep, sw, sh, orientation, table, codes } = *self;
+        let Self { s, v, sep, g, table, codes } = *self;
+        let (sw, sh) = (g.sw, g.sh);
         let mut out = vec![0u8; w * h];
         let codes = codes.filter(|c| c.len() == sw * sh);
         let n = &s.negative;
@@ -625,7 +764,7 @@ impl DetailSource<'_> {
             let oy = y + j * step;
             for (i, o) in row.iter_mut().enumerate() {
                 let ox = x + i * step;
-                let (sx, sy) = sensor_xy(orientation, sw, sh, ox, oy);
+                let (sx, sy) = g.sensor_px(ox, oy);
                 *o = if v.show_mask {
                     n.mask8[sy * n.plane.width + sx]
                 } else if v.place == 0.0 {
@@ -645,14 +784,14 @@ impl DetailSource<'_> {
     /// The plate on the screen grid: three mixes of the same sample, each
     /// placed by its lamp, interleaved R, G, B.
     fn plate_grid(&self, plate: &PlateView, x: usize, y: usize, w: usize, h: usize, step: usize) -> Vec<u8> {
-        let Self { v, sep, sw, sh, orientation, table, .. } = *self;
+        let Self { v, sep, g, table, .. } = *self;
         let weights = plate.weights.weights();
         let mut out = vec![0u8; w * h * 3];
         out.par_chunks_mut(w * 3).enumerate().for_each(|(j, row)| {
             let oy = y + j * step;
             for (i, px) in row.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let ox = x + i * step;
-                let (sx, sy) = sensor_xy(orientation, sw, sh, ox, oy);
+                let (sx, sy) = g.sensor_px(ox, oy);
                 for c in 0..3 {
                     px[c] = show_sample(mix_at(sep, &weights[c], sx, sy), v.place + plate.lamps[c], table);
                 }
@@ -690,30 +829,18 @@ fn render_measured(
         return None;
     }
     let step = ask.step();
-    let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
-    let orientation = rotated(s.negative.orientation, v.rotation);
-    let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
-    let (x, y, origin) = match v.crop {
-        Some(c) => {
-            let (fw, fh) = s.upright_size();
-            let t = c.turned(v.rotation, fw as u32, fh as u32).sanitized(uw as u32, uh as u32);
-            (
-                ask.x.saturating_add(t.x as usize),
-                ask.y.saturating_add(t.y as usize),
-                (t.x as usize, t.y as usize),
-            )
-        }
-        None => (ask.x, ask.y, (0, 0)),
-    };
-    if x >= uw || y >= uh || ask.w == 0 || ask.h == 0 {
+    let g = Geometry::of(s, v);
+    let (cx, cy, _, _) = g.window(s, v);
+    let (x, y, origin) = (ask.x.saturating_add(cx), ask.y.saturating_add(cy), (cx, cy));
+    if x >= g.fw || y >= g.fh || ask.w == 0 || ask.h == 0 {
         return None;
     }
-    let w = ask.w.min((uw - x).div_ceil(step));
-    let h = ask.h.min((uh - y).div_ceil(step));
+    let w = ask.w.min((g.fw - x).div_ceil(step));
+    let h = ask.h.min((g.fh - y).div_ceil(step));
     if w == 0 || h == 0 {
         return None;
     }
-    let gray = measured_gray(s, v, table, codes, MeasuredSpan { sw, sh, orientation, x, y, w, h, step })?;
+    let gray = measured_gray(s, v, table, codes, MeasuredSpan { g, x, y, w, h, step })?;
     debug_assert_eq!(gray.len(), w * h);
     Some(DetailImage {
         ask: DetailAsk { x: x.saturating_sub(origin.0), y: y.saturating_sub(origin.1), w, h, step },
@@ -723,9 +850,7 @@ fn render_measured(
 }
 
 struct MeasuredSpan {
-    sw: usize,
-    sh: usize,
-    orientation: u16,
+    g: Geometry,
     x: usize,
     y: usize,
     w: usize,
@@ -740,10 +865,23 @@ fn measured_gray(
     codes: Option<&[u16]>,
     span: MeasuredSpan,
 ) -> Option<Vec<u8>> {
-    let MeasuredSpan { sw, sh, orientation, x, y, w, h, step } = span;
+    let MeasuredSpan { g, x, y, w, h, step } = span;
+    let Geometry { sw, sh, orientation, .. } = g;
     let n = &s.negative;
     let rect = DetailRect { x, y, w, h };
     if step == 1 {
+        if g.map.is_some() {
+            let to_u8 = |p: f64| (p.clamp(0.0, 1.0) * 255.0).round() as u8;
+            if v.show_mask {
+                let [plane] = g.warped(rect, MASK_KERNEL, |sensor| {
+                    Some([orient(&mask_window(n, sensor)?, orientation)])
+                })?;
+                return Some(plane.data.par_iter().map(|&p| to_u8(p)).collect());
+            }
+            let [plane] =
+                g.warped(rect, v.kernel, |sensor| Some([orient(&crop(&n.plane, sensor)?, orientation)]))?;
+            return Some(display_bytes(&plane, v.place, table));
+        }
         if v.show_mask {
             let src = source_rect(orientation, sw, sh, rect);
             let upright = orient(&mask_window(n, src)?, orientation);
@@ -765,7 +903,7 @@ fn measured_gray(
         let oy = y + j * step;
         for (i, o) in row.iter_mut().enumerate() {
             let ox = x + i * step;
-            let (sx, sy) = sensor_xy(orientation, sw, sh, ox, oy);
+            let (sx, sy) = g.sensor_px(ox, oy);
             *o = if v.show_mask {
                 n.mask8[sy * n.plane.width + sx]
             } else if v.place == 0.0 {
@@ -867,9 +1005,18 @@ pub fn render_print_detail(
         w: rect.w.min(lay.image_w - rect.x).max(1),
         h: rect.h.min(lay.image_h - rect.y).max(1),
     };
-    let (ox, oy, sw, sh) = source_window(full_w, full_h, recipe.crop);
     let pix = PixelRect { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
-    let (x0, y0, x1, y1) = source_coverage(sw, sh, lay.image_w, lay.image_h, recipe.resample, pix);
+    // Through a turn the tile is warped from its upright footprint, as
+    // the export is; without one the crop window is resized, as before.
+    let turned = straighten::turns(recipe.angle);
+    let map = straighten::print_map(full_w, full_h, recipe.angle, recipe.crop, lay.image_w, lay.image_h);
+    let (ox, oy, sw, sh) =
+        if turned { (0, 0, full_w, full_h) } else { source_window(full_w, full_h, recipe.crop) };
+    let (x0, y0, x1, y1) = if turned {
+        straighten::footprint(&map, recipe.resample, pix, full_w, full_h)
+    } else {
+        source_coverage(sw, sh, lay.image_w, lay.image_h, recipe.resample, pix)
+    };
     if x1 <= x0 || y1 <= y0 {
         return None;
     }
@@ -879,7 +1026,12 @@ pub fn render_print_detail(
     debug_assert_eq!((mixed.width, mixed.height), (upright.w, upright.h));
     let enlarge = |plane: &Plane| {
         let window = PlaneWindow { plane, origin_x: x0, origin_y: y0, full_w: sw, full_h: sh };
-        match resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix) {
+        let out = if turned {
+            straighten::warp(window, &map, recipe.resample, pix)
+        } else {
+            resize_rect(window, lay.image_w, lay.image_h, recipe.resample, pix)
+        };
+        match out {
             Ok(p) => Some(p),
             Err(e) => {
                 tracing::error!("{e}");
@@ -1331,11 +1483,13 @@ struct Counts {
     neg_high: usize,
     view_low: usize,
     view_high: usize,
+    /// Pixels counted: the rectangle, less what a turned window leaves out.
+    total: usize,
 }
 
 impl Default for Counts {
     fn default() -> Self {
-        Self { neg: [0; 256], view: [0; 256], neg_low: 0, neg_high: 0, view_low: 0, view_high: 0 }
+        Self { neg: [0; 256], view: [0; 256], neg_low: 0, neg_high: 0, view_low: 0, view_high: 0, total: 0 }
     }
 }
 
@@ -1351,6 +1505,7 @@ impl Counts {
         self.neg_high += o.neg_high;
         self.view_low += o.view_low;
         self.view_high += o.view_high;
+        self.total += o.total;
     }
 }
 
@@ -1382,7 +1537,7 @@ impl Histogram {
         w: &Weights,
         table: &ToneTable,
         place: f64,
-        window: Option<(usize, usize, usize, usize)>,
+        window: Option<HistWindow>,
     ) -> (Self, Self) {
         let k1 = w.g - w.r - w.b;
         let k2 = 2.0 * (w.r - w.b);
@@ -1398,7 +1553,7 @@ impl Histogram {
         plane: &Plane,
         table: &ToneTable,
         place: f64,
-        window: Option<(usize, usize, usize, usize)>,
+        window: Option<HistWindow>,
     ) -> (Self, Self) {
         Self::count(plane.width, plane.height, window, table, place, |y| {
             let row = plane.row(y);
@@ -1415,7 +1570,7 @@ impl Histogram {
         width: usize,
         table: &ToneTable,
         place: f64,
-        window: Option<(usize, usize, usize, usize)>,
+        window: Option<HistWindow>,
     ) -> (Self, Self) {
         let height = codes.len().checked_div(width).unwrap_or(0);
         Self::count(width, height, window, table, place, |y| {
@@ -1432,19 +1587,20 @@ impl Histogram {
     fn count<R: Fn(usize) -> f64>(
         width: usize,
         height: usize,
-        window: Option<(usize, usize, usize, usize)>,
+        window: Option<HistWindow>,
         table: &ToneTable,
         place: f64,
         row: impl Fn(usize) -> R + Sync,
     ) -> (Self, Self) {
         let (x0, y0, x1, y1) = match window {
-            Some((x, y, w, h)) => {
+            Some(HistWindow { x, y, w, h, .. }) => {
                 let x0 = x.min(width);
                 let y0 = y.min(height);
                 (x0, y0, x.saturating_add(w).min(width).max(x0), y.saturating_add(h).min(height).max(y0))
             }
             None => (0, 0, width, height),
         };
+        let quad = window.filter(|w| w.quad.is_some());
         let lut_neg = neg_lut();
         let global = 2f64.powf(place);
         let parts: Vec<Counts> = (y0..y1)
@@ -1453,6 +1609,10 @@ impl Histogram {
                 let code_at = row(y);
                 let mut c = Counts::default();
                 for x in x0..x1 {
+                    if quad.is_some_and(|q| !q.holds(x, y)) {
+                        continue;
+                    }
+                    c.total += 1;
                     let m = code_at(x);
                     let q = q16(m);
                     c.neg[lut_neg[q] as usize] += 1;
@@ -1474,7 +1634,7 @@ impl Histogram {
         for c in parts {
             all.add(&c);
         }
-        let total = (x1 - x0) * (y1 - y0);
+        let total = all.total;
         (
             Self::from_bins(all.neg, total, all.neg_low, all.neg_high),
             Self::from_bins(all.view, total, all.view_low, all.view_high),
@@ -1587,19 +1747,63 @@ impl Default for HistCache {
     }
 }
 
-fn hist_window(s: &Session, v: &ViewParams) -> Option<(usize, usize, usize, usize)> {
-    v.crop.map(|c| {
-        let (fw, fh) = s.upright_size();
-        let c = c.sanitized(fw as u32, fh as u32);
-        let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
-        let r = source_rect(
-            s.negative.orientation,
-            sw,
-            sh,
-            DetailRect { x: c.x as usize, y: c.y as usize, w: c.w as usize, h: c.h as usize },
-        );
-        (r.x, r.y, r.w, r.h)
-    })
+/// The sensor pixels a histogram counts: a rectangle, and with a turn the
+/// tilted window inside it, tested pixel by pixel through `quad`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HistWindow {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+    /// Sensor → frame, and the window on the frame `(x0, y0, x1, y1)`,
+    /// half-open, continuous. `None` counts the whole rectangle.
+    pub quad: Option<(Affine, [f64; 4])>,
+}
+
+impl HistWindow {
+    /// Is sensor pixel `(x, y)` counted?
+    #[inline]
+    fn holds(&self, x: usize, y: usize) -> bool {
+        match &self.quad {
+            None => true,
+            Some((m, [x0, y0, x1, y1])) => {
+                let (fx, fy) = m.apply(x as f64 + 0.5, y as f64 + 0.5);
+                fx >= *x0 && fx < *x1 && fy >= *y0 && fy < *y1
+            }
+        }
+    }
+}
+
+/// What the histograms count: the crop, in sensor pixels. Without a crop
+/// and without a turn, everything. A turned frame without a crop is the
+/// frame itself: the corners the turn leaves out are not in the picture.
+fn hist_window(s: &Session, v: &ViewParams) -> Option<HistWindow> {
+    let (uw, uh) = s.upright_size();
+    let (fw, fh) = s.frame_size(v.angle);
+    let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
+    let o = s.negative.orientation;
+    let c = match v.crop {
+        Some(c) => c.sanitized(fw as u32, fh as u32),
+        None if straighten::turns(v.angle) => CropRect { x: 0, y: 0, w: fw as u32, h: fh as u32 },
+        None => return None,
+    };
+    let frame_rect = DetailRect { x: c.x as usize, y: c.y as usize, w: c.w as usize, h: c.h as usize };
+    if !straighten::turns(v.angle) {
+        let r = source_rect(o, sw, sh, frame_rect);
+        return Some(HistWindow { x: r.x, y: r.y, w: r.w, h: r.h, quad: None });
+    }
+    // The window's footprint upright (its corners through the turn), then
+    // the sensor rectangle around that; inside it, every pixel is asked.
+    let to_upright = straighten::frame_to_upright(uw, uh, v.angle);
+    let pix = PixelRect { x: frame_rect.x, y: frame_rect.y, w: frame_rect.w, h: frame_rect.h };
+    let (x0, y0, x1, y1) = straighten::footprint(&to_upright, ResampleKernel::Area, pix, uw, uh);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let r = source_rect(o, sw, sh, DetailRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+    let to_frame = to_upright.inverse()?.after(&straighten::orient_map(o, sw, sh));
+    let quad = [c.x as f64, c.y as f64, (c.x + c.w) as f64, (c.y + c.h) as f64];
+    Some(HistWindow { x: r.x, y: r.y, w: r.w, h: r.h, quad: Some((to_frame, quad)) })
 }
 
 impl HistCache {
@@ -1684,8 +1888,9 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
     let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
     if v.show_mask {
         let mut plane = orient(&pp.mask, rotated(1, v.rotation));
+        plane = straighten::straighten(&plane, v.angle, MASK_KERNEL);
         if let Some(c) = v.crop {
-            let (fw, fh) = s.upright_size();
+            let (fw, fh) = s.frame_size(v.angle);
             let turned = c.turned(v.rotation, fw as u32, fh as u32);
             plane = window_plane(&plane, scale_crop(turned, s.preview.scale, plane.width, plane.height));
         }
@@ -1704,12 +1909,13 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
     }
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.histograms(s, v, table);
-    // Turn, then cut the window, on the small planes.
+    // Turn, straighten, then cut the window, on the small planes.
     let shown = |plane: Plane| -> Plane {
         let turned = orient(&plane, rotated(1, v.rotation));
+        let turned = straighten::straighten(&turned, v.angle, v.kernel);
         match v.crop {
             Some(c) => {
-                let (fw, fh) = s.upright_size();
+                let (fw, fh) = s.frame_size(v.angle);
                 let window = c.turned(v.rotation, fw as u32, fh as u32);
                 let scaled = scale_crop(window, s.preview.scale, turned.width, turned.height);
                 window_plane(&turned, scaled)
@@ -2128,6 +2334,8 @@ mod histogram_tests {
             place: 0.0,
             show_mask: false,
             rotation: 0,
+            angle: 0.0,
+            kernel: ResampleKernel::default(),
             crop: None,
             plate: None,
         };
@@ -2140,6 +2348,41 @@ mod histogram_tests {
         )
         .unwrap();
         assert_eq!(detail.gray, display_bytes(&session.negative.plane, 0.0, &table));
+
+        // Straightened: the 1:1 tile is the frame, and its pixels are the
+        // upright negative warped with the recipe's kernel, as the export
+        // writes them. The fit copy has the frame's size and proportion.
+        let angle = 4.0;
+        let turned = ViewParams { angle, kernel: ResampleKernel::CatmullRom, ..view.clone() };
+        let (fw, fh) = straighten::frame_size(w, h, angle);
+        assert!(fw < w && fh < h);
+        let detail = render_detail(
+            &session,
+            &turned,
+            DetailAsk::pixels(DetailRect { x: 0, y: 0, w: fw, h: fh }),
+            &table,
+            Some(&a),
+        )
+        .unwrap();
+        let expected = straighten::straighten(&session.negative.plane, angle, ResampleKernel::CatmullRom);
+        assert_eq!((expected.width, expected.height), (fw, fh));
+        assert_eq!(detail.gray, display_bytes(&expected, 0.0, &table));
+        let preview = render_preview(&session, &turned, &mut cache, &table);
+        assert_eq!((preview.width, preview.height), straighten::frame_size(w, h, angle));
+        // The histogram counts only the frame's pixels.
+        assert!(preview.hist_view.total <= fw * fh);
+        assert!(preview.hist_view.total > 0);
+        // And the whole frame turned 90° is the frame of the turned negative.
+        let quarter = ViewParams { rotation: 1, ..turned.clone() };
+        let d = render_detail(
+            &session,
+            &quarter,
+            DetailAsk::pixels(DetailRect { x: 0, y: 0, w: fh, h: fw }),
+            &table,
+            Some(&a),
+        )
+        .unwrap();
+        assert_eq!(d.gray, display_bytes(&mimizan_core::print::orient(&expected, 6), 0.0, &table));
     }
 
     /// A plate on a grey Bayer mosaic: the preview, the 1:1 window, the
@@ -2205,6 +2448,8 @@ mod histogram_tests {
             place: 0.0,
             show_mask: false,
             rotation: 1,
+            angle: 0.0,
+            kernel: ResampleKernel::default(),
             crop: None,
             plate: Some(plate),
         };

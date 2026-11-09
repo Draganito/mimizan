@@ -23,12 +23,13 @@ use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::cfa::BayerPhase;
 use mimizan_core::decode::SensorKind;
+use mimizan_core::linear::Framing;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateInfo, PlateSpace, PlateWeights};
 use mimizan_core::print::{self as pr, PrintParams, PrintSource};
-use mimizan_core::recipe::{CropRect, Recipe, Sharpen};
+use mimizan_core::recipe::{Recipe, Sharpen};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -64,16 +65,17 @@ pub enum Job {
     /// The linear export: the separation for another program, no print.
     /// In the monochrome process the mixed negative as a linear grey TIFF
     /// with its mask beside it; in the plate process the channels as a
-    /// linear DNG. Only the crop and the turns are applied.
+    /// linear DNG. Only the framing is applied: the turns, the straighten
+    /// and the crop, as the print recipe carries them.
     ExportLinear {
         session: Arc<Session>,
         weights: Weights,
         /// The DNG of the channels plate instead of the grey negative.
         plate: bool,
-        /// Window on the turned picture, as the print recipe carries it.
-        crop: Option<CropRect>,
+        /// The turns, the straighten with its kernel, and the window on
+        /// the turned frame.
+        framing: Framing,
         path: PathBuf,
-        orientation: u16,
     },
 }
 
@@ -198,8 +200,8 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
             Some(plate) => export_plate(&session, weights, &plate, recipe, &path, orientation, &status),
             None => export(&session, weights, recipe, &path, orientation, &status),
         },
-        Job::ExportLinear { session, weights, plate, crop, path, orientation } => {
-            export_linear(&session, weights, plate, crop, &path, orientation, &status)
+        Job::ExportLinear { session, weights, plate, framing, path } => {
+            export_linear(&session, weights, plate, &framing, &path, &status)
         }
     }
 }
@@ -542,14 +544,13 @@ fn export_plate(
 /// The linear export. Monochrome process: the mixed negative (the file's
 /// own plane on a monochrome sensor) as a linear grey TIFF, the mask
 /// beside it. Plate process: the channels plate, white balance undone, as
-/// a linear DNG with the camera's matrix. Both upright and cut to `crop`.
+/// a linear DNG with the camera's matrix. Both framed as `framing` says.
 fn export_linear(
     s: &Session,
     weights: Weights,
     plate: bool,
-    crop: Option<CropRect>,
+    framing: &Framing,
     path: &Path,
-    orientation: u16,
     status: &dyn Fn(String),
 ) -> Result<Event> {
     use mimizan_core::linear::{write_dng, write_negative, DngMeta};
@@ -570,7 +571,7 @@ fn export_linear(
             .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
         status(format!("writing {}", path.display()));
         let [r, g, b] = &planes;
-        write_dng(path, [r, g, b], orientation, crop, &meta)?
+        write_dng(path, [r, g, b], framing, &meta)?
     } else {
         status(if s.is_mono() { "framing".into() } else { "mixing".into() });
         let mixed = mixed_plane(s, &weights)?;
@@ -578,7 +579,7 @@ fn export_linear(
         let mask = s.mask_plane()?;
         let desc = serde_json::to_string(&info)?;
         status(format!("writing {}", path.display()));
-        write_negative(path, plane, Some(&mask), orientation, crop, &desc)?
+        write_negative(path, plane, Some(&mask), framing, &desc)?
     };
     Ok(Event::Exported {
         path: path.to_path_buf(),

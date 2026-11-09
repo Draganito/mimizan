@@ -21,16 +21,19 @@
 //!   weighted sum of measured photosites, and the colour is band-limited
 //!   to the carriers, under a full-resolution luminance.
 //!
-//! Orientation and crop are applied to the pixels: a turn is a
-//! permutation, a crop a window, neither resamples. The files carry
-//! orientation 1.
+//! Orientation, straighten and crop are applied to the pixels, as the
+//! recipe says ([`Framing`]): a 90° turn is a permutation, a crop a
+//! window, neither resamples. The straighten does, once, with the
+//! recipe's kernel, the way the print does; a recipe without one leaves
+//! every sample as measured. The files carry orientation 1.
 
 use crate::decode::RawFrame;
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
 use crate::plane::Plane;
-use crate::print::{orient, window_plane};
+use crate::print::{orient, window_plane, MASK_KERNEL};
 use crate::recipe::CropRect;
+use crate::resize::ResampleKernel;
 use crate::tiffout::{write_gray16, write_gray8, TiffMeta};
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -158,35 +161,71 @@ pub struct Written {
     pub height: usize,
 }
 
-/// Upright, then the window.
-fn framed(p: &Plane, orientation: u16, crop: Option<CropRect>) -> Plane {
-    let up = orient(p, orientation);
-    match crop {
+/// How the picture is framed on its way out: the TIFF orientation (the
+/// file's plus the user's 90° turns), the recipe's straighten and its
+/// kernel, and the crop on the straightened frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Framing {
+    /// TIFF orientation to apply, 1..=8.
+    pub orientation: u16,
+    /// The straighten, degrees clockwise; zero turns nothing.
+    pub angle: f64,
+    /// The kernel the straighten resamples with (the recipe's).
+    pub kernel: ResampleKernel,
+    /// Window on the straightened frame.
+    pub crop: Option<CropRect>,
+}
+
+impl Framing {
+    /// Upright by `orientation`, nothing else.
+    pub fn upright(orientation: u16) -> Self {
+        Self { orientation, angle: 0.0, kernel: ResampleKernel::default(), crop: None }
+    }
+
+    /// Upright, cut to `crop`, no straighten.
+    pub fn cut(orientation: u16, crop: Option<CropRect>) -> Self {
+        Self { crop, ..Self::upright(orientation) }
+    }
+
+    /// Size of the file written for an `w×h` plane (before orientation).
+    pub fn size(&self, w: usize, h: usize) -> (usize, usize) {
+        let (uw, uh) = if matches!(self.orientation, 5..=8) { (h, w) } else { (w, h) };
+        let (fw, fh) = crate::straighten::frame_size(uw, uh, self.angle);
+        let (_, _, cw, ch) = crate::print::source_window(fw, fh, self.crop);
+        (cw, ch)
+    }
+}
+
+/// Upright, straightened with `kernel`, then the window.
+fn framed(p: &Plane, f: &Framing, kernel: ResampleKernel) -> Plane {
+    let up = orient(p, f.orientation);
+    let up = crate::straighten::straighten(&up, f.angle, kernel);
+    match f.crop {
         Some(c) => window_plane(&up, c.sanitized(up.width as u32, up.height as u32)),
         None => up,
     }
 }
 
 /// The monochrome negative as the command writes it: linear 16-bit grey,
-/// upright and cut to `crop`, the JSON in the description, orientation 1;
-/// beside it `<stem>.mask.tif`, the sharpening mask framed the same way
-/// (`mask` is `max(M)` with saturated pixels at 1, the sidecar as a
-/// plane). Returns the size written.
+/// framed as `framing` says, the JSON in the description, orientation 1;
+/// beside it `<stem>.mask.tif`, the sharpening mask framed the same way,
+/// its straighten with [`MASK_KERNEL`] so a flag stays a flag (`mask` is
+/// `max(M)` with saturated pixels at 1, the sidecar as a plane). Returns
+/// the size written.
 pub fn write_negative(
     path: &Path,
     plane: &Plane,
     mask: Option<&Plane>,
-    orientation: u16,
-    crop: Option<CropRect>,
+    framing: &Framing,
     description: &str,
 ) -> Result<Written> {
-    let out = framed(plane, orientation, crop);
+    let out = framed(plane, framing, framing.kernel);
     write_gray16(path, &out, &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None })?;
     if let Some(m) = mask {
         if (m.width, m.height) != (plane.width, plane.height) {
             return Err(Error::Invalid("the mask and the negative differ in size".into()));
         }
-        let fm = framed(m, orientation, crop);
+        let fm = framed(m, framing, MASK_KERNEL);
         let bytes: Vec<u8> = fm.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
         write_gray8(
             &mask_sidecar(path),
@@ -210,7 +249,8 @@ pub fn mask_sidecar(out: &Path) -> std::path::PathBuf {
 /// each `L̂` plus its band-limited chrominance, on the balanced channels).
 /// Each is divided by its multiplier, so a neutral reads the camera's
 /// as-shot neutral again and every channel clips at the sensor's white;
-/// then turned upright, cut to `crop`, and quantised to 16 bits.
+/// then framed as `framing` says (upright, straightened, cut), and
+/// quantised to 16 bits.
 ///
 /// Tags: DNG 1.4 (backward 1.1), `LinearRaw`, `ColorMatrix1` the camera's
 /// matrix, `CalibrationIlluminant1` its illuminant, `AsShotNeutral` the
@@ -219,8 +259,7 @@ pub fn mask_sidecar(out: &Path) -> std::path::PathBuf {
 pub fn write_dng(
     path: &Path,
     balanced: [&Plane; 3],
-    orientation: u16,
-    crop: Option<CropRect>,
+    framing: &Framing,
     meta: &DngMeta<'_>,
 ) -> Result<Written> {
     let [r, g, b] = balanced;
@@ -239,7 +278,7 @@ pub fn write_dng(
     let mut data: Vec<u16> = Vec::new();
     let (mut width, mut height) = (0usize, 0usize);
     for (c, plane) in balanced.iter().enumerate() {
-        let f = framed(plane, orientation, crop);
+        let f = framed(plane, framing, framing.kernel);
         if c == 0 {
             width = f.width;
             height = f.height;
@@ -333,7 +372,8 @@ mod tests {
         let path = tmp("plate.dng");
         // Orientation 6 (90° cw) and a crop in the upright frame.
         let crop = Some(CropRect { x: 1, y: 2, w: 4, h: 3 });
-        let got = write_dng(&path, [&r, &g, &b], 6, crop, &meta).unwrap();
+        let framing = Framing::cut(6, crop);
+        let got = write_dng(&path, [&r, &g, &b], &framing, &meta).unwrap();
         assert_eq!(got, Written { width: 4, height: 3 });
 
         // The `tiff` decoder refuses LinearRaw; the first IFD is read by
@@ -413,7 +453,7 @@ mod tests {
         assert_eq!(px.len(), 3 * 4 * 3);
         // The same frame, computed here: the three ramps are 2:1:1.5 of one
         // picture, so unbalanced they are equal, and equal to the green.
-        let want = framed(&g, 6, crop);
+        let want = framed(&g, &framing, framing.kernel);
         for (i, p) in px.chunks(3).enumerate() {
             let q = (want.data[i].clamp(0.0, 1.0) * 65535.0).round() as u16;
             assert_eq!(p, &[q, q, q], "pixel {i}");
@@ -434,10 +474,10 @@ mod tests {
             wb: [0.0, 1.0, 1.0],
             description: "",
         };
-        assert!(write_dng(&tmp("bad.dng"), [&p, &p, &p], 1, None, &bad).is_err());
+        assert!(write_dng(&tmp("bad.dng"), [&p, &p, &p], &Framing::upright(1), &bad).is_err());
         let ok = DngMeta { wb: [1.0; 3], ..bad };
         let q = ramp(4, 3, 1.0);
-        assert!(write_dng(&tmp("bad2.dng"), [&p, &p, &q], 1, None, &ok).is_err());
+        assert!(write_dng(&tmp("bad2.dng"), [&p, &p, &q], &Framing::upright(1), &ok).is_err());
         let frame_without_matrix = crate::decode::RawFrame {
             make: String::new(),
             model: String::new(),
@@ -469,19 +509,48 @@ mod tests {
         let mask = Plane::from_vec(w, h, (0..w * h).map(|i| if i % 2 == 0 { 1.0 } else { 0.5 }).collect());
         let path = tmp("neg.tif");
         let crop = Some(CropRect { x: 2, y: 1, w: 3, h: 4 });
-        let got = write_negative(&path, &plane, Some(&mask), 8, crop, r#"{"stage":"negative"}"#).unwrap();
+        let framing = Framing::cut(8, crop);
+        let got = write_negative(&path, &plane, Some(&mask), &framing, r#"{"stage":"negative"}"#).unwrap();
         assert_eq!(got, Written { width: 3, height: 4 });
         let read = crate::tiffin::read_gray(&path).unwrap();
         assert_eq!((read.plane.width, read.plane.height, read.orientation), (3, 4, 1));
-        let want = framed(&plane, 8, crop);
+        let want = framed(&plane, &framing, framing.kernel);
         for (a, b) in read.plane.data.iter().zip(&want.data) {
             assert!((a - b).abs() < 1.0 / 65535.0, "{a} vs {b}");
         }
         let (mw, mh, bytes) = crate::tiffin::read_mask8(&mask_sidecar(&path)).unwrap();
         assert_eq!((mw, mh), (3, 4));
-        let wm = framed(&mask, 8, crop);
+        let wm = framed(&mask, &framing, MASK_KERNEL);
         for (a, b) in bytes.iter().zip(&wm.data) {
             assert_eq!(*a, (b * 255.0).round() as u8);
         }
+    }
+
+    /// With a straighten the file is the frame, then the crop on it: the
+    /// size `Framing::size` says, the mask the same size, a flag still a
+    /// flag, and a flat picture still flat.
+    #[test]
+    fn negative_is_straightened_before_the_cut() {
+        let (w, h) = (60usize, 40usize);
+        let plane = Plane::from_vec(w, h, vec![0.25; w * h]);
+        let mask = Plane::from_vec(w, h, vec![1.0; w * h]);
+        let path = tmp("neg_turned.tif");
+        let crop = Some(CropRect { x: 4, y: 3, w: 30, h: 20 });
+        let framing = Framing { orientation: 6, angle: -4.0, kernel: ResampleKernel::BSpline, crop };
+        let (fw, fh) = crate::straighten::frame_size(h, w, -4.0);
+        assert!(fw < h && fh < w, "{fw}x{fh}");
+        assert_eq!(framing.size(w, h), (30, 20));
+        let got = write_negative(&path, &plane, Some(&mask), &framing, "{}").unwrap();
+        assert_eq!(got, Written { width: 30, height: 20 });
+        let read = crate::tiffin::read_gray(&path).unwrap();
+        for v in &read.plane.data {
+            assert!((v - 0.25).abs() < 1.0 / 65535.0, "{v}");
+        }
+        let (mw, mh, bytes) = crate::tiffin::read_mask8(&mask_sidecar(&path)).unwrap();
+        assert_eq!((mw, mh), (30, 20));
+        assert!(bytes.iter().all(|&b| b == 255));
+        // Without a crop the file is the whole frame.
+        let whole = Framing { crop: None, ..framing };
+        assert_eq!(whole.size(w, h), (fw, fh));
     }
 }

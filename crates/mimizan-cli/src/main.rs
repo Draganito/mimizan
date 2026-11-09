@@ -169,6 +169,12 @@ enum Cmd {
         /// when there is one; either ring stands on its own.
         #[arg(long, value_name = "MM")]
         black_mm: Option<f64>,
+        /// Straighten: turn the picture by this many degrees, clockwise
+        /// positive, within ±45, and keep the largest window of its own
+        /// proportion; the recipe's crop lies in that window. One
+        /// resampling with --resample's kernel, together with the size.
+        #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
+        angle: Option<f64>,
         /// Output resolution, dots per inch (default from the recipe, 360)
         #[arg(long)]
         dpi: Option<f64>,
@@ -287,6 +293,7 @@ fn main() -> Result<()> {
             resample,
             border_mm,
             black_mm,
+            angle,
             dpi,
             usm_amount,
             usm_k,
@@ -307,6 +314,7 @@ fn main() -> Result<()> {
             resample,
             border_mm,
             black_mm,
+            angle,
             dpi,
             usm_amount,
             usm_k,
