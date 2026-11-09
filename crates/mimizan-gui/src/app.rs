@@ -3,7 +3,9 @@
 //! Enlarger below). Nothing here changes pixels; it only chooses
 //! parameters and hands them to the workers.
 
-use crate::browser::{self, home_dir, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs};
+use crate::browser::{
+    self, home_dir, ExportFormat, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs,
+};
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::filter_strip::{self, filter_ink, filter_short, filter_strip, Field};
@@ -531,6 +533,8 @@ pub struct App {
     sheet_cm: [f64; 2],
     /// What the Print window's lengths are shown and typed in.
     ruler: Ruler,
+    /// The file the Export button writes, TIFF or JPEG.
+    format: ExportFormat,
     /// The export estimate the user was warned about. A second click with
     /// the same estimate goes ahead; a different one warns again.
     export_warned: Option<u64>,
@@ -741,6 +745,7 @@ impl App {
             },
             sheet_cm: [30.0, 40.0],
             ruler: persisted.ruler.unwrap_or_default(),
+            format: persisted.format.unwrap_or_default(),
             sharpen_at: None,
             pick_card: false,
             card_status: None,
@@ -838,6 +843,7 @@ impl App {
             plate_filters: Some(self.plate_last.filters),
             plate_space: Some(self.plate_last.space),
             ruler: Some(self.ruler),
+            format: Some(self.format),
             folder_bookmark: self.saved_bookmark(),
         }
         .save();
@@ -1620,7 +1626,7 @@ impl App {
             .as_ref()
             .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
             .unwrap_or_else(|| "mimizan".into());
-        let name = format!("{stem}.tif");
+        let name = format!("{stem}.{}", self.format.extension());
         self.export_kind = ExportKind::Print;
         if self.save_with_panel(&name) {
             return;
@@ -1660,7 +1666,7 @@ impl App {
         if sandboxed() {
             // The panel appends the extension itself, so the path it hands
             // back is written as it is: the grant is for that path alone.
-            let extensions = export_extensions(self.export_kind, self.linear_is_dng());
+            let extensions = export_extensions(self.export_kind, self.linear_is_dng(), self.format);
             if let Some(path) = mimizan_mac::pick_save(self.export_directory().as_deref(), name, extensions) {
                 self.export_to(path, true);
             }
@@ -1688,7 +1694,7 @@ impl App {
                 path.display()
             ));
         }
-        let extensions = export_extensions(self.export_kind, self.linear_is_dng());
+        let extensions = export_extensions(self.export_kind, self.linear_is_dng(), self.format);
         let path = if granted { path } else { with_ext(path, extensions) };
         let Some(s) = &self.session else { return };
         match self.export_kind {
@@ -2184,8 +2190,8 @@ impl App {
                     self.busy = None;
                     self.last_view = None;
                 }
-                Event::Exported { tiff, width, height, ms } => {
-                    self.log(format!("wrote {} ({width}x{height}) in {ms} ms", tiff.display()));
+                Event::Exported { path, width, height, ms } => {
+                    self.log(format!("wrote {} ({width}x{height}) in {ms} ms", path.display()));
                     self.busy = None;
                 }
                 Event::Refused { job, message } => self.retry_refused(job, message),
@@ -3393,17 +3399,40 @@ impl App {
     /// sharpening mode stays off. Peak, below the tile, is the desktop
     /// high-pass. The 1:1 box is the print pixels.
     fn print_section(&mut self, ui: &mut egui::Ui) {
-        // The file the export writes, first: it is the process's.
-        ui.horizontal(|ui| {
-            print_field_label(ui, "file");
-            match self.edit.plate {
-                Some(mut params) => {
-                    ui.label(RichText::new("16-bit RGB TIFF ·").weak()).on_hover_text(
-                        "The three positives as the channels of one RGB file, with a matrix/TRC profile \
-                         of the primaries beside and the paper's gamma 2.2.",
-                    );
-                    // The primaries the plates are projected through: the file's profile.
-                    egui::ComboBox::from_id_salt("plate-space")
+        // The file the export writes, first: it is the process's. The
+        // format is the program's: the same sheet, 16-bit TIFF or 8-bit
+        // JPEG, remembered across files.
+        let format_changed = ui
+            .horizontal(|ui| {
+                print_field_label(ui, "file");
+                let mut changed = false;
+                for f in ExportFormat::ALL {
+                    changed |= ui
+                        .selectable_value(&mut self.format, f, f.name())
+                        .on_hover_text(match f {
+                            ExportFormat::Tiff => {
+                                "16 bit, the ICC profile embedded, the recipe in the description. The print \
+                                 for the printer and the archive."
+                            }
+                            ExportFormat::Jpeg => {
+                                "8 bit at quality 100, no chroma subsampling, the same ICC profile and the \
+                                 dpi embedded, no description. The print for the screen and the web."
+                            }
+                        })
+                        .changed();
+                }
+                let bits = match self.format {
+                    ExportFormat::Tiff => "16-bit",
+                    ExportFormat::Jpeg => "8-bit",
+                };
+                match self.edit.plate {
+                    Some(mut params) => {
+                        ui.label(RichText::new(format!("{bits} RGB ·")).weak()).on_hover_text(
+                            "The three positives as the channels of one RGB file, with a matrix/TRC profile \
+                             of the primaries beside and the paper's gamma 2.2.",
+                        );
+                        // The primaries the plates are projected through: the file's profile.
+                        egui::ComboBox::from_id_salt("plate-space")
                         .selected_text(space_name(params.space))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB")
@@ -3416,18 +3445,24 @@ impl App {
                                  carries the profile.",
                             );
                         })
-                        .response
-                        .on_hover_text("The projection primaries, and the profile of the file.");
-                    if self.edit.plate != Some(params) {
-                        self.edit.plate = Some(params);
+                            .response
+                            .on_hover_text("The projection primaries, and the profile of the file.");
+                        if self.edit.plate != Some(params) {
+                            self.edit.plate = Some(params);
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new(format!("{bits} grey · gamma 2.2")).weak())
+                            .on_hover_text("The sheet as one grey channel with a gamma 2.2 profile.");
                     }
                 }
-                None => {
-                    ui.label(RichText::new("16-bit grey TIFF · gamma 2.2").weak())
-                        .on_hover_text("The sheet as one grey channel with a gamma 2.2 profile.");
-                }
-            }
-        });
+                changed
+            })
+            .inner;
+        if format_changed {
+            // The format is a setting of the program, not of the recipe.
+            self.persist();
+        }
         // One rule for the sheet: the fields are the sheet in the printer,
         // always in the crop's proportion. Type one side and the other
         // follows the picture; the rings are taken from inside the sheet
@@ -3804,6 +3839,11 @@ impl App {
         } else {
             ", no sharpening".to_string()
         };
+        // The JPEG has no description: the recipe stays in the file beside the RAW.
+        let (ext, bits, described) = match self.format {
+            ExportFormat::Tiff => ("tif", "16 bit", true),
+            ExportFormat::Jpeg => ("jpg", "8 bit, quality 100", false),
+        };
         match self.plate_view() {
             Some(p) => {
                 let space = match p.space {
@@ -3815,17 +3855,20 @@ impl App {
                 } else {
                     String::new()
                 };
+                let desc = if described { ", recipe and plate in the description" } else { "" };
                 format!(
                     "Writes the three-colour plate on the {look}{rot}{local}{lamps}:\n\
-                     <name>.tif  {ow} x {oh} px, 16 bit RGB, {space} gamma 2.2 ICC, {} filters{sharpen}, \
-                     recipe and plate in the description",
+                     <name>.{ext}  {ow} x {oh} px, {bits} RGB, {space} gamma 2.2 ICC, {} filters{sharpen}{desc}",
                     p.weights.filters.name()
                 )
             }
-            None => format!(
-                "Writes the print on the {look}{rot}{local}:\n\
-                 <name>.tif  {ow} x {oh} px, 16 bit, gamma 2.2 grey ICC{sharpen}, recipe in the description"
-            ),
+            None => {
+                let desc = if described { ", recipe in the description" } else { "" };
+                format!(
+                    "Writes the print on the {look}{rot}{local}:\n\
+                     <name>.{ext}  {ow} x {oh} px, {bits}, gamma 2.2 grey ICC{sharpen}{desc}"
+                )
+            }
         }
     }
 
@@ -4539,12 +4582,15 @@ fn start_folder() -> Option<PathBuf> {
 
 /// The file extensions an export may carry: the first is the one given
 /// to a name that has none, the rest are accepted as they are. The print
-/// and the linear negative are TIFFs under either spelling; the linear
-/// plate is a DNG and nothing else.
-fn export_extensions(kind: ExportKind, dng: bool) -> &'static [&'static str] {
-    match (kind, dng) {
-        (ExportKind::Linear, true) => &["dng"],
-        _ => &["tif", "tiff"],
+/// is a TIFF or a JPEG, the chosen format first and the other still
+/// accepted when typed; the linear negative is a TIFF under either
+/// spelling; the linear plate is a DNG and nothing else.
+fn export_extensions(kind: ExportKind, dng: bool, format: ExportFormat) -> &'static [&'static str] {
+    match (kind, dng, format) {
+        (ExportKind::Linear, true, _) => &["dng"],
+        (ExportKind::Linear, false, _) => &["tif", "tiff"],
+        (ExportKind::Print, _, ExportFormat::Tiff) => &["tif", "tiff", "jpg", "jpeg"],
+        (ExportKind::Print, _, ExportFormat::Jpeg) => &["jpg", "jpeg", "tif", "tiff"],
     }
 }
 
@@ -5644,7 +5690,8 @@ impl App {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        crumb_label, export_extensions, toolbar_gaps, with_ext, without_verbatim_prefix, ExportKind,
+        crumb_label, export_extensions, toolbar_gaps, with_ext, without_verbatim_prefix, ExportFormat,
+        ExportKind,
     };
     use std::path::{Path, PathBuf};
 
@@ -5681,15 +5728,22 @@ mod path_tests {
 
     #[test]
     fn an_export_name_gets_its_kind_of_extension() {
-        let tiff = export_extensions(ExportKind::Print, false);
-        let negative = export_extensions(ExportKind::Linear, false);
-        let dng = export_extensions(ExportKind::Linear, true);
+        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff);
+        let jpeg = export_extensions(ExportKind::Print, false, ExportFormat::Jpeg);
+        let negative = export_extensions(ExportKind::Linear, false, ExportFormat::Jpeg);
+        let dng = export_extensions(ExportKind::Linear, true, ExportFormat::Tiff);
         // Either spelling of TIFF stands, in any case; a name without one
         // gets the first; a DNG accepts no TIFF and a TIFF no DNG.
         assert_eq!(with_ext(PathBuf::from("print.TIFF"), tiff), PathBuf::from("print.TIFF"));
         assert_eq!(with_ext(PathBuf::from("print.tif"), tiff), PathBuf::from("print.tif"));
         assert_eq!(with_ext(PathBuf::from("print"), tiff), PathBuf::from("print.tif"));
         assert_eq!(with_ext(PathBuf::from("print.dng"), tiff), PathBuf::from("print.tif"));
+        // The other print format, typed, is kept; a bare name takes the chosen one.
+        assert_eq!(with_ext(PathBuf::from("print.JPG"), tiff), PathBuf::from("print.JPG"));
+        assert_eq!(with_ext(PathBuf::from("print"), jpeg), PathBuf::from("print.jpg"));
+        assert_eq!(with_ext(PathBuf::from("print.tiff"), jpeg), PathBuf::from("print.tiff"));
+        // The linear negative is a TIFF whatever the print's format.
+        assert_eq!(with_ext(PathBuf::from("neg.jpg"), negative), PathBuf::from("neg.tif"));
         assert_eq!(with_ext(PathBuf::from("neg.tiff"), negative), PathBuf::from("neg.tiff"));
         assert_eq!(with_ext(PathBuf::from("plate.tiff"), dng), PathBuf::from("plate.dng"));
         assert_eq!(with_ext(PathBuf::from("plate.DNG"), dng), PathBuf::from("plate.DNG"));

@@ -430,12 +430,9 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     Ok(r)
 }
 
-/// `mimizan print`: negative TIFF → print TIFF through a recipe.
+/// `mimizan print`: negative TIFF → print TIFF (or JPEG) through a recipe.
 pub fn print(a: &PrintArgs) -> Result<()> {
     use mimizan_core::print::{self as pr, PrintParams};
-    if pr::is_jpeg_path(&a.out) {
-        bail!("the print is written as a 16-bit TIFF; give -o a .tif path");
-    }
     if !(a.usm_k.is_finite() && a.usm_k > 0.0) {
         bail!("--usm-k must be positive");
     }

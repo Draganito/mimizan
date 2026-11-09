@@ -45,8 +45,10 @@ pub enum Job {
     /// frame alone, not the session: the UI may let the session go while
     /// this runs, so its planes are not held beside the new ones.
     Redevelop { source: Redevelop, develop: DevelopParams },
-    /// One export, one file. The 16-bit TIFF is the recipe rendered in one
-    /// pass against the negative: placing, paper or look, size and border.
+    /// One export, one file. The sheet is the recipe rendered in one pass
+    /// against the negative: placing, paper or look, size and border. A
+    /// `.jpg` path writes the 8-bit JPEG, anything else the 16-bit TIFF
+    /// (`print::write`).
     /// The desktop GUI sends the sharpening mode off; peak, when the recipe
     /// has it on, is part of that same pass.
     Export {
@@ -81,8 +83,8 @@ pub enum Event {
     Status(String),
     /// An `Open` or `Redevelop` finished.
     Opened(Arc<Session>),
-    /// An `Export` finished.
-    Exported { tiff: PathBuf, width: usize, height: usize, ms: u128 },
+    /// An `Export` or `ExportLinear` finished: the file written and its size.
+    Exported { path: PathBuf, width: usize, height: usize, ms: u128 },
     /// The development would not fit in free memory and was not started.
     /// The job comes back so the UI can let the picture it holds go and
     /// send it once more; `message` is for the log when it cannot.
@@ -482,7 +484,7 @@ fn export(
     status(format!("writing {}", path.display()));
     pr::write(&out, path, &params)?;
     Ok(Event::Exported {
-        tiff: path.to_path_buf(),
+        path: path.to_path_buf(),
         width: out.info.width,
         height: out.info.height,
         ms: t.elapsed().as_millis(),
@@ -530,7 +532,7 @@ fn export_plate(
     status(format!("writing {}", path.display()));
     pr::write(&out, path, &params)?;
     Ok(Event::Exported {
-        tiff: path.to_path_buf(),
+        path: path.to_path_buf(),
         width: out.info.width,
         height: out.info.height,
         ms: t.elapsed().as_millis(),
@@ -579,7 +581,7 @@ fn export_linear(
         write_negative(path, plane, Some(&mask), orientation, crop, &desc)?
     };
     Ok(Event::Exported {
-        tiff: path.to_path_buf(),
+        path: path.to_path_buf(),
         width: written.width,
         height: written.height,
         ms: t.elapsed().as_millis(),

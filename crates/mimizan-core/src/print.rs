@@ -1180,20 +1180,35 @@ pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
     };
     let meta = TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.recipe.dpi) };
     match (&out.plate, is_jpeg_path(path)) {
-        (Some(sheet), true) => write_rgb_jpeg(sheet.rgb(&out.plane), sheet.space, path, trc)?,
+        (Some(sheet), true) => {
+            write_rgb_jpeg(sheet.rgb(&out.plane), sheet.space, path, trc, Some(p.recipe.dpi))?
+        }
         (Some(sheet), false) => crate::tiffout::write_rgb16(path, sheet.rgb(&out.plane), sheet.space, &meta)?,
-        (None, true) => write_jpeg(&out.plane, path, trc)?,
+        (None, true) => write_jpeg(&out.plane, path, trc, Some(p.recipe.dpi))?,
         (None, false) => write_gray16(path, &out.plane, &meta)?,
     }
     Ok(())
 }
 
-/// JPEG of a plate print: 8-bit RGB, quality 100, the RGB ICC embedded.
+/// The JFIF density of a print: its dpi, whole, when there is one and it
+/// fits the two bytes; else the aspect ratio 1:1, which says nothing.
+fn jpeg_density(dpi: Option<f64>) -> image::codecs::jpeg::PixelDensity {
+    use image::codecs::jpeg::{PixelDensity, PixelDensityUnit};
+    match dpi.map(f64::round).filter(|d| *d >= 1.0 && *d <= f64::from(u16::MAX)) {
+        Some(d) => PixelDensity { density: (d as u16, d as u16), unit: PixelDensityUnit::Inches },
+        None => PixelDensity::default(),
+    }
+}
+
+/// JPEG of a plate print: 8-bit RGB, quality 100, no chroma subsampling
+/// (every block carries its own colour), the RGB ICC embedded, the dpi in
+/// the JFIF header.
 pub fn write_rgb_jpeg(
     rgb: [&Plane; 3],
     space: crate::plate::PlateSpace,
     path: &Path,
     trc: GrayTrc,
+    dpi: Option<f64>,
 ) -> Result<()> {
     use image::ImageEncoder;
     let [r, g, b] = rgb;
@@ -1212,6 +1227,7 @@ pub fn write_rgb_jpeg(
     });
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
+    enc.set_pixel_density(jpeg_density(dpi));
     enc.set_icc_profile(crate::icc::rgb_profile(space, trc))
         .map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
     enc.write_image(&buf, r.width as u32, r.height as u32, image::ExtendedColorType::Rgb8)?;
@@ -1228,12 +1244,13 @@ pub fn is_jpeg_path(path: &Path) -> bool {
 
 /// JPEG of an already encoded plane: full print resolution, 8-bit grey (one
 /// channel, so no chroma subsampling), quality 100, the same grey ICC as
-/// the TIFF embedded.
-pub fn write_jpeg(plane: &Plane, path: &Path, trc: GrayTrc) -> Result<()> {
+/// the TIFF embedded, the dpi in the JFIF header.
+pub fn write_jpeg(plane: &Plane, path: &Path, trc: GrayTrc, dpi: Option<f64>) -> Result<()> {
     use image::ImageEncoder;
     let buf: Vec<u8> = plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
+    enc.set_pixel_density(jpeg_density(dpi));
     enc.set_icc_profile(crate::icc::gray_profile(trc))
         .map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
     enc.write_image(&buf, plane.width as u32, plane.height as u32, image::ExtendedColorType::L8)?;

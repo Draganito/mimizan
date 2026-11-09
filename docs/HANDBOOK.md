@@ -11,9 +11,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.12/mimizan_0.16.12-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.12-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.12/mimizan-0.16.12-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.12/mimizan-0.16.12-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.16.13/mimizan_0.16.13-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.16.13-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.16.13/mimizan-0.16.13-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.16.13/mimizan-0.16.13-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -60,7 +60,9 @@ is amber whenever you are away from it.
 
 - The size is the sheet in the printer. Type one side, the other follows.
 - The white border and the black film edge sit inside the sheet.
-- *Export* writes a 16-bit TIFF, the same as the preview.
+- *Export* writes the sheet, the same as the preview: a 16-bit TIFF, or
+  an 8-bit JPEG for the screen. TIFF or JPEG on the file line; the
+  program remembers it.
 
 Crop: *Crop* at the top, pick a format (4×5, 5×7, square…), *Apply*.
 90° turns the picture.
@@ -74,8 +76,8 @@ two lamps, red and blue, as two bars under the strip, R and B at their
 left edge, zero at the mark in the middle. Click or drag, wheel for a
 twelfth, double click for zero and back. Green is the
 reference. The taking filters are Camera, Wratten or Channels. The
-export is an RGB TIFF, sRGB by default; the primaries are in *Print*,
-on the file line.
+export is an RGB TIFF or JPEG, sRGB by default; the primaries are in
+*Print*, on the file line.
 
 ## On the phone
 

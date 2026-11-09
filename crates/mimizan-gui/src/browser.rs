@@ -528,6 +528,40 @@ impl Ruler {
     }
 }
 
+/// The file the Export button writes. A setting of the program, not of
+/// the recipe: the recipe is the development, the format is the export's.
+/// The pixels are the same sheet either way; only the container differs.
+#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    /// 16-bit TIFF, the recipe in the description, the ICC profile embedded.
+    #[default]
+    Tiff,
+    /// 8-bit JPEG at quality 100, the same ICC profile embedded. Grey is one
+    /// channel, so no chroma subsampling; the plate is RGB.
+    Jpeg,
+}
+
+impl ExportFormat {
+    pub const ALL: [ExportFormat; 2] = [ExportFormat::Tiff, ExportFormat::Jpeg];
+
+    /// The label on the switch.
+    pub fn name(self) -> &'static str {
+        match self {
+            ExportFormat::Tiff => "TIFF",
+            ExportFormat::Jpeg => "JPEG",
+        }
+    }
+
+    /// The extension a name without one is given.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Tiff => "tif",
+            ExportFormat::Jpeg => "jpg",
+        }
+    }
+}
+
 /// `gui.json`. Every field has a default, so a file from an older or newer
 /// version still loads.
 #[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq)]
@@ -555,6 +589,8 @@ pub struct Persisted {
     pub plate_space: Option<PlateSpace>,
     /// The Print window's ruler. `None` means metric.
     pub ruler: Option<Ruler>,
+    /// The file the Export button writes. `None` means TIFF.
+    pub format: Option<ExportFormat>,
     /// Security-scoped bookmark for the folder opened on macOS. Absent on
     /// Linux and Windows, and on a Mac build that is not sandboxed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

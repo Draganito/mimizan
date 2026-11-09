@@ -127,10 +127,12 @@ enum Cmd {
         dng: bool,
     },
     /// Negative TIFF -> print file in one pass: size, place, paper or look, border,
-    /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC). Every print
+    /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC), or an 8-bit JPEG
+    /// at quality 100 with the same profile when -o ends in .jpg. Every print
     /// decision can come from a recipe file (--recipe); explicit flags override its fields.
     Print {
         negative: PathBuf,
+        /// The print: a .tif for 16 bit, a .jpg for 8 bit.
         #[arg(short, long)]
         out: PathBuf,
         /// Recipe JSON (as written by --write-recipe or the GUI); flags override
