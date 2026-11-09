@@ -18,8 +18,10 @@
 //!   stroke is the time the tip covered it, and the stops are read at the
 //!   middle of a straight pass: a pass straight through a point gives it
 //!   exactly the stroke's stops, a pass that only brushes it gives less
-//!   (the chord), a second pass adds. The hand set down and not moved is
-//!   the tip resting there.
+//!   (the chord), a second pass adds. The hand is set down at the start
+//!   and lifted at the end, each for half a pass, so a stroke begins and
+//!   ends with its stops; set down and not moved, it is the tip resting
+//!   there.
 //! * The card ([`Stroke::Card`]) is a straight edge pushed from one place
 //!   to another: the paper beyond where it ends up had the light the whole
 //!   time, the paper behind where it started none of it, and the band in
@@ -59,8 +61,12 @@ pub const REACH: f64 = 2.0;
 /// Longest half-axis, widest feather and longest push of a card, long sides.
 pub const SIZE_LIMIT: f64 = 4.0;
 /// Along a path the tip is set down every this fraction of its smaller
-/// half-axis, or of twice its feather, whichever is finer.
+/// half-axis (finer for a soft edge, [`path_step`]), and the dwell raster
+/// has this many points per smaller half-axis.
 const STEPS_PER_UNIT: f64 = 16.0;
+/// A soft edge is sampled along the path no finer than this fraction of
+/// the smaller half-axis, however narrow its feather.
+const FINEST_STEPS_PER_UNIT: f64 = 64.0;
 /// Most places one stroke is set down at; a longer path is sampled coarser.
 const MAX_SAMPLES: usize = 1 << 18;
 /// Prepared strokes kept between fields, by their rasters' bytes.
@@ -465,29 +471,51 @@ struct Sample {
     w: f64,
 }
 
-/// The step along a path, and of the dwell raster: a sixteenth of the
-/// smaller half-axis, or of twice the feather, whichever is finer.
+/// The step along a path: a sixteenth of the smaller half-axis, or of
+/// twice the feather when that is finer, down to a 64th of the half-axis.
+/// A hard edge is resolved by the sixteenth; a soft one is sampled finer
+/// so its ramp is summed smoothly, but a feather narrower than an eighth
+/// of the half-axis gains nothing from more samples that a hard edge
+/// does not already forgo.
 fn path_step(tip: &Tip) -> f64 {
     let (rx, ry) = tip.axes();
-    rx.min(ry).min(if tip.feather > 0.0 { 2.0 * tip.feather } else { f64::INFINITY }) / STEPS_PER_UNIT
+    let axis = rx.min(ry);
+    let soft = if tip.feather > 0.0 { 2.0 * tip.feather } else { f64::INFINITY };
+    axis.min(soft).max(axis * STEPS_PER_UNIT / FINEST_STEPS_PER_UNIT) / STEPS_PER_UNIT
 }
 
-/// Where along the path the tip is set down: a sample every `step` of
-/// the way from its start (`full`), and the tail, the last part of the
-/// path shorter than a step, as one sample with that part's share. The
-/// steps are fixed from the start, so a path that grows keeps the
-/// samples it had and adds to them. A path of no length has only the
-/// tail: the tip resting at its first point with the whole of the time.
+/// The spacing of the dwell raster: a sixteenth of the smaller half-axis,
+/// whatever the feather. The read between its points softens an edge by
+/// less than that; a raster fine enough for a narrow feather would cost
+/// the square of the ratio, for every sample set down on it.
+fn raster_step(tip: &Tip) -> f64 {
+    let (rx, ry) = tip.axes();
+    rx.min(ry) / STEPS_PER_UNIT
+}
+
+/// Where along the path the tip is set down: the hand set down at the
+/// start for half a pass, then a sample every `step` of the way (`full`),
+/// and the tail: the last part of the path shorter than a step, as one
+/// sample with that part's share, and the hand lifted at the end after
+/// another half pass. The rests make a stroke begin and end with its
+/// stops, where a tip only moving would give its start and its end half
+/// a chord; and a path of no length is the two rests in one place, the
+/// tip resting with the whole of a pass, which is the click. The steps
+/// are fixed from the start, so a path that grows keeps the samples it
+/// had and adds to them; only the tail moves.
 #[derive(Clone, Debug)]
 struct Sampled {
     step: f64,
     full: Vec<Sample>,
-    tail: Option<Sample>,
+    tail: Vec<Sample>,
 }
+
+/// The share of a pass the hand rests at either end of a path.
+const REST: f64 = 0.5;
 
 fn sample_path(tip: &Tip, points: &[[f64; 2]]) -> Sampled {
     let step = path_step(tip);
-    let Some(&[x0, y0]) = points.first() else { return Sampled { step, full: Vec::new(), tail: None } };
+    let Some(&[x0, y0]) = points.first() else { return Sampled { step, full: Vec::new(), tail: Vec::new() } };
     let mut segments: Vec<([f64; 2], [f64; 2], f64)> = Vec::new();
     for pair in points.windows(2) {
         let (p, q) = (pair[0], pair[1]);
@@ -498,7 +526,7 @@ fn sample_path(tip: &Tip, points: &[[f64; 2]]) -> Sampled {
     }
     let total: f64 = segments.iter().map(|s| s.2).sum();
     if segments.is_empty() || total <= 0.0 {
-        return Sampled { step, full: Vec::new(), tail: Some(Sample { x: x0, y: y0, w: 1.0 }) };
+        return Sampled { step, full: Vec::new(), tail: vec![Sample { x: x0, y: y0, w: 1.0 }] };
     }
     // A path too long for its step is sampled coarser, in equal steps.
     let (step, n) = if total / step > MAX_SAMPLES as f64 {
@@ -521,8 +549,15 @@ fn sample_path(tip: &Tip, points: &[[f64; 2]]) -> Sampled {
         let t = ((s - start) / len).clamp(0.0, 1.0);
         Sample { x: p[0] + (q[0] - p[0]) * t, y: p[1] + (q[1] - p[1]) * t, w: share / (2.0 * half) }
     };
-    let full: Vec<Sample> = (0..n).map(|k| at((k as f64 + 0.5) * step, step)).collect();
-    let tail = (rest > 1e-12 * total.max(1.0)).then(|| at(n as f64 * step + rest * 0.5, rest));
+    let full: Vec<Sample> = std::iter::once(Sample { x: x0, y: y0, w: REST })
+        .chain((0..n).map(|k| at((k as f64 + 0.5) * step, step)))
+        .collect();
+    let mut tail = Vec::with_capacity(2);
+    if rest > 1e-12 * total.max(1.0) {
+        tail.push(at(n as f64 * step + rest * 0.5, rest));
+    }
+    let [x1, y1] = segments[segments.len() - 1].1;
+    tail.push(Sample { x: x1, y: y1, w: REST });
     Sampled { step, full, tail }
 }
 
@@ -611,6 +646,17 @@ impl ReadyTip {
         self.outside2.sqrt()
     }
 
+    /// Half-widths of the axis-aligned box the tip can touch: the turned
+    /// ellipse's extents plus the feather. Tighter than the reach for an
+    /// eccentric tip, so a stamp of it visits fewer points.
+    fn extent(&self) -> (f64, f64) {
+        let Tip { rx, ry, feather, .. } = self.tip;
+        let (s, c) = (self.sin, self.cos);
+        let ex = ((rx * c).powi(2) + (ry * s).powi(2)).sqrt() + feather.max(0.0);
+        let ey = ((rx * s).powi(2) + (ry * c).powi(2)).sqrt() + feather.max(0.0);
+        (ex.min(self.reach()), ey.min(self.reach()))
+    }
+
     /// [`Tip::weight`] of a point `(dx, dy)` from the centre.
     #[inline]
     fn weight(&self, dx: f64, dy: f64) -> f64 {
@@ -640,14 +686,14 @@ fn reach_box(samples: &[Sample], reach: f64, step: f64) -> (f64, f64, f64, f64) 
     (x0 - m, y0 - m, x1 + m, y1 + m)
 }
 
-/// The dwell of a moving tip, worked out once on a grid of points a path
-/// step apart and read between them. The tip and its penumbra are
-/// resolved by the step ([`STEPS_PER_UNIT`]); what a pixel reads is the
-/// bilinear blend of the four grid points around it, which is within a
-/// small part of a percent of the sum where the edge is soft and softens a
-/// hard edge by less than a sixteenth of the tip. A raster grows: new
-/// samples are added to the points they reach, the grid widened on its
-/// own lattice when they lie outside it.
+/// The dwell of a moving tip, worked out once on a grid of points a
+/// [`raster_step`] apart and read between them. The tip is resolved by
+/// the step ([`STEPS_PER_UNIT`]); what a pixel reads is the bilinear
+/// blend of the four grid points around it, which is within a small part
+/// of a percent of the sum where the edge is softer than the step and
+/// softens a harder edge by less than a sixteenth of the tip. A raster
+/// grows: new samples are added to the points they reach, the grid
+/// widened on its own lattice when they lie outside it.
 #[derive(Clone, Debug)]
 struct Raster {
     x0: f64,
@@ -662,12 +708,14 @@ struct Raster {
 
 impl Raster {
     /// Every grid point summed over the samples near it, in parallel.
-    fn build(tip: &ReadyTip, samples: &[Sample], step: f64) -> Self {
+    /// `h` is the spacing asked for ([`raster_step`]); a box too wide for
+    /// [`MAX_RASTER`] points of it is rastered coarser.
+    fn build(tip: &ReadyTip, samples: &[Sample], h: f64) -> Self {
         let reach = tip.reach();
-        let bounds = reach_box(samples, reach, step);
+        let bounds = reach_box(samples, reach, h);
         let grid = Grid::new(samples, bounds, reach);
         let (x0, y0, x1, y1) = bounds;
-        let h = step.max((x1 - x0) / MAX_RASTER as f64).max((y1 - y0) / MAX_RASTER as f64);
+        let h = h.max((x1 - x0) / MAX_RASTER as f64).max((y1 - y0) / MAX_RASTER as f64);
         let nx = ((x1 - x0) / h).ceil() as usize + 1;
         let ny = ((y1 - y0) / h).ceil() as usize + 1;
         let mut w = vec![0f32; nx * ny];
@@ -697,12 +745,12 @@ impl Raster {
 
     /// `samples` added to the grid points they reach. `false` when the
     /// widened grid would pass [`MAX_RASTER`]: then it is built afresh.
-    fn extend(&mut self, tip: &ReadyTip, samples: &[Sample], step: f64) -> bool {
+    fn extend(&mut self, tip: &ReadyTip, samples: &[Sample]) -> bool {
         if samples.is_empty() {
             return true;
         }
         let reach = tip.reach();
-        let (bx0, by0, bx1, by1) = reach_box(samples, reach, step);
+        let (bx0, by0, bx1, by1) = reach_box(samples, reach, self.h);
         // Widen on the lattice: whole steps before and after.
         let before_x = ((self.x0 - bx0) / self.h).ceil().max(0.0) as usize;
         let before_y = ((self.y0 - by0) / self.h).ceil().max(0.0) as usize;
@@ -725,11 +773,12 @@ impl Raster {
             self.ny = ny;
             self.w = w;
         }
+        let (ex, ey) = tip.extent();
         for s in samples {
-            let i0 = (((s.x - reach - self.x0) / self.h).floor().max(0.0) as usize).min(self.nx - 1);
-            let i1 = (((s.x + reach - self.x0) / self.h).ceil().max(0.0) as usize).min(self.nx - 1);
-            let j0 = (((s.y - reach - self.y0) / self.h).floor().max(0.0) as usize).min(self.ny - 1);
-            let j1 = (((s.y + reach - self.y0) / self.h).ceil().max(0.0) as usize).min(self.ny - 1);
+            let i0 = (((s.x - ex - self.x0) / self.h).floor().max(0.0) as usize).min(self.nx - 1);
+            let i1 = (((s.x + ex - self.x0) / self.h).ceil().max(0.0) as usize).min(self.nx - 1);
+            let j0 = (((s.y - ey - self.y0) / self.h).floor().max(0.0) as usize).min(self.ny - 1);
+            let j1 = (((s.y + ey - self.y0) / self.h).ceil().max(0.0) as usize).min(self.ny - 1);
             for j in j0..=j1 {
                 let y = self.y0 + j as f64 * self.h;
                 let row = &mut self.w[j * self.nx..(j + 1) * self.nx];
@@ -767,12 +816,13 @@ impl Raster {
 enum Ready {
     /// The hand set down and held: the tip itself.
     Still { tip: ReadyTip, x: f64, y: f64, gain: f64, light: Light },
-    /// The hand moved: its full steps on a raster, its tail read as the
-    /// tip; the path it was made from, so a longer path can grow it.
+    /// The hand moved: its full steps on a raster, its tail (the last
+    /// part of the path and the rest at its end) read as the tip; the
+    /// path it was made from, so a longer path can grow it.
     Moving {
         tip: ReadyTip,
         raster: Raster,
-        tail: Option<Sample>,
+        tail: Vec<Sample>,
         full: usize,
         step: f64,
         points: Vec<[f64; 2]>,
@@ -858,13 +908,13 @@ impl Ready {
             Stroke::Hand { tip, light, points, .. } => {
                 let ready = ReadyTip::new(*tip);
                 let sampled = sample_path(tip, points);
-                match (sampled.full.as_slice(), sampled.tail) {
-                    ([], None) => Ready::Still { tip: ready, x: 0.0, y: 0.0, gain: 0.0, light: *light },
-                    ([], Some(one)) => Ready::Still { tip: ready, x: one.x, y: one.y, gain, light: *light },
-                    (full, tail) => Ready::Moving {
+                match (sampled.full.as_slice(), sampled.tail.as_slice()) {
+                    ([], []) => Ready::Still { tip: ready, x: 0.0, y: 0.0, gain: 0.0, light: *light },
+                    ([], [one]) => Ready::Still { tip: ready, x: one.x, y: one.y, gain, light: *light },
+                    (full, _) => Ready::Moving {
                         tip: ready,
-                        raster: Raster::build(&ready, full, sampled.step),
-                        tail,
+                        raster: Raster::build(&ready, full, raster_step(tip)),
+                        tail: sampled.tail,
                         full: full.len(),
                         step: sampled.step,
                         points: points.clone(),
@@ -908,7 +958,7 @@ impl Ready {
             return None;
         }
         let mut raster = raster.clone();
-        if !raster.extend(ready, &sampled.full[*full..], *step) {
+        if !raster.extend(ready, &sampled.full[*full..]) {
             return None;
         }
         Some(Ready::Moving {
@@ -926,7 +976,9 @@ impl Ready {
     /// What this takes to keep.
     fn bytes(&self) -> usize {
         match self {
-            Ready::Moving { raster, points, .. } => raster.w.len() * 4 + points.len() * 16 + 128,
+            Ready::Moving { raster, points, tail, .. } => {
+                raster.w.len() * 4 + points.len() * 16 + tail.len() * 24 + 128
+            }
             _ => 128,
         }
     }
@@ -952,8 +1004,8 @@ impl Ready {
             }
             Ready::Moving { tip, raster, tail, .. } => {
                 let (mut x0, mut y0, mut x1, mut y1) = raster.bounds();
-                if let Some(t) = tail {
-                    let r = tip.reach();
+                let r = tip.reach();
+                for t in tail {
                     x0 = x0.min(t.x - r);
                     y0 = y0.min(t.y - r);
                     x1 = x1.max(t.x + r);
@@ -971,7 +1023,7 @@ impl Ready {
             Ready::Still { tip, x: cx, y: cy, .. } => tip.weight(x - cx, y - cy),
             Ready::Moving { tip, raster, tail, .. } => {
                 let mut w = raster.weight(x, y);
-                if let Some(t) = tail {
+                for t in tail {
                     w += tip.weight(x - t.x, y - t.y) * t.w;
                 }
                 w
@@ -1691,6 +1743,37 @@ mod tests {
     /// a percent of the stroke where the edge is soft; a hard edge, read
     /// between grid points, is softened by at most a sixteenth of the tip,
     /// so there the two agree once the edge's own band is left out.
+    /// A stroke begins where the hand is set down: the first point of a
+    /// drag has the stops like a click, and keeps them as the path grows;
+    /// the end has them too; a path a hair long is the click.
+    #[test]
+    fn a_stroke_begins_and_ends_with_its_stops() {
+        for t in [tip(0.1, 0.1, 0.0, 0.02), tip(0.1, 0.1, 0.0, 0.0), tip(0.15, 0.05, 30.0, 0.01)] {
+            let click = hand(t, 1.0, Light::Both, &[[0.0, 0.0]]);
+            let hair = hand(t, 1.0, Light::Both, &[[0.0, 0.0], [1e-4, 0.0]]);
+            for (x, y) in [(0.0, 0.0), (0.05, 0.0), (0.0, 0.04), (0.09, 0.0), (-0.03, 0.03)] {
+                let (a, b) = (click.weight(x, y), hair.weight(x, y));
+                assert!((a - b).abs() < 0.02, "{t:?} at ({x}, {y}): click {a}, hair {b}");
+            }
+            // A quarter of the half-axis on, the first frame of a drag: the
+            // stops, and the little the hand moved while still over it.
+            let first = hand(t, 1.0, Light::Both, &[[0.0, 0.0], [0.025, 0.0]]);
+            assert!(
+                (first.weight(0.0, 0.0) - 1.125).abs() < 0.05,
+                "{t:?}: first frame {}",
+                first.weight(0.0, 0.0)
+            );
+            // A long pass: its start, its middle and its end have the stops.
+            let long = hand(t, 1.0, Light::Both, &[[0.0, 0.0], [0.6, 0.0]]);
+            for x in [0.0, 0.3, 0.6] {
+                let tol = if t.feather == 0.0 { 0.07 } else { 0.03 };
+                assert!((long.weight(x, 0.0) - 1.0).abs() < tol, "{t:?} at {x}: {}", long.weight(x, 0.0));
+            }
+            // Before the start, nothing more than the resting tip gives.
+            assert!(long.weight(-0.2, 0.0) < 1e-9);
+        }
+    }
+
     #[test]
     fn the_raster_reads_the_plain_sum() {
         let scribble: Vec<[f64; 2]> =

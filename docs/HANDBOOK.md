@@ -11,9 +11,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.18.0/mimizan_0.18.0-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.18.0-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.18.0/mimizan-0.18.0-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.18.0/mimizan-0.18.0-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.18.1/mimizan_0.18.1-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.18.1-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.18.1/mimizan-0.18.1-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.18.1/mimizan-0.18.1-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -77,15 +77,14 @@ picture's: set it once, lock it, and paint every negative with it.
 soft shadow. *Set* shows the tip in the middle of the picture, and
 nothing in the picture changes while you shape it: the dots size it,
 the ring turns it, the square is the penumbra, the number is the stops
-(drag up and down, hundredths; Shift slows it). The light, *both*,
-*soft* or *hard*, is in the Enlarger's Brush line; leave it on *both*
-unless you want the split-grade burn. Enter or *Paint* locks it and
-keeps it.
+(drag up and down, hundredths; Shift slows it), and the row beneath
+it is the light, *both*, *soft* or *hard*; leave it on *both* unless
+you want the split-grade burn. Enter or *Paint* locks it and keeps it.
 Locked, the tip follows the pointer: drag the hand along the picture,
 or push the card from where you press to where you let go (the side it
 ends up on had the light all along). +1 is twice the time where the
 pass went through (darker), −1 half (lighter); passing twice adds.
-Alt shows the strokes; *Clear* in the Enlarger takes them away. Escape
+Alt shows the strokes; *Clear* at the top takes them away. Escape
 opens the brush again, and a second Escape puts the tool down. Orange
 burns, blue dodges.
 

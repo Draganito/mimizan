@@ -3046,8 +3046,9 @@ mod histogram_tests {
     }
 
     /// The tally rebinned is the walk: to the pixel at place 0, with a
-    /// window, a turn and a stroke; with a placing, the dequantised code
-    /// can move a boundary pixel by a bin, no more.
+    /// window and a turn; under a stroke, or with a placing, the paper is
+    /// read at the dequantised code rather than the float, which can move
+    /// a boundary pixel by a bin, no more.
     #[test]
     fn the_tally_rebins_as_the_walk_counts() {
         use mimizan_core::burn::{Light, Stroke, Tip};
@@ -3071,8 +3072,14 @@ mod histogram_tests {
             let (n1, v1) = Histogram::of_separation(&sep, &wts, &table, 0.0, window, field);
             let (n2, v2) = Histogram::of_tally(&tally, &codes, w, window, &table, 0.0, field);
             assert_eq!(n1, n2);
-            assert_eq!(v1, v2);
             assert!(v1.total > 0);
+            if field.is_none() {
+                assert_eq!(v1, v2);
+            } else {
+                assert_eq!((v1.total, v1.low, v1.high), (v2.total, v2.low, v2.high));
+                let moved: u32 = v1.bins.iter().zip(&v2.bins).map(|(a, b)| a.abs_diff(*b)).sum();
+                assert!(moved <= 2 * 2, "{moved} pixels moved under the stroke");
+            }
         }
         for place in [-0.7, 0.4] {
             let tally = Tally::of(&codes, w, None);

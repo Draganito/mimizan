@@ -774,15 +774,21 @@ feather fits inside the tip (the penumbra is symmetric about the edge)
 and more when it does not. So a straight pass through a point gives it
 exactly the stroke's stops, a pass that brushes it gives the chord
 profile $\sqrt{1 - d^2/r^2}$ across, going back and forth adds, and a
-hand set down and not moved is the tip itself. The path is sampled at a
-fixed step from its start, a sixteenth of the smaller half-axis or of
-twice the feather, whichever is finer, the last part shorter than a
-step as one sample with that part's share, so the same recipe gives the
-same print on every machine and a path that grows keeps the samples it
-had; a moving stroke's dwell is then summed once on a grid of that step
-and read bilinearly, which is within a part of a percent of the sum
-where the edge is soft and softens a hard one by less than a sixteenth
-of the tip. The print evaluates the paper exactly at every pixel; the
+hand set down and not moved is the tip itself. The hand is set down at
+the start of the path and lifted at its end, each for half a pass, so a
+stroke begins and ends with its stops where a tip only moving would
+give them half a chord, and a path of no length is the resting tip
+again; a stroke shorter than the tip holds what is under it for more
+than a pass, as it would. The path is sampled at a
+fixed step from its start, a sixteenth of the smaller half-axis, or of
+twice the feather when that is finer, down to a 64th of the half-axis,
+the last part shorter than a step as one sample with that part's share,
+so the same recipe gives the same print on every machine and a path
+that grows keeps the samples it had; a moving stroke's dwell is then
+summed once on a grid a sixteenth of the half-axis apart and read
+bilinearly, which is within a part of a percent of the sum where the
+edge is softer than the grid and softens a harder one by less than a
+sixteenth of the tip. The print evaluates the paper exactly at every pixel; the
 desktop reads it from tables of each pass's exposure, within a
 thousandth. The *card* is a straight edge pushed a distance
 $\ell$ along its normal: the paper beyond where it ends up had the

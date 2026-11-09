@@ -26,15 +26,6 @@ pub enum Tool {
     Card,
 }
 
-impl Tool {
-    pub fn name(self) -> &'static str {
-        match self {
-            Tool::Hand => "hand",
-            Tool::Card => "card",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HandBrush {
     pub tip: Tip,
@@ -204,6 +195,30 @@ pub const FEATHER_PT: f32 = 14.0;
 pub const STOPS_PER_PT: f64 = 0.0025;
 /// The smallest half-axis the hand can be given.
 pub const MIN_AXIS: f64 = 0.002;
+/// The lights are written this far below the penumbra handle's stand-off.
+pub const LIGHT_PT: f32 = 30.0;
+/// One light's slot in that row, centre to centre.
+pub const LIGHT_SLOT_PT: f32 = 48.0;
+/// The size of a light's pill, for the press.
+pub const LIGHT_SIZE_PT: (f32, f32) = (44.0, 20.0);
+
+/// Where the three lights are written under the open brush at normalised
+/// `(cx, cy)`, `k` screen points per unit: a row below the tip and its
+/// penumbra, both in the middle, as `(light, x, y)`. The row does not
+/// turn with the tip; it is read, not dragged.
+pub fn lights(b: &Brush, cx: f64, cy: f64, k: f64) -> [(Light, f64, f64); 3] {
+    let below = match b.tool {
+        Tool::Hand => {
+            let Tip { rx, ry, angle, feather } = b.hand.tip;
+            let (s, c) = angle.to_radians().sin_cos();
+            ((rx * s).powi(2) + (ry * c).powi(2)).sqrt() + feather
+        }
+        Tool::Card => b.card.feather,
+    };
+    let y = cy + below + f64::from(FEATHER_PT + LIGHT_PT) / k;
+    let slot = f64::from(LIGHT_SLOT_PT) / k;
+    [(Light::Both, cx - slot, y), (Light::Soft, cx, y), (Light::Hard, cx + slot, y)]
+}
 
 pub fn clamp_reach(v: f64) -> f64 {
     v.clamp(-burn::REACH, burn::REACH)
@@ -523,6 +538,25 @@ mod tests {
         assert_eq!((b.light(), b.hand.light, b.card.light), (Light::Hard, Light::Hard, Light::Both));
         assert_eq!(label(-1.0, Light::Soft), "-1.00 soft");
         assert_eq!(label(0.25, Light::Both), "+0.25");
+    }
+
+    /// The lights stand in a row under the tip, clear of the penumbra
+    /// handle, both in the middle, whichever way the tip is turned.
+    #[test]
+    fn the_lights_are_written_under_the_tip() {
+        let k = 400.0;
+        for b in [hand(0.1, 0.05, 0.0, 0.02), hand(0.1, 0.05, 90.0, 0.02), card(-90.0, 0.08)] {
+            let row = lights(&b, 0.2, -0.1, k);
+            assert_eq!(row[1].0, Light::Soft);
+            assert!((row[1].1 - 0.2).abs() < 1e-12 && row[0].1 < row[1].1 && row[1].1 < row[2].1);
+            assert!(row.iter().all(|l| l.2 == row[0].2));
+            let lowest_handle = handles(&b, 0.2, -0.1, k).iter().map(|h| h.2).fold(f64::MIN, f64::max);
+            assert!(row[0].2 > lowest_handle + 20.0 / k, "{:?}: {} vs {lowest_handle}", b.tool, row[0].2);
+        }
+        // Turned a quarter, the hand's x half-axis points down: the row moves with it.
+        let flat = lights(&hand(0.1, 0.05, 0.0, 0.0), 0.0, 0.0, k)[0].2;
+        let tall = lights(&hand(0.1, 0.05, 90.0, 0.0), 0.0, 0.0, k)[0].2;
+        assert!((tall - flat - 0.05).abs() < 1e-9);
     }
 
     /// Stage ↔ normalised through the map and back lands where it started,

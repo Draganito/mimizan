@@ -1918,13 +1918,73 @@ impl App {
 
     /// Where the open brush stands: the middle of the picture on view.
     fn brush_centre(&self, rect: Rect, to_norm: &straighten::Affine) -> (f64, f64) {
+        let shown = self.shown_stage(rect);
+        brush::stage_to_norm(shown.center(), rect, to_norm)
+    }
+
+    /// The part of the picture's `rect` that is on the stage.
+    fn shown_stage(&self, rect: Rect) -> Rect {
         let shown = self.last_stage.map_or(rect, |stage| rect.intersect(stage));
-        let c = if shown.is_positive() { shown.center() } else { rect.center() };
-        brush::stage_to_norm(c, rect, to_norm)
+        if shown.is_positive() {
+            shown
+        } else {
+            rect
+        }
+    }
+
+    /// The three lights under the open brush, in screen points: the row
+    /// kept on the stage, so it can be read with a large tip or one near
+    /// an edge.
+    fn light_row(
+        &self,
+        rect: Rect,
+        centre: (f64, f64),
+        k: f64,
+        back: &straighten::Affine,
+    ) -> [(Light, Pos2); 3] {
+        let row = brush::lights(&self.brush, centre.0, centre.1, k);
+        let mut at = row.map(|(l, x, y)| (l, brush::norm_to_stage(x, y, rect, back)));
+        let shown = self.shown_stage(rect);
+        let (hw, hh) = (brush::LIGHT_SIZE_PT.0 / 2.0, brush::LIGHT_SIZE_PT.1 / 2.0);
+        let (left, right) = (at[0].1.x - hw, at[2].1.x + hw);
+        let dx = (shown.left() + 4.0 - left).max(0.0) + (shown.right() - 4.0 - right).min(0.0);
+        let dy = (shown.top() + 4.0 - (at[0].1.y - hh)).max(0.0)
+            + (shown.bottom() - 4.0 - (at[0].1.y + hh)).min(0.0);
+        for (_, p) in &mut at {
+            *p += Vec2::new(dx, dy);
+        }
+        at
+    }
+
+    /// The light under a press at `p`, in the open brush's row.
+    fn light_at(
+        &self,
+        rect: Rect,
+        centre: (f64, f64),
+        k: f64,
+        back: &straighten::Affine,
+        p: Pos2,
+    ) -> Option<Light> {
+        let size = Vec2::new(brush::LIGHT_SIZE_PT.0, brush::LIGHT_SIZE_PT.1);
+        self.light_row(rect, centre, k, back)
+            .into_iter()
+            .find(|(_, c)| Rect::from_center_size(*c, size).contains(p))
+            .map(|(l, _)| l)
+    }
+
+    /// The brush's light chosen on the stage; kept with a brush that is kept.
+    fn choose_light(&mut self, light: Light) {
+        if self.brush.light() != light {
+            self.brush.set_light(light);
+            if self.brush_set {
+                self.persist();
+            }
+        }
     }
 
     /// The burn tool on the stage. Open, a press on a handle of the tip
-    /// sets the brush and nothing else moves. Locked, a primary press
+    /// sets the brush, a click on a light chooses it, and nothing else
+    /// moves. Locked, a primary press
     /// starts a stroke: the hand's path follows the pointer, the card is
     /// pushed from the press to where the pointer lets go. Every change
     /// goes straight into the recipe, so the preview follows the hand;
@@ -1955,6 +2015,9 @@ impl App {
                     let (x, y) = brush::stage_to_norm(p, rect, &to_norm);
                     match brush::hit(&self.brush, centre.0, centre.1, k, x, y, slop) {
                         Some(h) => brush_cursor(h, false),
+                        None if self.light_at(rect, centre, k, &back, p).is_some() => {
+                            CursorIcon::PointingHand
+                        }
                         None => CursorIcon::Default,
                     }
                 };
@@ -1973,6 +2036,10 @@ impl App {
                 if let Some(hit) = brush::hit(&self.brush, centre.0, centre.1, k, x, y, slop) {
                     self.burn_drag =
                         Some(BrushDrag::Handle { hit, origin: self.brush, centre, start: (x, y) });
+                } else if let Some(light) = self.light_at(rect, centre, k, &back, at) {
+                    // A click, not a drag: the press is used up here.
+                    self.choose_light(light);
+                    return;
                 }
             } else if self.edit.recipe.burns.len() < burn::MAX_STROKES {
                 let index = self.edit.recipe.burns.len();
@@ -2025,7 +2092,7 @@ impl App {
 
     /// The brush over the picture. Open: the tip in the middle of the
     /// stage with its handles, its penumbra dashed, its stops at the
-    /// centre. Locked: the tip under the pointer, the stroke being made,
+    /// centre, the three lights in a row beneath it. Locked: the tip under the pointer, the stroke being made,
     /// and with Alt held the paths of every stroke.
     fn paint_burns(&self, ui: &egui::Ui, painter: &egui::Painter, response: &egui::Response, rect: Rect) {
         let Some((to_norm, back)) = self.burn_map() else { return };
@@ -2107,6 +2174,11 @@ impl App {
                     }
                 }
             }
+            // The light, chosen here: both passes, or one alone.
+            let chosen = b.light();
+            for (light, p) in self.light_row(rect, (cx, cy), k, &back) {
+                brush_choice(&painter, p, light.name(), ink, light == chosen);
+            }
             return;
         }
         // Locked: the strokes' paths while Alt is held, and the card being
@@ -2160,63 +2232,6 @@ impl App {
             tip_at(cx, cy);
             brush_label(&painter, p + Vec2::new(14.0, 14.0), &brush::label(b.stops(), b.light()), ink, 11.0);
         }
-    }
-
-    /// The Enlarger's line for the brush: what it is set to, how many
-    /// strokes the picture has, and a way to take them all away.
-    fn burn_rows(&mut self, ui: &mut egui::Ui) {
-        let n = self.edit.recipe.burns.len();
-        if n == 0 && !self.burn_on {
-            return;
-        }
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            let b = &self.brush;
-            let mut txt = format!("Brush · {} {:+.2}", b.tool.name(), b.stops());
-            if n > 0 {
-                txt.push_str(&format!(" · {n} stroke{}", if n == 1 { "" } else { "s" }));
-            }
-            ui.label(RichText::new(txt).weak()).on_hover_text(if self.burn_locked {
-                "The brush as it is set. Paint on the picture; Alt shows the strokes."
-            } else {
-                "Set the brush on the picture: the dots size it, the ring turns it, the square is its penumbra, \
-                 the number its stops (drag up and down in hundredths; Shift slows it). Enter locks it."
-            });
-            if n > 0
-                && ui.button("Clear").on_hover_text("Take every stroke away. The brush stays as it is.").clicked()
-            {
-                self.edit.recipe.burns.clear();
-                self.burn_drag = None;
-            }
-            if n > 0 && !self.burn_on && ui.button("Burn").on_hover_text("Burn on, to paint more.").clicked() {
-                self.arm_burn();
-            }
-        });
-        if !self.burn_on {
-            return;
-        }
-        // Which pass the time goes to. Both is the working grade; one
-        // alone is the split-grade burn.
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("light").weak()).on_hover_text(
-                "Which pass the brush's time goes to. Both is the working grade; soft or hard alone is the split-grade burn.",
-            );
-            let hover = [
-                "Both passes: the time under the working grade, as one filter would give it.",
-                "The soft pass alone: moves the highlights, leaves the shadows.",
-                "The hard pass alone: moves the shadows, leaves the highlights.",
-            ];
-            for (light, hover) in Light::ALL.into_iter().zip(hover) {
-                if ui.selectable_label(self.brush.light() == light, light.name()).on_hover_text(hover).clicked()
-                    && self.brush.light() != light
-                {
-                    self.brush.set_light(light);
-                    if self.brush_set {
-                        self.persist();
-                    }
-                }
-            }
-        });
     }
 
     fn start_export(&mut self) {
@@ -3139,39 +3154,32 @@ impl App {
         self.export_to(path, false);
     }
 
-    /// Three always-visible groups. The windows sit on the left, the picture
-    /// in the middle, the way back on the right. Each group is a flat well,
-    /// and the bar shows between them.
+    /// Two rows. The first is what is shown: the windows and the process
+    /// on the left, the way back beside them, the note in what is left.
+    /// The second is what is done to the picture: the easel, the brush
+    /// and the turn, one well with a bar between the tools. Each group is
+    /// a flat well, and the bar shows between them.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        let id = ui.id();
-        let full = ui.available_width();
-        let lw = ui.ctx().data(|d| d.get_temp::<f32>(id.with("win")).unwrap_or(300.0));
-        let pw = ui.ctx().data(|d| d.get_temp::<f32>(id.with("pic")).unwrap_or(340.0));
-        let hw = ui.ctx().data(|d| d.get_temp::<f32>(id.with("hist")).unwrap_or(150.0));
-        let (gap_l, gap_r) = toolbar_gaps(full, lw, pw, hw);
-        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            let windows = tool_well(ui, |ui| {
+            tool_well(ui, |ui| {
                 self.toolbar_windows(ui);
                 ui.add_space(10.0);
                 self.toolbar_process(ui);
             });
-            ui.add_space(gap_l);
-            let picture = tool_well(ui, |ui| self.toolbar_picture(ui));
-            ui.add_space(gap_r);
-            let history = tool_well(ui, |ui| self.toolbar_history(ui));
+            ui.add_space(16.0);
+            tool_well(ui, |ui| self.toolbar_history(ui));
             ui.add_space(12.0);
             // The note takes only what is left and is cut, never painted over the wells.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.set_max_width(ui.available_width());
                 self.toolbar_status(ui);
             });
-            ui.ctx().data_mut(|d| {
-                d.insert_temp(id.with("win"), windows.rect.width());
-                d.insert_temp(id.with("pic"), picture.rect.width());
-                d.insert_temp(id.with("hist"), history.rect.width());
-            });
+        });
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            tool_well(ui, |ui| self.toolbar_picture(ui));
         });
     }
 
@@ -3232,8 +3240,18 @@ impl App {
         });
     }
 
+    /// The tools in the recipe's order: the turn, then the straighten and
+    /// the window, then the strokes.
     fn toolbar_picture(&mut self, ui: &mut egui::Ui) {
         let has = self.session.is_some();
+        if ui
+            .add_enabled(has, egui::Button::new("⟳ 90°"))
+            .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
+            .clicked()
+        {
+            self.edit.rotation = (self.edit.rotation + 1) % 4;
+        }
+        tool_bar(ui);
         let mut crop_on = self.crop_open;
         if ui
             .add_enabled(has, egui::Checkbox::new(&mut crop_on, "Crop"))
@@ -3310,7 +3328,7 @@ impl App {
             self.apply_crop();
         }
         // The brush: dodging and burning on the picture as it prints.
-        ui.add_space(8.0);
+        tool_bar(ui);
         let mut burn_on = self.burn_on;
         if ui
             .add_enabled(has, egui::Checkbox::new(&mut burn_on, "Burn"))
@@ -3362,14 +3380,21 @@ impl App {
                 self.lock_brush();
             }
         });
-        // The picture's turn, apart from the frame.
-        ui.add_space(16.0);
+        // The strokes the picture has, and the way to take them all away.
+        let n = self.edit.recipe.burns.len();
+        ui.add_space(6.0);
+        if n > 0 {
+            ui.label(RichText::new(format!("{n} stroke{}", if n == 1 { "" } else { "s" })).weak());
+            ui.add_space(2.0);
+        }
         if ui
-            .add_enabled(has, egui::Button::new("⟳ 90°"))
-            .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
+            .add_enabled(has && n > 0, egui::Button::new("Clear"))
+            .on_hover_text("Take every stroke away. The brush stays as it is; Undo brings them back.")
+            .on_disabled_hover_text("No strokes on this picture.")
             .clicked()
         {
-            self.edit.rotation = (self.edit.rotation + 1) % 4;
+            self.edit.recipe.burns.clear();
+            self.burn_drag = None;
         }
     }
 
@@ -4027,7 +4052,6 @@ impl App {
             {
                 self.edit.recipe.curve = Tone::paper();
             }
-            self.burn_rows(ui);
             return;
         };
         let mut split = split;
@@ -4067,7 +4091,6 @@ impl App {
                 }
             });
         }
-        self.burn_rows(ui);
     }
 
     /// The projector's lamps, under the paper: stops added to the red and
@@ -5175,6 +5198,21 @@ fn brush_cursor(hit: Hit, held: bool) -> CursorIcon {
     }
 }
 
+/// One of a row of choices on the stage: the chosen one a pill of the
+/// ink with dark text, the others the ink's text on the dark pill.
+fn brush_choice(painter: &egui::Painter, p: Pos2, txt: &str, ink: Color32, chosen: bool) {
+    let size = Vec2::new(brush::LIGHT_SIZE_PT.0, brush::LIGHT_SIZE_PT.1);
+    let pill = Rect::from_center_size(p, size);
+    let (fill, text) = if chosen {
+        (ink, Color32::from_black_alpha(230))
+    } else {
+        (Color32::from_black_alpha(150), ink.gamma_multiply(0.8))
+    };
+    painter.rect_filled(pill, 4.0, fill);
+    let galley = painter.layout_no_wrap(txt.to_owned(), egui::FontId::proportional(12.0), text);
+    painter.galley(p - galley.size() / 2.0, galley, text);
+}
+
 /// Text on a dark pill, centred at `p`.
 fn brush_label(painter: &egui::Painter, p: Pos2, txt: &str, ink: Color32, size: f32) {
     let galley = painter.layout_no_wrap(txt.to_owned(), egui::FontId::proportional(size), ink);
@@ -5334,20 +5372,6 @@ fn crumb_label(path: &Path) -> String {
 
 /// Gaps that put the picture group on the centre of the bar and the history
 /// group against the status note. A narrow bar keeps a short gap instead.
-fn toolbar_gaps(full: f32, windows: f32, picture: f32, history: f32) -> (f32, f32) {
-    let min_gap = 16.0;
-    let status = (full * 0.2).clamp(40.0, 240.0);
-    let spare = full - windows - picture - history - status;
-    if spare < 2.0 * min_gap {
-        return (8.0, 8.0);
-    }
-    let picture_left =
-        ((full - picture) * 0.5).clamp(windows + min_gap, full - status - history - min_gap - picture);
-    let gap_l = picture_left - windows;
-    let gap_r = (full - status - history) - (picture_left + picture);
-    (gap_l, gap_r)
-}
-
 /// The widest of `8×10` and `10×8`, in the button font.
 fn widest_frame_text(ui: &egui::Ui) -> f32 {
     let font = egui::TextStyle::Button.resolve(ui.style());
@@ -5383,6 +5407,13 @@ fn frame_cell(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui:
 }
 
 /// One flat tray. The bar stays visible around it, so the three groups separate.
+/// The bar between two tools in a well.
+fn tool_bar(ui: &mut egui::Ui) {
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
+}
+
 fn tool_well(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
     let panel = ui.visuals().panel_fill;
     let fill = Color32::from_rgb(
@@ -6538,8 +6569,7 @@ impl App {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        crumb_label, export_extensions, toolbar_gaps, with_ext, without_verbatim_prefix, ExportFormat,
-        ExportKind,
+        crumb_label, export_extensions, with_ext, without_verbatim_prefix, ExportFormat, ExportKind,
     };
     use std::path::{Path, PathBuf};
 
@@ -6559,19 +6589,6 @@ mod path_tests {
             assert_eq!(crumb_label(Path::new(r"C:\")), "C:");
             assert_eq!(crumb_label(Path::new(r"C:\Users")), "Users");
         }
-    }
-
-    #[test]
-    fn the_picture_group_sits_in_the_middle_when_there_is_room() {
-        let (left, right) = toolbar_gaps(1200.0, 300.0, 340.0, 150.0);
-        let picture_center = 300.0 + left + 170.0;
-        assert!((picture_center - 600.0).abs() < 1.0);
-        assert!(left >= 16.0 && right >= 16.0);
-    }
-
-    #[test]
-    fn a_narrow_bar_keeps_a_short_gap() {
-        assert_eq!(toolbar_gaps(400.0, 300.0, 340.0, 150.0), (8.0, 8.0));
     }
 
     #[test]
