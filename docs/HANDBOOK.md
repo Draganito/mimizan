@@ -11,9 +11,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.17.0/mimizan_0.17.0-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.17.0-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.17.0/mimizan-0.17.0-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.17.0/mimizan-0.17.0-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.17.1/mimizan_0.17.1-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.17.1-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.17.1/mimizan-0.17.1-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.17.1/mimizan-0.17.1-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
