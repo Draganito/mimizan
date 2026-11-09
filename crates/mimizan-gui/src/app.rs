@@ -6,6 +6,7 @@
 use crate::browser::{
     self, home_dir, ExportFormat, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs,
 };
+use crate::brush::{self, Brush, Hit, Tool};
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
 use crate::filter_strip::{self, filter_ink, filter_short, filter_strip, Field};
@@ -21,6 +22,7 @@ use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
 use egui_file_dialog::{FileDialog, OpeningMode};
+use mimizan_core::burn::{self, Light, Stroke};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, Weights};
 use mimizan_core::paper::{self, SplitGrade};
@@ -249,6 +251,26 @@ struct CropDrag {
     /// Press position, in the upright picture's pixels.
     start_x: f32,
     start_y: f32,
+}
+
+/// What the pointer holds while the burn tool is up.
+#[derive(Clone, Debug)]
+enum BrushDrag {
+    /// The brush is being set: a handle of the tip shown on the stage.
+    Handle {
+        hit: Hit,
+        /// The brush at the press.
+        origin: Brush,
+        /// Where the tip is shown, normalised.
+        centre: (f64, f64),
+        /// The press, normalised.
+        start: (f64, f64),
+    },
+    /// The hand painting: the stroke's index in the recipe and the last
+    /// point kept of its path, shown-normalised.
+    Paint { index: usize, last: (f64, f64) },
+    /// The card pushed from the press: the stroke's index and the press.
+    Push { index: usize, from: (f64, f64) },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -626,6 +648,8 @@ pub struct App {
     shown_generation: u64,
     last_view: Option<ViewParams>,
     preview_ms: u128,
+    /// How long the last detail window took, ms.
+    detail_ms: u128,
     hist_view: Histogram,
     hist_negative: Histogram,
     /// The plate's three channels, outlines over the print histogram.
@@ -651,6 +675,19 @@ pub struct App {
     straighten_on: bool,
     /// The line being drawn, in screen points.
     line_drag: Option<[Pos2; 2]>,
+    /// The burn tool is up: the brush is set on the stage, or, locked,
+    /// paints strokes into the recipe. The strokes apply at once.
+    burn_on: bool,
+    /// The brush is locked: a primary drag paints. Open, the tip stands
+    /// in the middle of the stage with its handles and nothing in the
+    /// picture changes.
+    burn_locked: bool,
+    /// The one brush, kept with the program's settings.
+    brush: Brush,
+    /// The brush was set and locked once, on this or an earlier run; a
+    /// first use opens it instead.
+    brush_set: bool,
+    burn_drag: Option<BrushDrag>,
     /// The Print window's content ran past its edge, and the log has it.
     print_overflow_logged: bool,
 
@@ -803,6 +840,7 @@ impl App {
             shown_generation: 0,
             last_view: None,
             preview_ms: 0,
+            detail_ms: 0,
             hist_view: Histogram::empty(),
             hist_negative: Histogram::empty(),
             hist_rgb: None,
@@ -818,6 +856,11 @@ impl App {
             angle_draft: 0.0,
             straighten_on: false,
             line_drag: None,
+            burn_on: false,
+            burn_locked: false,
+            brush: persisted.brush.map(Brush::sanitized).unwrap_or_default(),
+            brush_set: persisted.brush.is_some(),
+            burn_drag: None,
             print_overflow_logged: false,
             // A launch from the Store has its working directory in System32.
             // The save dialog always opens on the directory set for this export.
@@ -861,6 +904,7 @@ impl App {
             plate_space: Some(self.plate_last.space),
             ruler: Some(self.ruler),
             format: Some(self.format),
+            brush: self.brush_set.then_some(self.brush),
             folder_bookmark: self.saved_bookmark(),
         }
         .save();
@@ -1089,6 +1133,8 @@ impl App {
         if self.crop_open && angle_changed {
             self.arm_crop();
         }
+        // The stroke under the pointer may be gone from this state.
+        self.burn_drag = None;
         // A recipe without a sheet (the defaults, or an older file) meant
         // the picture's pixels with the rings added outside. That file,
         // said as a sheet: the same pixels, the same TIFF.
@@ -1299,6 +1345,8 @@ impl App {
             angle: self.view_angle(),
             // While the easel is up the whole negative is shown.
             crop: if self.crop_open { None } else { r.crop },
+            burns: r.burns.clone(),
+            burn_live: matches!(self.burn_drag, Some(BrushDrag::Paint { .. } | BrushDrag::Push { .. })),
             plate: self.plate_view(),
         }
     }
@@ -1403,14 +1451,18 @@ impl App {
         recipe
     }
 
-    /// The recipe with its window turned into the current upright picture
-    /// and clamped to it (a sidecar from another file may be larger).
+    /// The recipe with its window and its burns turned into the current
+    /// upright picture, the window clamped to it (a sidecar from another
+    /// file may be larger).
     fn print_recipe(&self) -> Recipe {
         let mut recipe = self.edit.recipe.clone();
         if let Some(c) = recipe.crop {
             let (fw, fh) = self.frame_at(recipe.angle);
             let (uw, uh) = self.export_size_at(recipe.angle);
             recipe.crop = Some(c.turned(self.rotation(), fw, fh).sanitized(uw as u32, uh as u32));
+        }
+        if !recipe.burns.is_empty() {
+            recipe.burns = burn::turned(&recipe.burns, self.rotation());
         }
         recipe
     }
@@ -1544,6 +1596,8 @@ impl App {
             return;
         }
         self.line_drag = None;
+        // The easel shows the whole frame; the brush works on the window.
+        self.close_burn();
         if let Some(c) = self.edit.recipe.crop {
             let c = c.sanitized(fw, fh);
             let (format, turned) = PaperFormat::match_window(fw, fh, c.w, c.h);
@@ -1791,6 +1845,378 @@ impl App {
         for p in [frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom()] {
             painter.rect_filled(Rect::from_center_size(p, Vec2::splat(12.0)), 1.0, orange);
         }
+    }
+
+    // ---- The burn tool: the brush over the picture ------------------------
+
+    /// Burn on. The easel goes down: the strokes are painted on the
+    /// picture as it prints, window and all. A brush that was set before
+    /// comes up locked, ready to paint; a fresh one comes up open.
+    fn arm_burn(&mut self) {
+        if self.crop_open {
+            self.close_crop();
+        }
+        self.burn_on = true;
+        self.burn_drag = None;
+        self.burn_locked = self.brush_set;
+    }
+
+    fn close_burn(&mut self) {
+        self.burn_on = false;
+        self.burn_drag = None;
+    }
+
+    /// The brush locked: it is now the tool, and it is kept.
+    fn lock_brush(&mut self) {
+        self.burn_locked = true;
+        self.burn_drag = None;
+        self.brush_set = true;
+        self.persist();
+    }
+
+    fn open_brush(&mut self) {
+        self.burn_locked = false;
+        self.burn_drag = None;
+    }
+
+    /// From a point of the picture on the stage (0..1 across and down it)
+    /// to the shown picture's normalised coordinates, and back. The
+    /// picture is the window, through the straighten, onto the upright
+    /// negative after the user's turns: the same chain the render reads
+    /// the strokes through.
+    fn burn_map(&self) -> Option<(straighten::Affine, straighten::Affine)> {
+        let (pw, ph) = self.picture_size();
+        let (tw, th) = self.export_size_at(0.0);
+        if pw == 0 || ph == 0 || tw == 0 || th == 0 {
+            return None;
+        }
+        let (ox, oy) = match self.print_recipe().crop {
+            Some(c) => (f64::from(c.x), f64::from(c.y)),
+            None => (0.0, 0.0),
+        };
+        let unit_to_window =
+            straighten::Affine { a: pw as f64, b: 0.0, c: 0.0, d: ph as f64, tx: ox, ty: oy };
+        let to_norm = burn::normalize(tw, th)
+            .after(&straighten::frame_to_upright(tw, th, self.edit.recipe.angle))
+            .after(&unit_to_window);
+        let back = to_norm.inverse()?;
+        Some((to_norm, back))
+    }
+
+    /// A stroke as shown, stored file-upright.
+    fn store_shown_stroke(&mut self, index: usize, s: Stroke) {
+        let back = (4 - self.rotation() % 4) % 4;
+        if let Some(slot) = self.edit.recipe.burns.get_mut(index) {
+            *slot = s.turned(back);
+        }
+    }
+
+    /// One stroke of the recipe as shown, turned into the picture on view.
+    fn shown_stroke(&self, index: usize) -> Option<Stroke> {
+        self.edit.recipe.burns.get(index).map(|s| s.turned(self.rotation()))
+    }
+
+    /// Where the open brush stands: the middle of the picture on view.
+    fn brush_centre(&self, rect: Rect, to_norm: &straighten::Affine) -> (f64, f64) {
+        let shown = self.last_stage.map_or(rect, |stage| rect.intersect(stage));
+        let c = if shown.is_positive() { shown.center() } else { rect.center() };
+        brush::stage_to_norm(c, rect, to_norm)
+    }
+
+    /// The burn tool on the stage. Open, a press on a handle of the tip
+    /// sets the brush and nothing else moves. Locked, a primary press
+    /// starts a stroke: the hand's path follows the pointer, the card is
+    /// pushed from the press to where the pointer lets go. Every change
+    /// goes straight into the recipe, so the preview follows the hand;
+    /// the release is one step of the history.
+    fn burn_interact(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect) {
+        let down_on = response.is_pointer_button_down_on();
+        if rect.width() <= 1.0 || rect.height() <= 1.0 {
+            self.burn_drag = None;
+            return;
+        }
+        let Some((to_norm, back)) = self.burn_map() else {
+            self.burn_drag = None;
+            return;
+        };
+        let k = brush::points_per_unit(rect, &back);
+        if k <= 0.0 || k.is_nan() {
+            return;
+        }
+        let slop = f64::from(brush::HANDLE_PT) / k;
+        let ptr = ui.input(|i| i.pointer.latest_pos());
+        let centre = self.brush_centre(rect, &to_norm);
+        if !down_on {
+            self.burn_drag = None;
+            if let Some(p) = response.hover_pos().filter(|p| rect.contains(*p)) {
+                let icon = if self.burn_locked {
+                    CursorIcon::None
+                } else {
+                    let (x, y) = brush::stage_to_norm(p, rect, &to_norm);
+                    match brush::hit(&self.brush, centre.0, centre.1, k, x, y, slop) {
+                        Some(h) => brush_cursor(h, false),
+                        None => CursorIcon::Default,
+                    }
+                };
+                ui.ctx().set_cursor_icon(icon);
+            }
+            return;
+        }
+        let Some(ptr) = ptr else { return };
+        if self.burn_drag.is_none() && ui.input(|i| i.pointer.primary_pressed()) {
+            let at = ui.input(|i| i.pointer.press_origin()).unwrap_or(ptr);
+            if !rect.contains(at) {
+                return;
+            }
+            let (x, y) = brush::stage_to_norm(at, rect, &to_norm);
+            if !self.burn_locked {
+                if let Some(hit) = brush::hit(&self.brush, centre.0, centre.1, k, x, y, slop) {
+                    self.burn_drag =
+                        Some(BrushDrag::Handle { hit, origin: self.brush, centre, start: (x, y) });
+                }
+            } else if self.edit.recipe.burns.len() < burn::MAX_STROKES {
+                let index = self.edit.recipe.burns.len();
+                let (x, y) = (brush::clamp_reach(x), brush::clamp_reach(y));
+                let fresh = match self.brush.tool {
+                    Tool::Hand => self.brush.hand_stroke(vec![[x, y]]),
+                    Tool::Card => self.brush.card_stroke((x, y), (x, y)),
+                };
+                self.edit.recipe.burns.push(fresh.clone());
+                self.store_shown_stroke(index, fresh);
+                self.burn_drag = Some(match self.brush.tool {
+                    Tool::Hand => BrushDrag::Paint { index, last: (x, y) },
+                    Tool::Card => BrushDrag::Push { index, from: (x, y) },
+                });
+            }
+        }
+        let Some(d) = self.burn_drag.clone() else { return };
+        let (x, y) = brush::stage_to_norm(ptr, rect, &to_norm);
+        match d {
+            BrushDrag::Handle { hit, origin, centre, start } => {
+                let fine = if ui.input(|i| i.modifiers.shift) { 0.1 } else { 1.0 };
+                self.brush = brush::dragged(&origin, hit, centre, start, (x, y), k, fine);
+                ui.ctx().set_cursor_icon(brush_cursor(hit, true));
+            }
+            BrushDrag::Paint { index, last } => {
+                ui.ctx().set_cursor_icon(CursorIcon::None);
+                let Some(Stroke::Hand { mut points, .. }) = self.shown_stroke(index) else {
+                    self.burn_drag = None;
+                    return;
+                };
+                let (x, y) = (brush::clamp_reach(x), brush::clamp_reach(y));
+                if (x - last.0).hypot(y - last.1) >= self.brush.spacing() && points.len() < burn::MAX_POINTS {
+                    points.push([x, y]);
+                    let stroke = self.brush.hand_stroke(points);
+                    self.store_shown_stroke(index, stroke);
+                    self.burn_drag = Some(BrushDrag::Paint { index, last: (x, y) });
+                }
+            }
+            BrushDrag::Push { index, from } => {
+                ui.ctx().set_cursor_icon(CursorIcon::None);
+                if index >= self.edit.recipe.burns.len() {
+                    self.burn_drag = None;
+                    return;
+                }
+                let stroke = self.brush.card_stroke(from, (brush::clamp_reach(x), brush::clamp_reach(y)));
+                self.store_shown_stroke(index, stroke);
+            }
+        }
+    }
+
+    /// The brush over the picture. Open: the tip in the middle of the
+    /// stage with its handles, its penumbra dashed, its stops at the
+    /// centre. Locked: the tip under the pointer, the stroke being made,
+    /// and with Alt held the paths of every stroke.
+    fn paint_burns(&self, ui: &egui::Ui, painter: &egui::Painter, response: &egui::Response, rect: Rect) {
+        let Some((to_norm, back)) = self.burn_map() else { return };
+        let k = brush::points_per_unit(rect, &back);
+        if k <= 0.0 || k.is_nan() {
+            return;
+        }
+        let painter = painter.with_clip_rect(painter.clip_rect().intersect(rect));
+        let at = |x: f64, y: f64| brush::norm_to_stage(x, y, rect, &back);
+        let b = &self.brush;
+        let ink = brush::ink(b.stops());
+        let stroke = egui::Stroke::new(1.5, ink);
+        let faint = egui::Stroke::new(1.0, ink.gamma_multiply(0.6));
+        // The tip at normalised (cx, cy): outline and penumbra.
+        let tip_at = |cx: f64, cy: f64| match b.tool {
+            Tool::Hand => {
+                let tip = &b.hand.tip;
+                painter.add(egui::Shape::closed_line(brush::tip_outline(tip, cx, cy, 0.0, &at), stroke));
+                if tip.feather > 0.0 {
+                    for off in [-tip.feather, tip.feather] {
+                        let mut pts = brush::tip_outline(tip, cx, cy, off, &at);
+                        pts.push(pts[0]);
+                        painter.extend(egui::Shape::dashed_line(&pts, faint, 4.0, 4.0));
+                    }
+                }
+            }
+            Tool::Card => {
+                let (s, c) = b.card.angle.to_radians().sin_cos();
+                let (dx, dy) = (-s, c);
+                let reach = 2.0 * burn::REACH;
+                let line = |off: f64| {
+                    [
+                        at(cx + c * off - dx * reach, cy + s * off - dy * reach),
+                        at(cx + c * off + dx * reach, cy + s * off + dy * reach),
+                    ]
+                };
+                painter.line_segment(line(0.0), stroke);
+                if b.card.feather > 0.0 {
+                    for off in [-b.card.feather, b.card.feather] {
+                        painter.extend(egui::Shape::dashed_line(&line(off), faint, 4.0, 4.0));
+                    }
+                }
+                // Ticks into the lit side, every 24 points along the edge.
+                let step = 24.0 / k;
+                let tick = 8.0 / k;
+                let n = (reach / step).ceil() as i32;
+                for j in -n..=n {
+                    let (px, py) = (cx + dx * step * j as f64, cy + dy * step * j as f64);
+                    painter.line_segment([at(px, py), at(px + c * tick, py + s * tick)], faint);
+                }
+            }
+        };
+        if !self.burn_locked {
+            let (cx, cy) = self.brush_centre(rect, &to_norm);
+            tip_at(cx, cy);
+            for (hit, hx, hy) in brush::handles(b, cx, cy, k) {
+                let p = at(hx, hy);
+                match hit {
+                    Hit::Rotate(_) => {
+                        // A stalk from the tip to the turn handle.
+                        let (sx, sy) = match b.tool {
+                            Tool::Hand => {
+                                let (s, c) = b.hand.tip.angle.to_radians().sin_cos();
+                                (cx + b.hand.tip.rx * c, cy + b.hand.tip.rx * s)
+                            }
+                            Tool::Card => (cx, cy),
+                        };
+                        painter.line_segment([at(sx, sy), p], faint);
+                        painter.circle_stroke(p, 5.0, egui::Stroke::new(1.5, ink));
+                    }
+                    Hit::Feather => {
+                        painter.rect_filled(Rect::from_center_size(p, Vec2::splat(8.0)), 1.0, ink);
+                    }
+                    Hit::Stops => {
+                        brush_label(&painter, p, &brush::label(b.stops(), b.light()), ink, 13.0);
+                    }
+                    Hit::Axis(_) => {
+                        painter.circle_filled(p, 4.5, ink);
+                    }
+                }
+            }
+            return;
+        }
+        // Locked: the strokes' paths while Alt is held, and the card being
+        // pushed. A hand being painted shows only in the picture.
+        let show_paths = ui.input(|i| i.modifiers.alt);
+        let pushing = match &self.burn_drag {
+            Some(BrushDrag::Push { index, .. }) => Some(*index),
+            _ => None,
+        };
+        for (i, s) in self.edit.recipe.burns.iter().enumerate() {
+            if !show_paths && pushing != Some(i) {
+                continue;
+            }
+            let s = s.turned(self.rotation());
+            let ink = brush::ink(s.stops());
+            let path = egui::Stroke::new(1.5, ink.gamma_multiply(if pushing == Some(i) { 1.0 } else { 0.8 }));
+            match &s {
+                Stroke::Hand { points, .. } => {
+                    let pts: Vec<Pos2> = points.iter().map(|&[x, y]| at(x, y)).collect();
+                    if pts.len() == 1 {
+                        painter.circle_filled(pts[0], 3.0, path.color);
+                    } else {
+                        painter.add(egui::Shape::line(pts.clone(), path));
+                    }
+                    if let Some(p) = pts.first() {
+                        painter.circle_stroke(*p, 4.0, path);
+                    }
+                }
+                Stroke::Card { x, y, angle, travel, .. } => {
+                    let (s, c) = angle.to_radians().sin_cos();
+                    let half = 40.0 / k;
+                    let edge = |px: f64, py: f64| {
+                        [at(px + s * half, py - c * half), at(px - s * half, py + c * half)]
+                    };
+                    painter.line_segment(edge(*x, *y), path);
+                    let (ex, ey) = if *travel > 0.0 {
+                        (x + c * travel, y + s * travel)
+                    } else {
+                        (x + c * 12.0 / k, y + s * 12.0 / k)
+                    };
+                    if *travel > 0.0 {
+                        painter.line_segment(edge(ex, ey), path);
+                    }
+                    painter.arrow(at(*x, *y), at(ex, ey) - at(*x, *y), path);
+                }
+            }
+        }
+        // The tip under the pointer.
+        if let Some(p) = response.hover_pos().filter(|p| rect.contains(*p)) {
+            let (cx, cy) = brush::stage_to_norm(p, rect, &to_norm);
+            tip_at(cx, cy);
+            brush_label(&painter, p + Vec2::new(14.0, 14.0), &brush::label(b.stops(), b.light()), ink, 11.0);
+        }
+    }
+
+    /// The Enlarger's line for the brush: what it is set to, how many
+    /// strokes the picture has, and a way to take them all away.
+    fn burn_rows(&mut self, ui: &mut egui::Ui) {
+        let n = self.edit.recipe.burns.len();
+        if n == 0 && !self.burn_on {
+            return;
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let b = &self.brush;
+            let mut txt = format!("Brush · {} {:+.2}", b.tool.name(), b.stops());
+            if n > 0 {
+                txt.push_str(&format!(" · {n} stroke{}", if n == 1 { "" } else { "s" }));
+            }
+            ui.label(RichText::new(txt).weak()).on_hover_text(if self.burn_locked {
+                "The brush as it is set. Paint on the picture; Alt shows the strokes."
+            } else {
+                "Set the brush on the picture: the dots size it, the ring turns it, the square is its penumbra, \
+                 the number its stops (drag up and down in hundredths; Shift slows it). Enter locks it."
+            });
+            if n > 0
+                && ui.button("Clear").on_hover_text("Take every stroke away. The brush stays as it is.").clicked()
+            {
+                self.edit.recipe.burns.clear();
+                self.burn_drag = None;
+            }
+            if n > 0 && !self.burn_on && ui.button("Burn").on_hover_text("Burn on, to paint more.").clicked() {
+                self.arm_burn();
+            }
+        });
+        if !self.burn_on {
+            return;
+        }
+        // Which pass the time goes to. Both is the working grade; one
+        // alone is the split-grade burn.
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("light").weak()).on_hover_text(
+                "Which pass the brush's time goes to. Both is the working grade; soft or hard alone is the split-grade burn.",
+            );
+            let hover = [
+                "Both passes: the time under the working grade, as one filter would give it.",
+                "The soft pass alone: moves the highlights, leaves the shadows.",
+                "The hard pass alone: moves the shadows, leaves the highlights.",
+            ];
+            for (light, hover) in Light::ALL.into_iter().zip(hover) {
+                if ui.selectable_label(self.brush.light() == light, light.name()).on_hover_text(hover).clicked()
+                    && self.brush.light() != light
+                {
+                    self.brush.set_light(light);
+                    if self.brush_set {
+                        self.persist();
+                    }
+                }
+            }
+        });
     }
 
     fn start_export(&mut self) {
@@ -2110,6 +2536,7 @@ impl App {
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.close_crop();
+        self.close_burn();
         // The easel's own state goes with the development: the draft
         // straighten and the chosen sheet, so the toolbar says what the
         // picture is.
@@ -2375,6 +2802,28 @@ impl App {
                             self.edit.plate = Some(PlateParams { filters, ..PlateParams::default() });
                             self.follow_process();
                         }
+                        if let Some(which) =
+                            self.screenshot_to.as_ref().and(std::env::var_os("MIMIZAN_SCREENSHOT_BURN"))
+                        {
+                            // Two strokes in the unattended capture, the brush
+                            // open on the stage: a dodge of the hand in the
+                            // lower left, a burn of the card pushed into the sky.
+                            // `=card` opens the card instead of the hand.
+                            if which == "card" {
+                                self.brush.tool = Tool::Card;
+                            }
+                            let mut dodge = self.brush;
+                            dodge.hand.stops = -0.5;
+                            let mut sky = self.brush;
+                            sky.card.stops = 1.0;
+                            sky.card.light = Light::Soft;
+                            self.edit.recipe.burns = vec![
+                                dodge.hand_stroke(vec![[-0.3, 0.12], [-0.22, 0.16], [-0.12, 0.14]]),
+                                sky.card_stroke((0.0, -0.1), (0.0, -0.25)),
+                            ];
+                            self.arm_burn();
+                            self.burn_locked = false;
+                        }
                         self.recipe_baseline = self.recipe_for_file();
                     }
                     // A re-development has new pixels: the measured radius
@@ -2581,7 +3030,11 @@ impl App {
     }
 
     fn apply_preview(&mut self, ctx: &egui::Context, r: PreviewResult) {
-        self.preview_ms = r.ms;
+        if r.image.is_some() {
+            self.preview_ms = r.ms;
+        } else if r.detail.is_some() {
+            self.detail_ms = r.ms;
+        }
         if let Some(im) = r.image {
             // A turned picture keeps its magnification and its centre:
             // turn the pan with it, and let the panel re-derive the zoom
@@ -2856,6 +3309,59 @@ impl App {
         {
             self.apply_crop();
         }
+        // The brush: dodging and burning on the picture as it prints.
+        ui.add_space(8.0);
+        let mut burn_on = self.burn_on;
+        if ui
+            .add_enabled(has, egui::Checkbox::new(&mut burn_on, "Burn"))
+            .on_hover_text(
+                "Dodge and burn with the brush. Set it on the picture, lock it (Enter), then paint: a drag of \
+                 the hand, a push of the card. The strokes print at once; Alt shows them.",
+            )
+            .changed()
+        {
+            if burn_on {
+                self.arm_burn();
+            } else {
+                self.close_burn();
+            }
+        }
+        ui.add_enabled_ui(has && self.burn_on, |ui| {
+            let tools = [
+                (Tool::Hand, "Hand", "The hand: an ellipse with a soft edge, painted along a path."),
+                (
+                    Tool::Card,
+                    "Card",
+                    "The card: a straight edge with a soft shadow, pushed from one place to another.",
+                ),
+            ];
+            for (tool, label, hint) in tools {
+                if ui.selectable_label(self.brush.tool == tool, label).on_hover_text(hint).clicked()
+                    && self.brush.tool != tool
+                {
+                    self.brush.tool = tool;
+                    self.burn_drag = None;
+                }
+            }
+            if ui
+                .selectable_label(!self.burn_locked, "Set")
+                .on_hover_text(
+                    "Open the brush: its handles on the picture, nothing in the picture changes (Escape).",
+                )
+                .clicked()
+            {
+                self.open_brush();
+            }
+            if ui
+                .selectable_label(self.burn_locked, "Paint")
+                .on_hover_text(
+                    "Lock the brush and paint with it (Enter). The brush is kept for every picture.",
+                )
+                .clicked()
+            {
+                self.lock_brush();
+            }
+        });
         // The picture's turn, apart from the frame.
         ui.add_space(16.0);
         if ui
@@ -3108,11 +3614,12 @@ impl App {
             val(
                 ui,
                 format!(
-                    "{} x {} ({:.1} %), {} ms",
+                    "{} x {} ({:.1} %), {} ms, window {} ms",
                     self.tex_size[0],
                     self.tex_size[1],
                     100.0 * s.preview.scale,
-                    self.preview_ms
+                    self.preview_ms,
+                    self.detail_ms
                 ),
             );
             ui.end_row();
@@ -3520,6 +4027,7 @@ impl App {
             {
                 self.edit.recipe.curve = Tone::paper();
             }
+            self.burn_rows(ui);
             return;
         };
         let mut split = split;
@@ -3559,6 +4067,7 @@ impl App {
                 }
             });
         }
+        self.burn_rows(ui);
     }
 
     /// The projector's lamps, under the paper: stops added to the red and
@@ -4469,6 +4978,7 @@ impl App {
             self.cross_drag = pressed_on_cross;
             if self.cross_drag {
                 self.crop_drag = None;
+                self.burn_drag = None;
             }
         }
         if self.cross_drag {
@@ -4486,7 +4996,15 @@ impl App {
             if self.crop_open {
                 self.crop_interact(ui, &response, rect);
             }
-            if response.dragged() && self.crop_drag.is_none() && self.line_drag.is_none() {
+            if self.burn_on {
+                self.burn_interact(ui, &response, rect);
+            }
+            // With the brush locked the first button paints, open it may hold
+            // a handle; the others still pan.
+            let drawing = self.burn_on
+                && response.dragged_by(egui::PointerButton::Primary)
+                && (self.burn_locked || self.burn_drag.is_some());
+            if response.dragged() && self.crop_drag.is_none() && self.line_drag.is_none() && !drawing {
                 self.pan = (self.pan + response.drag_delta()).clamp(bounds.0, bounds.1);
                 (rect, _, _, _, _) = place(self.zoom, self.pan);
             }
@@ -4590,6 +5108,9 @@ impl App {
             self.paint_crop(&painter, rect);
             self.paint_line(&painter);
         }
+        if self.burn_on {
+            self.paint_burns(ui, &painter, &response, rect);
+        }
         // After the sharp tile and the crop shade, or the cross disappears
         // under them once the preview would be upscaled.
         if let Some([nx, ny]) = cross {
@@ -4607,7 +5128,7 @@ impl App {
             let near = response.hover_pos().is_some_and(|h| h.distance(p) <= CROSS_GRAB);
             if self.cross_drag {
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-            } else if near && self.crop_drag.is_none() {
+            } else if near && self.crop_drag.is_none() && self.burn_drag.is_none() {
                 ui.ctx().set_cursor_icon(CursorIcon::Grab);
                 response.clone().on_hover_text("Drag moves the 1:1 box.");
             }
@@ -4635,6 +5156,35 @@ impl App {
 
 fn image_pos(ptr: Pos2, rect: Rect, uw: u32, uh: u32) -> (f32, f32) {
     ((ptr.x - rect.left()) / rect.width() * uw as f32, (ptr.y - rect.top()) / rect.height() * uh as f32)
+}
+
+// ---- Burn tool: cursors and labels ---------------------------------------
+
+fn brush_cursor(hit: Hit, held: bool) -> CursorIcon {
+    match hit {
+        Hit::Axis(0 | 2) => CursorIcon::ResizeHorizontal,
+        Hit::Axis(_) => CursorIcon::ResizeVertical,
+        Hit::Rotate(_) | Hit::Feather => CursorIcon::PointingHand,
+        Hit::Stops => {
+            if held {
+                CursorIcon::ResizeVertical
+            } else {
+                CursorIcon::Grab
+            }
+        }
+    }
+}
+
+/// Text on a dark pill, centred at `p`.
+fn brush_label(painter: &egui::Painter, p: Pos2, txt: &str, ink: Color32, size: f32) {
+    let galley = painter.layout_no_wrap(txt.to_owned(), egui::FontId::proportional(size), ink);
+    let pos = p - galley.size() / 2.0;
+    painter.rect_filled(
+        Rect::from_min_size(pos, galley.size()).expand(3.0),
+        3.0,
+        Color32::from_black_alpha(150),
+    );
+    painter.galley(pos, galley, ink);
 }
 
 /// `corner` and `edge` are half-widths in image pixels. Corners win. Anywhere
@@ -5934,6 +6484,21 @@ impl App {
         }
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             self.apply_crop();
+        }
+        // The burn tool: Enter locks the brush, Escape opens it, and puts
+        // the tool down when it is open. Not while the pointer holds it.
+        if self.burn_on && self.burn_drag.is_none() {
+            if !self.burn_locked && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+            {
+                self.lock_brush();
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                if self.burn_locked {
+                    self.open_brush();
+                } else {
+                    self.close_burn();
+                }
+            }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
             self.set_process(!self.plate_process());

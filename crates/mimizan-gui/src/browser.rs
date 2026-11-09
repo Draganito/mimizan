@@ -591,6 +591,11 @@ pub struct Persisted {
     pub ruler: Option<Ruler>,
     /// The file the Export button writes. `None` means TIFF.
     pub format: Option<ExportFormat>,
+    /// The dodging brush: the hand and the card as last set. `None` on a
+    /// fresh install means the defaults, and that the brush is still to
+    /// be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brush: Option<crate::brush::Brush>,
     /// Security-scoped bookmark for the folder opened on macOS. Absent on
     /// Linux and Windows, and on a Mac build that is not sandboxed.
     #[serde(default, skip_serializing_if = "Option::is_none")]

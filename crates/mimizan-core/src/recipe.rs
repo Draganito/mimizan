@@ -8,6 +8,7 @@
 //! file `mimizan print --recipe` reads. Identical recipes give identical
 //! 16-bit files; that is why the export never needs to see the history.
 
+use crate::burn::Stroke;
 use crate::calib::LookFile;
 use crate::error::{Error, Result};
 use crate::mix::Weights;
@@ -234,6 +235,13 @@ pub struct Recipe {
     /// full frame. Old recipes omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crop: Option<CropRect>,
+    /// The dodges and burns: the strokes of the hand and the card over the
+    /// upright negative, each with its time in stops and the light it is
+    /// done under (`burn.rs`). They sit on the negative, not on the
+    /// window: a crop or a straighten moves none of them. Empty, and old
+    /// recipes that omit it, burn nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub burns: Vec<Stroke>,
     /// The monochrome mix on the balanced channels, for a darkroom that
     /// develops from the RAW. `None` is the camera's default. A print of
     /// an already mixed negative ignores it. Old recipes omit it.
@@ -298,6 +306,7 @@ impl Default for Recipe {
             peak: Peak::default(),
             angle: 0.0,
             crop: None,
+            burns: Vec::new(),
             mix: None,
             plate: None,
         }
@@ -520,6 +529,7 @@ impl Recipe {
                 return Err(Error::Invalid("crop must cover at least one pixel".into()));
             }
         }
+        crate::burn::validate(&self.burns)?;
         if let Some(m) = self.mix {
             let w = [m.r, m.g, m.b];
             if w.iter().any(|v| !v.is_finite() || *v < 0.0) || (w.iter().sum::<f64>() - 1.0).abs() > 1e-6 {
@@ -739,6 +749,54 @@ mod tests {
         assert!(Recipe { angle: -45.0, ..Recipe::on_paper() }.validate().is_ok());
         assert!(Recipe { angle: 45.01, ..Recipe::on_paper() }.validate().is_err());
         assert!(Recipe { angle: f64::NAN, ..Recipe::on_paper() }.validate().is_err());
+    }
+
+    #[test]
+    fn burns_in_the_file_and_within_their_limits() {
+        use crate::burn::{Light, Tip};
+        // None: not written, and a file without them reads as none.
+        let plain = Recipe::on_paper();
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(!json.contains("burns"), "{json}");
+        assert!(serde_json::from_str::<Recipe>(&json).unwrap().burns.is_empty());
+        let burned = Recipe {
+            burns: vec![
+                Stroke::Hand {
+                    tip: Tip { rx: 0.3, ry: 0.2, angle: 15.0, feather: 0.05 },
+                    stops: -1.0,
+                    light: Light::Both,
+                    points: vec![[0.1, -0.2], [0.15, -0.1]],
+                },
+                Stroke::Card {
+                    x: 0.0,
+                    y: -0.3,
+                    angle: -90.0,
+                    travel: 0.1,
+                    feather: 0.1,
+                    stops: 2.0,
+                    light: Light::Soft,
+                },
+            ],
+            ..Recipe::on_paper()
+        };
+        burned.validate().unwrap();
+        let json = serde_json::to_string_pretty(&burned).unwrap();
+        assert!(json.contains(r#""tool": "card""#) && json.contains(r#""light": "soft""#), "{json}");
+        let back: Recipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, burned);
+        let hot = Recipe {
+            burns: vec![Stroke::Card {
+                x: 0.0,
+                y: 0.0,
+                angle: 0.0,
+                travel: 0.0,
+                feather: 0.0,
+                stops: 9.0,
+                light: Light::Both,
+            }],
+            ..Recipe::on_paper()
+        };
+        assert!(hot.validate().is_err());
     }
 
     #[test]

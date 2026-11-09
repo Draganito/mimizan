@@ -204,22 +204,46 @@ pub fn print_map(
 /// Indices are clamped to `0..len` and their weights folded onto the edge
 /// sample, as the separable resize does. A kernel that touches nothing
 /// (the box exactly between two pixels) takes the nearest one.
-fn axis_taps(c: f64, len: usize, kernel: ResampleKernel, stretch: f64, w: &mut Vec<f64>) -> usize {
+/// The kernel is passed as its support and a function, so a warp's inner
+/// loop runs one kernel without a match per tap.
+#[inline]
+fn axis_taps_with(
+    c: f64,
+    len: usize,
+    kernel_support: f64,
+    eval: &impl Fn(f64) -> f64,
+    stretch: f64,
+    w: &mut Vec<f64>,
+) -> usize {
     w.clear();
-    let support = kernel.support() * stretch;
-    let lo = (c - support).floor() as isize;
-    let hi = (c + support).ceil() as isize;
+    let support = kernel_support * stretch;
+    // The kernels are zero at and beyond their support, so the taps are
+    // the integers strictly inside `c ± support`: four for a cubic at
+    // scale 1, not the six the rounded-out bounds would hold.
+    let lo = (c - support).floor() as isize + 1;
+    let hi = ((c + support).ceil() as isize - 1).max(lo);
     let last = len as isize - 1;
     let first = lo.clamp(0, last);
     let end = hi.clamp(0, last);
-    w.resize((end - first + 1) as usize, 0.0);
     let mut sum = 0.0;
-    for j in lo..=hi {
-        let v = kernel.eval((j as f64 - c) / stretch);
-        if v != 0.0 {
-            let jc = j.clamp(0, last);
-            w[(jc - first) as usize] += v;
+    if lo >= 0 && hi <= last {
+        // Interior: every tap its own sample, no folding.
+        for j in lo..=hi {
+            let d = j as f64 - c;
+            let v = eval(if stretch == 1.0 { d } else { d / stretch });
+            w.push(v);
             sum += v;
+        }
+    } else {
+        w.resize((end - first + 1) as usize, 0.0);
+        for j in lo..=hi {
+            let d = j as f64 - c;
+            let v = eval(if stretch == 1.0 { d } else { d / stretch });
+            if v != 0.0 {
+                let jc = j.clamp(0, last);
+                w[(jc - first) as usize] += v;
+                sum += v;
+            }
         }
     }
     if sum.abs() < 1e-12 {
@@ -313,11 +337,31 @@ pub fn warp(
             src.origin_x, src.origin_y
         )));
     }
+    match kernel {
+        ResampleKernel::Lanczos3 => warp_with(src, map, kernel, rect, &|x| ResampleKernel::Lanczos3.eval(x)),
+        ResampleKernel::Mitchell => warp_with(src, map, kernel, rect, &|x| ResampleKernel::Mitchell.eval(x)),
+        ResampleKernel::CatmullRom => {
+            warp_with(src, map, kernel, rect, &|x| ResampleKernel::CatmullRom.eval(x))
+        }
+        ResampleKernel::BSpline => warp_with(src, map, kernel, rect, &|x| ResampleKernel::BSpline.eval(x)),
+        ResampleKernel::Area => warp_with(src, map, kernel, rect, &|x| ResampleKernel::Area.eval(x)),
+    }
+}
+
+/// The checked `warp` for one kernel, `eval` being that kernel's function.
+fn warp_with(
+    src: PlaneWindow<'_>,
+    map: &Affine,
+    kernel: ResampleKernel,
+    rect: PixelRect,
+    eval: &(impl Fn(f64) -> f64 + Sync),
+) -> crate::Result<Plane> {
     let (sx, sy) = map.scales();
     let (stretch_x, stretch_y) = (sx.max(1.0), sy.max(1.0));
     let (full_w, full_h) = (src.full_w, src.full_h);
     let (ox, oy) = (src.origin_x, src.origin_y);
     let plane = src.plane;
+    let support = kernel.support();
     let mut out = Plane::zeros(rect.w, rect.h);
     out.data.par_chunks_mut(rect.w).enumerate().for_each(|(row_i, row)| {
         let mut wx = Vec::with_capacity(8);
@@ -326,14 +370,14 @@ pub fn warp(
         for (col_i, o) in row.iter_mut().enumerate() {
             let x = (rect.x + col_i) as f64 + 0.5;
             let (u, v) = map.apply(x, y);
-            let jx = axis_taps(u - 0.5, full_w, kernel, stretch_x, &mut wx);
-            let jy = axis_taps(v - 0.5, full_h, kernel, stretch_y, &mut wy);
+            let jx = axis_taps_with(u - 0.5, full_w, support, eval, stretch_x, &mut wx);
+            let jy = axis_taps_with(v - 0.5, full_h, support, eval, stretch_y, &mut wy);
             let mut acc = 0.0;
             for (ky, wyk) in wy.iter().enumerate() {
-                let s = plane.row(jy + ky - oy);
+                let s = &plane.row(jy + ky - oy)[jx - ox..jx - ox + wx.len()];
                 let mut line = 0.0;
-                for (kx, wxk) in wx.iter().enumerate() {
-                    line += wxk * s[jx + kx - ox];
+                for (wxk, sk) in wx.iter().zip(s) {
+                    line += wxk * sk;
                 }
                 acc += wyk * line;
             }
@@ -360,6 +404,90 @@ pub fn straighten(src: &Plane, angle: f64, kernel: ResampleKernel) -> Plane {
     }
     let (fw, fh) = frame_size(src.width, src.height, angle);
     warp_plane(src, &frame_to_upright(src.width, src.height, angle), fw, fh, kernel)
+}
+
+/// Fractional positions a [`PhasedKernel`] holds weights for.
+const PHASES: usize = 4096;
+
+/// A cubic kernel's four tap weights at `PHASES` fractional positions,
+/// normalised: the weights `warp_phased` reads instead of evaluating the
+/// kernel per pixel. The position is rounded to the nearest 1/4096 px,
+/// which moves a sample by under 1/8192 px: within a 16-bit step on a
+/// smooth picture, a few on a hard edge, nothing at 8 bits. A screen
+/// preview does not see it; the exports and the 1:1 windows use `warp`.
+pub struct PhasedKernel {
+    weights: Vec<[f64; 4]>,
+}
+
+impl PhasedKernel {
+    /// `kernel` must have support 2 (the cubics); others are an error.
+    pub fn new(kernel: ResampleKernel) -> crate::Result<Self> {
+        if kernel.support() != 2.0 {
+            return Err(crate::Error::Invalid(format!("{kernel:?} is not a four-tap kernel")));
+        }
+        let weights = (0..PHASES)
+            .map(|p| {
+                let f = p as f64 / PHASES as f64;
+                let mut w =
+                    [kernel.eval(-1.0 - f), kernel.eval(-f), kernel.eval(1.0 - f), kernel.eval(2.0 - f)];
+                let sum: f64 = w.iter().sum();
+                for v in &mut w {
+                    *v /= sum;
+                }
+                w
+            })
+            .collect();
+        Ok(Self { weights })
+    }
+
+    /// First source index and the weights for source centre `c`.
+    #[inline]
+    fn taps(&self, c: f64) -> (isize, &[f64; 4]) {
+        let base = c.floor();
+        let p = ((c - base) * PHASES as f64).round() as usize;
+        if p >= PHASES {
+            return (base as isize, &self.weights[0]);
+        }
+        (base as isize - 1, &self.weights[p])
+    }
+}
+
+/// `warp_plane` for a map without a size step (a turn, a shift), the
+/// kernel read from `phased`; edge taps take the edge sample. The small
+/// preview's straighten.
+pub fn warp_phased(src: &Plane, map: &Affine, dst_w: usize, dst_h: usize, phased: &PhasedKernel) -> Plane {
+    let mut out = Plane::zeros(dst_w, dst_h);
+    if src.width == 0 || src.height == 0 {
+        return out;
+    }
+    let (last_x, last_y) = (src.width as isize - 1, src.height as isize - 1);
+    out.data.par_chunks_mut(dst_w).enumerate().for_each(|(row_i, row)| {
+        let y = row_i as f64 + 0.5;
+        for (col_i, o) in row.iter_mut().enumerate() {
+            let x = col_i as f64 + 0.5;
+            let (u, v) = map.apply(x, y);
+            let (jx, wx) = phased.taps(u - 0.5);
+            let (jy, wy) = phased.taps(v - 0.5);
+            let xs = [jx, jx + 1, jx + 2, jx + 3].map(|j| j.clamp(0, last_x) as usize);
+            let mut acc = 0.0;
+            for (k, wyk) in wy.iter().enumerate() {
+                let s = src.row((jy + k as isize).clamp(0, last_y) as usize);
+                let line = wx[0] * s[xs[0]] + wx[1] * s[xs[1]] + wx[2] * s[xs[2]] + wx[3] * s[xs[3]];
+                acc += wyk * line;
+            }
+            *o = acc;
+        }
+    });
+    out
+}
+
+/// `straighten` through `warp_phased`: the small preview's turn.
+pub fn straighten_phased(src: &Plane, angle: f64, phased: &PhasedKernel) -> Plane {
+    if !turns(angle) {
+        return src.clone();
+    }
+    let (fw, fh) = frame_size(src.width, src.height, angle);
+    warp_phased(src, &frame_to_upright(src.width, src.height, angle), fw, fh, phased)
 }
 
 /// The turn that puts the line from `(x0, y0)` to `(x1, y1)` (screen
@@ -395,6 +523,30 @@ mod tests {
             }
         }
         p
+    }
+
+    /// The phased straighten is the exact one to well under a 16-bit step
+    /// on a smooth picture, edges included, and refuses a wider kernel.
+    #[test]
+    fn the_phased_turn_reads_as_the_exact_one() {
+        let src = {
+            let mut p = Plane::zeros(90, 70);
+            for y in 0..70 {
+                for x in 0..90 {
+                    p.set(x, y, 0.5 + 0.4 * ((x as f64) * 0.21).sin() * ((y as f64) * 0.17).cos());
+                }
+            }
+            p
+        };
+        let phased = PhasedKernel::new(STRAIGHTEN_KERNEL).unwrap();
+        for angle in [0.0, 1.5, -7.0, 30.0] {
+            let exact = straighten(&src, angle, STRAIGHTEN_KERNEL);
+            let fast = straighten_phased(&src, angle, &phased);
+            assert_eq!((exact.width, exact.height), (fast.width, fast.height));
+            let worst = exact.data.iter().zip(&fast.data).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert!(worst < 1.0 / 65535.0, "angle {angle}: off by {worst}");
+        }
+        assert!(PhasedKernel::new(ResampleKernel::Lanczos3).is_err());
     }
 
     #[test]

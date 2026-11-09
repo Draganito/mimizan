@@ -5,6 +5,7 @@
 pub mod baseline;
 pub mod bench;
 pub mod blockfft;
+pub mod burn;
 pub mod calib;
 pub mod calibrate;
 pub mod cfa;

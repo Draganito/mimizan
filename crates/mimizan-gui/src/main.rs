@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 mod app;
 mod browser;
+mod brush;
 mod cpu;
 mod edit;
 mod filter_strip;

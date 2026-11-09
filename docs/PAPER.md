@@ -713,8 +713,9 @@ negative TIFF of §6.1 framed the same way, with its mask sidecar.
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
 carries as JSON): mix → orientation → crop window (whole pixels of the
-upright negative; omitted, the full frame) → size → placing and tone in one
-step (multiplicative exposure, $L' = L\cdot 2^{p}$, then the paper) →
+upright negative; omitted, the full frame) → size → placing, the strokes
+and tone in one step (multiplicative exposure, $L' = L\cdot 2^{p}$, the
+local time of each pass, then the paper) →
 sheet (with a size, the file is that sheet turned the picture's way, the
 picture fitted into what the black edge and the paper border leave and
 centred, the border being the least paper; without one, the picture's
@@ -736,8 +737,64 @@ $D/D_{\max} = 1 - (1-a)(1-b)$, behind a straight-line negative of
 $\gamma_n = 0.6$, so $\log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L)$
 for a scene value $L$ and an exposure time of $t$ stops. The print value
 is the reflectance $10^{-D}$ relative to the base with $D_{\max} = 2.0$
-taken to black, encoded $x^{1/2.2}$. The two times are the only tone
-parameters (there is no local exposure: no dodging or burning), the base
+taken to black, encoded $x^{1/2.2}$. The two times are the only global
+tone parameters; the local ones are the darkroom's *dodging and
+burning*, a list of strokes in the recipe (`burns`): movements of the
+hand, or of a card, over the upright negative, in coordinates
+normalised to its long side (origin at the centre, $x$ right, $y$ down,
+so a stroke is independent of the crop, the straighten and the print
+size, and a 90° turn of the picture maps it by $(x, y) \to (-y, x)$),
+each with a time in stops $s_i$ and the light it is done under (both
+passes, soft alone, hard alone). At a point of the picture the time of a
+pass is $T = 1 + \sum_i w_i\,(2^{s_i} - 1)$, clamped at 0, with $w_i \ge 0$
+the share of the stroke's time the point received. Times add rather
+than stops, as seconds under the enlarger do, so two overlapping
+one-stop passes are three times the base, not four. The pass is then
+exposed for $t + \log_2 T$ stops and the two passes share the silver as
+before; a stroke under one light leaves the other pass as printed, which
+is the split-grade burn of the highlights or the shadows alone. Because
+the stroke changes the time and not the scene value, a clipped highlight
+dodged to $T = 0$ goes to paper white, and a look with a single light is
+evaluated at $L/T$.
+
+No edge is a line: the lens is a disc of light above the hand, and its
+shadow has a penumbra, the lit fraction of that disc past a straight
+edge at signed distance $d$, $P(\tau) = (\arccos\tau -
+\tau\sqrt{1 - \tau^2})/\pi$, $\tau = d/f$, with $f$ the half-width of
+the penumbra, the hand's height above the paper as one number. The
+*hand* is a tip, an ellipse with half-axes $r_x, r_y$, turned by an
+angle, with such an edge; the weight of a resting tip at a point is $P$
+of the point's distance to the outline. Moved along a path at a steady
+pace, the share a point receives is the dwell, the path length over
+which the tip covered it, in units of the dwell of a pass straight
+through the tip's centre in the direction of travel: $w = \int
+P\,\mathrm{d}s \,/\, 2h_u$, where $2h_u$ is the integral of the tip's
+weight along the central line in direction $u$, the chord when the
+feather fits inside the tip (the penumbra is symmetric about the edge)
+and more when it does not. So a straight pass through a point gives it
+exactly the stroke's stops, a pass that brushes it gives the chord
+profile $\sqrt{1 - d^2/r^2}$ across, going back and forth adds, and a
+hand set down and not moved is the tip itself. The path is sampled at a
+fixed step from its start, a sixteenth of the smaller half-axis or of
+twice the feather, whichever is finer, the last part shorter than a
+step as one sample with that part's share, so the same recipe gives the
+same print on every machine and a path that grows keeps the samples it
+had; a moving stroke's dwell is then summed once on a grid of that step
+and read bilinearly, which is within a part of a percent of the sum
+where the edge is soft and softens a hard one by less than a sixteenth
+of the tip. The print evaluates the paper exactly at every pixel; the
+desktop reads it from tables of each pass's exposure, within a
+thousandth. The *card* is a straight edge pushed a distance
+$\ell$ along its normal: the paper beyond where it ends up had the
+light the whole time, the paper behind where it started none of it, and
+between them the edge's shadow averaged over the push, in closed form
+$w(s) = \frac{f}{\ell}\,[Q((\ell - s)/f) - Q(-s/f)]$ with $Q$ the
+antiderivative of $P$, $Q(\tau) = [\tau\arccos\tau - \sqrt{1 -
+\tau^2} + (1 - \tau^2)^{3/2}/3]/\pi$ on $(-1, 1)$, $\tau$ below and $0$
+above; a card held still ($\ell = 0$) is the edge's penumbra. The
+strokes are read through the same affine map as the pixels, so the
+fitted print, the desktop's 1:1 window, its preview and its histogram
+all show the same stroke. The base
 exposure is the pair that puts the grey card at $D = 0.67$ and the clip
 at $D = 0.10$, and a look (monotone PCHIP through points in $[0,1]^2$
 after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a

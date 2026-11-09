@@ -15,9 +15,10 @@
 //! The thumbnail thread and the folder counter live in `browser`.
 
 use crate::session::{
-    cover_detail, next_session_id, preview_planes, render_detail, render_preview, render_print_detail,
-    render_sharpen_loupe, DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams, HistCache,
-    PlateView, PreviewImage, RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
+    cover_detail, next_session_id, preview_planes, render_detail, render_detail_linear, render_preview,
+    render_print_detail, render_print_linear, render_sharpen_loupe, tone_tile, DetailAsk, DetailImage,
+    DetailRect, DetailTile, DevelopParams, HistCache, LinearTile, PlateView, PreviewImage, PreviewStages,
+    RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -29,8 +30,10 @@ use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateInfo, PlateSpace, PlateWeights};
 use mimizan_core::print::{self as pr, PrintParams, PrintSource};
-use mimizan_core::recipe::{Recipe, Sharpen};
+use mimizan_core::recipe::{CropRect, Recipe, Sharpen};
+use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -616,15 +619,20 @@ pub struct Preview {
     tx: Sender<PreviewRequest>,
     rx: Receiver<PreviewResult>,
     ctx: egui::Context,
+    /// The newest generation asked for. The worker reads it between its
+    /// stages and drops what no one wants any more.
+    latest: Arc<AtomicU64>,
 }
 
 impl Preview {
     pub fn spawn(ctx: egui::Context) -> Self {
-        let (tx, rx) = start_preview(&ctx);
-        Self { tx, rx, ctx }
+        let latest = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = start_preview(&ctx, Arc::clone(&latest));
+        Self { tx, rx, ctx, latest }
     }
 
     pub fn request(&mut self, r: PreviewRequest) {
+        self.latest.store(r.generation, Ordering::Relaxed);
         if let Err(std::sync::mpsc::SendError(r)) = self.tx.send(r) {
             self.restart();
             let _ = self.tx.send(r);
@@ -650,14 +658,15 @@ impl Preview {
 
     fn restart(&mut self) {
         tracing::error!("preview stopped; starting it again");
-        let (tx, rx) = start_preview(&self.ctx);
+        let (tx, rx) = start_preview(&self.ctx, Arc::clone(&self.latest));
         self.tx = tx;
         self.rx = rx;
     }
 }
 
 /// What the preview thread keeps between requests, so an unchanged view
-/// costs nothing and a pan reuses the overlap of the last detail tile.
+/// costs nothing, a view that changes only the tone pays only the tone,
+/// and a pan reuses the overlap of the last detail tile.
 #[derive(Default)]
 struct PreviewHold {
     last: Option<(u64, ViewParams)>,
@@ -665,11 +674,55 @@ struct PreviewHold {
     last_inspect: Option<Recipe>,
     held: Option<DetailTile>,
     held_print: bool,
+    /// The linear picture of the held tile, when it was rendered whole:
+    /// the next tone, placing or stroke re-tones it instead of rendering.
+    linear: Option<(LinearKey, LinearTile)>,
     hists: HistCache,
     tones: ToneHold,
+    stages: PreviewStages,
 }
 
-fn start_preview(ctx: &egui::Context) -> (Sender<PreviewRequest>, Receiver<PreviewResult>) {
+/// Everything the linear picture of a detail tile depends on: the picture,
+/// the ask, the geometry, the mix, and the print's fit when it is one —
+/// not the placing, the tone or the strokes.
+#[derive(Clone, PartialEq)]
+struct LinearKey {
+    session: u64,
+    ask: DetailAsk,
+    rotation: u8,
+    angle: f64,
+    crop: Option<CropRect>,
+    weights: Weights,
+    plate: Option<PlateWeights>,
+    /// The print's recipe with what the tone stage reads taken out.
+    print: Option<Recipe>,
+}
+
+impl LinearKey {
+    fn of(req: &PreviewRequest, ask: DetailAsk) -> Self {
+        let print = req.inspect.as_ref().map(|r| Recipe {
+            place: 0.0,
+            curve: Tone::default(),
+            burns: Vec::new(),
+            ..r.clone()
+        });
+        Self {
+            session: req.session.id,
+            ask,
+            rotation: req.view.rotation,
+            angle: req.view.angle,
+            crop: req.view.crop,
+            weights: req.view.weights,
+            plate: req.view.plate.map(|p| p.weights),
+            print,
+        }
+    }
+}
+
+fn start_preview(
+    ctx: &egui::Context,
+    latest: Arc<AtomicU64>,
+) -> (Sender<PreviewRequest>, Receiver<PreviewResult>) {
     let (tx, reqs) = channel::<PreviewRequest>();
     let (results, rx) = channel::<PreviewResult>();
     let ctx = ctx.clone();
@@ -683,27 +736,25 @@ fn start_preview(ctx: &egui::Context) -> (Sender<PreviewRequest>, Receiver<Previ
                 }
                 let generation = req.generation;
                 let started = Instant::now();
-                let outcome =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| paint_preview(&mut hold, req)));
-                let result = match outcome {
-                    Ok(image) => image,
-                    Err(payload) => {
-                        // The hold may be half updated. Drop it and start clean.
-                        hold = PreviewHold::default();
-                        Some(PreviewResult {
-                            generation,
-                            image: None,
-                            detail: None,
-                            ms: started.elapsed().as_millis(),
-                            failed: Some(format!("stopped: {}", panic_message(&payload))),
-                        })
-                    }
+                let stale = || latest.load(Ordering::Relaxed) != generation;
+                let send = |r: PreviewResult| {
+                    let _ = results.send(r);
+                    ctx.request_repaint();
                 };
-                let Some(r) = result else { continue };
-                if results.send(r).is_err() {
-                    break;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    paint_preview(&mut hold, req, &stale, &send)
+                }));
+                if let Err(payload) = outcome {
+                    // The hold may be half updated. Drop it and start clean.
+                    hold = PreviewHold::default();
+                    send(PreviewResult {
+                        generation,
+                        image: None,
+                        detail: None,
+                        ms: started.elapsed().as_millis(),
+                        failed: Some(format!("stopped: {}", panic_message(&payload))),
+                    });
                 }
-                ctx.request_repaint();
             }
         })
         .expect("spawn preview worker");
@@ -720,7 +771,15 @@ fn held_tile_stale(view_changed: bool, print_kind_changed: bool, inspect_changed
     view_changed || print_kind_changed || inspect_changed
 }
 
-fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewResult> {
+/// One request: the whole picture first, sent as soon as it is done, then
+/// the detail window, unless a newer request has arrived meanwhile
+/// (`stale`), which will ask for its own.
+fn paint_preview(
+    hold: &mut PreviewHold,
+    req: PreviewRequest,
+    stale: &dyn Fn() -> bool,
+    send: &dyn Fn(PreviewResult),
+) {
     let t = Instant::now();
     let key = (req.session.id, req.view.clone());
     let view_changed = hold.last.as_ref() != Some(&key);
@@ -730,48 +789,97 @@ fn paint_preview(hold: &mut PreviewHold, req: PreviewRequest) -> Option<PreviewR
         hold.held = None;
     }
     let table = hold.tones.get(&req.view.tone);
-    let image = view_changed.then(|| render_preview(&req.session, &req.view, &mut hold.hists, table));
-    let detail_due = req.detail.is_some()
-        && (view_changed || hold.last_detail != req.detail || hold.last_inspect != req.inspect);
-    let detail = if detail_due {
-        let ask = req.detail?;
-        let print = req.inspect.is_some();
-        if held_tile_stale(view_changed, print != hold.held_print, hold.last_inspect != req.inspect) {
-            hold.held = None;
-        }
-        hold.held_print = print;
+    // Under a stroke being painted with a sharp window up, the window
+    // covers what is seen: the small picture waits for the release (the
+    // view differs then, and it is rendered), the window follows the hand.
+    let window_covers = req.view.burn_live && req.detail.is_some() && !req.view.show_mask;
+    if view_changed && !window_covers {
+        let image = render_preview(&req.session, &req.view, &mut hold.hists, &mut hold.stages, table);
+        hold.last = Some(key);
+        send(PreviewResult {
+            generation: req.generation,
+            image: Some(image),
+            detail: None,
+            ms: t.elapsed().as_millis(),
+            failed: None,
+        });
+    }
+    let Some(ask) = req.detail else {
+        // No window asked for: what was held answers nothing now, so the
+        // next ask renders.
+        hold.last_detail = None;
+        hold.last_inspect = req.inspect;
+        return;
+    };
+    let detail_due = view_changed || hold.last_detail != req.detail || hold.last_inspect != req.inspect;
+    if !detail_due {
+        return;
+    }
+    if stale() {
+        // A newer request will ask for its own window; this one's is not
+        // rendered, and must not count as held.
+        hold.last_detail = None;
+        return;
+    }
+    let t = Instant::now();
+    let print = req.inspect.is_some();
+    if held_tile_stale(view_changed, print != hold.held_print, hold.last_inspect != req.inspect) {
+        hold.held = None;
+    }
+    hold.held_print = print;
+    let linear_key = LinearKey::of(&req, ask);
+    let same_linear = hold.linear.as_ref().is_some_and(|(k, _)| *k == linear_key);
+    let tile = if same_linear && !req.view.show_mask {
+        // Only the tone, the placing or the strokes changed: re-tone the
+        // held linear picture.
+        let (_, lin) = hold.linear.as_ref().unwrap();
+        let d = tone_tile(lin, &req.view, req.inspect.as_ref(), table);
+        DetailTile { ask: d.ask, gray: d.gray, rgb: d.rgb }
+    } else {
+        // Rendered whole, the linear picture is kept; a strip of a pan is
+        // not, and the next change renders whole once.
+        let mut linear: Option<LinearTile> = None;
         let tile = if let Some(recipe) = &req.inspect {
             let recipe = recipe.clone();
             cover_detail(hold.held.as_ref(), ask, |sub| {
                 let rect = DetailRect { x: sub.x, y: sub.y, w: sub.w, h: sub.h };
-                render_print_detail(&req.session, &req.view, &recipe, rect, table)
+                if req.view.show_mask {
+                    return render_print_detail(&req.session, &req.view, &recipe, rect, table);
+                }
+                let lin = render_print_linear(&req.session, &req.view, &recipe, rect)?;
+                let d = tone_tile(&lin, &req.view, Some(&recipe), table);
+                if sub == ask {
+                    linear = Some(lin);
+                }
+                Some(d)
             })
         } else {
-            let codes = (req.view.place == 0.0 && !req.view.show_mask)
-                .then(|| hold.hists.codes_for(&req.session, &req.view.weights));
             cover_detail(hold.held.as_ref(), ask, |sub| {
-                render_detail(&req.session, &req.view, sub, table, codes)
+                if req.view.show_mask {
+                    return render_detail(&req.session, &req.view, sub, table);
+                }
+                let lin = render_detail_linear(&req.session, &req.view, sub)?;
+                let d = tone_tile(&lin, &req.view, None, table);
+                if sub == ask {
+                    linear = Some(lin);
+                }
+                Some(d)
             })
         };
-        let image = DetailImage { ask: tile.ask, gray: tile.gray.clone(), rgb: tile.rgb.clone() };
-        hold.held = Some(tile);
-        Some(image)
-    } else {
-        None
+        hold.linear = linear.map(|l| (linear_key, l));
+        tile
     };
-    hold.last = Some(key);
+    let image = DetailImage { ask: tile.ask, gray: tile.gray.clone(), rgb: tile.rgb.clone() };
+    hold.held = Some(tile);
     hold.last_detail = req.detail;
     hold.last_inspect = req.inspect;
-    if image.is_none() && detail.is_none() {
-        return None;
-    }
-    Some(PreviewResult {
+    send(PreviewResult {
         generation: req.generation,
-        image,
-        detail,
+        image: None,
+        detail: Some(image),
         ms: t.elapsed().as_millis(),
         failed: None,
-    })
+    });
 }
 
 /// One 1:1 box of the print. Coalesced like the preview: a slider drag

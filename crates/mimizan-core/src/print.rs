@@ -1,11 +1,12 @@
 //! Negative -> print file: the one pass.
-//! Upright -> crop window -> size -> place -> curve -> black edge ->
+//! Upright -> straighten -> crop window -> size -> place -> [burns ->] curve -> black edge ->
 //! white border -> [Richardson–Lucy ->] USM -> peak on the picture ->
 //! one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
 //! print decision (viewing model constant, sidecar use).
 
+use crate::burn::{Field, Stroke};
 use crate::deconv::{richardson_lucy, DECONV_ITERATIONS};
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
@@ -849,6 +850,34 @@ pub fn loupe_source_rect(
     (x0 + ox, y0 + oy, x1 + ox, y1 + oy)
 }
 
+/// The recipe's burns as a function of the print's pixels: a `image_w ×
+/// image_h` picture read back through the window and the turn onto the
+/// upright `full_w × full_h` negative, then normalised. `None` without a
+/// burn. The same map the pixels take, so a burn sits on the grain it
+/// was drawn on at every size and every angle.
+pub fn burn_field(r: &Recipe, full_w: usize, full_h: usize, image_w: usize, image_h: usize) -> Option<Field> {
+    if r.burns.is_empty() || full_w == 0 || full_h == 0 || image_w == 0 || image_h == 0 {
+        return None;
+    }
+    let map = crate::straighten::print_map(full_w, full_h, r.angle, r.crop, image_w, image_h);
+    Field::new(&r.burns, crate::burn::normalize(full_w, full_h).after(&map))
+}
+
+/// One line for the log: how many, and each one's tool, stops and light.
+pub fn burn_text(burns: &[Stroke]) -> String {
+    let each: Vec<String> = burns
+        .iter()
+        .map(|b| {
+            let light = match b.light() {
+                crate::burn::Light::Both => String::new(),
+                l => format!(" {}", l.name()),
+            };
+            format!("{} {:+.2}{light}", b.name(), b.stops())
+        })
+        .collect();
+    format!("{} burn{}: {}", burns.len(), if burns.len() == 1 { "" } else { "s" }, each.join(", "))
+}
+
 /// Kernel the mask sidecar is resampled with. Its weights are positive and
 /// sum to one, so a saturated flag (exactly 1.0) stays exactly 1.0 when the
 /// picture is enlarged, and nothing overshoots into or out of the flag when
@@ -898,7 +927,9 @@ pub fn sharpen_window(
         let kernel =
             if turned { crate::straighten::kernel_for(&map, p.recipe.resample) } else { p.recipe.resample };
         let mut picture = resample(linear, kernel, pic)?;
-        crate::tone::render(&mut picture, p.recipe.place, &tone);
+        // The burns at the box's own print pixels, through the same map.
+        let field = burn_field(&p.recipe, full_w, full_h, g.image_w, g.image_h);
+        crate::tone::render_with(&mut picture, p.recipe.place, &tone, field.as_ref(), (g.pic_x, g.pic_y));
         let ox = g.pic_x + g.off_x - g.tile_x;
         let oy = g.pic_y + g.off_y - g.tile_y;
         for y in 0..g.pic_h {
@@ -1089,11 +1120,11 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     }
     let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
     let (tw, th) = (lay.image_w, lay.image_h);
+    let (uw, uh) = (plane.width, plane.height);
     if crate::straighten::turns(r.angle) {
         // The straighten, the crop and the size in one resampling: every
         // print pixel is read back through the window and the turn into
         // the upright negative, with the print's kernel.
-        let (uw, uh) = (plane.width, plane.height);
         let (fw, fh) = crate::straighten::frame_size(uw, uh, r.angle);
         let map = crate::straighten::print_map(uw, uh, r.angle, r.crop, tw, th);
         let kernel = crate::straighten::kernel_for(&map, r.resample);
@@ -1125,13 +1156,19 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     }
 
     // Placing and the tone in one pass: stops on the linear luminance,
-    // then paper or look.
+    // then paper or look. With burns, each print pixel is read back
+    // through the same map as the pixels onto the negative, where the
+    // shapes sit, and gets its own times.
     if r.place != 0.0 {
         info!("place {:+.2} stops", r.place);
     }
     let tone = r.curve.compile();
     info!("tone {}", r.curve.name());
-    crate::tone::render(&mut plane, r.place, &tone);
+    let field = burn_field(r, uw, uh, tw, th);
+    if field.is_some() {
+        info!("{}", burn_text(&r.burns));
+    }
+    crate::tone::render_with(&mut plane, r.place, &tone, field.as_ref(), (0, 0));
 
     let px_mm = |px: usize| px as f64 * 25.4 / r.dpi;
     if lay.black_px > 0 {
@@ -2150,6 +2187,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A burn is drawn on the negative. Whatever the window, the turn and
+    /// the size, the print's dark spot lands where that point of the
+    /// negative lands; and the print box shows the same pixels as the
+    /// full print.
+    #[test]
+    fn a_burn_sits_on_the_negative_through_every_map() {
+        use crate::burn::{Light, Tip};
+        let (w, h) = (60, 40);
+        let plane = Plane::from_vec(w, h, vec![0.3; w * h]);
+        // The unit is 60: centre (0.25, 0) is the upright point (45, 20), six pixels wide.
+        let burn = Stroke::Hand {
+            tip: Tip { rx: 0.1, ry: 0.1, angle: 0.0, feather: 0.02 },
+            stops: 1.5,
+            light: Light::Both,
+            points: vec![[0.25, 0.0]],
+        };
+        fn source(p: &Plane) -> PrintSource<'_> {
+            PrintSource { plane: p, mask: None, orientation: 1, name: "t".into(), description: None }
+        }
+        let centroid = |out: &Plane, plain: f64| -> (f64, f64) {
+            let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);
+            for y in 0..out.height {
+                for x in 0..out.width {
+                    let d = plain - out.at(x, y);
+                    if d > 1e-6 {
+                        sx += d * (x as f64 + 0.5);
+                        sy += d * (y as f64 + 0.5);
+                        n += d;
+                    }
+                }
+            }
+            (sx / n, sy / n)
+        };
+        let plain = Recipe::on_paper().curve.compile().eval(0.3);
+        // 1:1, no window: the spot is at (45, 20).
+        let flat = Recipe { burns: vec![burn.clone()], ..Recipe::on_paper() };
+        let out =
+            render_planes(&source(&plane), &PrintParams { recipe: flat.clone(), ..PrintParams::default() });
+        assert_eq!((out.plane.width, out.plane.height), (w, h));
+        let (cx, cy) = centroid(&out.plane, plain);
+        assert!((cx - 45.0).abs() < 0.05 && (cy - 20.0).abs() < 0.05, "{cx},{cy}");
+        assert_eq!(out.plane.at(5, 20), plain, "far from the hole nothing changes");
+        assert!(out.plane.at(45, 20) < plain - 0.05, "inside it the print is darker");
+        // The untouched recipe is untouched: no burns, the same bits as before.
+        let before = render_planes(&source(&plane), &PrintParams::default());
+        let none = render_planes(
+            &source(&plane),
+            &PrintParams { recipe: Recipe { burns: vec![], ..Recipe::default() }, ..PrintParams::default() },
+        );
+        assert_eq!(before.plane.data, none.plane.data);
+        // A window from (30, 10): the spot is at (15, 10) of the print.
+        let cropped = Recipe { crop: Some(CropRect { x: 30, y: 10, w: 30, h: 20 }), ..flat.clone() };
+        let out = render_planes(&source(&plane), &PrintParams { recipe: cropped, ..PrintParams::default() });
+        let (cx, cy) = centroid(&out.plane, plain);
+        assert!((cx - 15.0).abs() < 0.05 && (cy - 10.0).abs() < 0.05, "{cx},{cy}");
+        // A turn and an enlargement: the spot, mapped back through the
+        // print's map, is still that point of the negative.
+        let turned = Recipe {
+            angle: 7.0,
+            size: Some(PrintSize::Physical { width_in: 1.2, height_in: 0.8 }),
+            dpi: 100.0,
+            ..flat.clone()
+        };
+        let params = PrintParams { recipe: turned.clone(), ..PrintParams::default() };
+        let out = render_planes(&source(&plane), &params);
+        let lay = layout(w, h, 1, &params);
+        let map = crate::straighten::print_map(w, h, 7.0, None, lay.image_w, lay.image_h);
+        let (cx, cy) = centroid(&out.plane, plain);
+        let (ux, uy) = map.apply(cx, cy);
+        assert!((ux - 45.0).abs() < 0.3 && (uy - 20.0).abs() < 0.3, "{ux},{uy}");
+        // The print box of that turned, enlarged, burned print is the print.
+        for (nx, ny) in [(0.5, 0.5), (0.75, 0.5), (0.1, 0.9)] {
+            let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 15);
+            assert!(ex > sx && ey > sy);
+            let mut lc = Plane::zeros(ex - sx, ey - sy);
+            for y in 0..lc.height {
+                for x in 0..lc.width {
+                    lc.set(x, y, plane.at(sx + x, sy + y));
+                }
+            }
+            let got = sharpen_window(
+                PlaneWindow { plane: &lc, origin_x: sx, origin_y: sy, full_w: w, full_h: h },
+                None,
+                &params,
+                nx,
+                ny,
+                15,
+            )
+            .expect("loupe window");
+            let g = loupe_geom(
+                &lay,
+                params.recipe.sharpen,
+                nx,
+                ny,
+                15,
+                peak_halo_px(&params.recipe, lay.enlargement),
+            );
+            for y in 0..got.height {
+                for x in 0..got.width {
+                    let expect = out.plane.at(g.view_x + x, g.view_y + y);
+                    assert_eq!(got.at(x, y).to_bits(), expect.to_bits(), "at {nx},{ny} +{x},{y}");
+                }
+            }
+        }
+        assert_eq!(burn_text(&flat.burns), "1 burn: hand +1.50");
+        let soft = Stroke::Card {
+            x: 0.0,
+            y: 0.0,
+            angle: 0.0,
+            travel: 0.0,
+            feather: 0.0,
+            stops: -0.5,
+            light: Light::Soft,
+        };
+        assert_eq!(burn_text(&[burn, soft]), "2 burns: hand +1.50, card -0.50 soft");
     }
 
     /// Size, dpi and a kernel narrower than Lanczos-3 must not read outside

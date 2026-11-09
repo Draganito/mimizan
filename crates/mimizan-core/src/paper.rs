@@ -147,6 +147,19 @@ enum Component {
     Soft { mu: f64, h_speed: f64, toe: f64 },
 }
 
+/// Where the toe's quadratic turns: below this `u` it would rise again.
+/// A toe that keeps falling (`toe ≤ 0`) has no such point. Exposures
+/// that far under the stroke (some forty stops) only come from a dodge
+/// that takes nearly all the time away; the toe is held at its lowest
+/// there, so the curve stays monotone down to no light at all.
+fn toe_floor(toe: f64) -> f64 {
+    if toe > 0.0 {
+        -soft_cubic_dz(SOFT_H1) / (2.0 * toe)
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
 impl Component {
     #[inline]
     fn fraction(&self, log_e: f64) -> f64 {
@@ -155,7 +168,7 @@ impl Component {
             Component::Soft { mu, h_speed, toe } => {
                 let h = h_speed + 2.0 * (log_e - mu);
                 let z = if h < SOFT_H1 {
-                    let u = h - SOFT_H1;
+                    let u = (h - SOFT_H1).max(toe_floor(toe));
                     soft_cubic_z(SOFT_H1) + soft_cubic_dz(SOFT_H1) * u + toe * u * u
                 } else if h > SOFT_H2 {
                     soft_cubic_z(SOFT_H2) + soft_cubic_dz(SOFT_H2) * (h - SOFT_H2)
@@ -243,6 +256,29 @@ impl Paper {
         1.0 - (1.0 - a) * (1.0 - b)
     }
 
+    /// [`Self::fraction_at`] with each pass's time multiplied by a factor:
+    /// the dodge or burn at this point. A factor of 1 is `fraction_at` to
+    /// the bit. A factor of 0 is a pass that never happened: no silver from
+    /// it, even under a clear negative.
+    #[inline]
+    fn fraction_timed(&self, l: f64, soft: f64, hard: f64, soft_time: f64, hard_time: f64) -> f64 {
+        if soft_time == 1.0 && hard_time == 1.0 {
+            return self.fraction_at(l, soft, hard);
+        }
+        let pass = |c: &Component, t: f64, time: f64| -> f64 {
+            if time <= 0.0 {
+                0.0
+            } else if l <= 0.0 {
+                1.0
+            } else {
+                c.fraction(log_exposure(l.min(1.0), t + time.log2()))
+            }
+        };
+        let a = pass(&self.soft, soft, soft_time);
+        let b = pass(&self.hard, hard, hard_time);
+        1.0 - (1.0 - a) * (1.0 - b)
+    }
+
     /// Encoded print value of a density fraction: reflectance relative to the
     /// base, the paper's black taken to 0, gamma 1/2.2.
     #[inline]
@@ -317,6 +353,17 @@ impl PaperCurve {
     #[inline]
     pub fn eval(&self, l: f64) -> f64 {
         self.paper.encode(self.paper.fraction_at(l, self.soft, self.hard))
+    }
+
+    /// Print value of scene value `l` where the soft pass lasted
+    /// `soft_time` times its time and the hard pass `hard_time` times its
+    /// own: the dodge or the burn at one point (`burn.rs`). Both 1 is
+    /// [`Self::eval`] to the bit. Time, not scene: a clipped highlight
+    /// dodged goes towards paper white, where a placing would hold it at
+    /// the clip.
+    #[inline]
+    pub fn eval_timed(&self, l: f64, soft_time: f64, hard_time: f64) -> f64 {
+        self.paper.encode(self.paper.fraction_timed(l, self.soft, self.hard, soft_time, hard_time))
     }
 
     /// Unexposed paper: what the border is made of. (A scene value of 0 is
@@ -410,6 +457,180 @@ impl PaperCurve {
     }
 }
 
+/// Entries of each pass's table in [`PaperTable`].
+const PASS_TABLE: usize = 8192;
+/// Stops either side of the pass's time the table covers.
+const PASS_SPAN: f64 = 40.0;
+/// Entries of the density-to-print table.
+const ENCODE_TABLE: usize = 16384;
+
+/// A [`PaperCurve`] tabulated for the screen: each pass's fraction is a
+/// function of one number, the stops of exposure it saw
+/// (`time + log₂ T − γₙ log₂ l`), so two tables of that and one of the
+/// encoding stand for the whole of [`PaperCurve::eval_timed`], read with
+/// linear interpolation, within a part in a thousand. The print keeps the
+/// exact evaluation.
+#[derive(Clone, Debug)]
+pub struct PaperTable {
+    soft: Vec<f32>,
+    hard: Vec<f32>,
+    encode: Vec<f32>,
+    /// `γₙ log₂ l` over the square root of `l` in 65536 steps: the
+    /// shadows a 16-bit code would lump together are told apart.
+    scene: Vec<f32>,
+    /// Entries per stop of exposure.
+    per_stop: f64,
+    white: f64,
+}
+
+/// Entries of the scene table: 16-bit steps of `√l`.
+const SCENE_TABLE: usize = 65536;
+
+impl PaperTable {
+    pub fn new(curve: &PaperCurve) -> Self {
+        let per_stop = (PASS_TABLE - 1) as f64 / (2.0 * PASS_SPAN);
+        // Entry `i` is the pass at `time + i / per_stop − PASS_SPAN` stops.
+        let pass = |c: &Component, t: f64| -> Vec<f32> {
+            (0..PASS_TABLE)
+                .map(|i| c.fraction(LOG10_2 * (t - PASS_SPAN + i as f64 / per_stop)) as f32)
+                .collect()
+        };
+        let soft = pass(&curve.paper.soft, curve.soft);
+        let hard = pass(&curve.paper.hard, curve.hard);
+        let encode = (0..ENCODE_TABLE)
+            .map(|i| curve.paper.encode(i as f64 / (ENCODE_TABLE - 1) as f64) as f32)
+            .collect();
+        let scene = (0..SCENE_TABLE)
+            .map(|i| (2.0 * NEGATIVE_GAMMA * (i.max(1) as f64 / (SCENE_TABLE - 1) as f64).log2()) as f32)
+            .collect();
+        Self { soft, hard, encode, scene, per_stop, white: curve.white() }
+    }
+
+    #[inline]
+    fn read(table: &[f32], f: f64) -> f64 {
+        if f <= 0.0 {
+            return f64::from(table[0]);
+        }
+        let last = table.len() - 1;
+        if f >= last as f64 {
+            return f64::from(table[last]);
+        }
+        let i = f as usize;
+        let t = f - i as f64;
+        f64::from(table[i]) * (1.0 - t) + f64::from(table[i + 1]) * t
+    }
+
+    /// [`PaperCurve::eval_timed`] from the tables.
+    #[inline]
+    pub fn eval_timed(&self, l: f64, soft_time: f64, hard_time: f64) -> f64 {
+        self.eval_logged(l, log2_time(soft_time), log2_time(hard_time))
+    }
+
+    /// `eval_timed` with the times given as their logarithms to base 2,
+    /// `−∞` for a pass that did not run: a field's times repeat from
+    /// pixel to pixel, their logarithms are taken once.
+    #[inline]
+    pub fn eval_logged(&self, l: f64, soft_log2: f64, hard_log2: f64) -> f64 {
+        if l <= 0.0 {
+            // A clear negative: the paper's black from any pass that ran.
+            return if soft_log2 == f64::NEG_INFINITY && hard_log2 == f64::NEG_INFINITY {
+                self.white
+            } else {
+                self.encode_fraction(1.0)
+            };
+        }
+        // The scene table is over √l; below its first step is below any
+        // paper's toe.
+        let code = (l.min(1.0).sqrt() * (SCENE_TABLE - 1) as f64 + 0.5) as usize;
+        let scene = f64::from(self.scene[code.clamp(1, SCENE_TABLE - 1)]);
+        let pass = |table: &[f32], log_time: f64| -> f64 {
+            if log_time == f64::NEG_INFINITY {
+                0.0
+            } else {
+                Self::read(table, (log_time - scene + PASS_SPAN) * self.per_stop)
+            }
+        };
+        let a = pass(&self.soft, soft_log2);
+        let b = pass(&self.hard, hard_log2);
+        self.encode_fraction(1.0 - (1.0 - a) * (1.0 - b))
+    }
+
+    #[inline]
+    fn encode_fraction(&self, f: f64) -> f64 {
+        Self::read(&self.encode, f.clamp(0.0, 1.0) * (ENCODE_TABLE - 1) as f64)
+    }
+}
+
+/// A function of a time factor tabulated for the screen: fine from 0 to 2
+/// (a 32768th apart), coarser from 2 to 64 (a 1024th), the function
+/// itself below a 128th and from 64. A field's times, 1 plus the weights
+/// times the gains, fall in the fine range unless a burn passes six stops.
+struct TimeTable {
+    fine: Vec<f32>,
+    coarse: Vec<f32>,
+    f: fn(f64) -> f64,
+}
+
+const TIME_FINE_PER: f64 = 32768.0;
+const TIME_FINE_TO: f64 = 2.0;
+const TIME_COARSE_PER: f64 = 1024.0;
+const TIME_COARSE_TO: f64 = 64.0;
+const TIME_FROM: f64 = 1.0 / 128.0;
+
+impl TimeTable {
+    fn new(f: fn(f64) -> f64) -> Self {
+        let fine = (0..=(TIME_FINE_TO * TIME_FINE_PER) as usize)
+            .map(|i| {
+                let t = i as f64 / TIME_FINE_PER;
+                if t < TIME_FROM {
+                    0.0
+                } else {
+                    f(t) as f32
+                }
+            })
+            .collect();
+        let coarse = (0..=((TIME_COARSE_TO - TIME_FINE_TO) * TIME_COARSE_PER) as usize)
+            .map(|i| f(TIME_FINE_TO + i as f64 / TIME_COARSE_PER) as f32)
+            .collect();
+        Self { fine, coarse, f }
+    }
+
+    #[inline]
+    fn at(&self, t: f64) -> f64 {
+        if t < TIME_FROM || t >= TIME_COARSE_TO || t.is_nan() {
+            return (self.f)(t);
+        }
+        if t < TIME_FINE_TO {
+            PaperTable::read(&self.fine, t * TIME_FINE_PER)
+        } else {
+            PaperTable::read(&self.coarse, (t - TIME_FINE_TO) * TIME_COARSE_PER)
+        }
+    }
+}
+
+static SCENE_FACTOR: LazyLock<TimeTable> =
+    LazyLock::new(|| TimeTable::new(|t| t.powf(-1.0 / NEGATIVE_GAMMA)));
+static LOG2_TIME: LazyLock<TimeTable> = LazyLock::new(|| TimeTable::new(f64::log2));
+
+/// [`ToneMap::scene_factor`](crate::tone::ToneMap::scene_factor) of paper
+/// under `time > 0` on both passes, `time^(−1/γₙ)`, from a table: within
+/// a part in 10⁵ of the power, in a tenth of its time.
+#[inline]
+pub fn scene_factor(time: f64) -> f64 {
+    SCENE_FACTOR.at(time)
+}
+
+/// `log₂ time` from a table, `−∞` for a pass that did not run: what
+/// [`PaperTable::eval_logged`] takes. Within 10⁻⁵ of the logarithm.
+#[inline]
+pub fn log2_time(time: f64) -> f64 {
+    if time <= 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        LOG2_TIME.at(time)
+    }
+}
+
 /// A grade as the darkroom writes it: 00, 0, ½, 1 … 5.
 pub fn grade_label(g: f64) -> String {
     if g < -0.75 {
@@ -429,6 +650,52 @@ mod tests {
 
     fn tone(soft: f64, hard: f64, l: f64) -> f64 {
         SplitGrade::new(soft, hard).curve().eval(l)
+    }
+
+    /// The tables read the exact paper to under a thousandth of the print
+    /// range at every time a stroke can give, and the ends exactly.
+    #[test]
+    fn the_table_reads_the_paper() {
+        for (soft, hard) in [(0.0, 0.0), (1.5, -2.0), (-3.0, 3.5), (4.0, 4.0)] {
+            let curve = SplitGrade::new(soft, hard).curve();
+            let table = PaperTable::new(&curve);
+            let mut worst = 0.0f64;
+            for i in 0..=400 {
+                let l = if i == 0 { 0.0 } else { 2f64.powf(-16.0 + 16.0 * i as f64 / 400.0) };
+                for (ts, th) in [
+                    (1.0, 1.0),
+                    (0.0, 1.0),
+                    (1.0, 0.0),
+                    (0.0, 0.0),
+                    (0.37, 2.9),
+                    (16.0, 1.0),
+                    (1.0, 0.01),
+                    (3841.0, 3841.0),
+                ] {
+                    let exact = curve.eval_timed(l, ts, th);
+                    let fast = table.eval_timed(l, ts, th);
+                    worst = worst.max((exact - fast).abs());
+                    assert!((exact - fast).abs() < 2e-3, "l {l} times {ts} {th}: {exact} vs {fast}");
+                }
+            }
+            assert!(worst < 1.5e-3, "{worst}");
+            // No pass at all: unexposed paper. A clear negative under a pass: black.
+            assert_eq!(table.eval_timed(0.5, 0.0, 0.0), curve.white());
+            assert_eq!(table.eval_timed(0.0, 1.0, 1.0), curve.eval(0.0));
+        }
+    }
+
+    /// The time tables are as close as they claim, over the times a field
+    /// produces and past the tables' ends.
+    #[test]
+    fn the_time_tables_keep_their_word() {
+        for i in 0..40_000 {
+            let t = 2f64.powf(-9.0 + 18.0 * i as f64 / 40_000.0);
+            let exact = t.powf(-1.0 / NEGATIVE_GAMMA);
+            assert!((scene_factor(t) / exact - 1.0).abs() < 1e-5, "factor at {t}");
+            assert!((log2_time(t) - t.log2()).abs() < 1e-5, "log at {t}");
+        }
+        assert_eq!(log2_time(0.0), f64::NEG_INFINITY);
     }
 
     /// The constants come out as designed: each component alone has its ISO
@@ -524,6 +791,67 @@ mod tests {
         assert_eq!(grade_label(0.3), "½");
         assert_eq!(grade_label(-0.2), "0");
         assert_eq!(grade_label(4.8), "5");
+    }
+
+    /// A dodge or a burn is time. Unit times are the plain curve to the
+    /// bit; the same factor on both passes is a shift of both times; one
+    /// pass alone moves its own end of the scale; no time at all is white,
+    /// even under a clear negative; and a clipped highlight dodged goes
+    /// whiter than the clip, which a placing could not do.
+    #[test]
+    fn time_is_local_exposure() {
+        let c = SplitGrade::new(0.3, -0.2).curve();
+        for &l in &[0.0, 0.004, 0.05, 0.18, 0.6, 1.0, 1.4] {
+            assert_eq!(c.eval_timed(l, 1.0, 1.0).to_bits(), c.eval(l).to_bits(), "{l}");
+        }
+        // Twice the time on both passes is +1 stop on both.
+        let up = SplitGrade::new(1.3, 0.8).curve();
+        for &l in &[0.01, 0.18, 0.6, 0.95] {
+            assert!((c.eval_timed(l, 2.0, 2.0) - up.eval(l)).abs() < 1e-12, "{l}");
+        }
+        // More soft light darkens the highlights and hardly the shadows;
+        // more hard light does the opposite.
+        let (zone_iii, zone_vii) = (GREY / 4.0, GREY * 4.0);
+        let d_soft = (
+            c.eval(zone_vii) - c.eval_timed(zone_vii, 2.0, 1.0),
+            c.eval(zone_iii) - c.eval_timed(zone_iii, 2.0, 1.0),
+        );
+        assert!(d_soft.0 > 4.0 * d_soft.1, "soft: {d_soft:?}");
+        let d_hard = (
+            c.eval(zone_vii) - c.eval_timed(zone_vii, 1.0, 2.0),
+            c.eval(zone_iii) - c.eval_timed(zone_iii, 1.0, 2.0),
+        );
+        assert!(d_hard.1 > d_hard.0, "hard: {d_hard:?}");
+        // No time: unexposed paper, whatever the negative.
+        assert_eq!(c.eval_timed(0.18, 0.0, 0.0), 1.0);
+        assert_eq!(c.eval_timed(0.0, 0.0, 0.0), 1.0);
+        // Half the time on both: lighter everywhere, still a print.
+        assert!(c.eval_timed(0.18, 0.5, 0.5) > c.eval(0.18));
+        assert!(
+            c.eval_timed(0.0, 0.5, 0.5) < 0.1,
+            "a clear negative under half the time is still near black"
+        );
+        // A clipped highlight (scene 1, Zone VIII at the base) dodged by a
+        // stop prints whiter than the clip; placed by a stop it stays there.
+        let base = SplitGrade::default().curve();
+        assert!(base.eval_timed(1.0, 0.5, 0.5) > base.eval(1.0) + 0.01);
+        assert_eq!(base.eval(2.0), base.eval(1.0));
+        // Monotone in the time factor, down to the faintest time.
+        let mut last = 0.0;
+        for i in 0..=400 {
+            let t = 2f64.powf(-40.0 + i as f64 * 0.1);
+            let v = c.eval_timed(0.3, t, t);
+            assert!(v <= last + 1e-12 || i == 0, "time {t}: {v} after {last}");
+            last = v;
+        }
+        assert!((last - c.eval(0.3)).abs() < 1e-9);
+        // The fitted toe opens downward, so it keeps falling to no light at
+        // all and needs no floor; a toe that turned would be held far below
+        // the stroke. Either way nothing within forty stops is touched.
+        let Component::Soft { toe, .. } = paper().soft else { panic!("soft") };
+        assert!(toe_floor(toe) < -20.0, "toe {toe}, floor {}", toe_floor(toe));
+        assert_eq!(toe_floor(0.01), -soft_cubic_dz(SOFT_H1) / 0.02);
+        assert!(toe_floor(0.01) < -20.0);
     }
 
     #[test]
