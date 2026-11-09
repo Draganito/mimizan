@@ -1909,10 +1909,14 @@ pub fn render_preview(s: &Session, v: &ViewParams, cache: &mut HistCache, table:
     }
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.histograms(s, v, table);
-    // Turn, straighten, then cut the window, on the small planes.
+    // Turn, straighten, then cut the window, on the small planes. The fit
+    // copy is drawn with Catmull-Rom whatever the recipe says: it shows
+    // the geometry, and the recipe's kernel is seen where it matters, in
+    // the 1:1 tiles and the print box. The default B-spline would soften
+    // a copy that is already small.
     let shown = |plane: Plane| -> Plane {
         let turned = orient(&plane, rotated(1, v.rotation));
-        let turned = straighten::straighten(&turned, v.angle, v.kernel);
+        let turned = straighten::straighten(&turned, v.angle, ResampleKernel::CatmullRom);
         match v.crop {
             Some(c) => {
                 let (fw, fh) = s.frame_size(v.angle);

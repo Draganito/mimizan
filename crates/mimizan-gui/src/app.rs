@@ -651,6 +651,8 @@ pub struct App {
     straighten_on: bool,
     /// The line being drawn, in screen points.
     line_drag: Option<[Pos2; 2]>,
+    /// The Print window's content ran past its edge, and the log has it.
+    print_overflow_logged: bool,
 
     dialog: FileDialog,
     /// The folder the Mac sandbox is allowed to read. Held for the whole
@@ -816,6 +818,7 @@ impl App {
             angle_draft: 0.0,
             straighten_on: false,
             line_drag: None,
+            print_overflow_logged: false,
             // A launch from the Store has its working directory in System32.
             // The save dialog always opens on the directory set for this export.
             export_kind: ExportKind::Print,
@@ -1424,7 +1427,9 @@ impl App {
 
     /// The print box's layout: the whole negative while the easel is up.
     fn loupe_layout(&self) -> Option<mimizan_core::print::Layout> {
-        let (w, h) = self.export_size();
+        // `layout` takes the whole negative and applies the recipe's
+        // straighten itself; the frame is not handed in twice.
+        let (w, h) = self.export_size_at(0.0);
         if w == 0 || h == 0 {
             return None;
         }
@@ -1434,7 +1439,8 @@ impl App {
 
     /// Output size of the print TIFF (after size step and border).
     fn print_layout(&self) -> Option<mimizan_core::print::Layout> {
-        let (w, h) = self.export_size_at(self.edit.recipe.angle);
+        // The whole negative: `layout` applies the straighten and the crop.
+        let (w, h) = self.export_size_at(0.0);
         if w == 0 || h == 0 {
             return None;
         }
@@ -3566,7 +3572,15 @@ impl App {
 
     /// Right window, step 3: the print and its export.
     fn print_panel(&mut self, ui: &mut egui::Ui) {
-        self.print_section(ui);
+        // The window's width, taken once. egui widens a ui to hold a row
+        // that runs past it, and every later row would then be laid out
+        // against that wider edge: a right-aligned control walks out of the
+        // window, a full-width button grows past it. Rows that reach the
+        // right edge are measured against this width instead, and a row
+        // that still runs past it is reported, once, in the log.
+        let width = ui.available_width();
+        let left = ui.max_rect().left();
+        self.print_section(ui, width);
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(6.0);
@@ -3578,8 +3592,7 @@ impl App {
         if ui
             .add_enabled(
                 idle && has,
-                egui::Button::new(RichText::new("Export…").strong())
-                    .min_size(Vec2::new(ui.available_width(), 30.0)),
+                egui::Button::new(RichText::new("Export…").strong()).min_size(Vec2::new(width, 30.0)),
             )
             .on_disabled_hover_text(hover.clone())
             .on_hover_text(hover)
@@ -3591,10 +3604,7 @@ impl App {
         ui.add_space(4.0);
         let hover = self.linear_hover_text();
         if ui
-            .add_enabled(
-                idle && has,
-                egui::Button::new("Negative…").min_size(Vec2::new(ui.available_width(), 24.0)),
-            )
+            .add_enabled(idle && has, egui::Button::new("Negative…").min_size(Vec2::new(width, 24.0)))
             .on_disabled_hover_text(hover.clone())
             .on_hover_text(hover)
             .clicked()
@@ -3611,6 +3621,11 @@ impl App {
                 .color(ui.visuals().warn_fg_color),
             );
         }
+        let over = ui.min_rect().right() - (left + width);
+        if over > 0.5 && !self.print_overflow_logged {
+            self.print_overflow_logged = true;
+            self.log(format!("the Print window's content runs {over:.0} pt past its right edge"));
+        }
     }
 
     /// The phone's sharpening mode stays off on the desktop. Peak is a
@@ -3625,10 +3640,11 @@ impl App {
     /// The print: size, resolution, border and resampling. The phone's
     /// sharpening mode stays off. Peak, below the tile, is the desktop
     /// high-pass. The 1:1 box is the print pixels.
-    fn print_section(&mut self, ui: &mut egui::Ui) {
+    fn print_section(&mut self, ui: &mut egui::Ui, width: f32) {
         // The file the export writes, first: it is the process's. The
         // format is the program's: the same sheet, 16-bit TIFF or 8-bit
-        // JPEG, remembered across files.
+        // JPEG, remembered across files. The row has to fit the window
+        // with "Adobe RGB" in the box, so the bits are in the hover texts.
         let format_changed = ui
             .horizontal(|ui| {
                 print_field_label(ui, "file");
@@ -3649,15 +3665,15 @@ impl App {
                         .changed();
                 }
                 let bits = match self.format {
-                    ExportFormat::Tiff => "16-bit",
-                    ExportFormat::Jpeg => "8-bit",
+                    ExportFormat::Tiff => "16 bit",
+                    ExportFormat::Jpeg => "8 bit",
                 };
                 match self.edit.plate {
                     Some(mut params) => {
-                        ui.label(RichText::new(format!("{bits} RGB ·")).weak()).on_hover_text(
-                            "The three positives as the channels of one RGB file, with a matrix/TRC profile \
-                             of the primaries beside and the paper's gamma 2.2.",
-                        );
+                        ui.label(RichText::new("RGB ·").weak()).on_hover_text(format!(
+                            "The three positives as the channels of one {bits} RGB file, with a matrix/TRC \
+                             profile of the primaries beside and the paper's gamma 2.2."
+                        ));
                         // The primaries the plates are projected through: the file's profile.
                         egui::ComboBox::from_id_salt("plate-space")
                         .selected_text(space_name(params.space))
@@ -3679,8 +3695,9 @@ impl App {
                         }
                     }
                     None => {
-                        ui.label(RichText::new(format!("{bits} grey · gamma 2.2")).weak())
-                            .on_hover_text("The sheet as one grey channel with a gamma 2.2 profile.");
+                        ui.label(RichText::new("grey · gamma 2.2").weak()).on_hover_text(format!(
+                            "The sheet as one {bits} grey channel with a gamma 2.2 profile."
+                        ));
                     }
                 }
                 changed
@@ -3698,25 +3715,29 @@ impl App {
         // the file is still that.
         let has_file = self.session.is_some();
         let one_to_one_now = self.is_one_to_one();
+        let row_h = ui.spacing().interact_size.y;
         let (one_to_one, ruler_changed) = ui
-            .horizontal(|ui| {
-                print_field_label(ui, "size");
-                let one = ui
-                    .add_enabled(has_file, egui::Button::selectable(one_to_one_now, "1:1"))
-                    .on_hover_text(
-                        "The sheet is the picture's pixels: no border, no black edge, no scaling. \
+            .allocate_ui_with_layout(
+                Vec2::new(width, row_h),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    print_field_label(ui, "size");
+                    let one = ui
+                        .add_enabled(has_file, egui::Button::selectable(one_to_one_now, "1:1"))
+                        .on_hover_text(
+                            "The sheet is the picture's pixels: no border, no black edge, no scaling. \
                          The start; the sheet typed from here stands, and rings, crop and dpi \
                          fit the picture inside it.",
-                    )
-                    .clicked();
-                // The ruler, at the right of the same row: the unit every
-                // length below is shown and typed in. The recipe keeps inches
-                // and millimetres whichever is chosen.
-                let ruler_changed = ui
-                    .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut changed = false;
-                        for r in Ruler::ALL.iter().rev() {
-                            let response = ui
+                        )
+                        .clicked();
+                    // The ruler, at the right of the same row: the unit every
+                    // length below is shown and typed in. The recipe keeps inches
+                    // and millimetres whichever is chosen.
+                    let ruler_changed = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let mut changed = false;
+                            for r in Ruler::ALL.iter().rev() {
+                                let response = ui
                                 .selectable_value(&mut self.ruler, *r, r.name())
                                 .on_hover_text(match r {
                                 Ruler::Metric => {
@@ -3725,13 +3746,14 @@ impl App {
                                 Ruler::Imperial => "Inches",
                                 Ruler::Pixels => "Pixels of the file, at the dpi below",
                             });
-                            changed |= response.changed();
-                        }
-                        changed
-                    })
-                    .inner;
-                (one, ruler_changed)
-            })
+                                changed |= response.changed();
+                            }
+                            changed
+                        })
+                        .inner;
+                    (one, ruler_changed)
+                },
+            )
             .inner;
         if ruler_changed {
             // The ruler is a setting of the program, not of the recipe: it
@@ -3884,7 +3906,8 @@ impl App {
     /// Bytes the export holds at its widest, from the same layout the
     /// panel shows. Absent until a file is open.
     fn export_memory(&self) -> Option<u64> {
-        let (w, h) = self.export_size_at(self.edit.recipe.angle);
+        // The whole negative; the estimate applies the straighten itself.
+        let (w, h) = self.export_size_at(0.0);
         if w == 0 || h == 0 {
             return None;
         }
