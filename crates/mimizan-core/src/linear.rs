@@ -32,7 +32,7 @@ use crate::decode::RawFrame;
 use crate::error::{Error, Result};
 use crate::icc::GrayTrc;
 use crate::plane::Plane;
-use crate::print::{orient, window_plane, MASK_KERNEL};
+use crate::print::{orient, sidecar_path, window_plane, MASK_KERNEL};
 use crate::recipe::CropRect;
 use crate::resize::ResampleKernel;
 use crate::straighten::STRAIGHTEN_KERNEL;
@@ -216,7 +216,7 @@ pub fn write_negative(
         let fm = framed(m, framing, MASK_KERNEL);
         let bytes: Vec<u8> = fm.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
         write_gray8(
-            &mask_sidecar(path),
+            &sidecar_path(path),
             fm.width,
             fm.height,
             &bytes,
@@ -224,12 +224,6 @@ pub fn write_negative(
         )?;
     }
     Ok(Written { width: out.width, height: out.height })
-}
-
-/// `<stem>.mask.tif` next to `out`.
-pub fn mask_sidecar(out: &Path) -> std::path::PathBuf {
-    let stem = out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    out.with_file_name(format!("{stem}.mask.tif"))
 }
 
 /// The plate as a linear DNG. `balanced` are the three channel planes of
@@ -513,7 +507,7 @@ mod tests {
         for (a, b) in read.plane.data.iter().zip(&want.data) {
             assert!((a - b).abs() < 1.0 / 65535.0, "{a} vs {b}");
         }
-        let (mw, mh, bytes) = crate::tiffin::read_mask8(&mask_sidecar(&path)).unwrap();
+        let (mw, mh, bytes) = crate::tiffin::read_mask8(&sidecar_path(&path)).unwrap();
         assert_eq!((mw, mh), (3, 4));
         let wm = framed(&mask, &framing, MASK_KERNEL);
         for (a, b) in bytes.iter().zip(&wm.data) {
@@ -540,7 +534,7 @@ mod tests {
         for v in &read.plane.data {
             assert!((v - 0.25).abs() < 1.0 / 65535.0, "{v}");
         }
-        let (mw, mh, bytes) = crate::tiffin::read_mask8(&mask_sidecar(&path)).unwrap();
+        let (mw, mh, bytes) = crate::tiffin::read_mask8(&sidecar_path(&path)).unwrap();
         assert_eq!((mw, mh), (30, 20));
         assert!(bytes.iter().all(|&b| b == 255));
         // Without a crop the file is the whole frame.

@@ -309,7 +309,8 @@ fn rotate_gray8_cw(w: usize, h: usize, g: &[u8], quarter_turns: u8) -> (usize, u
     (ow, oh, out)
 }
 
-/// `<negative stem>.mask.tif` next to the negative.
+/// `<negative stem>.mask.tif` next to the negative: where the mask is
+/// written and where the print looks for it.
 pub fn sidecar_path(neg: &Path) -> PathBuf {
     let stem = neg.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     neg.with_file_name(format!("{stem}.mask.tif"))

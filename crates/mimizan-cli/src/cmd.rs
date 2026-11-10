@@ -10,7 +10,7 @@ use mimizan_core::ingest::{ingest, IngestParams, WhiteBalance};
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
 use mimizan_core::pipeline::{self, NegativeParams};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace};
-use mimizan_core::print::LAMP_LIMIT;
+use mimizan_core::print::{sidecar_path, LAMP_LIMIT};
 use mimizan_core::separate::{MaskMode, SeparateParams};
 use mimizan_core::tiffout::{write_gray16, write_gray8, TiffMeta};
 use serde_json::json;
@@ -131,12 +131,6 @@ pub fn warn_inert_flags(p: &SeparateParams, cutoff: f64, rounds: usize) {
     if p.mask != MaskMode::Adaptive && rounds != d.rounds_max {
         warn!("--rounds has no effect without --mask adaptive");
     }
-}
-
-/// `<out stem>.mask.tif` next to the negative.
-pub fn sidecar_path(out: &Path) -> PathBuf {
-    let stem = out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    out.with_file_name(format!("{stem}.mask.tif"))
 }
 
 /// `mimizan negative`: RAW → linear 16-bit negative TIFF plus mask sidecar.
