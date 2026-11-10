@@ -440,6 +440,10 @@ pub fn render_plate(
     if p.lamps.iter().any(|&l| l != 0.0) {
         info!("lamps R {:+.2} G {:+.2} B {:+.2} stops", p.lamps[0], p.lamps[1], p.lamps[2]);
     }
+    // The red pass printed with its lamp on the placing. The print says
+    // the recipe that was asked for, and the lamps beside it: a recipe
+    // read back from the file must not carry the red lamp twice.
+    r.info.recipe = p.recipe.clone();
     r.info.plate = Some(PlatePrintInfo { filters: pi.filters, space: pi.space, lamps: p.lamps });
     r.info.ms = t.elapsed().as_millis();
     r.plate = Some(PlateSheet { green: g.plane, blue: b.plane, space: pi.space });
@@ -2686,6 +2690,9 @@ mod tests {
         assert!(warm.plane.data.iter().zip(&out.plane.data).all(|(a, b)| a >= b));
         assert!(warm.plane.data.iter().zip(&out.plane.data).any(|(a, b)| a > b));
         assert_eq!(warm.info.plate.as_ref().unwrap().lamps, [0.3, 0.0, 0.0]);
+        // The lamp is said once, beside the recipe: the recipe written
+        // into the print is the one asked for, its placing without the lamp.
+        assert_eq!(warm.info.recipe, lit.recipe);
     }
 
     /// Peak lifts the picture and leaves the paper. The 1:1 box is those
