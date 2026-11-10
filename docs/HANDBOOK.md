@@ -63,6 +63,9 @@ is amber whenever you are away from it.
 - *Export* writes the sheet, the same as the preview: a 16-bit TIFF, or
   an 8-bit JPEG for the screen. TIFF or JPEG on the file line; the
   program remembers it.
+  A sheet of more than 4 GiB (a colour print past 715 megapixels) is
+  written as a BigTIFF, which a classic TIFF cannot hold; not every
+  older program opens one.
 
 Crop: *Crop* at the top, pick a format (4×5, 5×7, square…), *Apply*.
 Straighten: with *Crop* open, *Straighten*, then draw a line along

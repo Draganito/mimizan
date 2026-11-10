@@ -6,9 +6,9 @@ use crate::plane::Plane;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, Write};
 use std::path::Path;
-use tiff::encoder::{colortype, Rational, TiffEncoder};
+use tiff::encoder::{colortype, Rational, TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, TiffValue};
 use tiff::tags::{ResolutionUnit, Tag};
 
 /// Tags written next to the pixels.
@@ -65,26 +65,12 @@ pub fn write_gray16_u16(
     data: &[u16],
     meta: &TiffMeta<'_>,
 ) -> Result<()> {
-    let description = ascii_description(meta.description);
-    let file = BufWriter::new(File::create(path)?);
-    let mut enc = TiffEncoder::new(file)?;
-    let mut img = enc.new_image::<colortype::Gray16>(width as u32, height as u32)?;
-    img.rows_per_strip(64)?;
     let icc = gray_profile(meta.trc);
-    {
-        let d = img.encoder();
-        d.write_tag(Tag::IccProfile, icc.as_slice())?;
-        d.write_tag(Tag::ImageDescription, &*description)?;
-        d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
-        if meta.orientation >= 1 && meta.orientation <= 8 {
-            d.write_tag(Tag::Orientation, meta.orientation)?;
-        }
-    }
-    if let Some(dpi) = meta.dpi {
-        img.resolution(ResolutionUnit::Inch, Rational { n: (dpi * 1000.0).round() as u32, d: 1000 });
-    }
-    img.write_data(data)?;
-    Ok(())
+    write_image::<colortype::Gray16>(
+        path,
+        &Image { width, height, rows_per_strip: 64, data },
+        &meta.tags(&icc),
+    )
 }
 
 /// Interleave three planes of equal size into 16-bit RGB samples.
@@ -115,36 +101,124 @@ pub fn write_rgb16(
 ) -> Result<()> {
     let data = interleave_rgb16(rgb)?;
     let (width, height) = (rgb[0].width, rgb[0].height);
-    let description = ascii_description(meta.description);
-    let file = BufWriter::new(File::create(path)?);
-    let mut enc = TiffEncoder::new(file)?;
-    let mut img = enc.new_image::<colortype::RGB16>(width as u32, height as u32)?;
-    img.rows_per_strip(64)?;
     let icc = crate::icc::rgb_profile(space, meta.trc);
-    {
-        let d = img.encoder();
-        d.write_tag(Tag::IccProfile, icc.as_slice())?;
-        d.write_tag(Tag::ImageDescription, &*description)?;
-        d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
-        if meta.orientation >= 1 && meta.orientation <= 8 {
-            d.write_tag(Tag::Orientation, meta.orientation)?;
-        }
-    }
-    if let Some(dpi) = meta.dpi {
-        img.resolution(ResolutionUnit::Inch, Rational { n: (dpi * 1000.0).round() as u32, d: 1000 });
-    }
-    img.write_data(&data)?;
-    Ok(())
+    write_image::<colortype::RGB16>(
+        path,
+        &Image { width, height, rows_per_strip: 64, data: &data },
+        &meta.tags(&icc),
+    )
 }
 
 /// 8-bit grey TIFF (mask sidecar).
 pub fn write_gray8(path: &Path, width: usize, height: usize, data: &[u8], description: &str) -> Result<()> {
+    let tags = Tags { description, icc: None, software: false, orientation: 0, dpi: None };
+    write_image::<colortype::Gray8>(path, &Image { width, height, rows_per_strip: 256, data }, &tags)
+}
+
+/// The samples of one picture and how they are cut into strips.
+struct Image<'a, T> {
+    width: usize,
+    height: usize,
+    rows_per_strip: u32,
+    data: &'a [T],
+}
+
+/// What is written beside the samples.
+struct Tags<'a> {
+    description: &'a str,
+    icc: Option<&'a [u8]>,
+    /// `Software`: this program and its version.
+    software: bool,
+    /// EXIF orientation 1–8; anything else writes no tag.
+    orientation: u16,
+    dpi: Option<f64>,
+}
+
+impl TiffMeta<'_> {
+    fn tags<'a>(&'a self, icc: &'a [u8]) -> Tags<'a> {
+        Tags {
+            description: self.description,
+            icc: Some(icc),
+            software: true,
+            orientation: self.orientation,
+            dpi: self.dpi,
+        }
+    }
+}
+
+/// Whether a file of `sample_bytes` of pixels in `strips` strips, with
+/// `tag_bytes` of profile and description, is within a classic TIFF. Its
+/// offsets are 32 bits, and the directory, the profile, the description
+/// and the two lists of the strips are written after the pixels, so the
+/// whole file has to end below 4 GiB. Counted with room to spare: 16
+/// bytes a strip for the two lists and their padding, and 64 KiB for the
+/// header and the directory.
+fn fits_classic(sample_bytes: u64, strips: u64, tag_bytes: u64) -> bool {
+    sample_bytes
+        .checked_add(tag_bytes)
+        .and_then(|n| n.checked_add(strips.saturating_mul(16)))
+        .and_then(|n| n.checked_add(64 << 10))
+        .is_some_and(|n| n <= u64::from(u32::MAX))
+}
+
+/// One picture written to `path`: a classic TIFF, which every program
+/// reads, when the file ends below its 4 GiB; a BigTIFF, the same tags
+/// with offsets of 64 bits, when it does not. The classic encoder fails
+/// at the first strip that starts past 4 GiB, with that much of the file
+/// written.
+fn write_image<C>(path: &Path, image: &Image<'_, C::Inner>, tags: &Tags<'_>) -> Result<()>
+where
+    C: colortype::ColorType,
+    [C::Inner]: TiffValue,
+{
+    let description = ascii_description(tags.description);
+    let sample_bytes = std::mem::size_of_val(image.data) as u64;
+    let strips = (image.height as u64).div_ceil(u64::from(image.rows_per_strip.max(1)));
+    let tag_bytes = (description.len() + tags.icc.map_or(0, <[u8]>::len)) as u64;
     let file = BufWriter::new(File::create(path)?);
-    let mut enc = TiffEncoder::new(file)?;
-    let mut img = enc.new_image::<colortype::Gray8>(width as u32, height as u32)?;
-    img.rows_per_strip(256)?;
-    img.encoder().write_tag(Tag::ImageDescription, &*ascii_description(description))?;
-    img.write_data(data)?;
+    if fits_classic(sample_bytes, strips, tag_bytes) {
+        encode::<_, TiffKindStandard, C>(TiffEncoder::new(file)?, image, &description, tags)
+    } else {
+        tracing::info!(
+            "{}: {:.1} GiB is past a classic TIFF, written as BigTIFF",
+            path.display(),
+            sample_bytes as f64 / (1u64 << 30) as f64
+        );
+        encode::<_, TiffKindBig, C>(TiffEncoder::new_big(file)?, image, &description, tags)
+    }
+}
+
+fn encode<W, K, C>(
+    mut enc: TiffEncoder<W, K>,
+    image: &Image<'_, C::Inner>,
+    description: &str,
+    tags: &Tags<'_>,
+) -> Result<()>
+where
+    W: Write + Seek,
+    K: TiffKind,
+    C: colortype::ColorType,
+    [C::Inner]: TiffValue,
+{
+    let mut img = enc.new_image::<C>(image.width as u32, image.height as u32)?;
+    img.rows_per_strip(image.rows_per_strip)?;
+    {
+        let d = img.encoder();
+        if let Some(icc) = tags.icc {
+            d.write_tag(Tag::IccProfile, icc)?;
+        }
+        d.write_tag(Tag::ImageDescription, description)?;
+        if tags.software {
+            d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
+        }
+        if tags.orientation >= 1 && tags.orientation <= 8 {
+            d.write_tag(Tag::Orientation, tags.orientation)?;
+        }
+    }
+    if let Some(dpi) = tags.dpi {
+        img.resolution(ResolutionUnit::Inch, Rational { n: (dpi * 1000.0).round() as u32, d: 1000 });
+    }
+    img.write_data(image.data)?;
     Ok(())
 }
 
@@ -198,5 +272,62 @@ mod tests {
         let mask = tmp("mask.tif");
         write_gray8(&mask, 8, 6, &[0u8; 48], DESCRIPTION).unwrap();
         same_json(read_gray_header(&mask).unwrap());
+    }
+
+    /// A classic TIFF ends below 4 GiB. A plate's print is six bytes a
+    /// pixel: 715 megapixels fit, 716 do not. A grey one is two.
+    #[test]
+    fn a_picture_past_four_gigabytes_is_no_classic_tiff() {
+        let strips = |h: u64| h.div_ceil(64);
+        assert!(fits_classic(6 * 26_000 * 27_500, strips(27_500), 4096));
+        assert!(!fits_classic(6 * 26_000 * 27_540, strips(27_540), 4096));
+        assert!(fits_classic(2 * 40_000 * 53_000, strips(53_000), 4096));
+        assert!(!fits_classic(2 * 40_000 * 54_000, strips(54_000), 4096));
+        // What is written after the pixels counts too.
+        let full = u64::from(u32::MAX) - (64 << 10) - 16;
+        assert!(fits_classic(full, 1, 0));
+        assert!(!fits_classic(full, 1, 1));
+        assert!(!fits_classic(full, 2, 0));
+        assert!(!fits_classic(u64::MAX, 1, 1));
+    }
+
+    /// The BigTIFF a picture past 4 GiB is written as, at a size a test
+    /// can write: the same pixels and the same tags read back.
+    #[test]
+    fn a_bigtiff_reads_back_as_the_classic_one() {
+        let meta =
+            TiffMeta { description: DESCRIPTION, trc: GrayTrc::Gamma(2.2), orientation: 6, dpi: Some(300.0) };
+        let (w, h) = (40usize, 150usize);
+        let data: Vec<u16> = (0..w * h).map(|i| (i * 11 % 65536) as u16).collect();
+        let icc = gray_profile(meta.trc);
+        let image = Image { width: w, height: h, rows_per_strip: 64, data: &data[..] };
+
+        let classic = tmp("classic.tif");
+        write_gray16_u16(&classic, w, h, &data, &meta).unwrap();
+        let big = tmp("big.tif");
+        let file = BufWriter::new(File::create(&big).unwrap());
+        encode::<_, TiffKindBig, colortype::Gray16>(
+            TiffEncoder::new_big(file).unwrap(),
+            &image,
+            &ascii_description(DESCRIPTION),
+            &meta.tags(&icc),
+        )
+        .unwrap();
+
+        // The two differ in the header: 42 for the classic, 43 for the big.
+        let head = |p: &Path| std::fs::read(p).unwrap()[..4].to_vec();
+        assert_eq!(head(&classic), [b'I', b'I', 42, 0]);
+        assert_eq!(head(&big), [b'I', b'I', 43, 0]);
+        let (a, b) = (read_gray(&classic).unwrap(), read_gray(&big).unwrap());
+        assert_eq!((b.plane.width, b.plane.height, b.bits, b.orientation), (w, h, 16, 6));
+        assert_eq!(a.plane.data, b.plane.data);
+        assert_eq!(a.orientation, b.orientation);
+        same_json(b.description);
+        let tag = |p: &Path, t: Tag| {
+            let mut dec = tiff::decoder::Decoder::new(File::open(p).unwrap()).unwrap();
+            dec.get_tag_u8_vec(t).ok()
+        };
+        assert_eq!(tag(&big, Tag::IccProfile), Some(icc.clone()));
+        assert_eq!(tag(&big, Tag::IccProfile), tag(&classic, Tag::IccProfile));
     }
 }
