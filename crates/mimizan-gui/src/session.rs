@@ -188,8 +188,8 @@ impl Session {
         self.negative.separation.is_none()
     }
 
-    /// None on a monochrome negative, and none when a colour file was stored
-    /// without its separation. Callers turn that into a failed preview.
+    /// None on a monochrome negative: `is_mono` is this, asked the other
+    /// way round.
     pub fn separation(&self) -> Option<&Separation> {
         self.negative.separation.as_ref()
     }
@@ -2156,7 +2156,9 @@ fn hist_field(s: &Session, v: &ViewParams) -> Option<Field> {
 impl HistCache {
     fn ensure(&mut self, s: &Session, w: &Weights) {
         let ptr = s.id;
-        if s.is_mono() {
+        // A monochrome sensor has no mix: the measured plane, whatever the
+        // weights say.
+        let Some(sep) = s.separation() else {
             if self.session == Some(ptr) && self.width == s.negative.plane.width && !self.codes.is_empty() {
                 return;
             }
@@ -2167,19 +2169,10 @@ impl HistCache {
             self.tally = None;
             self.hist_key = None;
             return;
-        }
+        };
         if self.session == Some(ptr) && self.weights.as_ref() == Some(w) {
             return;
         }
-        let Some(sep) = s.separation() else {
-            self.codes.clear();
-            self.width = 0;
-            self.session = Some(ptr);
-            self.weights = Some(*w);
-            self.tally = None;
-            self.hist_key = None;
-            return;
-        };
         self.width = sep.lum.width;
         self.codes = mix_codes(sep, w);
         self.session = Some(ptr);

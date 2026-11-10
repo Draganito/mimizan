@@ -441,10 +441,8 @@ fn measure_peak(
     Ok((radius, amount, tuned.found))
 }
 
-/// Result of one peak measurement; `generation` tells the app whether it
-/// still belongs to the open picture.
+/// Result of one peak measurement.
 pub struct PeakMeasured {
-    pub generation: u64,
     pub radius: f64,
     pub amount: f64,
     pub found: bool,
@@ -458,7 +456,8 @@ pub enum PeakPoll {
     Lost,
 }
 
-/// One measurement of the open print. A newer one drops this receiver.
+/// One measurement of the open print. The app drops it with the picture
+/// it was started on, so a result that arrives is that picture's.
 pub struct PeakMeasure {
     rx: Receiver<PeakMeasured>,
 }
@@ -467,7 +466,6 @@ impl PeakMeasure {
     /// Start the measurement on its own thread.
     pub fn start(
         ctx: egui::Context,
-        generation: u64,
         session: Arc<Session>,
         weights: Weights,
         recipe: Recipe,
@@ -482,7 +480,7 @@ impl PeakMeasure {
                 }));
                 match outcome {
                     Ok(Ok((radius, amount, found))) => {
-                        let _ = tx.send(PeakMeasured { generation, radius, amount, found });
+                        let _ = tx.send(PeakMeasured { radius, amount, found });
                     }
                     Ok(Err(e)) => tracing::error!("peak measure failed: {e:#}"),
                     Err(_) => tracing::error!("peak measure stopped"),

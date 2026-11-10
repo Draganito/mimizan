@@ -101,7 +101,6 @@ pub struct Entry {
 pub struct Folder {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
-    pub sort: Sort,
     /// Bumped on every scan so thumbnails of an old listing are ignored.
     pub generation: u64,
     /// Visible subfolders (not hidden ones), natural order: the strip shows
@@ -154,14 +153,13 @@ impl Folder {
         subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
         let subdirs =
             subdirs.into_iter().map(|p| SubDir { name: dir_name(&p), path: p, raws: None }).collect();
-        let mut f = Self { path: path.to_path_buf(), entries, sort, generation, subdirs };
+        let mut f = Self { path: path.to_path_buf(), entries, generation, subdirs };
         f.resort(sort);
         Ok(f)
     }
 
     /// Reorder the entries; the thumbnails stay with their files.
     pub fn resort(&mut self, sort: Sort) {
-        self.sort = sort;
         match sort {
             Sort::Name => self.entries.sort_by(|a, b| natural_cmp(&a.name, &b.name)),
             Sort::Date => self

@@ -621,8 +621,7 @@ pub struct App {
     peak_held: bool,
     /// Start one measurement on the next frame. Cleared when it starts.
     peak_arm: bool,
-    /// Identifies the measurement in flight. A new file advances it.
-    peak_gen: u64,
+    /// The measurement in flight. A new file or a loaded recipe drops it.
     peak_measure: Option<PeakMeasure>,
     /// Radius and amount Peak measured on this negative, in negative pixels.
     /// The fields may have been moved; reset puts these back.
@@ -866,7 +865,6 @@ impl App {
             card_status: None,
             peak_held: false,
             peak_arm: false,
-            peak_gen: 0,
             peak_measure: None,
             peak_measured: None,
             cross_drag: false,
@@ -2665,7 +2663,6 @@ impl App {
         self.peak_arm =
             !fresh && self.peak_measured.is_none() && self.session.is_some() && self.screenshot_to.is_none();
         self.peak_held = true;
-        self.peak_gen = self.peak_gen.wrapping_add(1);
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
         self.close_crop();
@@ -4093,13 +4090,13 @@ impl App {
         let base = cam.map(|c| c.0).unwrap_or_default();
         let current = self.weights();
         let same = |a: &Weights, b: &Weights| (a.r - b.r).abs() < 5e-4 && (a.b - b.b).abs() < 5e-4;
-        let mut fields: Vec<Field> = Vec::with_capacity(MIX_LABELS.len());
-        let mut targets: Vec<Option<Weights>> = Vec::with_capacity(MIX_LABELS.len());
+        let mut fields: Vec<Field> = Vec::new();
+        let mut targets: Vec<Option<Weights>> = Vec::new();
         // The field the weights stand on, if any; a later one wins a tie.
         let mut selected: Option<usize> = None;
         let native = Weights::default();
         fields.push(Field::new(
-            MIX_LABELS[0],
+            MIX_NATIVE,
             Color32::WHITE,
             "¼ ½ ¼: the Bayer luminance, no colour weighed in.",
         ));
@@ -4110,7 +4107,7 @@ impl App {
         match cam {
             Some((w, _, _)) => {
                 fields.push(Field::new(
-                    MIX_LABELS[1],
+                    filter_short(ColorFilter::None),
                     Color32::WHITE,
                     "The panchromatic response, calibrated for this sensor.",
                 ));
@@ -4122,7 +4119,7 @@ impl App {
             None => {
                 fields.push(
                     Field::new(
-                        MIX_LABELS[1],
+                        filter_short(ColorFilter::None),
                         Color32::WHITE,
                         "The panchromatic response, calibrated for the sensor: no camera file for this one.",
                     )
@@ -4140,7 +4137,6 @@ impl App {
                 selected = Some(fields.len() - 1);
             }
         }
-        debug_assert_eq!(fields.len(), MIX_LABELS.len());
         if let Some(w) = filter_strip(ui, "mix-strip", &fields, selected, width).and_then(|k| targets[k]) {
             self.set_weights(w);
         }
@@ -4867,7 +4863,6 @@ impl App {
     fn note_peak_source(&mut self) {
         self.peak_measure = None;
         self.peak_measured = None;
-        self.peak_gen = self.peak_gen.wrapping_add(1);
         self.peak_held = !self.edit.recipe.peak.is_unset();
         self.peak_arm = self.session.is_some() && self.screenshot_to.is_none();
     }
@@ -4877,14 +4872,8 @@ impl App {
         let mut recipe = self.print_recipe();
         recipe.sharpen = Sharpen::Off;
         recipe.peak.on = false;
-        self.peak_measure = Some(PeakMeasure::start(
-            ctx.clone(),
-            self.peak_gen,
-            session,
-            self.weights(),
-            recipe,
-            self.export_orientation(),
-        ));
+        self.peak_measure =
+            Some(PeakMeasure::start(ctx.clone(), session, self.weights(), recipe, self.export_orientation()));
     }
 
     fn poll_peak(&mut self) {
@@ -4892,11 +4881,9 @@ impl App {
         match poll {
             Some(PeakPoll::Ready(result)) => {
                 self.peak_measure = None;
-                if result.generation == self.peak_gen {
-                    self.peak_measured = Some((result.radius, result.amount));
-                    if !self.peak_held {
-                        self.apply_measured_peak(result.radius, result.amount, result.found);
-                    }
+                self.peak_measured = Some((result.radius, result.amount));
+                if !self.peak_held {
+                    self.apply_measured_peak(result.radius, result.amount, result.found);
                 }
             }
             Some(PeakPoll::Lost) => {
@@ -6327,12 +6314,15 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
     let paint =
         |text: &str| ui.painter().layout_no_wrap(text.to_owned(), body.clone(), Color32::WHITE).size().x;
     let grade = paint("≈ grade 00 · 00.0 stops of scene");
-    let strip = filter_strip::min_width(ui, &MIX_LABELS);
+    let labels: Vec<&str> =
+        std::iter::once(MIX_NATIVE).chain(ColorFilter::ALL.into_iter().map(filter_short)).collect();
+    let strip = filter_strip::min_width(ui, &labels);
     grade.max(strip)
 }
 
-/// The fields of the monochrome mix, for the width they need.
-const MIX_LABELS: [&str; 8] = ["Native", "Pan", "Y8", "YG11", "O16", "R25", "G58", "B47"];
+/// The first field of the monochrome mix: the Bayer luminance. The others
+/// are the glasses by their short names, the panchromatic one first.
+const MIX_NATIVE: &str = "Native";
 
 /// Gap between the stage edge and a panel.
 const PANEL_GAP: f32 = 12.0;
