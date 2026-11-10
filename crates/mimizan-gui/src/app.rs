@@ -738,6 +738,9 @@ pub struct App {
     /// The save dialog was up when this frame began: the keys of the
     /// frame are the dialog's, the Enter that names the file included.
     dialog_up: bool,
+    /// The window was asked to close while an export was being written,
+    /// and closes when the file is whole.
+    close_waits: bool,
     /// A text field had the keyboard when this frame began, which is
     /// when the last one ended.
     typing: bool,
@@ -923,6 +926,7 @@ impl App {
                 dialog
             },
             dialog_up: false,
+            close_waits: false,
             typing: false,
             #[cfg(target_os = "macos")]
             folder_grant: None,
@@ -2762,16 +2766,40 @@ impl App {
             )
     }
 
-    /// The window was asked to close. A changed recipe stays until the
-    /// question is answered. An unattended screenshot is never asked.
+    /// The window was asked to close. An export on its way is written
+    /// out first: the program ends with the window and the file would
+    /// stay cut off. A changed recipe stays until the question is
+    /// answered. An unattended screenshot is never asked.
     fn guard_close(&mut self, ctx: &egui::Context) {
         let requested = ctx.input(|i| i.viewport().close_requested());
-        if !requested || self.close_allowed || self.screenshot_to.is_some() {
+        if self.screenshot_to.is_some() {
             return;
         }
-        if self.should_ask_to_save() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending_leave = Some(Leave::Quit);
+        let writing = self.heavy.writing();
+        match close_step(requested, self.close_allowed, self.close_waits, writing, self.should_ask_to_save())
+        {
+            CloseStep::Stay => {}
+            CloseStep::Wait => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.close_waits = true;
+                self.log(
+                    "the export is still being written: the window closes when the file is whole. \
+                     Close once more to close now and leave the file cut off",
+                );
+            }
+            CloseStep::Ask => {
+                if requested {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                }
+                self.close_waits = false;
+                self.pending_leave = Some(Leave::Quit);
+            }
+            CloseStep::Close => {
+                self.close_waits = false;
+                if !requested {
+                    self.follow_leave(ctx, Leave::Quit);
+                }
+            }
         }
     }
 
@@ -6293,6 +6321,41 @@ const ENLARGER_MIN_W: f32 = 64.0;
 /// Grab radius of the crosshair, points. Covers its arms.
 const CROSS_GRAB: f32 = 14.0;
 
+/// What a frame does about closing the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseStep {
+    /// Nothing to do: nobody asked, or the answer was given already.
+    Stay,
+    /// Not yet: an export is being written, and the window closes after it.
+    Wait,
+    /// Not yet: the recipe has changes, and the question is put.
+    Ask,
+    /// The window closes.
+    Close,
+}
+
+/// `requested`: the window was asked to close in this frame. `allowed`:
+/// the question about the recipe is answered. `waits`: an earlier request
+/// is waiting for an export. `writing`: an export is on its way.
+/// `unsaved`: the recipe has changes to ask about.
+///
+/// The first request during an export waits for the file; the second
+/// does not, so a write that hangs cannot hold the window for good.
+fn close_step(requested: bool, allowed: bool, waits: bool, writing: bool, unsaved: bool) -> CloseStep {
+    let asked = requested && !allowed;
+    let written = waits && !writing;
+    if !asked && !written {
+        return CloseStep::Stay;
+    }
+    if asked && writing && !waits {
+        CloseStep::Wait
+    } else if unsaved && !allowed {
+        CloseStep::Ask
+    } else {
+        CloseStep::Close
+    }
+}
+
 /// A text field has the keyboard. egui's own `wants_keyboard_input` is
 /// also true while a button holds focus (after Tab), which would mute every
 /// shortcut; only a text edit should.
@@ -6826,6 +6889,36 @@ mod key_tests {
         // Neither without the command key, and no other letter.
         assert_eq!(pressed(Key::Z, Modifiers::NONE), (false, false));
         assert_eq!(pressed(Key::X, Modifiers::COMMAND), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::{close_step, CloseStep};
+
+    /// `close_step(requested, allowed, waits, writing, unsaved)`.
+    #[test]
+    fn the_window_waits_for_an_export_and_asks_for_the_recipe() {
+        // Nobody asked.
+        assert_eq!(close_step(false, false, false, false, true), CloseStep::Stay);
+        assert_eq!(close_step(false, false, false, true, true), CloseStep::Stay);
+        // Asked with nothing on its way: closed, or the recipe's question.
+        assert_eq!(close_step(true, false, false, false, false), CloseStep::Close);
+        assert_eq!(close_step(true, false, false, false, true), CloseStep::Ask);
+        // The question is answered and the close it sent arrives.
+        assert_eq!(close_step(true, true, false, false, true), CloseStep::Stay);
+
+        // Asked while a file is written: not yet, whatever the recipe.
+        assert_eq!(close_step(true, false, false, true, false), CloseStep::Wait);
+        assert_eq!(close_step(true, false, false, true, true), CloseStep::Wait);
+        // Still writing, and nothing more is done about it.
+        assert_eq!(close_step(false, false, true, true, false), CloseStep::Stay);
+        // The file is whole: what the first request would have done.
+        assert_eq!(close_step(false, false, true, false, false), CloseStep::Close);
+        assert_eq!(close_step(false, false, true, false, true), CloseStep::Ask);
+        // Asked once more while it is still writing: no second wait.
+        assert_eq!(close_step(true, false, true, true, false), CloseStep::Close);
+        assert_eq!(close_step(true, false, true, true, true), CloseStep::Ask);
     }
 }
 

@@ -33,7 +33,7 @@ use mimizan_core::print::{self as pr, PrintParams, PrintSource};
 use mimizan_core::recipe::{CropRect, Recipe, Sharpen};
 use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -99,6 +99,11 @@ pub enum Event {
 }
 
 impl Job {
+    /// Whether the job writes a file.
+    fn is_export(&self) -> bool {
+        matches!(self, Job::Export { .. } | Job::ExportLinear { .. })
+    }
+
     /// The file an `Open` or `Redevelop` is about; none for an export.
     pub fn developed_path(&self) -> Option<&Path> {
         match self {
@@ -109,26 +114,65 @@ impl Job {
     }
 }
 
+/// The exports sent and not yet written out. The program ends with its
+/// window, and the thread that writes with the program: a file still on
+/// its way then stays cut off on the disk, so the window asks here first.
+#[derive(Clone, Default)]
+struct Writing(Arc<AtomicUsize>);
+
+/// One export on its way. It travels with its job and is counted until it
+/// is dropped: when the file is written, when the export failed or
+/// panicked, or when the queue it waited in is gone.
+struct WritingOne(Arc<AtomicUsize>);
+
+impl Writing {
+    fn begin(&self) -> WritingOne {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        WritingOne(Arc::clone(&self.0))
+    }
+
+    fn any(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+}
+
+impl Drop for WritingOne {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A job in the queue, with its count when it is an export.
+type Queued = (Job, Option<WritingOne>);
+
 /// Handle to the `Heavy` thread; restarted if it ever dies.
 pub struct Heavy {
-    tx: Sender<Job>,
+    tx: Sender<Queued>,
     rx: Receiver<Event>,
     ctx: egui::Context,
+    writing: Writing,
 }
 
 impl Heavy {
     /// Start the thread.
     pub fn spawn(ctx: egui::Context) -> Self {
         let (tx, rx) = start_heavy(&ctx);
-        Self { tx, rx, ctx }
+        Self { tx, rx, ctx, writing: Writing::default() }
     }
 
     /// Queue a job.
     pub fn send(&mut self, job: Job) {
-        if let Err(std::sync::mpsc::SendError(job)) = self.tx.send(job) {
+        let writing = job.is_export().then(|| self.writing.begin());
+        if let Err(std::sync::mpsc::SendError(queued)) = self.tx.send((job, writing)) {
             self.restart();
-            let _ = self.tx.send(job);
+            let _ = self.tx.send(queued);
         }
+    }
+
+    /// An export is queued or being written. False again by the time its
+    /// `Exported` or `Failed` can be polled.
+    pub fn writing(&self) -> bool {
+        self.writing.any()
     }
 
     /// The next event, if one is waiting.
@@ -151,14 +195,14 @@ impl Heavy {
     }
 }
 
-fn start_heavy(ctx: &egui::Context) -> (Sender<Job>, Receiver<Event>) {
-    let (tx, jobs) = channel::<Job>();
+fn start_heavy(ctx: &egui::Context) -> (Sender<Queued>, Receiver<Event>) {
+    let (tx, jobs) = channel::<Queued>();
     let (events, rx) = channel::<Event>();
     let ctx = ctx.clone();
     thread::Builder::new()
         .name("mimizan-heavy".into())
         .spawn(move || {
-            while let Ok(job) = jobs.recv() {
+            while let Ok((job, writing)) = jobs.recv() {
                 let outcome =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_heavy(job, &events, &ctx)));
                 let ev = match outcome {
@@ -166,6 +210,9 @@ fn start_heavy(ctx: &egui::Context) -> (Sender<Job>, Receiver<Event>) {
                     Ok(Err(e)) => Event::Failed(format!("{e:#}")),
                     Err(payload) => Event::Failed(format!("stopped: {}", panic_message(&payload))),
                 };
+                // The file is closed: no longer counted before the UI
+                // hears of it.
+                drop(writing);
                 if events.send(ev).is_err() {
                     break;
                 }
@@ -1119,6 +1166,86 @@ mod tests {
         // The same print asked for again is still served from what is held.
         assert!(window(&mut hold, None, 200.0, 4).is_none());
         assert!(hold.held.is_some());
+    }
+
+    fn export_job(session: &Arc<Session>, path: PathBuf) -> Job {
+        Job::Export {
+            session: Arc::clone(session),
+            weights: Weights::default(),
+            plate: None,
+            recipe: Recipe::on_paper(),
+            path,
+            orientation: 1,
+        }
+    }
+
+    /// The window waits for an export that is counted. It is counted from
+    /// the moment it is sent, and no longer when its queue is gone or the
+    /// work on it panicked, or the window could never close.
+    #[test]
+    fn an_export_is_counted_while_it_is_on_its_way() {
+        let session = Arc::new(grey_session());
+        // A queue nobody works on: what is sent stays in it.
+        let (tx, jobs) = channel::<Queued>();
+        let (_events, rx) = channel::<Event>();
+        let mut heavy = Heavy { tx, rx, ctx: egui::Context::default(), writing: Writing::default() };
+        assert!(!heavy.writing());
+        heavy.send(Job::Open {
+            path: "none.nef".into(),
+            develop: DevelopParams::default(),
+            cameras_dir: PathBuf::new(),
+        });
+        assert!(!heavy.writing(), "opening a file writes none");
+        heavy.send(export_job(&session, "a.tif".into()));
+        heavy.send(export_job(&session, "b.tif".into()));
+        assert!(heavy.writing());
+        let (_open, _) = jobs.recv().unwrap();
+        let (_first, one) = jobs.recv().unwrap();
+        drop(one);
+        assert!(heavy.writing(), "the second is still queued");
+        drop(jobs);
+        assert!(!heavy.writing(), "nothing is written from a queue that is gone");
+
+        let writing = Writing::default();
+        let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _one = writing.begin();
+            assert!(writing.any());
+            panic!("the export stopped");
+        }));
+        assert!(stopped.is_err());
+        assert!(!writing.any());
+    }
+
+    /// Through the thread itself: when the UI hears that the file is
+    /// written, or that it could not be, the export is no longer counted
+    /// and the file is whole.
+    #[test]
+    fn an_export_is_no_longer_counted_when_its_event_arrives() {
+        let session = Arc::new(grey_session());
+        let dir = std::env::temp_dir().join(format!("mimizan-gui-writing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut heavy = Heavy::spawn(egui::Context::default());
+        let settled = |heavy: &mut Heavy| loop {
+            match heavy.poll() {
+                Some(Event::Status(_)) | None => std::thread::sleep(std::time::Duration::from_millis(2)),
+                Some(ev) => return (ev, heavy.writing()),
+            }
+        };
+
+        let path = dir.join("print.tif");
+        heavy.send(export_job(&session, path.clone()));
+        let (ev, writing) = settled(&mut heavy);
+        assert!(matches!(ev, Event::Exported { .. }));
+        assert!(!writing);
+        let print = mimizan_core::tiffin::read_gray(&path).unwrap();
+        assert!(print.plane.width > 0);
+
+        // A folder that is not there: the export fails and is let go.
+        heavy.send(export_job(&session, dir.join("none").join("print.tif")));
+        let (ev, writing) = settled(&mut heavy);
+        assert!(matches!(ev, Event::Failed(_)));
+        assert!(!writing);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The export of a plate from a grey mosaic is a 16-bit RGB file whose
