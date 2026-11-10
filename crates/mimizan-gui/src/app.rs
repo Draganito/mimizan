@@ -738,6 +738,9 @@ pub struct App {
     /// The save dialog was up when this frame began: the keys of the
     /// frame are the dialog's, the Enter that names the file included.
     dialog_up: bool,
+    /// A text field had the keyboard when this frame began, which is
+    /// when the last one ended.
+    typing: bool,
     /// The folder the Mac sandbox is allowed to read. Held for the whole
     /// time that folder (and its subfolders) stay open.
     #[cfg(target_os = "macos")]
@@ -920,6 +923,7 @@ impl App {
                 dialog
             },
             dialog_up: false,
+            typing: false,
             #[cfg(target_os = "macos")]
             folder_grant: None,
             cameras_dir,
@@ -2390,6 +2394,15 @@ impl App {
     /// no key reaches the picture or the strip behind it. An arrow in the
     /// dialog's list would open the next file, and the print of that one
     /// would be saved under this one's name.
+    /// This frame's keys are not the shortcuts': a question is up, or a
+    /// text field has the keyboard or had it when the frame began. The
+    /// Enter or Escape that ends typing in a number is still in the input
+    /// after the field has given the keyboard back, and would otherwise
+    /// keep the crop or put the brush down as well.
+    fn keys_are_taken(&self, ctx: &egui::Context) -> bool {
+        self.question_open() || self.typing || text_edit_focused(ctx)
+    }
+
     fn question_open(&self) -> bool {
         self.pending_leave.is_some() || self.pending_replace.is_some() || self.dialog_up
     }
@@ -5153,7 +5166,7 @@ impl App {
         if self.pick_card {
             // The key is used up here: it puts the pipette down and is not
             // the brush's Escape as well.
-            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            if !self.typing && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.pick_card = false;
             } else if clicked_on_picture && self.stage_shows_session() {
                 if let Some(ptr) = response.interact_pointer_pos() {
@@ -5676,7 +5689,7 @@ impl App {
     /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
     /// keyboard is not in a text field, whether or not the strip is up.
     fn strip_keys(&mut self, ctx: &egui::Context) {
-        if self.question_open() || text_edit_focused(ctx) {
+        if self.keys_are_taken(ctx) {
             return;
         }
         let (b, left, right) = ctx.input(|i| {
@@ -6237,6 +6250,8 @@ impl eframe::App for App {
         self.strip_keys(&ctx);
         self.save_prompt(&ctx);
         self.replace_prompt(&ctx);
+        // For the keys of the next frame.
+        self.typing = text_edit_focused(&ctx);
     }
 }
 
@@ -6683,7 +6698,7 @@ impl App {
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
     /// every panel. Enter keeps the crop. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
-        if self.question_open() || text_edit_focused(ctx) {
+        if self.keys_are_taken(ctx) {
             return;
         }
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -6744,8 +6759,52 @@ fn undo_redo_keys(i: &mut egui::InputState) -> (bool, bool) {
 
 #[cfg(test)]
 mod key_tests {
-    use super::undo_redo_keys;
+    use super::{text_edit_focused, undo_redo_keys};
     use egui::{Event, InputState, Key, Modifiers};
+
+    /// One frame with a number field in it and `key` pressed: whether a
+    /// text field has the keyboard when the frame is drawn, and whether
+    /// the key is still there for a shortcut to take.
+    fn frame_with_field(ctx: &egui::Context, value: &mut f64, key: Option<Key>) -> (bool, bool) {
+        let mut input = egui::RawInput::default();
+        if let Some(key) = key {
+            let modifiers = Modifiers::NONE;
+            input.events.push(Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            });
+        }
+        let mut seen = (false, false);
+        let _ = ctx.run_ui(input, |ui| {
+            let field = ui.add(egui::DragValue::new(value));
+            if key.is_none() {
+                field.request_focus();
+            }
+            let typing = text_edit_focused(ui.ctx());
+            let left = key.is_some_and(|key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, key)));
+            seen = (typing, left);
+        });
+        seen
+    }
+
+    /// Why the shortcuts ask who had the keyboard when the frame began:
+    /// Enter and Escape end typing in a number, and in the frame of that
+    /// key the field no longer has the keyboard and the key is still in
+    /// the input.
+    #[test]
+    fn the_key_that_ends_typing_is_still_there_after_the_field() {
+        for key in [Key::Enter, Key::Escape] {
+            let ctx = egui::Context::default();
+            let mut value = 3.0;
+            // The field takes the keyboard and shows its text.
+            frame_with_field(&ctx, &mut value, None);
+            assert_eq!(frame_with_field(&ctx, &mut value, None), (true, false), "{key:?}");
+            assert_eq!(frame_with_field(&ctx, &mut value, Some(key)), (false, true), "{key:?}");
+        }
+    }
 
     fn pressed(key: Key, modifiers: Modifiers) -> (bool, bool) {
         let mut i = InputState::default();
