@@ -806,8 +806,13 @@ fn paint_preview(
     }
     let Some(ask) = req.detail else {
         // No window asked for: what was held answers nothing now, so the
-        // next ask renders.
+        // next ask renders. A print that changed here is written down as
+        // the last one, and the next ask would find it unchanged: the
+        // window held from the print before goes now.
         hold.last_detail = None;
+        if hold.last_inspect != req.inspect {
+            hold.held = None;
+        }
         hold.last_inspect = req.inspect;
         return;
     };
@@ -1023,11 +1028,8 @@ mod tests {
         assert!(!held_tile_stale(false, false, false));
     }
 
-    /// The export of a plate from a grey mosaic is a 16-bit RGB file whose
-    /// three channels are equal, the same size the grey export has, and a
-    /// blue lamp lifts the blue channel alone.
-    #[test]
-    fn plate_export_writes_grey_as_equal_channels() {
+    /// A small Bayer session of a grey ramp, top to bottom.
+    fn grey_session() -> Session {
         let (w, h) = (40usize, 24usize);
         let raw: Vec<u16> =
             (0..w * h).map(|i| (150.0 + 700.0 * ((i / w) as f64 / h as f64)) as u16).collect();
@@ -1054,7 +1056,7 @@ mod tests {
         let negative = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&negative).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
-        let session = Session {
+        Session {
             id: next_session_id(),
             path: "grey.nef".into(),
             frame: Arc::new(frame),
@@ -1064,7 +1066,67 @@ mod tests {
             develop: DevelopParams::default(),
             preview,
             raw_hist,
+        }
+    }
+
+    /// The 1:1 window of a print is asked for, the view goes back to the
+    /// fit while the print gets another dpi, and the window is asked for
+    /// again. The window held from the first print is on another grid:
+    /// what comes back is the new print, as if nothing had been held.
+    #[test]
+    fn a_print_changed_while_no_window_is_up_drops_the_held_one() {
+        let session = Arc::new(grey_session());
+        let view = ViewParams {
+            weights: Weights::default(),
+            tone: Tone::paper(),
+            place: 0.0,
+            show_mask: false,
+            rotation: 0,
+            angle: 0.0,
+            crop: None,
+            burns: Vec::new(),
+            burn_live: false,
+            plate: None,
         };
+        let print = |dpi: f64| Recipe {
+            size: Some(pr::PrintSize::parse("8x4.8cm").unwrap()),
+            dpi,
+            ..Recipe::on_paper()
+        };
+        let ask = DetailAsk { x: 8, y: 8, w: 48, h: 32, step: 1 };
+        let window = |hold: &mut PreviewHold, detail: Option<DetailAsk>, dpi: f64, generation: u64| {
+            let sent = std::cell::RefCell::new(Vec::new());
+            let req = PreviewRequest {
+                session: Arc::clone(&session),
+                view: view.clone(),
+                detail,
+                inspect: Some(print(dpi)),
+                generation,
+            };
+            paint_preview(hold, req, &|| false, &|r| sent.borrow_mut().push(r));
+            sent.into_inner().into_iter().find_map(|r| r.detail).map(|d| d.gray)
+        };
+
+        let mut hold = PreviewHold::default();
+        let first = window(&mut hold, Some(ask), 100.0, 1).expect("the first window");
+        assert!(window(&mut hold, None, 200.0, 2).is_none());
+        let again = window(&mut hold, Some(ask), 200.0, 3).expect("the window of the new print");
+
+        let fresh = window(&mut PreviewHold::default(), Some(ask), 200.0, 1).expect("a fresh window");
+        assert_ne!(first, fresh, "the two prints differ under the window");
+        assert_eq!(again, fresh);
+
+        // The same print asked for again is still served from what is held.
+        assert!(window(&mut hold, None, 200.0, 4).is_none());
+        assert!(hold.held.is_some());
+    }
+
+    /// The export of a plate from a grey mosaic is a 16-bit RGB file whose
+    /// three channels are equal, the same size the grey export has, and a
+    /// blue lamp lifts the blue channel alone.
+    #[test]
+    fn plate_export_writes_grey_as_equal_channels() {
+        let session = grey_session();
         let dir = std::env::temp_dir().join(format!("mimizan-gui-plate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let quiet = |_s: String| {};
