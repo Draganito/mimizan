@@ -326,7 +326,7 @@ enum WbChoice {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HistSource {
-    /// The 8-bit view as shown (after placing and the paper, or the mask).
+    /// The 8-bit view as shown (after placing and the paper).
     View,
     /// The linear mix before the curve, on a gamma-2.2 axis.
     Negative,
@@ -670,7 +670,6 @@ pub struct App {
     plate_resolved: Option<PlateResolved>,
 
     // Preview
-    show_mask: bool,
     texture: Option<TextureHandle>,
     tex_size: [usize; 2],
     /// Rotation the shown texture was rendered with.
@@ -890,7 +889,6 @@ impl App {
             wb_manual: [2.0, 1.0, 1.5],
             mask_mode: DevelopParams::default().mask,
             plate_resolved: None,
-            show_mask: false,
             texture: None,
             tex_size: [0, 0],
             tex_rotation: 0,
@@ -1408,7 +1406,6 @@ impl App {
             weights: self.weights(),
             tone: r.curve.clone(),
             place: r.place,
-            show_mask: self.show_mask,
             rotation: self.edit.rotation,
             angle: self.view_angle(),
             // While the easel is up the whole negative is shown.
@@ -1569,13 +1566,12 @@ impl App {
     }
 
     /// The rings the edit asks for around the texture on the stage. Flat
-    /// values, painted under the picture, not rendered into it. The mask
-    /// view and the open crop are not a sheet. Only meaningful while the
-    /// texture is this session's picture: `held_dress` covers the moment
-    /// it is not.
+    /// values, painted under the picture, not rendered into it. The open
+    /// crop is not a sheet. Only meaningful while the texture is this
+    /// session's picture: `held_dress` covers the moment it is not.
     fn rings(&self) -> Rings {
         let [tw, _] = self.tex_size;
-        if self.show_mask || self.crop_open || tw == 0 {
+        if self.crop_open || tw == 0 {
             return Rings::default();
         }
         let Some(l) = self.print_layout() else { return Rings::default() };
@@ -1623,10 +1619,8 @@ impl App {
         if self.crop_open {
             return self.export_size();
         }
-        if !self.show_mask {
-            if let Some(lay) = self.print_layout() {
-                return (lay.image_w, lay.image_h);
-            }
+        if let Some(lay) = self.print_layout() {
+            return (lay.image_w, lay.image_h);
         }
         self.picture_size()
     }
@@ -1634,7 +1628,7 @@ impl App {
     /// The print recipe when 100% is a window of the fitted picture.
     /// `None` keeps 100% on the negative's own pixels.
     fn inspect_recipe(&self) -> Option<Recipe> {
-        if self.session.is_none() || self.crop_open || self.show_mask {
+        if self.session.is_none() || self.crop_open {
             return None;
         }
         let recipe = self.print_recipe();
@@ -2663,7 +2657,6 @@ impl App {
         // The file next to the RAW is written only when that question is saved.
         self.tex_rotation = 0;
         self.keep_scale = None;
-        self.show_mask = false;
         // Drop a measurement that is still running. Fresh opens arm a new
         // one after this. A reset keeps the default radius and amount, and
         // finishes a measurement that has not landed yet so the print reset
@@ -4084,8 +4077,6 @@ impl App {
                     RichText::new(t).weak()
                 });
             });
-        } else if self.show_mask && self.hist_source == HistSource::Negative {
-            ui.label(RichText::new("mask view: no negative histogram").weak());
         }
         ui.add_space(10.0);
         ui.separator();

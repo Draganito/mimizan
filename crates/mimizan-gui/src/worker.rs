@@ -15,10 +15,10 @@
 //! The thumbnail thread and the folder counter live in `browser`.
 
 use crate::session::{
-    cover_detail, next_session_id, preview_planes, render_detail, render_detail_linear, render_preview,
-    render_print_detail, render_print_linear, render_sharpen_loupe, tone_tile, DetailAsk, DetailImage,
-    DetailRect, DetailTile, DevelopParams, HistCache, LinearTile, PlateView, PreviewImage, PreviewStages,
-    RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
+    cover_detail, next_session_id, preview_planes, render_detail_linear, render_preview, render_print_linear,
+    render_sharpen_loupe, tone_tile, DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams,
+    HistCache, LinearTile, PlateView, PreviewImage, PreviewStages, RawHistogram, Session, SharpenLoupe,
+    ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -843,7 +843,7 @@ fn paint_preview(
     // Under a stroke being painted with a sharp window up, the window
     // covers what is seen: the small picture waits for the release (the
     // view differs then, and it is rendered), the window follows the hand.
-    let window_covers = req.view.burn_live && req.detail.is_some() && !req.view.show_mask;
+    let window_covers = req.view.burn_live && req.detail.is_some();
     if view_changed && !window_covers {
         let image = render_preview(&req.session, &req.view, &mut hold.hists, &mut hold.stages, table);
         hold.last = Some(key);
@@ -886,7 +886,7 @@ fn paint_preview(
     hold.held_print = print;
     let linear_key = LinearKey::of(&req, ask);
     let same_linear = hold.linear.as_ref().is_some_and(|(k, _)| *k == linear_key);
-    let tile = if same_linear && !req.view.show_mask {
+    let tile = if same_linear {
         // Only the tone, the placing or the strokes changed: re-tone the
         // held linear picture.
         let (_, lin) = hold.linear.as_ref().unwrap();
@@ -900,9 +900,6 @@ fn paint_preview(
             let recipe = recipe.clone();
             cover_detail(hold.held.as_ref(), ask, |sub| {
                 let rect = DetailRect { x: sub.x, y: sub.y, w: sub.w, h: sub.h };
-                if req.view.show_mask {
-                    return render_print_detail(&req.session, &req.view, &recipe, rect, table);
-                }
                 let lin = render_print_linear(&req.session, &req.view, &recipe, rect)?;
                 let d = tone_tile(&lin, &req.view, Some(&recipe), table);
                 if sub == ask {
@@ -912,9 +909,6 @@ fn paint_preview(
             })
         } else {
             cover_detail(hold.held.as_ref(), ask, |sub| {
-                if req.view.show_mask {
-                    return render_detail(&req.session, &req.view, sub, table);
-                }
                 let lin = render_detail_linear(&req.session, &req.view, sub)?;
                 let d = tone_tile(&lin, &req.view, None, table);
                 if sub == ask {
@@ -1133,7 +1127,6 @@ mod tests {
             weights: Weights::default(),
             tone: Tone::paper(),
             place: 0.0,
-            show_mask: false,
             rotation: 0,
             angle: 0.0,
             crop: None,

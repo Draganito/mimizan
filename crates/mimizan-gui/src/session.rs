@@ -18,7 +18,7 @@ use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{
     burn_field, layout, loupe_source_rect, orient, rotated, sharpen_window, source_window, window_plane,
-    PrintParams, MASK_KERNEL,
+    PrintParams,
 };
 use mimizan_core::recipe::{CropRect, Recipe};
 use mimizan_core::resize::{
@@ -66,11 +66,9 @@ impl DevelopParams {
     }
 }
 
-/// Upright, downscaled separation plus the sharpening mask at the same size.
+/// The upright, downscaled separation the interactive view draws.
 pub struct PreviewPlanes {
     pub sep: Separation,
-    /// `max(M)` with saturated pixels forced to 1 (the sidecar as a plane).
-    pub mask: Plane,
     /// Preview width / upright full width.
     pub scale: f64,
 }
@@ -281,11 +279,6 @@ impl PreviewShrink {
         orient(&shrunk, self.orientation)
     }
 
-    /// The sidecar as a plane at preview size.
-    fn mask(&self, neg: &Negative) -> mimizan_core::Result<Plane> {
-        Ok(self.small(&mask_plane_of(neg)?))
-    }
-
     fn scale(&self) -> f64 {
         self.pw as f64 / self.w as f64
     }
@@ -299,7 +292,6 @@ pub fn preview_planes(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         return preview_measured(neg);
     };
     let sh = PreviewShrink::new(neg);
-    let mask = sh.mask(neg)?;
     let sep_small = Separation {
         lum: sh.small(&sep.lum),
         c1: sh.small(&sep.c1),
@@ -308,7 +300,7 @@ pub fn preview_planes(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         rounds: sep.rounds,
         phase: sep.phase,
     };
-    Ok(PreviewPlanes { sep: sep_small, mask, scale: sh.scale() })
+    Ok(PreviewPlanes { sep: sep_small, scale: sh.scale() })
 }
 
 /// Preview of a measured plane. Chrominance stays empty at preview size so
@@ -316,7 +308,6 @@ pub fn preview_planes(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
 fn preview_measured(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
     let sh = PreviewShrink::new(neg);
     let lum = sh.small(&neg.plane);
-    let mask = sh.mask(neg)?;
     let zero = Plane::zeros(sh.pw, sh.ph);
     let sep = Separation {
         lum,
@@ -326,7 +317,7 @@ fn preview_measured(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         rounds: 0,
         phase: mimizan_core::cfa::BayerPhase::RGGB,
     };
-    Ok(PreviewPlanes { sep, mask, scale: sh.scale() })
+    Ok(PreviewPlanes { sep, scale: sh.scale() })
 }
 
 /// Everything the preview depends on besides the session. The preview is the
@@ -338,7 +329,6 @@ pub struct ViewParams {
     pub tone: Tone,
     /// Placing in stops before the tone (`Recipe::place`).
     pub place: f64,
-    pub show_mask: bool,
     /// Extra clockwise quarter turns on top of the file's orientation.
     pub rotation: u8,
     /// The straighten: degrees the upright negative is turned, clockwise
@@ -451,14 +441,14 @@ impl Geometry {
 
     /// Frame pixels `rect` through the turn: the upright footprint the
     /// kernel reads is mapped to the sensor, `upright_of` gives those
-    /// pixels upright, and the warp resamples them with `kernel`. `None`
-    /// without a turn, or when the source cannot be had.
+    /// pixels upright, and the warp resamples them with the straighten's
+    /// kernel. `None` without a turn, or when the source cannot be had.
     fn warped<const N: usize>(
         &self,
         rect: DetailRect,
-        kernel: ResampleKernel,
         upright_of: impl Fn(DetailRect) -> Option<[Plane; N]>,
     ) -> Option<[Plane; N]> {
+        let kernel = STRAIGHTEN_KERNEL;
         let map = self.map.as_ref()?;
         let pix = PixelRect { x: rect.x, y: rect.y, w: rect.w, h: rect.h };
         let (x0, y0, x1, y1) = straighten::footprint(map, kernel, pix, self.uw, self.uh);
@@ -643,24 +633,11 @@ fn crop(p: &Plane, r: DetailRect) -> Option<Plane> {
     Some(out)
 }
 
-/// The mask bytes are one per sensor sample. A short buffer used to be read
-/// past its end when the mask was on screen.
-fn mask_covers(s: &Session) -> bool {
-    let n = &s.negative;
-    n.plane.width.checked_mul(n.plane.height).is_some_and(|k| n.mask8.len() == k)
-}
-
-/// Render `ask` of the negative.
-///
-/// `step` of 1 is every file pixel. A larger step reads only that grid, the
-/// nearest file pixel of each screen pixel. The mask is the sidecar.
-/// Otherwise the pixels are the 8-bit face of the file: the linear picture
-/// of the ask ([`render_detail_linear`]) placed, toned and burned
-/// ([`tone_tile`]). The ask is clamped to the image.
-pub fn render_detail(s: &Session, v: &ViewParams, ask: DetailAsk, table: &ToneTable) -> Option<DetailImage> {
-    if v.show_mask {
-        return render_mask_detail(s, v, ask);
-    }
+/// `ask` of the negative as the worker shows it, its two steps in one, for
+/// the tests' expectations: the linear picture of the ask
+/// ([`render_detail_linear`]) placed, toned and burned ([`tone_tile`]).
+#[cfg(test)]
+fn render_detail(s: &Session, v: &ViewParams, ask: DetailAsk, table: &ToneTable) -> Option<DetailImage> {
     Some(tone_tile(&render_detail_linear(s, v, ask)?, v, None, table))
 }
 
@@ -741,7 +718,7 @@ fn frame_ask(
 
 /// The linear picture of `ask` of the file as viewed: the mix, resampled
 /// through the turn at 1:1 or sampled on the screen's grid, and the
-/// plates with it when the view is in colour. Not the mask.
+/// plates with it when the view is in colour.
 pub fn render_detail_linear(s: &Session, v: &ViewParams, ask: DetailAsk) -> Option<LinearTile> {
     let step = ask.step();
     let g = Geometry::of(s, v);
@@ -793,9 +770,8 @@ fn mixed_linear(
 ) -> Option<Plane> {
     if step == 1 {
         if g.map.is_some() {
-            let [plane] = g.warped(rect, STRAIGHTEN_KERNEL, |sensor| {
-                Some([mixed_upright(sep, weights, sensor, g.orientation)?])
-            })?;
+            let [plane] =
+                g.warped(rect, |sensor| Some([mixed_upright(sep, weights, sensor, g.orientation)?]))?;
             return Some(plane);
         }
         let src = source_rect(g.orientation, g.sw, g.sh, rect);
@@ -814,7 +790,7 @@ fn plate_linear(
 ) -> Option<[Plane; 3]> {
     if step == 1 {
         if g.map.is_some() {
-            return g.warped(rect, STRAIGHTEN_KERNEL, |sensor| plate_upright(sep, w, sensor, g.orientation));
+            return g.warped(rect, |sensor| plate_upright(sep, w, sensor, g.orientation));
         }
         let sensor = source_rect(g.orientation, g.sw, g.sh, rect);
         return plate_upright(sep, w, sensor, g.orientation);
@@ -829,9 +805,7 @@ fn measured_linear(s: &Session, g: &Geometry, rect: DetailRect, step: usize) -> 
     let n = &s.negative;
     if step == 1 {
         if g.map.is_some() {
-            let [plane] = g.warped(rect, STRAIGHTEN_KERNEL, |sensor| {
-                Some([orient(&crop(&n.plane, sensor)?, g.orientation)])
-            })?;
+            let [plane] = g.warped(rect, |sensor| Some([orient(&crop(&n.plane, sensor)?, g.orientation)]))?;
             return Some(plane);
         }
         let src = source_rect(g.orientation, g.sw, g.sh, rect);
@@ -854,48 +828,6 @@ fn sampled(g: &Geometry, rect: DetailRect, step: usize, at: impl Fn(usize, usize
         }
     });
     out
-}
-
-/// The sidecar mask over `ask`, as bytes: resampled through the turn at
-/// 1:1 with the mask's kernel, else cut or sampled. One byte per sensor
-/// sample, so a monochrome and a Bayer negative read alike.
-fn render_mask_detail(s: &Session, v: &ViewParams, ask: DetailAsk) -> Option<DetailImage> {
-    if !mask_covers(s) {
-        return None;
-    }
-    let step = ask.step();
-    let g = Geometry::of(s, v);
-    let (rect, origin) = frame_ask(&g, s, v, ask)?;
-    let DetailRect { x, y, w, h } = rect;
-    let n = &s.negative;
-    let to_u8 = |m: f64| (m.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let gray = if step == 1 {
-        let plane = if g.map.is_some() {
-            let [plane] = g.warped(rect, MASK_KERNEL, |sensor| {
-                Some([orient(&mask_window(n, sensor)?, g.orientation)])
-            })?;
-            plane
-        } else {
-            let src = source_rect(g.orientation, g.sw, g.sh, rect);
-            orient(&mask_window(n, src)?, g.orientation)
-        };
-        plane.data.par_iter().map(|&m| to_u8(m)).collect()
-    } else {
-        let mut out = vec![0u8; w * h];
-        out.par_chunks_mut(w).enumerate().for_each(|(j, row)| {
-            let oy = y + j * step;
-            for (i, o) in row.iter_mut().enumerate() {
-                let (sx, sy) = g.sensor_px(x + i * step, oy);
-                *o = n.mask8[sy * n.plane.width + sx];
-            }
-        });
-        out
-    };
-    Some(DetailImage {
-        ask: DetailAsk { x: x.saturating_sub(origin.0), y: y.saturating_sub(origin.1), w, h, step },
-        gray,
-        rgb: None,
-    })
 }
 
 /// One row of frame pixels under the field: the normalisation done once
@@ -1057,19 +989,18 @@ fn display_rgb_with(
     out
 }
 
-/// The visible window of a fitted print: the recipe's kernel on the negative,
-/// then the same table as the file's 16-bit codes. Borders stay outside the
-/// picture. Desktop sharpening is off, so the tile is not sharpened.
-pub fn render_print_detail(
+/// The visible window of a fitted print as the worker shows it, its two
+/// steps in one, for the tests' expectations: the recipe's kernel on the
+/// negative ([`render_print_linear`]), then the same table as the file's
+/// 16-bit codes ([`tone_tile`]).
+#[cfg(test)]
+fn render_print_detail(
     s: &Session,
     v: &ViewParams,
     recipe: &Recipe,
     rect: DetailRect,
     table: &ToneTable,
 ) -> Option<DetailImage> {
-    if v.show_mask {
-        return render_detail(s, v, DetailAsk::pixels(rect), table);
-    }
     Some(tone_tile(&render_print_linear(s, v, recipe, rect)?, v, Some(recipe), table))
 }
 
@@ -2009,38 +1940,6 @@ impl Histogram {
         )
     }
 
-    pub fn of_bytes(g: &[u8]) -> Self {
-        // Row-ordered partial histograms, merged deterministically.
-        let parts: Vec<([u32; 256], u64)> = g
-            .par_chunks(1 << 16)
-            .map(|c| {
-                let mut b = [0u32; 256];
-                let mut s = 0u64;
-                for &v in c {
-                    b[v as usize] += 1;
-                    s += v as u64;
-                }
-                (b, s)
-            })
-            .collect();
-        let mut bins = [0u32; 256];
-        let mut sum = 0u64;
-        for (b, s) in parts {
-            for (o, v) in bins.iter_mut().zip(b.iter()) {
-                *o += v;
-            }
-            sum += s;
-        }
-        let total = g.len();
-        Self {
-            bins,
-            total,
-            mean: if total > 0 { sum as f64 / (255.0 * total as f64) } else { 0.0 },
-            low: bins[0] as usize,
-            high: bins[255] as usize,
-        }
-    }
-
     /// Fraction of pixels clipped to black.
     pub fn clipped_low(&self) -> f64 {
         self.frac(self.low)
@@ -2323,14 +2222,11 @@ impl HistCache {
     }
 }
 
-/// The phase table of `kernel` for the small preview's turn, built once;
-/// `None` for a kernel other than the straighten's four-tap one, which is
-/// evaluated (the mask's box).
-fn phased(kernel: ResampleKernel) -> Option<&'static PhasedKernel> {
+/// The phase table of the straighten's kernel for the small preview's
+/// turn, built once; `None` when the kernel has no table and is evaluated.
+fn phased() -> Option<&'static PhasedKernel> {
     static STRAIGHTEN: OnceLock<Option<PhasedKernel>> = OnceLock::new();
-    (kernel == STRAIGHTEN_KERNEL)
-        .then(|| STRAIGHTEN.get_or_init(|| PhasedKernel::new(kernel).ok()).as_ref())
-        .flatten()
+    STRAIGHTEN.get_or_init(|| PhasedKernel::new(STRAIGHTEN_KERNEL).ok()).as_ref()
 }
 
 /// Scale a full-resolution upright window onto the preview plane.
@@ -2352,7 +2248,6 @@ pub struct PreviewStages {
     shown: Option<(ShownKey, Shown)>,
     mixed: Option<((ShownKey, Weights), Plane)>,
     plate: Option<((ShownKey, PlateWeights), [Plane; 3])>,
-    mask: Option<(ShownKey, Plane)>,
 }
 
 /// What the geometry of the preview depends on.
@@ -2376,16 +2271,11 @@ impl PreviewStages {
     /// reads the kernel's weights from a table of phases (a quarter of the
     /// exact warp's time; the difference is below a 16-bit step), the 1:1
     /// tiles and the exports evaluate it.
-    fn show(
-        s: &Session,
-        v: &ViewParams,
-        plane: &Plane,
-        kernel: ResampleKernel,
-    ) -> (Plane, (usize, usize), CropRect) {
+    fn show(s: &Session, v: &ViewParams, plane: &Plane) -> (Plane, (usize, usize), CropRect) {
         let turned = orient(plane, rotated(1, v.rotation));
-        let turned = match phased(kernel) {
+        let turned = match phased() {
             Some(k) => straighten::straighten_phased(&turned, v.angle, k),
-            None => straighten::straighten(&turned, v.angle, kernel),
+            None => straighten::straighten(&turned, v.angle, STRAIGHTEN_KERNEL),
         };
         let small = (turned.width, turned.height);
         match v.crop {
@@ -2406,16 +2296,13 @@ impl PreviewStages {
         let key = Self::key(s, v);
         if self.shown.as_ref().is_none_or(|(k, _)| *k != key) {
             let pp = &s.preview;
-            let (lum, small, window) = Self::show(s, v, &pp.sep.lum, STRAIGHTEN_KERNEL);
+            let (lum, small, window) = Self::show(s, v, &pp.sep.lum);
             // A monochrome negative has no colour to show; its chrominance
             // stays the empty planes the mix ignores.
             let (c1, c2) = if s.is_mono() {
                 (Plane::zeros(lum.width, lum.height), Plane::zeros(lum.width, lum.height))
             } else {
-                (
-                    Self::show(s, v, &pp.sep.c1, STRAIGHTEN_KERNEL).0,
-                    Self::show(s, v, &pp.sep.c2, STRAIGHTEN_KERNEL).0,
-                )
+                (Self::show(s, v, &pp.sep.c1).0, Self::show(s, v, &pp.sep.c2).0)
             };
             let sep = Separation {
                 lum,
@@ -2451,19 +2338,10 @@ impl PreviewStages {
         }
         &self.plate.as_ref().unwrap().1
     }
-
-    fn mask(&mut self, s: &Session, v: &ViewParams) -> &Plane {
-        let key = Self::key(s, v);
-        if self.mask.as_ref().is_none_or(|(k, _)| *k != key) {
-            let (plane, _, _) = Self::show(s, v, &s.preview.mask, MASK_KERNEL);
-            self.mask = Some((key, plane));
-        }
-        &self.mask.as_ref().unwrap().1
-    }
 }
 
 /// 8-bit grey preview of the whole negative: the downscaled mix, then the
-/// tone table (or the mask), in the picture's final orientation. The
+/// tone table, in the picture's final orientation. The
 /// stages that stand are taken from `stages`.
 pub fn render_preview(
     s: &Session,
@@ -2472,22 +2350,6 @@ pub fn render_preview(
     stages: &mut PreviewStages,
     table: &ToneTable,
 ) -> PreviewImage {
-    let to_u8 = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
-    if v.show_mask {
-        let plane = stages.mask(s, v);
-        let gray: Vec<u8> = plane.data.par_iter().map(|&m| to_u8(m)).collect();
-        let hist_view = Histogram::of_bytes(&gray);
-        return PreviewImage {
-            width: plane.width,
-            height: plane.height,
-            rotation: v.rotation,
-            gray,
-            rgb: None,
-            hist_view,
-            hist_negative: Histogram::empty(),
-            hist_rgb: None,
-        };
-    }
     // Histograms from the full-resolution separation, not the preview copy.
     let (hist_negative, hist_view) = cache.histograms(s, v, table);
     let g = Geometry::of(s, v);
@@ -2883,7 +2745,6 @@ mod histogram_tests {
             weights: shifted,
             tone: Tone::paper(),
             place: 0.0,
-            show_mask: false,
             rotation: 0,
             angle: 0.0,
             crop: None,
@@ -2984,7 +2845,6 @@ mod histogram_tests {
             weights: Weights::default(),
             tone: Tone::paper(),
             place: 0.0,
-            show_mask: false,
             rotation: 0,
             angle: 0.0,
             crop: None,
@@ -3191,7 +3051,6 @@ mod histogram_tests {
             weights: Weights::default(),
             tone: Tone::paper(),
             place: 0.0,
-            show_mask: false,
             rotation: 0,
             angle: 0.0,
             crop: None,
@@ -3210,7 +3069,6 @@ mod histogram_tests {
             ViewParams { angle: 3.0, plate: Some(plate), ..base.clone() },
             ViewParams { rotation: 1, angle: 3.0, ..base.clone() },
             ViewParams { crop: Some(CropRect { x: 4, y: 2, w: 30, h: 20 }), ..base.clone() },
-            ViewParams { show_mask: true, angle: 3.0, ..base.clone() },
             base.clone(),
         ];
         let mut stages = PreviewStages::default();
@@ -3338,7 +3196,6 @@ mod histogram_tests {
             weights: Weights::default(),
             tone: Tone::paper(),
             place: 0.0,
-            show_mask: false,
             rotation: 1,
             angle: 0.0,
             crop: None,
