@@ -866,6 +866,11 @@ impl Profile {
         }
         let (s0, s1) = (-feather, travel + feather);
         let step = (feather / 256.0).max((s1 - s0) / (PROFILE_MAX - 1) as f64);
+        // A feather so narrow that a 256th of it is nothing has no
+        // samples to take: the card is read as it is, like the hard one.
+        if step.is_nan() || step <= 0.0 {
+            return None;
+        }
         let n = ((s1 - s0) / step).ceil() as usize + 1;
         let w = (0..n).map(|i| card_weight(s0 + i as f64 * step, travel, feather) as f32).collect();
         Some(Self { s0, inv_step: 1.0 / step, w })
@@ -895,6 +900,16 @@ fn card_weight(s: f64, travel: f64, feather: f64) -> f64 {
         edge_weight(-s, feather)
     } else if feather > 0.0 {
         let f = feather;
+        // Past the penumbra on either side the weight is whole. Said
+        // outright: far from a very narrow edge the two integrals below
+        // are two equal large numbers, or two infinities, and their
+        // difference is nothing.
+        if s <= -f {
+            return 0.0;
+        }
+        if s >= travel + f {
+            return 1.0;
+        }
         f / travel * (penumbra_integral((travel - s) / f) - penumbra_integral(-s / f))
     } else {
         (s / travel).clamp(0.0, 1.0)
@@ -1469,6 +1484,24 @@ mod tests {
     fn pass(cx: f64, cy: f64, deg: f64) -> [[f64; 2]; 2] {
         let (s, c) = deg.to_radians().sin_cos();
         [[cx - 0.5 * c, cy - 0.5 * s], [cx + 0.5 * c, cy + 0.5 * s]]
+    }
+
+    /// The narrowest feather a recipe can carry is a number so small that
+    /// a 256th of it is nothing. Such a card passes the check as any
+    /// positive feather does, and it is a hard card for every pixel.
+    #[test]
+    fn a_feather_too_narrow_to_sample_is_a_hard_card() {
+        for (feather, travel) in [(5e-324, 0.0), (1e-322, 0.0), (5e-324, 1e-320), (1e-310, 0.0)] {
+            let soft = card(0.0, 0.0, 0.0, travel, feather, 1.0);
+            soft.validate().unwrap();
+            let hard = card(0.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+            let to_norm = normalize(100, 80);
+            let field = Field::new(std::slice::from_ref(&soft), to_norm).unwrap();
+            let edge = Field::new(std::slice::from_ref(&hard), to_norm).unwrap();
+            for (px, py) in [(10, 40), (49, 40), (51, 40), (90, 10)] {
+                assert_eq!(field.times_at(px, py), edge.times_at(px, py), "feather {feather} at {px},{py}");
+            }
+        }
     }
 
     #[test]
