@@ -19,7 +19,7 @@ No account. No network. The pictures stay on your computer.
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
 ```
 
-Then open the app (right-click, Open). The Mac App Store and TestFlight builds are signed and do not need this.
+Then open the app (right-click, Open). The TestFlight build is signed and does not need this.
 
 **Phone**
 
