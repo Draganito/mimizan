@@ -165,6 +165,23 @@ impl Brush {
     }
 }
 
+/// The shortest push of the card that has a direction, in points on the
+/// stage.
+pub const PUSH_MIN: f64 = 4.0;
+
+/// Where a card pressed at `from` is pushed to with the pointer at `to`,
+/// `k` points on the stage per unit. A hand that clicks does not hold
+/// still: under [`PUSH_MIN`] the pointer's wobble is no push, and the
+/// card stays at `from` as the brush is set. Taken as a push, a click
+/// would turn the card to wherever the wobble went.
+pub fn pushed_to(from: (f64, f64), to: (f64, f64), k: f64) -> (f64, f64) {
+    if (to.0 - from.0).hypot(to.1 - from.1) * k < PUSH_MIN {
+        from
+    } else {
+        to
+    }
+}
+
 /// A handle on the brush shown on the stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -492,6 +509,20 @@ mod tests {
         );
         let held = b.card_stroke((0.1, 0.1), (0.1, 0.1));
         assert!(matches!(held, Stroke::Card { angle: -90.0, travel: 0.0, .. }));
+        // A click wobbles a point or two on the stage. Taken as it comes
+        // it is a push to the lower right; through `pushed_to` it is the
+        // card held still, and a push of a few points more is a push.
+        let k = 600.0;
+        let from = (0.1, 0.1);
+        let wobble = (from.0 + 2.0 / k, from.1 + 1.5 / k);
+        assert!(matches!(b.card_stroke(from, wobble), Stroke::Card { angle, .. } if angle > 0.0));
+        let clicked = b.card_stroke(from, pushed_to(from, wobble, k));
+        assert!(matches!(clicked, Stroke::Card { angle: -90.0, travel: 0.0, .. }), "{clicked:?}");
+        let short = (from.0 + 6.0 / k, from.1);
+        assert_eq!(pushed_to(from, short, k), short);
+        assert!(
+            matches!(b.card_stroke(from, pushed_to(from, short, k)), Stroke::Card { angle, .. } if angle == 0.0)
+        );
         let h = hand(0.1, 0.05, 10.0, 0.02);
         let s = h.hand_stroke(vec![[0.0, 0.0], [0.1, 0.0]]);
         assert_eq!(

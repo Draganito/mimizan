@@ -2145,7 +2145,8 @@ impl App {
                     self.burn_drag = None;
                     return;
                 }
-                let stroke = self.brush.card_stroke(from, (brush::clamp_reach(x), brush::clamp_reach(y)));
+                let to = brush::pushed_to(from, (brush::clamp_reach(x), brush::clamp_reach(y)), k);
+                let stroke = self.brush.card_stroke(from, to);
                 self.store_shown_stroke(index, stroke);
             }
         }
