@@ -1729,15 +1729,27 @@ struct Counts {
     view_low: usize,
     view_high: usize,
     /// Pixels counted: the rectangle, less what a turned window leaves out.
+    /// The walk counts them; the tally brings its own total.
+    #[cfg(test)]
     total: usize,
 }
 
 impl Default for Counts {
     fn default() -> Self {
-        Self { neg: [0; 256], view: [0; 256], neg_low: 0, neg_high: 0, view_low: 0, view_high: 0, total: 0 }
+        Self {
+            neg: [0; 256],
+            view: [0; 256],
+            neg_low: 0,
+            neg_high: 0,
+            view_low: 0,
+            view_high: 0,
+            #[cfg(test)]
+            total: 0,
+        }
     }
 }
 
+#[cfg(test)]
 impl Counts {
     fn add(&mut self, o: &Self) {
         for (a, b) in self.neg.iter_mut().zip(o.neg.iter()) {
@@ -1838,7 +1850,9 @@ impl Histogram {
     /// from `codes`; the negative's bins do not see the strokes. A large
     /// burned area is sampled on a lattice of `k` pixels, each sample
     /// standing for `k²`, so the walk stays within `BURN_WALK_BUDGET`
-    /// pixels; up to that many it is exact.
+    /// pixels; up to that many it is exact. A sample stands for no more
+    /// pixels than the tally still has of its code, so every pixel is
+    /// counted once and the bins add up to the total.
     fn of_tally(
         tally: &Tally,
         codes: &[u16],
@@ -1861,9 +1875,9 @@ impl Histogram {
                 (y0..y1).into_par_iter().map(|y| FieldRow::new(Some(field), y, x0, x1).span.len()).sum();
             let k = (area.div_ceil(BURN_WALK_BUDGET) as f64).sqrt().ceil().max(1.0) as usize;
             let each = (k * k) as u32;
-            // Per row: the codes of the pixels with their own times, and
-            // their view bins.
-            let parts: Vec<(Vec<u16>, Counts)> = (y0..y1)
+            // Per row: the codes of the pixels with their own times, each
+            // with its view bin and whether the paper clips it.
+            let parts: Vec<Vec<(u16, u8, u8)>> = (y0..y1)
                 .into_par_iter()
                 .step_by(k)
                 .filter_map(|y| {
@@ -1875,7 +1889,6 @@ impl Histogram {
                     let row = &codes[y * width..(y + 1) * width];
                     let mut timed = Timed::new(table);
                     let mut taken = Vec::new();
-                    let mut c = Counts::default();
                     for x in span.step_by(k) {
                         if quad.is_some_and(|q| !q.holds(x, y)) {
                             continue;
@@ -1887,22 +1900,22 @@ impl Histogram {
                         let q = row[x];
                         let m = q as f64 / 65535.0;
                         let (bin, clip) = timed.view(if place == 0.0 { m } else { m * global }, times);
-                        c.view[bin as usize] += each;
-                        match clip {
-                            1 => c.view_low += each as usize,
-                            2 => c.view_high += each as usize,
-                            _ => {}
-                        }
-                        taken.push(q);
+                        taken.push((q, bin, clip));
                     }
-                    (!taken.is_empty()).then_some((taken, c))
+                    (!taken.is_empty()).then_some(taken)
                 })
                 .collect();
-            for (taken, c) in parts {
-                for q in taken {
-                    unit[q as usize] = unit[q as usize].saturating_sub(each);
+            for (q, bin, clip) in parts.into_iter().flatten() {
+                // What is counted under the stroke is what leaves the
+                // tally: `each`, or what the tally still has of the code.
+                let n = unit[q as usize].min(each);
+                unit[q as usize] -= n;
+                burned.view[bin as usize] += n;
+                match clip {
+                    1 => burned.view_low += n as usize,
+                    2 => burned.view_high += n as usize,
+                    _ => {}
                 }
-                burned.add(&c);
             }
         }
         let mut all = burned;
@@ -3090,6 +3103,42 @@ mod histogram_tests {
             let moved: u32 = v1.bins.iter().zip(&v2.bins).map(|(a, b)| a.abs_diff(*b)).sum();
             assert!(moved <= 2 * 4, "{moved} pixels moved at place {place}");
         }
+    }
+
+    /// A burned area too large to walk is sampled, and every pixel is still
+    /// counted once: the bins add up to the pixels, the clipped ones are
+    /// among them. Codes that seldom repeat are the case where a sample
+    /// stands for more pixels than the picture has of its code.
+    #[test]
+    fn a_sampled_burn_counts_every_pixel_once() {
+        use mimizan_core::burn::{Light, Stroke, Tip};
+        let (w, h) = (1600usize, 1400usize);
+        assert!(w * h > 2 * BURN_WALK_BUDGET);
+        let codes: Vec<u16> = (0..(w * h) as u64)
+            .map(|i| {
+                let mut z = i.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                ((z ^ (z >> 31)) >> 48) as u16
+            })
+            .collect();
+        let table = ToneTable::build(&Tone::paper().compile());
+        let stroke = Stroke::Hand {
+            tip: Tip { rx: 0.9, ry: 0.9, angle: 0.0, feather: 0.0 },
+            stops: 1.0,
+            light: Light::Both,
+            points: vec![[0.0, 0.0]],
+        };
+        let field = Field::new(std::slice::from_ref(&stroke), burn::normalize(w, h)).unwrap();
+        let tally = Tally::of(&codes, w, None);
+        let (plain_neg, plain) = Histogram::of_tally(&tally, &codes, w, None, &table, 0.0, None);
+        let (neg, view) = Histogram::of_tally(&tally, &codes, w, None, &table, 0.0, Some(&field));
+        let sum = |h: &Histogram| h.bins.iter().map(|&n| n as usize).sum::<usize>();
+        assert_eq!(neg, plain_neg);
+        assert_eq!((sum(&plain), plain.total), (w * h, w * h));
+        assert_ne!(view.bins, plain.bins);
+        assert_eq!((sum(&view), view.total), (w * h, w * h));
+        assert!(view.low + view.high <= view.total);
     }
 
     /// The staged preview is the fresh one: a tone, a weight, a turn and a
