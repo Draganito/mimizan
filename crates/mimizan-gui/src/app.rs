@@ -141,31 +141,74 @@ impl PaperFormat {
     }
 
     /// The format closest to a window, and whether that window is turned
-    /// against the picture's long side. The whole picture is its own format.
-    fn match_window(img_w: u32, img_h: u32, cw: u32, ch: u32) -> (Self, bool) {
-        let (format, turned, err) = Self::ALL
-            .into_iter()
-            .map(|f| {
-                let (a, b) = f.oriented(img_w, img_h);
-                let (turned, err) = ratio_turn(a, b, cw, ch);
-                (f, turned, err)
-            })
-            .min_by_key(|(_, _, err)| *err)
-            .unwrap_or((Self::R8x10, false, i64::MAX));
-        let (image_turned, image_err) = ratio_turn(img_w, img_h, cw, ch);
+    /// against the picture's long side. Formats of one shape (4×5, 8×10
+    /// and 16×20) are equally close: the whole picture is then its own
+    /// format, `current` stays what it is, and otherwise the first named
+    /// format is it.
+    fn match_window(img_w: u32, img_h: u32, cw: u32, ch: u32, current: Self) -> (Self, bool) {
+        let fit = |f: Self| {
+            let (a, b) = f.frame(img_w, img_h, false);
+            let (turned, gap) = ratio_turn(a, b, cw, ch);
+            (f, turned, gap)
+        };
+        let fits = Self::ALL.map(fit);
+        let image = fit(Self::Image);
+        let least = fits.iter().fold(image.2, |least, f| least.min(f.2));
         let whole = cw == img_w && ch == img_h;
-        if image_err < err || (image_err == err && whole) {
-            (Self::Image, image_turned)
+        let closest = || fits.iter().chain([&image]).filter(|f| f.2 == least);
+        let (format, turned, _) = if whole && image.2 == least {
+            image
+        } else if let Some(chosen) = closest().find(|f| f.0 == current) {
+            *chosen
         } else {
-            (format, turned)
-        }
+            closest().next().copied().unwrap_or(image)
+        };
+        (format, turned)
     }
 }
 
-/// Whether `cw`:`ch` sits across `a`:`b`, and how far the two ratios are.
-fn ratio_turn(a: u32, b: u32, cw: u32, ch: u32) -> (bool, i64) {
-    let along = (i64::from(cw) * i64::from(b) - i64::from(ch) * i64::from(a)).abs();
-    let across = (i64::from(cw) * i64::from(a) - i64::from(ch) * i64::from(b)).abs();
+/// How far a window is from a shape: `|cw·b − ch·a| / (cw·b + ch·a)` for
+/// the window `cw`×`ch` and the shape `a`:`b`. Zero is the same shape, and
+/// the number does not change with the size of either or with which side
+/// is called the width, so the gaps to two shapes can be compared.
+#[derive(Clone, Copy, Debug)]
+struct Gap {
+    num: u128,
+    den: u128,
+}
+
+impl Gap {
+    fn new(a: u32, b: u32, cw: u32, ch: u32) -> Self {
+        let (x, y) = (u128::from(cw) * u128::from(b), u128::from(ch) * u128::from(a));
+        Self { num: x.abs_diff(y), den: (x + y).max(1) }
+    }
+}
+
+// Fractions are compared cross-multiplied, in whole numbers. The sides are
+// pixel counts of a picture in memory, far below the 2³¹ where the product
+// would no longer fit.
+impl PartialEq for Gap {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Gap {}
+impl PartialOrd for Gap {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Gap {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.num * other.den).cmp(&(other.num * self.den))
+    }
+}
+
+/// Whether `cw`:`ch` sits across `a`:`b`, and how far it is from the
+/// closer of the two.
+fn ratio_turn(a: u32, b: u32, cw: u32, ch: u32) -> (bool, Gap) {
+    let along = Gap::new(a, b, cw, ch);
+    let across = Gap::new(b, a, cw, ch);
     if a != b && across < along {
         (true, across)
     } else {
@@ -1608,7 +1651,7 @@ impl App {
         self.close_burn();
         if let Some(c) = self.edit.recipe.crop {
             let c = c.sanitized(fw, fh);
-            let (format, turned) = PaperFormat::match_window(fw, fh, c.w, c.h);
+            let (format, turned) = PaperFormat::match_window(fw, fh, c.w, c.h, self.crop_format);
             self.crop_format = format;
             self.crop_turned = turned;
             self.crop_draft = c;
@@ -7104,15 +7147,53 @@ mod crop_drag_tests {
         assert_eq!(picture_terms(100, 80), (5, 4));
         assert_eq!(PaperFormat::Image.frame(6048, 4024, false), (6048, 4024));
         assert_eq!(PaperFormat::Image.frame(6048, 4024, true), (4024, 6048));
-        assert_eq!(PaperFormat::match_window(6048, 4024, 6048, 4024), (PaperFormat::Image, false));
-        assert_eq!(PaperFormat::match_window(100, 80, 50, 40), (PaperFormat::R4x5, false));
+        assert_eq!(
+            PaperFormat::match_window(6048, 4024, 6048, 4024, PaperFormat::R8x10),
+            (PaperFormat::Image, false)
+        );
+        assert_eq!(
+            PaperFormat::match_window(100, 80, 50, 40, PaperFormat::Square),
+            (PaperFormat::R4x5, false)
+        );
+    }
+
+    /// A window of the picture's own shape, a pixel off after rounding,
+    /// is still the picture's format and not the square.
+    #[test]
+    fn a_window_of_the_pictures_shape_is_the_picture_not_the_square() {
+        let now = PaperFormat::R8x10;
+        let (format, turned) = PaperFormat::match_window(6048, 4024, 3025, 2012, now);
+        assert_eq!((format, turned), (PaperFormat::Image, false));
+        let (format, turned) = PaperFormat::match_window(6048, 4024, 2012, 3025, now);
+        assert_eq!((format, turned), (PaperFormat::Image, true));
+        // A square is a square, and 5×7 is 5×7 on a picture of any size.
+        assert_eq!(PaperFormat::match_window(6048, 4024, 2000, 2001, now).0, PaperFormat::Square);
+        assert_eq!(PaperFormat::match_window(6048, 4024, 2800, 2001, now), (PaperFormat::R5x7, false));
+        assert_eq!(PaperFormat::match_window(60480, 40240, 28000, 20010, now), (PaperFormat::R5x7, false));
+    }
+
+    /// 4×5, 8×10 and 16×20 are one shape. The window of an 8×10 is found
+    /// as the 8×10 it was cut for, and with none of them chosen as the
+    /// first of the three.
+    #[test]
+    fn formats_of_one_shape_keep_the_one_chosen() {
+        for now in [PaperFormat::R4x5, PaperFormat::R8x10, PaperFormat::R16x20] {
+            assert_eq!(PaperFormat::match_window(6048, 4024, 5030, 4024, now), (now, false));
+            assert_eq!(PaperFormat::match_window(6048, 4024, 3219, 4024, now), (now, true));
+        }
+        assert_eq!(PaperFormat::match_window(6048, 4024, 5030, 4024, PaperFormat::R5x7).0, PaperFormat::R4x5);
+        // A picture that is 5:4 itself: its whole is the picture, a part of
+        // it the format chosen, and the picture when that was chosen.
+        assert_eq!(PaperFormat::match_window(100, 80, 100, 80, PaperFormat::R8x10).0, PaperFormat::Image);
+        assert_eq!(PaperFormat::match_window(100, 80, 50, 40, PaperFormat::R8x10).0, PaperFormat::R8x10);
+        assert_eq!(PaperFormat::match_window(100, 80, 50, 40, PaperFormat::Image).0, PaperFormat::Image);
     }
 
     #[test]
     fn a_portrait_window_on_a_landscape_picture_remembers_the_turn() {
-        let (format, turned) = PaperFormat::match_window(100, 80, 40, 50);
+        let (format, turned) = PaperFormat::match_window(100, 80, 40, 50, PaperFormat::R4x5);
         assert_eq!((format, turned), (PaperFormat::R4x5, true));
-        let (format, turned) = PaperFormat::match_window(100, 80, 50, 40);
+        let (format, turned) = PaperFormat::match_window(100, 80, 50, 40, PaperFormat::R4x5);
         assert_eq!((format, turned), (PaperFormat::R4x5, false));
     }
 
