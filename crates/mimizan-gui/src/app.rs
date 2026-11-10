@@ -402,8 +402,10 @@ struct StageDress {
 }
 
 /// What is kept of a session let go for room: enough for the recipe
-/// question and the sidecar's name while the picture is still on the
-/// stage and the edit is still its edit.
+/// question and the sidecar's name while the edit is still its edit.
+/// That is while its picture stands on the stage as a texture, and after
+/// its own development failed and took the picture with it
+/// (`released_after_failure`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Released {
     path: PathBuf,
@@ -506,6 +508,41 @@ fn opened_is_fresh(held: Option<&Path>, released: Option<&Path>, opened: &Path) 
     held.or(released).is_none_or(|before| before != opened)
 }
 
+/// What a development that failed leaves of the file let go for it; `job`
+/// is the file that development was of. The picture is gone either way.
+/// When the job was the file's own (a re-development, or its open sent
+/// again), the file stays the edit's: the recipe may hold work that is
+/// not saved, and the question on leaving needs the file to write it
+/// beside. Another file's open came after that question was answered.
+fn released_after_failure(released: Option<Released>, job: Option<&Path>) -> Option<Released> {
+    released.filter(|r| job == Some(r.path.as_path()))
+}
+
+/// What `open` does with a path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenStep {
+    /// The file is on the stage already.
+    Stay,
+    /// The recipe is not saved: the question first.
+    Ask,
+    Open,
+}
+
+/// `released` is the file the edit belongs to while no session is held.
+/// Opening that one brings its picture back under the same edit
+/// (`opened_is_fresh`), so the recipe goes nowhere and nothing is asked.
+fn open_step(held: Option<&Path>, released: Option<&Path>, path: &Path, unsaved: bool) -> OpenStep {
+    if held == Some(path) {
+        OpenStep::Stay
+    } else if released == Some(path) {
+        OpenStep::Open
+    } else if unsaved {
+        OpenStep::Ask
+    } else {
+        OpenStep::Open
+    }
+}
+
 /// Bytes the development of the file about to open will hold: from its
 /// size when the strip has read it, else the current session's own, the
 /// next file being most often from the same camera. Nothing to go by
@@ -541,7 +578,9 @@ pub struct App {
     /// A session let go to make room for the development under way
     /// (`make_room`). The picture stays on screen as its texture, and the
     /// recipe is still its recipe until the result lands; the result
-    /// decides whether it was the same file.
+    /// decides whether it was the same file. When the file's own
+    /// development fails, the picture goes and this stays: the edit is
+    /// still that file's until another one opens.
     released: Option<Released>,
     /// "Apply" was pressed: the re-development starts with the next frame.
     redevelop: Option<DevelopParams>,
@@ -2485,14 +2524,17 @@ impl App {
     fn open(&mut self, path: PathBuf) {
         // Absolute like the strip's entries, so the tile lights up.
         let path = readable_path(&path);
-        if self.session.as_ref().is_some_and(|s| s.path == path) {
-            return;
+        let step = open_step(
+            self.session.as_ref().map(|s| s.path.as_path()),
+            self.released.as_ref().map(|r| r.path.as_path()),
+            &path,
+            self.should_ask_to_save(),
+        );
+        match step {
+            OpenStep::Stay => {}
+            OpenStep::Ask => self.pending_leave = Some(Leave::Open(path)),
+            OpenStep::Open => self.start_open(path),
         }
-        if self.should_ask_to_save() {
-            self.pending_leave = Some(Leave::Open(path));
-            return;
-        }
-        self.start_open(path);
     }
 
     fn start_open(&mut self, path: PathBuf) {
@@ -2616,18 +2658,21 @@ impl App {
         self.log(format!("error: {message}. Close other programs and open it again"));
         self.busy = None;
         self.picture_gone_if_released();
-        self.current_path = self.session.as_ref().map(|s| s.path.clone());
     }
 
     /// A picture let go for room is gone with its texture once the job it
-    /// made room for has failed.
+    /// made room for has failed. `current_path` is still that job's file;
+    /// afterwards it is the file the edit belongs to, so the strip points
+    /// at what is left and not at the failure.
     fn picture_gone_if_released(&mut self) {
-        if self.released.take().is_some() {
+        if self.released.is_some() {
+            self.released = released_after_failure(self.released.take(), self.current_path.as_deref());
             self.texture = None;
             self.detail_texture = None;
             self.detail_rect = None;
             self.held_dress = None;
         }
+        self.current_path = self.developed_path().map(Path::to_path_buf);
     }
 
     /// Controls back to the session's defaults; the negative stays. A new
@@ -3002,7 +3047,6 @@ impl App {
                     // the strip must point at that one, not at the failure.
                     // A picture let go for room is gone with its texture.
                     self.picture_gone_if_released();
-                    self.current_path = self.session.as_ref().map(|s| s.path.clone());
                 }
             }
         }
@@ -7199,8 +7243,9 @@ mod sheet_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        dress_to_hold, hit_crop, moved_crop, must_make_room, opened_is_fresh, opening_memory, picture_terms,
-        recipe_needs_saving, stage_black_px, tile_must_wait, CropHit, PaperFormat, Rings, StageDress,
+        dress_to_hold, hit_crop, moved_crop, must_make_room, open_step, opened_is_fresh, opening_memory,
+        picture_terms, recipe_needs_saving, released_after_failure, stage_black_px, tile_must_wait, CropHit,
+        OpenStep, PaperFormat, Released, Rings, StageDress,
     };
     use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
     use mimizan_core::recipe::{CropCorner, CropRect, Recipe};
@@ -7263,6 +7308,40 @@ mod crop_drag_tests {
         assert!(big > small * 2, "{big} vs {small}");
         assert_eq!(opening_memory(None, Some(small)), Some(small));
         assert_eq!(opening_memory(None, None), None);
+    }
+
+    /// A re-development the machine cannot hold takes the picture with
+    /// it: the session was let go to make room. The edit is still that
+    /// file's, with whatever was not saved, so the file stays its file:
+    /// the question on leaving finds the recipe's name, and opening the
+    /// file again brings the picture back under the same edit.
+    #[test]
+    fn a_failed_development_leaves_the_edit_its_file() {
+        let a = Path::new("a.nef");
+        let b = Path::new("b.nef");
+        let let_go = || Some(Released { path: a.to_path_buf(), mono: false });
+        // Its own job failed: a re-development, or its open sent again.
+        assert_eq!(released_after_failure(let_go(), Some(a)), let_go());
+        // Another file's open failed: the question was answered before.
+        assert_eq!(released_after_failure(let_go(), Some(b)), None);
+        assert_eq!(released_after_failure(let_go(), None), None);
+        assert_eq!(released_after_failure(None, Some(a)), None);
+    }
+
+    #[test]
+    fn opening_asks_for_the_recipe_unless_the_file_is_the_edits() {
+        let a = Path::new("a.nef");
+        let b = Path::new("b.nef");
+        // On the stage already.
+        assert_eq!(open_step(Some(a), None, a, true), OpenStep::Stay);
+        // Another file: the question when the recipe is not saved.
+        assert_eq!(open_step(Some(a), None, b, true), OpenStep::Ask);
+        assert_eq!(open_step(Some(a), None, b, false), OpenStep::Open);
+        assert_eq!(open_step(None, None, b, false), OpenStep::Open);
+        // The file whose picture was lost comes back to its edit: there
+        // is nothing to ask, the recipe goes nowhere.
+        assert_eq!(open_step(None, Some(a), a, true), OpenStep::Open);
+        assert_eq!(open_step(None, Some(a), b, true), OpenStep::Ask);
     }
 
     #[test]
