@@ -510,6 +510,15 @@ fn opened_is_fresh(held: Option<&Path>, released: Option<&Path>, opened: &Path) 
     held.or(released).is_none_or(|before| before != opened)
 }
 
+/// Whether the radius and the amount in the fields stay when the file is
+/// developed again. `held`: they are not the measurement's (the user set
+/// them, a recipe brought them, or a reset put the defaults back).
+/// `at_measured`: they are, all the same, the numbers that were measured.
+/// Those follow the new measurement: they were the old pixels' radius.
+fn peak_held_after_redevelopment(held: bool, at_measured: bool) -> bool {
+    held && !at_measured
+}
+
 /// What a development that failed leaves of the file let go for it; `job`
 /// is the file that development was of. The picture is gone either way.
 /// When the job was the file's own (a re-development, or its open sent
@@ -683,8 +692,9 @@ pub struct App {
     pick_card: bool,
     /// What the last grey card read, shown under the white-balance row.
     card_status: Option<String>,
-    /// The user edited radius or amount on this file. A measurement will not
-    /// replace those numbers.
+    /// Radius and amount in the fields are not a measurement's: the user
+    /// set them, a recipe brought them, or a reset put the defaults back.
+    /// A measurement will not replace those numbers.
     peak_held: bool,
     /// Start one measurement on the next frame. Cleared when it starts.
     peak_arm: bool,
@@ -3091,7 +3101,11 @@ impl App {
                     }
                     // A re-development has new pixels: the measured radius
                     // belongs to the old ones.
-                    self.note_peak_source();
+                    if fresh {
+                        self.note_peak_source();
+                    } else {
+                        self.note_redeveloped();
+                    }
                     self.busy = None;
                     self.last_view = None;
                 }
@@ -4966,6 +4980,18 @@ impl App {
         self.peak_measure = None;
         self.peak_measured = None;
         self.peak_held = !self.edit.recipe.peak.is_unset();
+        self.peak_arm = self.session.is_some() && self.screenshot_to.is_none();
+    }
+
+    /// The same file developed again: the pixels are new, so they are
+    /// measured again. Whether the fields take that measurement is not
+    /// read off the numbers, as it is for a new file: the first
+    /// measurement filled them, and they would pass for the user's.
+    fn note_redeveloped(&mut self) {
+        let held = peak_held_after_redevelopment(self.peak_held, self.peak_at_measured());
+        self.peak_measure = None;
+        self.peak_measured = None;
+        self.peak_held = held;
         self.peak_arm = self.session.is_some() && self.screenshot_to.is_none();
     }
 
@@ -7304,8 +7330,9 @@ mod sheet_tests {
 mod crop_drag_tests {
     use super::{
         develop_for_open, dress_to_hold, hit_crop, moved_crop, must_make_room, open_step, opened_is_fresh,
-        opening_memory, picture_terms, recipe_needs_saving, released_after_failure, stage_black_px,
-        tile_must_wait, CropHit, OpenStep, PaperFormat, Released, Rings, StageDress,
+        opening_memory, peak_held_after_redevelopment, picture_terms, recipe_needs_saving,
+        released_after_failure, stage_black_px, tile_must_wait, CropHit, OpenStep, PaperFormat, Released,
+        Rings, StageDress,
     };
     use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
     use mimizan_core::recipe::{CropCorner, CropRect, Develop, Recipe};
@@ -7421,6 +7448,25 @@ mod crop_drag_tests {
         // An older recipe names none.
         assert_eq!(develop_for_open(card, false, Some(&Recipe::on_paper())), Develop::default());
         assert_eq!(develop_for_open(card, true, Some(&beside)), card);
+    }
+
+    /// Developed again (another white balance, another mask) the file has
+    /// new pixels and is measured again. The radius and the amount the
+    /// first measurement put in the fields are the measurement's, and
+    /// follow the new one; what the user set stays.
+    #[test]
+    fn a_redevelopment_measures_the_peak_again_for_fields_it_filled() {
+        // (held, at the measured numbers)
+        // The measurement filled the fields.
+        assert!(!peak_held_after_redevelopment(false, true));
+        // Still measuring when Apply was pressed.
+        assert!(!peak_held_after_redevelopment(false, false));
+        // The user moved a field, the recipe brought other numbers, or
+        // the controls were reset to the defaults.
+        assert!(peak_held_after_redevelopment(true, false));
+        // Moved, then put back with the row's reset; or a recipe that was
+        // saved with the measured numbers: the measurement's again.
+        assert!(!peak_held_after_redevelopment(true, true));
     }
 
     #[test]
