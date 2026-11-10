@@ -9,7 +9,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The dist build's cache, shared with the release (see release.yml).
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dist
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build the store package
         shell: pwsh
         run: pwsh -NoProfile -STA -ExecutionPolicy Bypass -File ./dist/make_msix.ps1

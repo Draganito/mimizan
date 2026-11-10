@@ -1,8 +1,20 @@
+# A v* tag builds the three packages and publishes them as a release.
+# Started by hand on main, it builds the same three as artifacts and
+# publishes nothing.
+#
+# The cache: a cache saved by a tag's run belongs to that tag, and no later
+# run can read it; a tag reads what main saved. So every workflow that
+# builds the dist profile (this one, Store, Mac App Store) reads one cache
+# per system under the name `dist`, and only a run on main saves it. The
+# tag's build then compiles the workspace alone. When the dependencies
+# change, the next run on main fills it again: Store and Mac App Store for
+# Windows and macOS, this workflow started by hand for all three.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,6 +26,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dist
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo-deb
         run: cargo install cargo-deb --locked
       - name: Build artefacts
@@ -32,6 +47,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dist
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build artefacts
         shell: pwsh
         run: pwsh -ExecutionPolicy Bypass -File ./dist/make_release.ps1
@@ -54,6 +72,9 @@ jobs:
         run: test "$(uname -m)" = arm64
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dist
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build artefacts
         run: bash dist/make_release_macos.sh
       - uses: actions/upload-artifact@v4
@@ -64,6 +85,8 @@ jobs:
 
   publish:
     needs: [linux, windows, macos]
+    # By hand on main there is no tag to publish under.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

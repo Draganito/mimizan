@@ -30,7 +30,11 @@ jobs:
       - name: Apple silicon
         run: test "$(uname -m)" = arm64
       - uses: dtolnay/rust-toolchain@stable
+      # The dist build's cache, shared with the release (see release.yml).
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dist
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
         run: bash dist/make_release_macos.sh
       - name: Sign the store package
