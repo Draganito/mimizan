@@ -297,10 +297,18 @@ impl PlateInfo {
         }
     }
 
-    /// Read the `plate` object out of a negative's description, if it is one.
-    pub fn from_description(desc: Option<&serde_json::Value>) -> Option<Self> {
-        let v = desc?.get("plate")?;
-        serde_json::from_value(v.clone()).ok()
+    /// Read the `plate` object out of a negative's description: `None`
+    /// when it has none and is a grey negative. One that is there and
+    /// cannot be read is an error: the file is three frames stacked all
+    /// the same, and printed as a grey negative it would be one picture
+    /// three frames tall.
+    pub fn from_description(desc: Option<&serde_json::Value>) -> crate::Result<Option<Self>> {
+        let Some(v) = desc.and_then(|d| d.get("plate")) else { return Ok(None) };
+        serde_json::from_value(v.clone()).map(Some).map_err(|e| {
+            crate::Error::Invalid(format!(
+                "the negative says it is a plate, but this version cannot read its plate record: {e}"
+            ))
+        })
     }
 }
 
@@ -475,9 +483,46 @@ mod tests {
             assert_eq!(back[i].data, rgb[i].data);
         }
         let json = serde_json::json!({ "plate": info });
-        assert_eq!(PlateInfo::from_description(Some(&json)).unwrap(), info);
-        assert!(PlateInfo::from_description(Some(&serde_json::json!({ "stage": "negative" }))).is_none());
+        assert_eq!(PlateInfo::from_description(Some(&json)).unwrap(), Some(info.clone()));
         assert!(split(&p(0.0), &info).is_err());
+    }
+
+    /// A file that says it is a plate in words this version does not know
+    /// (a colour space or a filter set of a later one) is still three
+    /// frames stacked. It is refused, not printed as one grey negative
+    /// three frames tall.
+    #[test]
+    fn a_plate_record_that_cannot_be_read_is_an_error_not_a_grey_negative() {
+        use crate::print::{render_within, PrintParams};
+        use crate::recipe::Recipe;
+        use crate::tiffout::{write_gray16, TiffMeta};
+
+        let (w, h) = (48, 32);
+        let frame = |v: f64| Plane::from_vec(w, h, vec![v; w * h]);
+        let plate = stack(&[frame(0.2), frame(0.4), frame(0.6)]).unwrap();
+        let info = PlateInfo::new(&PlateWeights::channels(), PlateSpace::AdobeRgb, h);
+        let mut record = serde_json::to_value(&info).unwrap();
+        record["space"] = serde_json::json!("a-space-of-tomorrow");
+        let unknown = serde_json::json!({ "stage": "negative", "plate": record });
+        assert!(PlateInfo::from_description(Some(&unknown)).is_err());
+        assert_eq!(
+            PlateInfo::from_description(Some(&serde_json::json!({ "stage": "negative" }))).unwrap(),
+            None
+        );
+        assert_eq!(PlateInfo::from_description(None).unwrap(), None);
+
+        let dir = std::env::temp_dir().join(format!("mimizan_plate_record_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.tif");
+        let desc = unknown.to_string();
+        let meta =
+            TiffMeta { description: &desc, trc: crate::icc::GrayTrc::Linear, orientation: 1, dpi: None };
+        write_gray16(&path, &plate, &meta).unwrap();
+        let p = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let printed = render_within(&path, &p, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let message = printed.err().expect("refused").to_string();
+        assert!(message.contains("plate"), "{message}");
     }
 
     /// A plate through the whole path: mosaic → separation → stacked plate

@@ -337,7 +337,7 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
     let t = Instant::now();
     let neg = read_gray(neg_path)?;
     let src_desc = neg.description.as_deref().and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok());
-    let plate_info = crate::plate::PlateInfo::from_description(src_desc.as_ref());
+    let plate_info = crate::plate::PlateInfo::from_description(src_desc.as_ref())?;
     // A plate is three frames stacked; the print works on one frame's size.
     let frames = match &plate_info {
         Some(pi) => Some(crate::plate::split(&neg.plane, pi)?),
