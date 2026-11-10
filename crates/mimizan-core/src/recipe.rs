@@ -183,6 +183,10 @@ fn is_zero(v: &f64) -> bool {
     *v == 0.0
 }
 
+fn no_turn(v: &u8) -> bool {
+    *v == 0
+}
+
 /// Every decision of the print pass. See the module doc.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Recipe {
@@ -221,6 +225,15 @@ pub struct Recipe {
     /// Peak high-pass. Absent in older recipes, which stay unsharpened.
     #[serde(default, skip_serializing_if = "Peak::is_unset")]
     pub peak: Peak,
+    /// The 90° turns: clockwise quarter turns of the picture on top of
+    /// the file's orientation, 0..=3. `angle`, `crop` and `burns` are told
+    /// on the upright negative as the file gives it, before these turns,
+    /// so a turn changes one number and nothing else;
+    /// [`Recipe::with_turns_applied`] carries them into the turned
+    /// picture, and the print does that itself. Zero, and old recipes
+    /// that omit it, turn nothing.
+    #[serde(default, skip_serializing_if = "no_turn")]
+    pub quarter_turns: u8,
     /// The straighten: degrees the upright negative is turned about its
     /// centre, clockwise positive, within ±[`crate::straighten::ANGLE_LIMIT`].
     /// The picture is then the largest window of the negative's proportion
@@ -303,6 +316,7 @@ impl Default for Recipe {
             black_mm: 0.0,
             sharpen: Sharpen::Off,
             peak: Peak::default(),
+            quarter_turns: 0,
             angle: 0.0,
             crop: None,
             burns: Vec::new(),
@@ -463,6 +477,30 @@ impl Recipe {
         Self { curve: Tone::paper(), ..Self::default() }
     }
 
+    /// The recipe on the turned picture: `quarter_turns` taken out of it
+    /// and put into the orientation, the window and the burns turned with
+    /// the picture. `orientation` is the file's TIFF orientation and
+    /// `w`×`h` the negative as stored, before it. What comes back is the
+    /// orientation to apply and a recipe without turns, which is what the
+    /// geometry of the print works on ([`crate::print::layout`] and the
+    /// functions beside it). Without turns both come back as they went in.
+    pub fn with_turns_applied(&self, orientation: u16, w: usize, h: usize) -> (u16, Recipe) {
+        let q = self.quarter_turns % 4;
+        let mut r = self.clone();
+        r.quarter_turns = 0;
+        if q == 0 {
+            return (orientation, r);
+        }
+        if let Some(c) = r.crop {
+            // The window lies in the straightened frame of the upright file.
+            let (uw, uh) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
+            let (fw, fh) = crate::straighten::frame_size(uw, uh, r.angle);
+            r.crop = Some(c.turned(q, fw as u32, fh as u32));
+        }
+        r.burns = crate::burn::turned(&r.burns, q);
+        (crate::print::rotated(orientation, q), r)
+    }
+
     /// Every field within its range, and the sheet the recipe asks for
     /// within [`SHEET_MAX_PX`]. A recipe that fails here is refused before
     /// a pixel is touched.
@@ -510,6 +548,9 @@ impl Recipe {
                     self.dpi
                 )));
             }
+        }
+        if self.quarter_turns > 3 {
+            return Err(Error::Invalid(format!("quarter turns {} not within 0..3", self.quarter_turns)));
         }
         if !self.angle.is_finite() || self.angle.abs() > crate::straighten::ANGLE_LIMIT {
             return Err(Error::Invalid(format!(
@@ -743,6 +784,63 @@ mod tests {
         assert!(Recipe { angle: -45.0, ..Recipe::on_paper() }.validate().is_ok());
         assert!(Recipe { angle: 45.01, ..Recipe::on_paper() }.validate().is_err());
         assert!(Recipe { angle: f64::NAN, ..Recipe::on_paper() }.validate().is_err());
+    }
+
+    #[test]
+    fn quarter_turns_in_the_file_and_within_their_limit() {
+        // None is not written: an old reader sees the recipe it knows, and
+        // a file without the field turns nothing.
+        let json = serde_json::to_string(&Recipe::on_paper()).unwrap();
+        assert!(!json.contains("quarter_turns"), "{json}");
+        let back: Recipe = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.quarter_turns, 0);
+        for q in 1..=3 {
+            let turned = Recipe { quarter_turns: q, ..Recipe::on_paper() };
+            turned.validate().unwrap();
+            let json = serde_json::to_string(&turned).unwrap();
+            assert!(json.contains(&format!(r#""quarter_turns":{q}"#)), "{json}");
+            assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap(), turned);
+        }
+        assert!(Recipe { quarter_turns: 4, ..Recipe::on_paper() }.validate().is_err());
+    }
+
+    #[test]
+    fn the_turns_go_into_the_orientation_the_window_and_the_burns() {
+        use crate::burn::{Light, Tip};
+        let stroke = Stroke::Hand {
+            tip: Tip { rx: 0.05, ry: 0.02, angle: 10.0, feather: 0.01 },
+            stops: 0.5,
+            light: Light::Both,
+            points: vec![[0.2, 0.1], [0.3, -0.1]],
+        };
+        let r = Recipe {
+            quarter_turns: 1,
+            crop: Some(CropRect { x: 10, y: 20, w: 30, h: 15 }),
+            burns: vec![stroke.clone()],
+            ..Recipe::on_paper()
+        };
+        // A 100×60 negative, upright as stored.
+        let (o, t) = r.with_turns_applied(1, 100, 60);
+        assert_eq!(o, crate::print::rotated(1, 1));
+        assert_eq!(t.quarter_turns, 0);
+        // The window in the 60×100 picture: its left edge is what was
+        // below it, its top what was left of it.
+        assert_eq!(t.crop, Some(CropRect { x: 60 - (20 + 15), y: 10, w: 15, h: 30 }));
+        assert_eq!(t.burns, vec![stroke.turned(1)]);
+        // Stored on its side (orientation 6), the upright file is 60×100.
+        let (o, t) = r.with_turns_applied(6, 100, 60);
+        assert_eq!(o, crate::print::rotated(6, 1));
+        assert_eq!(t.crop, Some(CropRect { x: 100 - (20 + 15), y: 10, w: 15, h: 30 }));
+        // Four turns are none, and no turn leaves the recipe as it is.
+        let flat = Recipe { quarter_turns: 0, ..r.clone() };
+        assert_eq!(flat.with_turns_applied(6, 100, 60), (6, flat.clone()));
+        let mut round = (1u16, r.clone());
+        for _ in 0..4 {
+            let (o, t) = Recipe { quarter_turns: 1, ..round.1 }.with_turns_applied(round.0, 100, 60);
+            round = (o, t);
+        }
+        assert_eq!(round.0, 1);
+        assert_eq!(round.1.crop, r.crop);
     }
 
     #[test]

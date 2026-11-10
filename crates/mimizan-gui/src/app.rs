@@ -1218,15 +1218,17 @@ impl App {
         self.edit.weights = Weights { r, g: 1.0 - r - b, b };
     }
 
+    /// The 90° turns of the picture, clockwise, on top of the file's
+    /// orientation: the recipe's.
     fn rotation(&self) -> u8 {
-        self.edit.rotation
+        self.edit.recipe.quarter_turns % 4
     }
 
     /// Replace the whole development (undo, redo, a loaded recipe) and drop
     /// tool state that pointed into the old one. The edit is taken as it
     /// is, so undo and redo land exactly on the history's entries.
     fn set_edit(&mut self, e: Edit) {
-        if e.rotation != self.edit.rotation {
+        if e.recipe.quarter_turns != self.edit.recipe.quarter_turns {
             self.keep_scale = None;
         }
         let angle_changed = e.recipe.angle != self.edit.recipe.angle;
@@ -1443,7 +1445,7 @@ impl App {
             weights: self.weights(),
             tone: r.curve.clone(),
             place: r.place,
-            rotation: self.edit.rotation,
+            rotation: self.rotation(),
             angle: self.view_angle(),
             // While the easel is up the whole negative is shown.
             crop: if self.crop_open { None } else { r.crop },
@@ -1495,7 +1497,10 @@ impl App {
         Some(PlateView { weights: *weights, space: params.space, lamps: self.edit.lamps_rgb() })
     }
 
-    /// Orientation the export applies: the file's plus the user's turns.
+    /// The orientation of the picture on the stage: the file's plus the
+    /// recipe's 90° turns. The print box, the measurement and the linear
+    /// export apply it with `print_recipe`; the print export hands the
+    /// turns to the core as the recipe's number.
     fn export_orientation(&self) -> u16 {
         let base = self.session.as_ref().map(|s| s.negative.orientation).unwrap_or(1);
         mimizan_core::print::rotated(base, self.rotation())
@@ -1553,18 +1558,18 @@ impl App {
         recipe
     }
 
-    /// The recipe with its window and its burns turned into the current
-    /// upright picture, the window clamped to it (a sidecar from another
-    /// file may be larger).
+    /// The recipe on the current upright picture: its 90° turns carried
+    /// out, so its window and its burns are turned with the picture and it
+    /// has no turn left (`export_orientation` has them). The window is
+    /// clamped to the picture (a sidecar from another file may be larger).
+    /// What the stage, the print box and the measurements work on; the
+    /// export takes the edit's recipe and lets the core do the same.
     fn print_recipe(&self) -> Recipe {
-        let mut recipe = self.edit.recipe.clone();
+        let (w, h) = self.session.as_ref().map(|s| s.upright_size()).unwrap_or((0, 0));
+        let (_, mut recipe) = self.edit.recipe.with_turns_applied(1, w, h);
         if let Some(c) = recipe.crop {
-            let (fw, fh) = self.frame_at(recipe.angle);
             let (uw, uh) = self.export_size_at(recipe.angle);
-            recipe.crop = Some(c.turned(self.rotation(), fw, fh).sanitized(uw as u32, uh as u32));
-        }
-        if !recipe.burns.is_empty() {
-            recipe.burns = burn::turned(&recipe.burns, self.rotation());
+            recipe.crop = Some(c.sanitized(uw as u32, uh as u32));
         }
         recipe
     }
@@ -2474,9 +2479,11 @@ impl App {
                     session: Arc::clone(s),
                     weights: self.weights(),
                     plate: self.plate_view(),
-                    recipe: self.print_recipe(),
+                    // The recipe as the file beside the RAW has it, its
+                    // 90° turns a number: the print carries them out on
+                    // the file's orientation and says this recipe.
+                    recipe: self.edit.recipe.clone(),
                     path,
-                    orientation: self.export_orientation(),
                 });
             }
             ExportKind::Linear => {
@@ -3187,7 +3194,7 @@ impl App {
             weights: self.weights(),
             tone: r.curve.clone(),
             place: r.place,
-            rotation: self.edit.rotation,
+            rotation: self.rotation(),
             angle: self.view_angle(),
             crop: if self.crop_open { None } else { r.crop },
             plate: self.plate_view(),
@@ -3441,7 +3448,7 @@ impl App {
             .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
             .clicked()
         {
-            self.edit.rotation = (self.edit.rotation + 1) % 4;
+            self.edit.recipe.quarter_turns = (self.rotation() + 1) % 4;
         }
         tool_bar(ui);
         let mut crop_on = self.crop_open;

@@ -54,7 +54,9 @@ pub enum Job {
     /// `.jpg` path writes the 8-bit JPEG, anything else the 16-bit TIFF
     /// (`print::write`).
     /// The desktop GUI sends the sharpening mode off; peak, when the recipe
-    /// has it on, is part of that same pass.
+    /// has it on, is part of that same pass. The recipe is the edit's own:
+    /// its 90° turns are carried out by the print, on the file's
+    /// orientation.
     Export {
         session: Arc<Session>,
         weights: Weights,
@@ -62,8 +64,6 @@ pub enum Job {
         plate: Option<PlateView>,
         recipe: Recipe,
         path: PathBuf,
-        /// TIFF orientation to apply (the file's, plus the user's turns).
-        orientation: u16,
     },
     /// The linear export: the separation for another program, no print.
     /// In the monochrome process the mixed negative as a linear grey TIFF
@@ -246,9 +246,9 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
                 message: format!("{e:#}"),
             }),
         },
-        Job::Export { session, weights, plate, recipe, path, orientation } => match plate {
-            Some(plate) => export_plate(&session, weights, &plate, recipe, &path, orientation, &status),
-            None => export(&session, weights, recipe, &path, orientation, &status),
+        Job::Export { session, weights, plate, recipe, path } => match plate {
+            Some(plate) => export_plate(&session, weights, &plate, recipe, &path, &status),
+            None => export(&session, weights, recipe, &path, &status),
         },
         Job::ExportLinear { session, weights, plate, framing, path } => {
             export_linear(&session, weights, plate, &framing, &path, &status)
@@ -506,7 +506,6 @@ fn export(
     weights: Weights,
     recipe: Recipe,
     path: &Path,
-    orientation: u16,
     status: &dyn Fn(String),
 ) -> Result<Event> {
     let t = Instant::now();
@@ -523,7 +522,7 @@ fn export(
     let src = PrintSource {
         plane,
         mask: mask.as_ref(),
-        orientation,
+        orientation: s.negative.orientation,
         name: s.path.display().to_string(),
         description: serde_json::to_value(&info).ok(),
     };
@@ -551,7 +550,6 @@ fn export_plate(
     plate: &PlateView,
     recipe: Recipe,
     path: &Path,
-    orientation: u16,
     status: &dyn Fn(String),
 ) -> Result<Event> {
     let t = Instant::now();
@@ -573,7 +571,7 @@ fn export_plate(
     let sources = [r, g, b].map(|plane| PrintSource {
         plane,
         mask: mask.as_ref(),
-        orientation,
+        orientation: s.negative.orientation,
         name: s.path.display().to_string(),
         description: description.clone(),
     });
@@ -1172,7 +1170,6 @@ mod tests {
             plate: None,
             recipe: Recipe::on_paper(),
             path,
-            orientation: 1,
         }
     }
 
@@ -1256,14 +1253,13 @@ mod tests {
         let quiet = |_s: String| {};
         let grey = dir.join("grey.tif");
         let recipe = Recipe::on_paper();
-        let ev = export(&session, Weights::default(), recipe.clone(), &grey, 1, &quiet).unwrap();
+        let ev = export(&session, Weights::default(), recipe.clone(), &grey, &quiet).unwrap();
         let Event::Exported { width, height, .. } = ev else { panic!("not exported") };
 
         let plate =
             PlateView { weights: PlateWeights::channels(), space: PlateSpace::AdobeRgb, lamps: [0.0; 3] };
         let path = dir.join("plate.tif");
-        let ev =
-            export_plate(&session, Weights::default(), &plate, recipe.clone(), &path, 1, &quiet).unwrap();
+        let ev = export_plate(&session, Weights::default(), &plate, recipe.clone(), &path, &quiet).unwrap();
         let Event::Exported { width: pw, height: ph, .. } = ev else { panic!("not exported") };
         assert_eq!((pw, ph), (width, height));
         let [r, g, b] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
@@ -1275,7 +1271,7 @@ mod tests {
 
         let lit = PlateView { lamps: [0.0, 0.0, 0.5], ..plate };
         let path = dir.join("plate_blue.tif");
-        export_plate(&session, Weights::default(), &lit, recipe, &path, 1, &quiet).unwrap();
+        export_plate(&session, Weights::default(), &lit, recipe, &path, &quiet).unwrap();
         let [r2, g2, b2] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
         assert_eq!(r2.data, r.data);
         assert_eq!(g2.data, g.data);

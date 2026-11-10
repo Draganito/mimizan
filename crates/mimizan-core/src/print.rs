@@ -356,10 +356,14 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
         neg.bits,
         neg.orientation
     );
+    // The estimate is of the picture as it is printed, the recipe's 90°
+    // turns carried out.
+    let (turned, on_turned) = p.recipe.with_turns_applied(neg.orientation, fw, fh);
+    let on_turned = PrintParams { recipe: on_turned, ..p.clone() };
     let need = if frames.is_some() {
-        plate_memory_estimate(fw, fh, neg.orientation, p)
+        plate_memory_estimate(fw, fh, turned, &on_turned)
     } else {
-        memory_estimate(fw, fh, neg.orientation, p)
+        memory_estimate(fw, fh, turned, &on_turned)
     };
     info!("print holds about {} at its widest", memory_text(need));
     if let Some(limit) = budget {
@@ -539,7 +543,10 @@ pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
     out
 }
 
-/// Layout for a negative of `w×h` (before orientation). With a size, the
+/// Layout for a negative of `w×h` (before orientation). The recipe's 90°
+/// turns are not read here, nor by the functions that take a layout's
+/// geometry beside it: they work on the turned picture, the orientation
+/// and the recipe [`Recipe::with_turns_applied`] gives. With a size, the
 /// file is that sheet, turned the picture's way; both rings are taken from
 /// it before the fit, so the picture plus black plus white never exceeds
 /// it, unless the frame alone is wider than the sheet, which leaves one
@@ -548,6 +555,7 @@ pub fn window_plane(p: &Plane, c: CropRect) -> Plane {
 /// outside the crop window and the picture pixels stay as they are.
 pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
     let r = &p.recipe;
+    debug_assert!(r.quarter_turns.is_multiple_of(4), "the layout is of the turned picture");
     let (w, h) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
     // The straighten leaves the frame; the crop is a window on that. The
     // fit and the enlargement are measured from the crop window.
@@ -1095,7 +1103,23 @@ fn apply_sharpen(
 }
 
 /// The one pass on in-memory planes. `info.ms` covers this call only.
+/// The recipe's 90° turns are carried out first, on top of the source's
+/// orientation; the print says the recipe that was asked for.
 pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
+    if !p.recipe.quarter_turns.is_multiple_of(4) {
+        let (orientation, recipe) =
+            p.recipe.with_turns_applied(src.orientation, src.plane.width, src.plane.height);
+        let turned = PrintSource {
+            plane: src.plane,
+            mask: src.mask,
+            orientation,
+            name: src.name.clone(),
+            description: src.description.clone(),
+        };
+        let mut out = render_planes(&turned, &PrintParams { recipe, ..p.clone() });
+        out.info.recipe = p.recipe.clone();
+        return out;
+    }
     let t = Instant::now();
     let r = &p.recipe;
     let mut mask: Option<Plane> = None;
@@ -1352,6 +1376,104 @@ mod tests {
         assert!(PrintSize::parse("1000x10in").is_err());
         assert!(PrintSize::parse("2048px").is_err());
         assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
+    }
+
+    /// The recipe's 90° turns turn the print and nothing else: the picture
+    /// with them is the picture without, turned, with its window, its
+    /// straighten, its size and its burns on the same grain. The window
+    /// alone is that to the bit. The card, the straighten and the size
+    /// step compute along turned axes and agree to the last digits. The
+    /// hand's dwell is a raster laid along the picture's axes, so a turned
+    /// stroke is sampled on another grid: the two agree as far as that
+    /// raster is fine, under a thousandth of the print's range here. The
+    /// print says the recipe it was asked for and the orientation it
+    /// applied.
+    #[test]
+    fn the_recipes_quarter_turns_turn_the_print() {
+        use crate::burn::{Light, Tip};
+        let (w, h) = (90, 60);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, 0.05 + 0.9 * ((x * 7 + y * 13) % 97) as f64 / 97.0);
+            }
+        }
+        // One quarter turn clockwise, written out: the left column of the
+        // turned picture is the bottom row of the other.
+        let cw = |p: &Plane| {
+            let mut out = Plane::zeros(p.height, p.width);
+            for y in 0..out.height {
+                for x in 0..out.width {
+                    out.set(x, y, p.at(y, p.height - 1 - x));
+                }
+            }
+            out
+        };
+        let print = |r: &Recipe, orientation: u16| {
+            let src =
+                PrintSource { plane: &plane, mask: None, orientation, name: "t".into(), description: None };
+            render_planes(&src, &PrintParams { recipe: r.clone(), ..PrintParams::default() })
+        };
+        let window =
+            Recipe { place: 0.3, crop: Some(CropRect { x: 10, y: 5, w: 50, h: 40 }), ..Recipe::on_paper() };
+        let card = Recipe {
+            burns: vec![Stroke::Card {
+                x: 0.05,
+                y: -0.1,
+                angle: 30.0,
+                travel: 0.2,
+                feather: 0.03,
+                stops: 1.0,
+                light: Light::Both,
+            }],
+            ..window.clone()
+        };
+        let hand = Recipe {
+            burns: vec![Stroke::Hand {
+                tip: Tip { rx: 0.12, ry: 0.05, angle: 20.0, feather: 0.03 },
+                stops: 1.0,
+                light: Light::Both,
+                points: vec![[-0.1, 0.05], [0.1, -0.05]],
+            }],
+            ..window.clone()
+        };
+        let straightened = Recipe { angle: 3.0, ..window.clone() };
+        // The picture is 113 wide on a sheet of 131: nine pixels of paper
+        // on either side, so the sheet turns onto itself as well.
+        let sized = Recipe {
+            size: Some(PrintSize::Physical { width_in: 1.31, height_in: 0.9 }),
+            dpi: 100.0,
+            ..window.clone()
+        };
+        let cases = [
+            ("window", &window, 0.0),
+            ("card", &card, 1e-12),
+            ("hand", &hand, 2e-3),
+            ("straighten", &straightened, 1e-12),
+            ("sized", &sized, 1e-12),
+        ];
+        for (what, flat, tolerance) in cases {
+            for orientation in [1u16, 6, 3] {
+                let base = print(flat, orientation);
+                for q in 1..=3u8 {
+                    let r = Recipe { quarter_turns: q, ..flat.clone() };
+                    let out = print(&r, orientation);
+                    let want = (0..q).fold(base.plane.clone(), |p, _| cw(&p));
+                    assert_eq!((out.plane.width, out.plane.height), (want.width, want.height));
+                    let worst =
+                        out.plane.data.iter().zip(&want.data).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+                    assert!(worst <= tolerance, "{what}, orientation {orientation}, {q} turns: {worst:e}");
+                    assert_eq!(out.info.recipe, r);
+                    assert_eq!(out.info.orientation_applied, rotated(orientation, q));
+                }
+            }
+        }
+        // The window is not the middle of the frame, so a turn that left
+        // it behind would show.
+        assert_ne!(
+            print(&window, 1).plane.data,
+            print(&Recipe { crop: None, ..window.clone() }, 1).plane.data
+        );
     }
 
     /// The mask's two exact values through every way a print resamples

@@ -1,7 +1,7 @@
 //! The editable development of one negative and its history. An `Edit` is
 //! the paper's "Entwicklungsdatensatz": the recipe the export renders plus
-//! what the export takes beside it (the mix, the plate and its lamps, the
-//! user's turns). The file next to the RAW carries the mix and the plate
+//! what the export takes beside it (the mix, the plate and its lamps).
+//! The file next to the RAW carries the mix and the plate
 //! inside the recipe (`recipe_for_file`); in memory they are fields of
 //! their own and the recipe's slots stay empty. The history is a list of
 //! such states, never of pixels: undo and redo swap the whole state, and
@@ -14,9 +14,10 @@ use mimizan_core::recipe::{PlateRecipe, Recipe};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
     pub weights: Weights,
+    /// The print, with the 90° turns (`quarter_turns`), the straighten,
+    /// the window and the burns as the file beside the RAW has them: on
+    /// the upright negative as the file gives it.
     pub recipe: Recipe,
-    /// Clockwise quarter turns added to the file's orientation (0..3).
-    pub rotation: u8,
     /// The three-colour plate: taking filters and projection primaries.
     /// `None` is the monochrome negative. Not in the recipe, like the
     /// weights: it is the negative's, not the print's.
@@ -29,7 +30,7 @@ pub struct Edit {
 impl Edit {
     /// The untouched development: the paper at its base exposure.
     pub fn new(weights: Weights) -> Self {
-        Self { weights, recipe: Recipe::on_paper(), rotation: 0, plate: None, lamps: [0.0; 2] }
+        Self { weights, recipe: Recipe::on_paper(), plate: None, lamps: [0.0; 2] }
     }
 
     /// The three lamps the print takes: red, green (fixed), blue.
@@ -188,6 +189,21 @@ mod tests {
         assert_eq!(mono.plate, None);
         assert_eq!(mono.lamps, [0.0; 2]);
         assert_eq!(mono.weights, e.weights, "no mix in the file keeps the weights");
+    }
+
+    /// The 90° turn is part of the picture the export writes, so the file
+    /// beside the RAW has to say it: without it the picture comes back
+    /// unturned, and a turn alone never asks to be saved.
+    #[test]
+    fn the_quarter_turn_is_in_the_file() {
+        let mut e = Edit::new(Weights::default());
+        let upright = e.recipe_for_file(true);
+        e.recipe.quarter_turns = 1;
+        let turned = e.recipe_for_file(true);
+        assert_ne!(turned, upright, "the turn is not in the recipe");
+        let mut back = Edit::new(Weights::default());
+        back.take_recipe(turned);
+        assert_eq!(back, e);
     }
 
     #[test]

@@ -122,7 +122,7 @@ enum Cmd {
         /// samples a pixel (LinearRaw), the camera's colour matrix and
         /// as-shot neutral in the tags. A RAW converter opens it as a RAW of
         /// the camera and skips its own demosaicing. Bayer sensors only; the
-        /// recipe's crop is applied; no mask sidecar.
+        /// recipe's 90° turns, straighten and crop are applied; no mask sidecar.
         #[arg(long)]
         dng: bool,
     },
@@ -176,6 +176,11 @@ enum Cmd {
         /// there is a size step, Catmull-Rom for a turn alone.
         #[arg(long, value_name = "DEG", allow_hyphen_values = true)]
         angle: Option<f64>,
+        /// Turn the picture by this many quarter turns clockwise, 0 to 3,
+        /// on top of the negative's orientation, before the straighten.
+        /// The recipe's crop and burns turn with it.
+        #[arg(long, value_name = "N")]
+        quarter_turns: Option<u8>,
         /// Output resolution, dots per inch (default from the recipe, 360)
         #[arg(long)]
         dpi: Option<f64>,
@@ -295,6 +300,7 @@ fn main() -> Result<()> {
             border_mm,
             black_mm,
             angle,
+            quarter_turns,
             dpi,
             usm_amount,
             usm_k,
@@ -316,6 +322,7 @@ fn main() -> Result<()> {
             border_mm,
             black_mm,
             angle,
+            quarter_turns,
             dpi,
             usm_amount,
             usm_k,

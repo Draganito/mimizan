@@ -3266,8 +3266,12 @@ mod histogram_tests {
     /// Contract 2 under the brush: the fitted print's window on the screen
     /// is the picture the export writes. A Bayer negative, a weight, a
     /// placing, the paper off its base, a straighten, a window, an
-    /// enlargement, a soft hand stroke and a card; every pixel of the
-    /// picture is compared with the 8-bit face of the file's 16-bit code.
+    /// enlargement, a soft hand stroke and a card, upright and through the
+    /// 90° turns; every pixel of the picture is compared with the 8-bit
+    /// face of the file's 16-bit code. The file is made from the recipe
+    /// as the edit holds it, the turns a number the print carries out;
+    /// the screen from the view's turn and the recipe on the turned
+    /// picture, as the stage asks for it.
     /// The screen reads the paper at the 16-bit code of the placed value,
     /// the file at the value itself, so a pixel on the edge between two
     /// screen levels may show the neighbouring one: one level, and rarely.
@@ -3337,8 +3341,12 @@ mod histogram_tests {
             },
         ];
         let weights = Weights { r: 0.5, g: 0.3, b: 0.2 };
-        for (angle, crop) in [(0.0, None), (2.0, Some(CropRect { x: 6, y: 4, w: 72, h: 48 }))] {
+        let framings = [(0.0, None), (2.0, Some(CropRect { x: 6, y: 4, w: 72, h: 48 }))];
+        for (quarter_turns, (angle, crop)) in
+            [0u8, 1, 2, 3].into_iter().flat_map(|q| framings.into_iter().map(move |f| (q, f)))
+        {
             let recipe = Recipe {
+                quarter_turns,
                 angle,
                 crop,
                 size: Some(PrintSize::Physical { width_in: 0.6, height_in: 0.4 }),
@@ -3353,7 +3361,7 @@ mod histogram_tests {
                 weights,
                 tone: recipe.curve.clone(),
                 place: recipe.place,
-                rotation: 0,
+                rotation: quarter_turns,
                 angle,
                 crop,
                 burns: burns.clone(),
@@ -3362,20 +3370,26 @@ mod histogram_tests {
             };
             // The file, as the export worker makes it.
             let mixed = mix(session.separation().unwrap(), &weights);
-            let print = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
             let src = PrintSource {
                 plane: &mixed,
                 mask: None,
-                orientation: 1,
+                orientation: session.negative.orientation,
                 name: "t".into(),
                 description: None,
             };
-            let file = render_planes(&src, &print);
-            let lay = layout(w, h, 1, &print);
+            let file = render_planes(&src, &PrintParams { recipe: recipe.clone(), ..PrintParams::default() });
+            assert_eq!(file.info.recipe, recipe);
+            // The screen: the whole picture as one window of the recipe
+            // on the turned picture.
+            let (turned, on_turned) = recipe.with_turns_applied(session.negative.orientation, w, h);
+            assert_eq!(turned, rotated(session.negative.orientation, quarter_turns));
+            let print = PrintParams { recipe: on_turned.clone(), ..PrintParams::default() };
+            let lay = layout(w, h, turned, &print);
             assert!(lay.enlargement > 1.0);
-            // The screen: the whole picture as one window.
+            assert_eq!((file.plane.width, file.plane.height), (lay.out_w, lay.out_h));
             let table = ToneTable::build(&view.tone.compile());
             let rect = DetailRect { x: 0, y: 0, w: lay.image_w, h: lay.image_h };
+            let recipe = on_turned;
             let shown = render_print_detail(&session, &view, &recipe, rect, &table).unwrap();
             assert_eq!((shown.ask.w, shown.ask.h), (lay.image_w, lay.image_h));
             let mut off_by_one = 0usize;
@@ -3384,18 +3398,24 @@ mod histogram_tests {
                     let code = q16(file.plane.at(lay.picture_x + x, lay.picture_y + y));
                     let face = ((code as f64 / 65535.0) * 255.0).round() as i32;
                     let d = (i32::from(shown.gray[y * lay.image_w + x]) - face).abs();
-                    assert!(d <= 1, "angle {angle} at {x},{y}: the screen is {d} levels from the file");
+                    assert!(d <= 1, "{quarter_turns} turns, angle {angle} at {x},{y}: the screen is {d} levels from the file");
                     off_by_one += (d == 1) as usize;
                 }
             }
             let pixels = lay.image_w * lay.image_h;
-            assert!(off_by_one * 1000 <= pixels, "angle {angle}: {off_by_one} of {pixels} a level off");
+            assert!(
+                off_by_one * 1000 <= pixels,
+                "{quarter_turns} turns, angle {angle}: {off_by_one} of {pixels} a level off"
+            );
             // The strokes are in that picture: without them it is another one.
             let bare = ViewParams { burns: Vec::new(), ..view.clone() };
             let bare_recipe = Recipe { burns: Vec::new(), ..recipe.clone() };
             let unburned = render_print_detail(&session, &bare, &bare_recipe, rect, &table).unwrap();
             let touched = shown.gray.iter().zip(&unburned.gray).filter(|(a, b)| a != b).count();
-            assert!(touched * 4 > pixels, "angle {angle}: the strokes reach {touched} of {pixels} pixels");
+            assert!(
+                touched * 4 > pixels,
+                "{quarter_turns} turns, angle {angle}: the strokes reach {touched} of {pixels} pixels"
+            );
         }
     }
 }

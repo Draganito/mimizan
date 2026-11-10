@@ -213,16 +213,13 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         );
     }
     // The DNG is the channels plate, nothing else: the converter does the
-    // colour. The recipe's crop still applies.
-    // The DNG is framed as the recipe says: its straighten and its crop
-    // on the straightened frame.
+    // colour. It is framed as the recipe says: its 90° turns, its
+    // straighten and its crop on the straightened frame.
     let recipe_framing = a
         .recipe
         .as_ref()
         .map(|p| {
-            mimizan_core::recipe::Recipe::load(p)
-                .map(|r| (r.angle, r.crop))
-                .with_context(|| format!("recipe file {}", p.display()))
+            mimizan_core::recipe::Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))
         })
         .transpose()?;
     if a.dng {
@@ -268,8 +265,10 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         let meta = mimizan_core::linear::DngMeta::of(&frame, neg.info.wb, &desc)
             .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
         let framing = match recipe_framing {
-            Some((angle, crop)) => {
-                mimizan_core::linear::Framing { orientation: neg.orientation, angle, crop }
+            Some(recipe) => {
+                // The window and the orientation of the turned picture.
+                let (orientation, r) = recipe.with_turns_applied(neg.orientation, r.width, r.height);
+                mimizan_core::linear::Framing { orientation, angle: r.angle, crop: r.crop }
             }
             None => mimizan_core::linear::Framing::upright(neg.orientation),
         };
@@ -341,6 +340,8 @@ pub struct PrintArgs {
     pub black_mm: Option<f64>,
     /// The straighten, degrees clockwise.
     pub angle: Option<f64>,
+    /// The 90° turns, clockwise, on top of the negative's orientation.
+    pub quarter_turns: Option<u8>,
     pub dpi: Option<f64>,
     pub usm_amount: Option<f64>,
     pub usm_k: f64,
@@ -413,6 +414,9 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     }
     if let Some(deg) = a.angle {
         r.angle = deg;
+    }
+    if let Some(q) = a.quarter_turns {
+        r.quarter_turns = q;
     }
     if let Some(d) = a.dpi {
         r.dpi = d;
