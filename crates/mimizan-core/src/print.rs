@@ -1373,6 +1373,50 @@ mod tests {
         assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
     }
 
+    /// The mask's two exact values through every way a print resamples
+    /// it: the fixed estimator's "allowed" still reads as allowed and a
+    /// burnt-out flag as a flag, on every pixel. In floating point the
+    /// resampled 0.8 is not 0.8 on every pixel, nor the flag 1.
+    #[test]
+    fn the_masks_exact_values_survive_the_resampling() {
+        use crate::usm::allows;
+        let allowed = f64::from((crate::usm::MASK_THRESHOLD * 255.0).round() as u8) / 255.0;
+        assert!(allows(allowed) && allows(254.0 / 255.0) && !allows(1.0) && !allows(203.0 / 255.0));
+        let (w, h) = (97, 61);
+        let flat = |v: f64| Plane::from_vec(w, h, vec![v; w * h]);
+        let mut lost = Vec::new();
+        let mut off_by_a_bit = 0;
+        let mut check = |how: String, under: Plane, flag: Plane| {
+            off_by_a_bit += under.data.iter().filter(|&&v| v < crate::usm::MASK_THRESHOLD).count();
+            off_by_a_bit += flag.data.iter().filter(|&&v| v != 1.0).count();
+            let n = under.data.iter().filter(|&&v| !allows(v)).count();
+            let m = flag.data.iter().filter(|&&v| allows(v)).count();
+            if n + m > 0 {
+                lost.push(format!("{how}: {n} not allowed, {m} flags lost"));
+            }
+        };
+        for (tw, th) in [(301, 189), (640, 402), (53, 33), (97, 200), (1000, 61), (31, 61)] {
+            check(
+                format!("resize to {tw}x{th}"),
+                resize_with(&flat(allowed), tw, th, MASK_KERNEL),
+                resize_with(&flat(1.0), tw, th, MASK_KERNEL),
+            );
+        }
+        for angle in [0.7, -3.3, 12.0] {
+            for (tw, th) in [(301, 189), (53, 33), (97, 61)] {
+                let map = crate::straighten::print_map(w, h, angle, None, tw, th);
+                check(
+                    format!("straighten {angle} to {tw}x{th}"),
+                    crate::straighten::warp_plane(&flat(allowed), &map, tw, th, MASK_KERNEL),
+                    crate::straighten::warp_plane(&flat(1.0), &map, tw, th, MASK_KERNEL),
+                );
+            }
+        }
+        assert!(lost.is_empty(), "{lost:#?}");
+        // What makes the 8-bit reading necessary: the values do move.
+        assert!(off_by_a_bit > 0);
+    }
+
     /// Richardson–Lucy on its own, without the unsharp mask after it,
     /// holds its planes all the same: an enlargement that deconvolves is
     /// not estimated as one that does not sharpen.

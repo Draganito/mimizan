@@ -8,6 +8,19 @@ pub const USM_K: f64 = 1.15e-5;
 /// Sidecar threshold: USM only where `mask ≥ 0.8` (204/255).
 pub const MASK_THRESHOLD: f64 = 0.8;
 
+/// Whether the mask allows sharpening at a pixel: at or above the
+/// threshold and not a burnt-out flag, both read on the sidecar's 8-bit
+/// scale. The mask reaches the print resampled, and weights that sum to
+/// one in whole numbers sum to a last bit less in floating point: taken
+/// as it comes, the fixed estimator's 0.8 was 0.7999… on a pixel in fifty
+/// of an enlargement and stayed unsharpened, and a flag reduced was 0.999…
+/// and was sharpened.
+#[inline]
+pub fn allows(mask: f64) -> bool {
+    let level = (mask * 255.0).round();
+    level >= (MASK_THRESHOLD * 255.0).round() && level < 255.0
+}
+
 /// `r_px = usm_k · d_mm · dpi`
 pub fn radius_px(usm_k: f64, viewing_distance_mm: f64, dpi: f64) -> f64 {
     usm_k * viewing_distance_mm * dpi
@@ -25,8 +38,9 @@ pub fn gaussian_blur(p: &Plane, sigma: f64) -> Plane {
     crate::filter::lowpass(p, &k)
 }
 
-/// `out = x + amount·(x − blur(x))` where `mask ≥ MASK_THRESHOLD` and the
-/// pixel is not flagged saturated (mask == 1.0 exactly, sidecar 255); else `x`.
+/// `out = x + amount·(x − blur(x))` where the mask [`allows`] it: at or
+/// above `MASK_THRESHOLD` and not flagged saturated (the sidecar's 255);
+/// else `x`.
 /// `mask == None` applies USM everywhere.
 pub fn unsharp(p: &Plane, sigma: f64, amount: f64, mask: Option<&Plane>) -> Plane {
     let mask_fits = mask.is_none_or(|m| (m.width, m.height) == (p.width, p.height));
@@ -42,7 +56,7 @@ pub fn unsharp(p: &Plane, sigma: f64, amount: f64, mask: Option<&Plane>) -> Plan
         for x in 0..w {
             let allow = match m {
                 None => true,
-                Some(mr) => mr[x] >= MASK_THRESHOLD && mr[x] < 1.0,
+                Some(mr) => allows(mr[x]),
             };
             row[x] = if allow { s[x] + amount * (s[x] - b[x]) } else { s[x] };
         }
