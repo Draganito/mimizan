@@ -41,8 +41,9 @@ pub struct CameraFile {
     pub model: String,
     /// `RGGB`, `BGGR`, `GRBG` or `GBRG`.
     pub bayer_phase: String,
-    /// Noise model `σ² = a·s + b` in normalised units, used when the RAW
-    /// carries none. Zero or positive.
+    /// Noise model `σ(s) = a·√s + b` in normalised units
+    /// ([`crate::ingest::NoiseModel`]), used when the RAW carries none.
+    /// Zero or positive.
     pub noise_a: f64,
     pub noise_b: f64,
     /// Mix weights, in `weights_space`.

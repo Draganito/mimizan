@@ -3881,10 +3881,6 @@ impl App {
         ui.collapsing("CPU", |ui| self.cpu_section(ui));
     }
 
-    /// The three-colour plate: on or off, the taking filters, the
-    /// projection primaries, and the three weight rows they come to. A
-    /// re-mix, not a re-development: the separation stays.
-    /// What the Negative window says the file is developed in.
     /// What the process line explains: for a plate, the weights the
     /// taking filters resolve to on the balanced channels, and the
     /// emulsion behind the Wratten glass.
@@ -4142,7 +4138,9 @@ impl App {
         }
     }
 
-    /// nothing wraps, nothing shrinks, and this window does not scroll.
+    /// The Enlarger window's body, laid out at the width its controls need
+    /// ([`enlarger_content_width`]) and clipped to the glass: nothing
+    /// wraps, nothing shrinks, and this window does not scroll.
     fn enlarger_panel(&mut self, ui: &mut egui::Ui) {
         let visible = ui.available_width().max(0.0);
         let width = visible.max(enlarger_content_width(ui));
@@ -5410,8 +5408,6 @@ fn corner_xy(r: CropRect, corner: CropCorner) -> (i32, i32) {
     }
 }
 
-/// Move or scale `origin` by a pointer delta. A zero delta leaves it where it
-/// was grabbed: the corner follows the movement, it does not jump to the pointer.
 /// The draft window carried from the frame `old` to the frame `new`: the
 /// same share of the frame about the same place, in `aspect`, inside.
 /// A window that was the whole frame is the whole new frame.
@@ -5436,6 +5432,8 @@ fn scaled_draft(draft: CropRect, old: (u32, u32), new: (u32, u32), aspect: (u32,
     CropRect { x, y, w, h }
 }
 
+/// Move or scale `origin` by a pointer delta. A zero delta leaves it where it
+/// was grabbed: the corner follows the movement, it does not jump to the pointer.
 fn moved_crop(
     origin: CropRect,
     hit: CropHit,
@@ -5521,8 +5519,6 @@ fn crumb_label(path: &Path) -> String {
     }
 }
 
-/// Gaps that put the picture group on the centre of the bar and the history
-/// group against the status note. A narrow bar keeps a short gap instead.
 /// The widest of `8×10` and `10×8`, in the button font.
 fn widest_frame_text(ui: &egui::Ui) -> f32 {
     let font = egui::TextStyle::Button.resolve(ui.style());

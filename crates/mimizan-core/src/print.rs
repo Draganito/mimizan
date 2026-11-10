@@ -2368,8 +2368,9 @@ mod tests {
     }
 
     /// Size, dpi and a kernel narrower than Lanczos-3 must not read outside
-    /// the crop. The mask resample is Lanczos-3 and only runs for USM; doing
-    /// it for every kernel walks off the window and kills the loupe thread.
+    /// the crop. The mask has its own kernel ([`MASK_KERNEL`]) and is only
+    /// resampled for USM; doing it for every print walks off the window and
+    /// kills the loupe thread.
     #[test]
     fn loupe_follows_size_dpi_and_kernel() {
         let (w, h) = (48, 32);

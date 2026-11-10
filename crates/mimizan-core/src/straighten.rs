@@ -6,8 +6,10 @@
 //! The turn is the one step of the pipeline that interpolates before the
 //! size step, so the two are done as one: [`warp`] maps every print pixel
 //! back through the crop, the frame and the turn into the upright
-//! negative and resamples there once, with the print's own kernel, the
-//! support stretched by the reduction as [`crate::resize`] stretches it.
+//! negative and resamples there once: with the print's own kernel when
+//! there is a size step, with [`STRAIGHTEN_KERNEL`] when the turn stands
+//! alone ([`kernel_for`]), the support stretched by the reduction as
+//! [`crate::resize`] stretches it.
 //! At angle zero nothing here runs; the separable resize keeps its bytes.
 //!
 //! The angle is in degrees, clockwise positive on the screen (y down), and

@@ -318,8 +318,8 @@ fn resize_cols(src: &Plane, dst_h: usize, kernel: ResampleKernel) -> Plane {
     out
 }
 
-/// Resample to exactly `dst_w × dst_h` with Lanczos-3 (the default kernel;
-/// the bench and the preview use this one).
+/// Resample to exactly `dst_w × dst_h` with Lanczos-3: the kernel of the
+/// bench and of the small preview, not the print's default.
 pub fn resize(src: &Plane, dst_w: usize, dst_h: usize) -> Plane {
     resize_with(src, dst_w, dst_h, ResampleKernel::Lanczos3)
 }

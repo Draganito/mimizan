@@ -1244,7 +1244,7 @@ pub fn render_sharpen_loupe(
         if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
     let (sx, sy, ex, ey) = loupe_source_rect(full_w, full_h, &params, nx, ny, view);
     // USM is the only step that reads the mask, and only then is the crop
-    // wide enough for its Lanczos-3 resample.
+    // wide enough for the mask's own resample (`MASK_KERNEL`).
     let want_mask = recipe.sharpen.usm_amount() > 0.0;
     let plate = plate.filter(|_| !s.is_mono());
     let (linear, plates, mask) = if ex > sx && ey > sy {

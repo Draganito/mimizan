@@ -1,4 +1,4 @@
-//! Sweep of separation variants on the Kodak conditions (PAPER §8.5).
+//! Sweep of separation variants on the Kodak conditions (PAPER §7.3).
 //! Mosaics are built once per condition, every variant is one separation,
 //! the figure is the mean luminance PSNR of `mimizan bench kodak` without
 //! the external converters. Needs `testdata/kodak` and, for `raw`/`soft`,
