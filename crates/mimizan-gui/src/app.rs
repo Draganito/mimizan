@@ -581,6 +581,9 @@ pub struct App {
     last_wanted: Vec<PathBuf>,
     /// Keyboard moved the selection: bring the tile into view once.
     scroll_to_selected: bool,
+    /// What the strip's textures were made for: the plate process, and
+    /// inverted.
+    strip_look: (bool, bool),
     /// Picture the strip should treat as current (the one opening or open).
     current_path: Option<PathBuf>,
 
@@ -843,6 +846,7 @@ impl App {
             dir_counts: None,
             last_wanted: Vec::new(),
             scroll_to_selected: false,
+            strip_look: (false, false),
             current_path: None,
             busy: None,
             log: Vec::new(),
@@ -1059,10 +1063,7 @@ impl App {
         if self.session.is_some() {
             self.edit.plate = plate.then_some(self.plate_last);
         }
-        if self.plate_default != plate {
-            self.plate_default = plate;
-            self.strip_textures_drop();
-        }
+        self.plate_default = plate;
         self.persist();
     }
 
@@ -1075,8 +1076,8 @@ impl App {
         }
     }
 
-    /// The strip's pictures are made again next frame (the process or the
-    /// inversion changed).
+    /// The strip's pictures are made again (`strip_panel`, when the process
+    /// or the inversion is not the one they were made for).
     fn strip_textures_drop(&mut self) {
         if let Some(f) = &mut self.folder {
             for e in &mut f.entries {
@@ -1097,7 +1098,6 @@ impl App {
             }
             if plate != self.plate_default {
                 self.plate_default = plate;
-                self.strip_textures_drop();
                 changed = true;
             }
             if changed {
@@ -5848,7 +5848,6 @@ impl App {
                     } else {
                         self.strip_negative = !negative;
                     }
-                    self.strip_textures_drop();
                     self.persist();
                 }
                 let mut sort = self.sort;
@@ -5900,6 +5899,13 @@ impl App {
         }
         let plate = self.plate_process();
         let negative = self.strip_inverted();
+        // The frames are made for one look. It follows the switches and
+        // the file: a monochrome sensor has no plate whatever the darkroom
+        // is set to, and frames made before it opened are not its look.
+        if self.strip_look != (plate, negative) {
+            self.strip_look = (plate, negative);
+            self.strip_textures_drop();
+        }
         let Some(folder) = &mut self.folder else { return };
         if folder.entries.is_empty() && folder.subdirs.is_empty() {
             ui.label(RichText::new("No RAW files and no folders here.").weak());
