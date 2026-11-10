@@ -21,7 +21,7 @@ use crate::worker::{
 use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
 };
-use egui_file_dialog::{FileDialog, OpeningMode};
+use egui_file_dialog::{DialogState, FileDialog, OpeningMode};
 use mimizan_core::burn::{self, Light, Stroke};
 use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, Weights};
@@ -692,6 +692,9 @@ pub struct App {
     print_overflow_logged: bool,
 
     dialog: FileDialog,
+    /// The save dialog was up when this frame began: the keys of the
+    /// frame are the dialog's, the Enter that names the file included.
+    dialog_up: bool,
     /// The folder the Mac sandbox is allowed to read. Held for the whole
     /// time that folder (and its subfolders) stay open.
     #[cfg(target_os = "macos")]
@@ -873,6 +876,7 @@ impl App {
                 dialog.config_mut().opening_mode = OpeningMode::AlwaysInitialDir;
                 dialog
             },
+            dialog_up: false,
             #[cfg(target_os = "macos")]
             folder_grant: None,
             cameras_dir,
@@ -2339,10 +2343,12 @@ impl App {
         }
     }
 
-    /// A question is on screen and has the keyboard: no key reaches the
-    /// picture or the strip behind it.
+    /// A question or the save dialog is on screen and has the keyboard:
+    /// no key reaches the picture or the strip behind it. An arrow in the
+    /// dialog's list would open the next file, and the print of that one
+    /// would be saved under this one's name.
     fn question_open(&self) -> bool {
-        self.pending_leave.is_some() || self.pending_replace.is_some()
+        self.pending_leave.is_some() || self.pending_replace.is_some() || self.dialog_up
     }
 
     /// Start the export to `path`, which is settled.
@@ -3198,6 +3204,9 @@ impl App {
     }
 
     fn handle_dialog(&mut self, ctx: &egui::Context) {
+        // Read before the update: the dialog closes in the frame its name
+        // is entered, and that Enter is still not one for the picture.
+        self.dialog_up = matches!(self.dialog.state(), DialogState::Open);
         self.dialog.update(ctx);
         let Some(path) = self.dialog.take_picked() else { return };
         self.export_to(path, false);
