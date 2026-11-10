@@ -645,10 +645,24 @@ fn config_path() -> Option<PathBuf> {
 impl Persisted {
     /// The saved settings, or the defaults when there is no readable file.
     pub fn load() -> Self {
-        config_path()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        config_path().and_then(|p| std::fs::read(p).ok()).map(|b| Self::from_json(&b)).unwrap_or_default()
+    }
+
+    /// The settings in `bytes`. A setting this version cannot read (a
+    /// value from a newer one, or a file edited by hand) is left at its
+    /// default and the others are kept.
+    fn from_json(bytes: &[u8]) -> Self {
+        if let Ok(all) = serde_json::from_slice(bytes) {
+            return all;
+        }
+        let Ok(serde_json::Value::Object(mut settings)) = serde_json::from_slice(bytes) else {
+            return Self::default();
+        };
+        settings.retain(|name, value| {
+            let alone = serde_json::Map::from_iter([(name.clone(), value.clone())]);
+            serde_json::from_value::<Self>(serde_json::Value::Object(alone)).is_ok()
+        });
+        serde_json::from_value(serde_json::Value::Object(settings)).unwrap_or_default()
     }
 
     /// Write the settings; a failure is silent (read-only home, no config dir).
@@ -695,6 +709,34 @@ mod tests {
         assert!(!is_raw(Path::new("x/._DSC_1.NEF")));
         assert!(!is_raw(Path::new("x/.hidden.dng")));
         assert!(is_raw(Path::new(".hidden/DSC_1.NEF")));
+    }
+
+    /// One value this version cannot read (written by a newer one, or by
+    /// hand) costs that setting, not the folder and the windows with it.
+    #[test]
+    fn one_unreadable_setting_leaves_the_others() {
+        let json = br#"{
+            "folder": "/photos/2026",
+            "sort": "by-moon",
+            "strip": false,
+            "panels": [true, false, true],
+            "strip_height": "tall",
+            "brush": { "tool": "hand" },
+            "a_setting_of_tomorrow": 3
+        }"#;
+        let p = Persisted::from_json(json);
+        assert_eq!(p.folder, Some(PathBuf::from("/photos/2026")));
+        assert_eq!(p.strip, Some(false));
+        assert_eq!(p.panels, Some([true, false, true]));
+        assert_eq!(p.sort, Sort::default());
+        assert_eq!(p.strip_height, None);
+        assert_eq!(p.brush, None);
+        // What is whole reads as before, and what is no JSON is the defaults.
+        let whole =
+            Persisted { folder: Some("/a".into()), ruler: Some(Ruler::default()), ..Persisted::default() };
+        assert_eq!(Persisted::from_json(&serde_json::to_vec(&whole).unwrap()), whole);
+        assert_eq!(Persisted::from_json(b"not json"), Persisted::default());
+        assert_eq!(Persisted::from_json(b"[1, 2]"), Persisted::default());
     }
 
     #[test]
