@@ -38,12 +38,16 @@ pub const ANGLE_LIMIT: f64 = 45.0;
 /// the one the turn takes.
 pub const STRAIGHTEN_KERNEL: ResampleKernel = ResampleKernel::CatmullRom;
 
+/// How far a map's scale may be from one and still be no size step: a
+/// turn's sine and cosine give a scale of one to the last bits, not one.
+const NO_SIZE_STEP: f64 = 1e-6;
+
 /// The kernel the one warp through `map` uses for the picture: the
 /// recipe's `resample` when the map has a size step, [`STRAIGHTEN_KERNEL`]
 /// when it is a turn alone (both scales one). The mask keeps its own.
 pub fn kernel_for(map: &Affine, resample: ResampleKernel) -> ResampleKernel {
     let (sx, sy) = map.scales();
-    if (sx - 1.0).abs() < 1e-6 && (sy - 1.0).abs() < 1e-6 {
+    if (sx - 1.0).abs() < NO_SIZE_STEP && (sy - 1.0).abs() < NO_SIZE_STEP {
         STRAIGHTEN_KERNEL
     } else {
         resample
@@ -205,7 +209,7 @@ pub fn print_map(
 /// stretched by `stretch`: first source index, then the folded weights.
 /// Indices are clamped to `0..len` and their weights folded onto the edge
 /// sample, as the separable resize does. A kernel that touches nothing
-/// (the box exactly between two pixels) takes the nearest one.
+/// takes the nearest one.
 /// The kernel is passed as its support and a function, so a warp's inner
 /// loop runs one kernel without a match per tap.
 #[inline]
@@ -259,6 +263,63 @@ fn axis_taps_with(
     first as usize
 }
 
+/// Taps of [`ResampleKernel::Area`] along one axis for source centre `c`
+/// (index units), `stretch` being what one destination pixel covers on
+/// that axis: first source index, then the weights.
+///
+/// Where the map reduces, the destination pixel covers `c ± stretch/2`
+/// and every source pixel is weighed by the length it shares with that,
+/// the span cut at the sensor's edge: the overlap weights of the
+/// separable resize, to which this is equal at angle zero. Whole pixels
+/// counted by their centres are not that: a box 2.5 wide then holds two
+/// pixels or three, and the mean moves by up to a quarter of a pixel
+/// from one print pixel to the next. Where the map does not reduce, the
+/// tap is the pixel the centre falls in, the hold: a turn alone moves
+/// no value, so a flag of the mask stays a flag.
+#[inline]
+fn area_axis_taps(c: f64, len: usize, stretch: f64, w: &mut Vec<f64>) -> usize {
+    w.clear();
+    let last = len as isize - 1;
+    let nearest = |w: &mut Vec<f64>| {
+        w.clear();
+        w.push(1.0);
+        c.round().clamp(0.0, last as f64) as usize
+    };
+    if stretch <= 1.0 + NO_SIZE_STEP {
+        return nearest(w);
+    }
+    // Pixel `j` spans `j ± 1/2`.
+    let left = (c - stretch / 2.0).max(-0.5);
+    let right = (c + stretch / 2.0).min(len as f64 - 0.5);
+    let first = ((left + 0.5).floor() as isize).clamp(0, last);
+    let end = ((right + 0.5).ceil() as isize - 1).clamp(first, last);
+    let mut sum = 0.0;
+    for j in first..=end {
+        let shared = (right.min(j as f64 + 0.5) - left.max(j as f64 - 0.5)).max(0.0);
+        w.push(shared);
+        sum += shared;
+    }
+    if sum < 1e-12 {
+        return nearest(w);
+    }
+    for v in w.iter_mut() {
+        *v /= sum;
+    }
+    first as usize
+}
+
+/// How far from a destination pixel's centre its taps along one axis
+/// lie, in source pixels, the kernel stretched by `stretch`. The area
+/// kernel's span, where it reduces, cuts a source pixel at each end and
+/// reads that pixel whole: half a pixel more than the span.
+fn reach(kernel: ResampleKernel, stretch: f64) -> f64 {
+    if kernel == ResampleKernel::Area && stretch > 1.0 + NO_SIZE_STEP {
+        0.5 * stretch + 0.5
+    } else {
+        kernel.support() * stretch
+    }
+}
+
 /// Source pixels `warp` reads for destination `rect` through `map` with
 /// `kernel`: `(x0, y0, x1, y1)`, half-open, clamped to the `src_w×src_h`
 /// source. The map is affine, so the extremes lie at the corners.
@@ -274,7 +335,7 @@ pub fn footprint(
     }
     let (sx, sy) = map.scales();
     let (stretch_x, stretch_y) = (sx.max(1.0), sy.max(1.0));
-    let (support_x, support_y) = (kernel.support() * stretch_x, kernel.support() * stretch_y);
+    let (support_x, support_y) = (reach(kernel, stretch_x), reach(kernel, stretch_y));
     let corners = [
         (rect.x as f64 + 0.5, rect.y as f64 + 0.5),
         ((rect.x + rect.w) as f64 - 0.5, rect.y as f64 + 0.5),
@@ -306,7 +367,8 @@ pub fn footprint(
 /// [`footprint`] of `rect`; a window that does not is an error, never a
 /// panic. The weights of one pixel are the kernel's along x times the
 /// kernel's along y, each normalised to one, each stretched by what one
-/// destination pixel covers on that axis when the map shrinks.
+/// destination pixel covers on that axis when the map shrinks. The area
+/// kernel has its own taps ([`area_axis_taps`]).
 pub fn warp(
     src: PlaneWindow<'_>,
     map: &Affine,
@@ -339,31 +401,39 @@ pub fn warp(
             src.origin_x, src.origin_y
         )));
     }
+    let support = kernel.support();
+    // One closure per kernel, so the inner loop runs that kernel's taps
+    // without a match per tap.
+    macro_rules! sampled {
+        ($k:expr) => {
+            warp_with(src, map, rect, &|c, len, stretch, w| {
+                axis_taps_with(c, len, support, &|x| $k.eval(x), stretch, w)
+            })
+        };
+    }
     match kernel {
-        ResampleKernel::Lanczos3 => warp_with(src, map, kernel, rect, &|x| ResampleKernel::Lanczos3.eval(x)),
-        ResampleKernel::Mitchell => warp_with(src, map, kernel, rect, &|x| ResampleKernel::Mitchell.eval(x)),
-        ResampleKernel::CatmullRom => {
-            warp_with(src, map, kernel, rect, &|x| ResampleKernel::CatmullRom.eval(x))
-        }
-        ResampleKernel::BSpline => warp_with(src, map, kernel, rect, &|x| ResampleKernel::BSpline.eval(x)),
-        ResampleKernel::Area => warp_with(src, map, kernel, rect, &|x| ResampleKernel::Area.eval(x)),
+        ResampleKernel::Lanczos3 => sampled!(ResampleKernel::Lanczos3),
+        ResampleKernel::Mitchell => sampled!(ResampleKernel::Mitchell),
+        ResampleKernel::CatmullRom => sampled!(ResampleKernel::CatmullRom),
+        ResampleKernel::BSpline => sampled!(ResampleKernel::BSpline),
+        ResampleKernel::Area => warp_with(src, map, rect, &area_axis_taps),
     }
 }
 
-/// The checked `warp` for one kernel, `eval` being that kernel's function.
+/// The checked `warp` for one kernel, `taps` being that kernel's along
+/// one axis: source centre, source length, stretch, the weights to fill;
+/// it returns the first source index.
 fn warp_with(
     src: PlaneWindow<'_>,
     map: &Affine,
-    kernel: ResampleKernel,
     rect: PixelRect,
-    eval: &(impl Fn(f64) -> f64 + Sync),
+    taps: &(impl Fn(f64, usize, f64, &mut Vec<f64>) -> usize + Sync),
 ) -> crate::Result<Plane> {
     let (sx, sy) = map.scales();
     let (stretch_x, stretch_y) = (sx.max(1.0), sy.max(1.0));
     let (full_w, full_h) = (src.full_w, src.full_h);
     let (ox, oy) = (src.origin_x, src.origin_y);
     let plane = src.plane;
-    let support = kernel.support();
     let mut out = Plane::zeros(rect.w, rect.h);
     out.data.par_chunks_mut(rect.w).enumerate().for_each(|(row_i, row)| {
         let mut wx = Vec::with_capacity(8);
@@ -372,8 +442,8 @@ fn warp_with(
         for (col_i, o) in row.iter_mut().enumerate() {
             let x = (rect.x + col_i) as f64 + 0.5;
             let (u, v) = map.apply(x, y);
-            let jx = axis_taps_with(u - 0.5, full_w, support, eval, stretch_x, &mut wx);
-            let jy = axis_taps_with(v - 0.5, full_h, support, eval, stretch_y, &mut wy);
+            let jx = taps(u - 0.5, full_w, stretch_x, &mut wx);
+            let jy = taps(v - 0.5, full_h, stretch_y, &mut wy);
             let mut acc = 0.0;
             for (ky, wyk) in wy.iter().enumerate() {
                 let s = &plane.row(jy + ky - oy)[jx - ox..jx - ox + wx.len()];
@@ -690,6 +760,49 @@ mod tests {
                 assert!((a - b).abs() < 1e-9, "{x},{y}: {a} vs {b}");
             }
         }
+    }
+
+    /// The area kernel through the warp is the area kernel: at angle zero
+    /// a reduction gives the separable resize's overlap weights, and
+    /// through a turn a ramp stays the ramp, every print pixel the mean
+    /// of the square it covers and not of however many whole pixels have
+    /// their centre in it.
+    #[test]
+    fn the_area_kernel_through_the_warp_weighs_by_overlap() {
+        let src = ramp(97, 61);
+        let mut worst: f64 = 0.0;
+        for (dw, dh) in [(45, 30), (39, 24), (60, 11), (96, 60)] {
+            let m = print_map(97, 61, 0.0, None, dw, dh);
+            let warped = warp_plane(&src, &m, dw, dh, ResampleKernel::Area);
+            let resized = crate::resize::resize_with(&src, dw, dh, ResampleKernel::Area);
+            for (a, b) in warped.data.iter().zip(&resized.data) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(worst < 1e-12, "angle zero: off the separable resize by {worst}");
+
+        // A plane that rises by one per pixel along x, turned and reduced
+        // by 2.5: the mean of the covered square is the value at its
+        // centre, to what the pixel steps inside a box that wide leave.
+        let (w, h) = (400usize, 300usize);
+        let mut slope = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                slope.set(x, y, x as f64);
+            }
+        }
+        let (fw, fh) = frame_size(w, h, 3.0);
+        let (dw, dh) = ((fw as f64 / 2.5) as usize, (fh as f64 / 2.5) as usize);
+        let m = print_map(w, h, 3.0, None, dw, dh);
+        let out = warp_plane(&slope, &m, dw, dh, ResampleKernel::Area);
+        let mut worst: f64 = 0.0;
+        for y in 2..dh - 2 {
+            for x in 2..dw - 2 {
+                let (u, _) = m.apply(x as f64 + 0.5, y as f64 + 0.5);
+                worst = worst.max((out.at(x, y) - (u - 0.5)).abs());
+            }
+        }
+        assert!(worst < 0.06, "through the turn: a ramp is off by {worst} px");
     }
 
     #[test]
