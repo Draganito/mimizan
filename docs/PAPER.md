@@ -998,10 +998,10 @@ negative, and the colour resolves to the carriers' band limit, about
 CPSNR on sRGB-encoded values, Kodak set, `bench plate`, channels filters,
 against the best of the sixteen demosaicers of §7.1: pixel-sharp 33.5 dB
 against LMMSE 39.4, 0 of 24 ahead; behind a lens (σ 0.75 px) 45.0 against
-RCD 46.2 and LMMSE 46.2, 0 of 24 ahead; at twice the sampling 47.2 against
-RCD 45.4, 4 of 24 ahead. The plate's green is
+RCD 46.2 and LMMSE 46.2, 3 of 24 ahead; at twice the sampling 47.2 against
+RCD 45.4, 22 of 24 ahead. The plate's green is
 its strongest channel in every condition, 3–5 dB above its own red and
-blue, and behind a lens and at twice the sampling it is above every
+5–10 dB above its blue, and behind a lens and at twice the sampling it is above every
 demosaicer's green (by 0.3 and 3.4 dB): it is
 `L̂ + Ĉ1'`, not interpolated; the blue is the weakest, where the camera's
 balance gain is largest. Method, file format and limits are in

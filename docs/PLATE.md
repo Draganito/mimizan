@@ -157,7 +157,8 @@ Three conditions, as in the monochrome bench: the pictures pixel-sharp
 before sampling, the sharpest real lens on a real sensor), and at twice
 the size (`--scale 2`, the picture upsampled 2× before sampling, a 48 MP
 sensor seen from the distance of 12 MP). Mean CPSNR and R/G/B PSNR in dB;
-the leads column counts pictures won. The rows marked *removed* are the
+the leads column counts pictures won, the removed rows among the
+contenders. The rows marked *removed* are the
 plate with the nonlinear last-octave step of 0.11–0.14; 0.15 took that
 step out (every pixel is a measured sum again), and the rows stay so the
 decision can be read against the numbers it was made on.
@@ -204,7 +205,14 @@ step recovered all but 1.1 dB of it, by computing pixels. As soon as the
 picture has passed a lens the plate is level with the best (RCD, LMMSE,
 DCB within 0.5 dB, every other demosaicer behind), and at the sampling of
 a real high-resolution sensor the plate leads by 2 dB. That is why the
-step could go: it paid only where no camera goes. The green channel of the plate is ahead everywhere by 2–5 dB: it is
+step could go: it paid only where no camera goes. Against the sixteen
+demosaicers alone, without the removed rows, the plate is ahead of every
+one of them on 0 of the 24 pixel-sharp pictures, on 3 behind a lens and on
+22 at twice the size (`bench plate` of 0.18.7, the same means as above).
+The green channel of the plate is its best, 3–5 dB above its red, and
+behind a lens and at twice the size it is above every demosaicer's green,
+by 0.3 and 3.4 dB (on the pixel-sharp pictures LMMSE's green is 5.7 dB
+ahead): it is
 the luminance plus Ĉ1' only, not interpolated. The blue trails, as it does
 in every method: one photosite in four, and the sRGB encoding weights its
 errors most.
