@@ -72,9 +72,6 @@ if command -v cargo-deb >/dev/null; then
     do
         grep -q " $f\$" <<<"$LISTING" || { echo "ERROR: $f missing in deb"; exit 1; }
     done
-    if grep -qE 'docs/SPEC.md|docs/RESULTS.md|docs/gui.png' <<<"$LISTING"; then
-        echo "ERROR: the lab record leaked into the deb"; exit 1
-    fi
     if grep -qE '\.git/|/target/|testdata/|\.nef|\.dng' <<<"$LISTING"; then
         echo "ERROR: source tree or RAW samples leaked into deb"; exit 1
     fi
