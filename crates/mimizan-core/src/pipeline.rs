@@ -257,7 +257,9 @@ pub fn plate_base(camera_file: Option<&CameraFile>, wb: [f64; 3]) -> Weights {
     camera_file.map(|c| c.weights_balanced(wb)).unwrap_or_default()
 }
 
-/// The 8-bit sidecar: `round(255 · mask_max)`, 255 where saturated.
+/// The 8-bit sidecar: `round(255 · mask_max)`, 255 where saturated and
+/// nowhere else. A mask that rounds to 255 is written as 254: every
+/// reader takes 255 for a burnt-out photosite.
 pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
     if mask_max.data.len() != saturated.len() {
         return Err(crate::Error::Invalid(format!(
@@ -270,7 +272,7 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
         .data
         .par_iter()
         .zip(saturated.par_iter())
-        .map(|(&m, &s)| if s != 0 { 255 } else { (m.clamp(0.0, 1.0) * 255.0).round() as u8 })
+        .map(|(&m, &s)| if s != 0 { 255 } else { ((m.clamp(0.0, 1.0) * 255.0).round() as u8).min(254) })
         .collect())
 }
 
@@ -414,6 +416,28 @@ mod tests {
         assert_ne!(m1.plane.data, m2.plane.data);
         // Without a camera file the emulsion is the native one.
         assert_eq!(plate_base(None, [2.0, 1.0, 1.5]), Weights::default());
+    }
+
+    /// 255 in the sidecar says "burnt out" and nothing else. A mask of 1,
+    /// which the block mask gives where a band holds nothing but noise, is
+    /// the place sharpening is most allowed: written as 255 it was read as
+    /// burnt out and left unsharpened.
+    #[test]
+    fn a_full_mask_is_not_written_as_burnt_out() {
+        let mask = Plane::from_vec(5, 1, vec![1.0, 0.999, 0.8, 0.5, 1.0]);
+        let bytes = mask_sidecar(&mask, &[0, 0, 0, 0, 1]).unwrap();
+        assert_eq!(bytes, [254, 254, 204, 128, 255]);
+        // Read back as the print reads it, the unsharp mask sharpens under
+        // the full mask and under the fixed estimator's, and not where
+        // the sensor was burnt out.
+        let read = Plane::from_vec(5, 1, bytes.iter().map(|&b| f64::from(b) / 255.0).collect());
+        let step = Plane::from_vec(5, 1, vec![0.2, 0.8, 0.2, 0.8, 0.2]);
+        let sharp = crate::usm::unsharp(&step, 1.0, 1.0, Some(&read));
+        for x in [0, 1, 2] {
+            assert_ne!(sharp.at(x, 0), step.at(x, 0), "pixel {x} under mask {}", read.at(x, 0));
+        }
+        assert_eq!(sharp.at(3, 0), step.at(3, 0));
+        assert_eq!(sharp.at(4, 0), step.at(4, 0));
     }
 
     #[test]
