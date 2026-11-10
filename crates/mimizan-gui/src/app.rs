@@ -682,6 +682,11 @@ pub struct App {
     /// and every file pixel is here. Below that, `step` is the screen grid.
     detail_texture: Option<TextureHandle>,
     detail_rect: Option<DetailAsk>,
+    /// The sessions whose pixels the picture on the stage and the sharp
+    /// tile over it are. The picture of a file just opened arrives before
+    /// its tile: until that one is there, the tile up is the file before.
+    texture_of: Option<u64>,
+    detail_of: Option<u64>,
     /// Window the view currently wants (None when the fit preview suffices).
     wanted_detail: Option<DetailAsk>,
     last_detail_request: Option<DetailAsk>,
@@ -890,6 +895,8 @@ impl App {
             keep_scale: None,
             detail_texture: None,
             detail_rect: None,
+            texture_of: None,
+            detail_of: None,
             wanted_detail: None,
             last_detail_request: None,
             last_inspect: None,
@@ -3214,6 +3221,7 @@ impl App {
                     _ => self.texture = Some(ctx.load_texture("preview", img, opts)),
                 }
                 self.tex_size = [im.width, im.height];
+                self.texture_of = Some(r.session);
             } else {
                 self.log("preview was the wrong size");
             }
@@ -3238,6 +3246,7 @@ impl App {
                 _ => self.detail_texture = Some(ctx.load_texture("detail", img, opts)),
             }
             self.detail_rect = Some(d.ask);
+            self.detail_of = Some(r.session);
         }
     }
 
@@ -5272,7 +5281,9 @@ impl App {
         if self.wanted_detail.is_none() {
             self.detail_rect = None;
         }
-        if let (Some(dt), Some(dr)) = (&self.detail_texture, self.detail_rect) {
+        // The tile of the file before is not laid over this file's picture.
+        let tile = self.detail_texture.as_ref().filter(|_| self.detail_of == self.texture_of);
+        if let (Some(dt), Some(dr)) = (tile, self.detail_rect) {
             let step = dr.step() as f32;
             let min = rect.min + Vec2::new(dr.x as f32, dr.y as f32) * pts_per_px;
             let drect =

@@ -653,6 +653,8 @@ pub struct PreviewRequest {
 
 pub struct PreviewResult {
     pub generation: u64,
+    /// The session whose pixels these are.
+    pub session: u64,
     /// New whole-image preview, when the view changed.
     pub image: Option<PreviewImage>,
     /// New 1:1 window, when one was requested and changed.
@@ -782,6 +784,7 @@ fn start_preview(
                     req = newer;
                 }
                 let generation = req.generation;
+                let session = req.session.id;
                 let started = Instant::now();
                 let stale = || latest.load(Ordering::Relaxed) != generation;
                 let send = |r: PreviewResult| {
@@ -796,6 +799,7 @@ fn start_preview(
                     hold = PreviewHold::default();
                     send(PreviewResult {
                         generation,
+                        session,
                         image: None,
                         detail: None,
                         ms: started.elapsed().as_millis(),
@@ -845,6 +849,7 @@ fn paint_preview(
         hold.last = Some(key);
         send(PreviewResult {
             generation: req.generation,
+            session: req.session.id,
             image: Some(image),
             detail: None,
             ms: t.elapsed().as_millis(),
@@ -927,6 +932,7 @@ fn paint_preview(
     hold.last_inspect = req.inspect;
     send(PreviewResult {
         generation: req.generation,
+        session: req.session.id,
         image: None,
         detail: Some(image),
         ms: t.elapsed().as_millis(),
