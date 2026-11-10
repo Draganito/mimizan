@@ -646,14 +646,21 @@ impl ReadyTip {
         self.outside2.sqrt()
     }
 
-    /// Half-widths of the axis-aligned box the tip can touch: the turned
-    /// ellipse's extents plus the feather. Tighter than the reach for an
-    /// eccentric tip, so a stamp of it visits fewer points.
+    /// Half-widths of an axis-aligned box that holds every point the tip
+    /// gives weight to. The distance is at least `(r − 1) b` at level `r`
+    /// ([`Tip::reach`]), so the weight ends inside the level
+    /// `1 + f/b`: the ellipse grown by that factor, turned, and its
+    /// extents. Tighter than the square of the reach for an eccentric
+    /// tip, so a stamp of it visits fewer points. (The ellipse's own
+    /// extents plus the feather are not enough: the distance is of the
+    /// first order, and off the ends of a long soft tip the weight reaches
+    /// further than the feather.)
     fn extent(&self) -> (f64, f64) {
-        let Tip { rx, ry, feather, .. } = self.tip;
+        let (rx, ry) = self.tip.axes();
+        let grown = 1.0 + self.tip.feather.max(0.0) / rx.min(ry);
         let (s, c) = (self.sin, self.cos);
-        let ex = ((rx * c).powi(2) + (ry * s).powi(2)).sqrt() + feather.max(0.0);
-        let ey = ((rx * s).powi(2) + (ry * c).powi(2)).sqrt() + feather.max(0.0);
+        let ex = grown * ((rx * c).powi(2) + (ry * s).powi(2)).sqrt();
+        let ey = grown * ((rx * s).powi(2) + (ry * c).powi(2)).sqrt();
         (ex.min(self.reach()), ey.min(self.reach()))
     }
 
@@ -1898,6 +1905,50 @@ mod tests {
         let other = hand(t, 0.8, Light::Soft, &path);
         assert!(Ready::grown(&a, &other).is_none());
         assert!(!Arc::ptr_eq(&prepared(&other), &a));
+    }
+
+    /// A stamp of the tip on a growing raster visits the points of the
+    /// tip's box and no others, so the box must hold every point the tip
+    /// gives weight to; and for a long narrow tip it is smaller than the
+    /// square of the reach, or the stamp gains nothing.
+    #[test]
+    fn the_tips_box_holds_all_of_its_weight() {
+        for t in [
+            tip(1.0, 0.1, 0.0, 0.1),
+            tip(0.3, 0.05, 0.0, 0.05),
+            tip(0.3, 0.05, 30.0, 0.02),
+            tip(0.05, 0.3, -70.0, 0.05),
+            tip(0.3, 0.03, 45.0, 0.03),
+            tip(0.2, 0.1, 0.0, 0.05),
+            tip(0.1, 0.1, 0.0, 0.05),
+            tip(0.3, 0.03, 10.0, 0.0),
+        ] {
+            let ready = ReadyTip::new(t);
+            let (ex, ey) = ready.extent();
+            let reach = ready.reach();
+            assert!(ex <= reach && ey <= reach);
+            let n = 800;
+            let (mut touched, mut outside, mut worst) = (0usize, 0usize, 0.0f64);
+            for i in 0..=n {
+                for j in 0..=n {
+                    let x = reach * (2.0 * i as f64 / n as f64 - 1.0);
+                    let y = reach * (2.0 * j as f64 / n as f64 - 1.0);
+                    let w = ready.weight(x, y);
+                    if w > 0.0 {
+                        touched += 1;
+                        if x.abs() > ex || y.abs() > ey {
+                            outside += 1;
+                            worst = worst.max(w);
+                        }
+                    }
+                }
+            }
+            assert!(touched > 1000, "{t:?}: {touched}");
+            assert_eq!(outside, 0, "{t:?}: box ({ex}, {ey}), weight up to {worst} outside it");
+        }
+        // Lying along an axis, the long narrow tip's box is narrow too.
+        let (ex, ey) = ReadyTip::new(tip(0.3, 0.03, 0.0, 0.03)).extent();
+        assert!(ey < 0.25 * ex, "({ex}, {ey})");
     }
 
     /// The cache lets its oldest strokes go by what they take to keep. A
