@@ -305,7 +305,10 @@ pub fn write_dng(
         d.write_tag(Tag::Orientation, 1u16)?;
         d.write_tag(Tag::Make, &*ascii_even(meta.make))?;
         d.write_tag(Tag::Model, &*ascii_even(meta.model))?;
-        d.write_tag(Tag::ImageDescription, &*ascii_even(meta.description))?;
+        // The description is JSON: its letters outside ASCII are escaped,
+        // not replaced, so the source path in it stays the path.
+        let description = crate::tiffout::ascii_description(meta.description);
+        d.write_tag(Tag::ImageDescription, &*ascii_even(&description))?;
         d.write_tag(Tag::Software, &*ascii_even(concat!("mimizan ", env!("CARGO_PKG_VERSION"))))?;
         // DNGVersion, DNGBackwardVersion.
         d.write_tag(Tag::Unknown(50706), &[1u8, 4, 0, 0][..])?;
@@ -368,7 +371,7 @@ mod tests {
             xyz_to_cam: m,
             illuminant: Some(21),
             wb,
-            description: "{}",
+            description: r#"{"source":"Zé"}"#,
         };
         let path = tmp("plate.dng");
         // Orientation 6 (90° cw) and a crop in the upright frame.
@@ -445,7 +448,11 @@ mod tests {
         // it. The accent became `?`, the NUL is gone.
         assert_eq!(dec.get_tag_ascii_string(Tag::Model).unwrap(), "Z? Test");
         assert_eq!(dec.get_tag_ascii_string(Tag::Unknown(50708)).unwrap().trim_end(), "Mimizan Z? Test");
-        assert_eq!(dec.get_tag_ascii_string(Tag::ImageDescription).unwrap(), "{} ");
+        // The description is JSON: its accent is escaped and reads back.
+        let description = dec.get_tag_ascii_string(Tag::ImageDescription).unwrap();
+        assert_eq!(description, r#"{"source":"Z\u00e9"} "#);
+        let read: serde_json::Value = serde_json::from_str(&description).unwrap();
+        assert_eq!(read["source"], "Zé");
         assert_eq!(ascii_even("abc"), "abc");
         assert_eq!(ascii_even("ab"), "ab ");
         assert_eq!(ascii_even("a\0é"), "a? ");
