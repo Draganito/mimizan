@@ -30,11 +30,16 @@ const RAW_EXTENSIONS: &[&str] = &[
     "mos", "iiq", "3fr", "fff", "kdc", "dcr", "dcs", "mrw", "x3f", "tfr", "ari", "srw", "raw",
 ];
 
-/// Does the extension name a RAW format (case-insensitive)?
+/// Does the extension name a RAW format (case-insensitive)? A hidden file
+/// is none: on a FAT or exFAT card macOS writes `._DSC_1.NEF` beside each
+/// RAW, with the RAW's extension and none of its pixels.
 fn is_raw(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+    let hidden = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'));
+    !hidden
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| RAW_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -681,6 +686,15 @@ mod tests {
         assert!(is_raw(Path::new("x/a.dng")));
         assert!(!is_raw(Path::new("x/a.jpg")));
         assert!(!is_raw(Path::new("x/noext")));
+    }
+
+    /// A file the Finder wrote beside a RAW on a card (`._DSC_1.NEF`) has
+    /// the RAW's extension and none of its pixels.
+    #[test]
+    fn a_hidden_file_is_no_raw() {
+        assert!(!is_raw(Path::new("x/._DSC_1.NEF")));
+        assert!(!is_raw(Path::new("x/.hidden.dng")));
+        assert!(is_raw(Path::new(".hidden/DSC_1.NEF")));
     }
 
     #[test]
