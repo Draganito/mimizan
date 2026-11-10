@@ -105,8 +105,6 @@ pub struct Negative {
     pub mask8: Vec<u8>,
     pub orientation: u16,
     pub info: NegativeInfo,
-    /// Saturation map of the mosaic (same size as `plane`).
-    pub saturated: Vec<u8>,
     /// Only with `NegativeParams::keep_separation`. Its `mask_max` is
     /// released (a 1×1 plane): `mask8` is the mask.
     pub separation: Option<crate::separate::Separation>,
@@ -199,7 +197,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         (None, _) => None,
     };
 
-    let (plane, mask8, saturated, separation) = match mosaic.phase {
+    let (plane, mask8, separation) = match mosaic.phase {
         Some(_) => {
             let t = Instant::now();
             let sep = separate(&mosaic, &p.separate)?;
@@ -225,7 +223,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
                 (mix_into(sep, &weights), None)
             };
             info.timing.mix_ms = t.elapsed().as_millis();
-            (plane, mask8, saturated, separation)
+            (plane, mask8, separation)
         }
         None => {
             let Mosaic { saturated, plane, .. } = mosaic;
@@ -233,10 +231,10 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             // No carriers on a mono sensor: sharpening allowed except at saturation.
             let allowed = (crate::separate::FIXED_MASK_VALUE * 255.0).round() as u8;
             let mask8 = saturated.iter().map(|&s| if s != 0 { 255 } else { allowed }).collect();
-            (plane, mask8, saturated, None)
+            (plane, mask8, None)
         }
     };
-    Ok(Negative { plane, mask8, orientation, info, saturated, separation })
+    Ok(Negative { plane, mask8, orientation, info, separation })
 }
 
 /// The panchromatic emulsion behind the plate's Wratten glass, on the
