@@ -635,8 +635,11 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     // estimate, blurred, ratio and correction as well. The mask's sheet
     // stays beside the picture's through both.
     let peak = if r.peak.applies() { m * sheet + 4.0 * picture } else { 0.0 };
-    let sharpen = if p.sharpens() && lay.resample_sigma_px > 0.0 {
-        let planes = if r.sharpen.deconv_passes() > 0 { 7.0 } else { 5.0 };
+    // Either of the two runs the stage, as in `apply_sharpen`: the
+    // deconvolution holds its planes whether or not the mask follows it.
+    let deconvolves = r.sharpen.deconv_passes() > 0;
+    let sharpen = if lay.resample_sigma_px > 0.0 && (deconvolves || r.sharpen.usm_amount() > 0.0) {
+        let planes = if deconvolves { 7.0 } else { 5.0 };
         m * sheet + planes * picture
     } else {
         0.0
@@ -1368,6 +1371,35 @@ mod tests {
         assert!(PrintSize::parse("1000x10in").is_err());
         assert!(PrintSize::parse("2048px").is_err());
         assert_eq!(PrintSize::parse("100x100mm").unwrap().pixels(254.0), (1000, 1000));
+    }
+
+    /// Richardson–Lucy on its own, without the unsharp mask after it,
+    /// holds its planes all the same: an enlargement that deconvolves is
+    /// not estimated as one that does not sharpen.
+    #[test]
+    fn memory_estimate_counts_deconvolution_without_usm() {
+        let enlarged = |sharpen: Sharpen| {
+            let mut recipe = Recipe::on_paper();
+            recipe.size = Some(PrintSize::parse("150x100cm").unwrap());
+            recipe.dpi = 300.0;
+            recipe.sharpen = sharpen;
+            let p = PrintParams { recipe, ..Default::default() };
+            let lay = layout(6000, 4000, 1, &p);
+            assert!(lay.resample_sigma_px > 0.0);
+            (memory_estimate(6000, 4000, 1, &p) as f64, (lay.image_w * lay.image_h) as f64)
+        };
+        let (off, picture) = enlarged(Sharpen::Off);
+        let (deconv, _) = enlarged(Sharpen::Deconv { passes: 3, usm_amount: 0.0 });
+        let (both, _) = enlarged(Sharpen::Deconv { passes: 3, usm_amount: 0.5 });
+        assert!(deconv >= 8.0 * 7.0 * picture, "{deconv} vs picture {picture}");
+        assert!(deconv > 1.5 * off, "{deconv} vs {off} without sharpening");
+        assert!(both >= deconv, "{both} with the mask vs {deconv}");
+        // At native size nothing is deconvolved, and nothing is counted.
+        let native = |sharpen: Sharpen| {
+            let recipe = Recipe { sharpen, ..Recipe::on_paper() };
+            memory_estimate(6000, 4000, 1, &PrintParams { recipe, ..Default::default() })
+        };
+        assert_eq!(native(Sharpen::Deconv { passes: 3, usm_amount: 0.0 }), native(Sharpen::Off));
     }
 
     #[test]
