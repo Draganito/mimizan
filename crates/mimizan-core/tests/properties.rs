@@ -97,8 +97,9 @@ proptest! {
         }
     }
 
-    /// The adaptive path on a flat colour field equals the fixed one: the mask
-    /// is zero where there is no luminance texture.
+    /// The two adaptive paths on a flat colour field equal the fixed one:
+    /// the block mask is zero where there is no luminance texture, and the
+    /// directional estimator has no direction to prefer.
     #[test]
     fn adaptive_equals_fixed_on_flat_colour(
         phase in phase_strategy(),
@@ -106,11 +107,15 @@ proptest! {
     ) {
         let (w, h) = (192, 160);
         let m = wrap(mosaic_of(phase, w, h, |_, _| (r, g, b)), phase);
-        let fixed = separate(&m, &SeparateParams { mask: mimizan_core::separate::MaskMode::Off, ..Default::default() })
+        use mimizan_core::separate::MaskMode;
+        let fixed = separate(&m, &SeparateParams { mask: MaskMode::Off, ..Default::default() })
             .expect("synthetic mosaic has a phase");
-        let adaptive = separate(&m, &SeparateParams::default()).expect("synthetic mosaic has a phase");
-        for (a, f) in adaptive.lum.data.iter().zip(&fixed.lum.data) {
-            prop_assert!((a - f).abs() < 1e-12);
+        for mask in [MaskMode::Adaptive, MaskMode::Dubois] {
+            let adaptive = separate(&m, &SeparateParams { mask, ..Default::default() })
+                .expect("synthetic mosaic has a phase");
+            for (a, f) in adaptive.lum.data.iter().zip(&fixed.lum.data) {
+                prop_assert!((a - f).abs() < 1e-12, "{mask:?}: {a} vs {f}");
+            }
         }
     }
 

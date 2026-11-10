@@ -61,16 +61,20 @@ fn on_paper(soft: f64, hard: f64) -> Recipe {
 
 /// Rows 1 and 7 of table 4: place = 0 changes nothing, for the neutral
 /// look and for the paper; the paper at its base exposure is a print, not
-/// the identity.
+/// the identity. The recipe has no mark for a step that was touched: a
+/// step named at its rest is the recipe that never named it, and one
+/// recipe is one picture, run after run.
 #[test]
 fn untouched_steps_change_nothing() {
     let neg = negative_on_disk("neutral");
+    let named = Recipe { place: 0.0, curve: Tone::Look(LookFile::neutral()), ..Recipe::default() };
+    assert_eq!(named, Recipe::default());
     let neutral = run(&neg, Recipe::default());
-    assert_eq!(run(&neg, Recipe { place: 0.0, ..Recipe::default() }), neutral);
-    assert_eq!(run(&neg, Recipe { curve: Tone::Look(LookFile::neutral()), ..Recipe::default() }), neutral);
+    assert_eq!(run(&neg, named), neutral);
+    let rested = Recipe { place: 0.0, ..on_paper(0.0, 0.0) };
+    assert_eq!(rested, Recipe::on_paper());
     let base = run(&neg, Recipe::on_paper());
-    assert_eq!(run(&neg, on_paper(0.0, 0.0)), base);
-    assert_eq!(run(&neg, Recipe { place: 0.0, ..Recipe::on_paper() }), base);
+    assert_eq!(run(&neg, rested), base);
     assert_ne!(base, neutral);
     // With a size and a kernel too: the same paper, the same picture.
     let sized = |curve: Tone| Recipe {
@@ -114,7 +118,11 @@ fn history_does_not_exist_for_the_export() {
     }
     let last = history.last().unwrap().clone();
     let from_history = run(&neg, last.clone());
-    let fresh = run(&neg, last.clone());
+    // The same set written down at once, by someone who never saw the hours.
+    let grade = last.curve.as_paper().unwrap();
+    let written = Recipe { place: last.place, ..on_paper(grade.soft, grade.hard) };
+    assert_eq!(written, last);
+    let fresh = run(&neg, written);
     assert_eq!(from_history, fresh);
     // And the recipe saved as JSON and read back gives the same picture.
     let dir = neg.parent().unwrap();

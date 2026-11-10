@@ -595,10 +595,12 @@ mod tests {
     #[test]
     fn patches_carrier_residual_stays_below_noise() {
         use crate::metrics::carrier_energy;
-        use crate::separate::{separate, SeparateParams};
+        use crate::separate::{separate, MaskMode, SeparateParams};
         use crate::synth::{mosaic, Scene, SynthParams};
         let s = mosaic(Scene::Patches, 1024, 1024, &SynthParams::default());
-        let sep = separate(&s.mosaic, &SeparateParams::default()).expect("synthetic mosaic has a phase");
+        // This module's mask: the default is the directional estimator.
+        let params = SeparateParams { mask: MaskMode::Adaptive, ..SeparateParams::default() };
+        let sep = separate(&s.mosaic, &params).expect("synthetic mosaic has a phase");
         let (pw, ph) = (1024 / 6, 1024 / 4);
         for row in 0..4 {
             for col in 0..6 {

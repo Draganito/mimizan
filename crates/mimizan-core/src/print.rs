@@ -2101,9 +2101,10 @@ mod tests {
         assert_eq!((lay.out_w, lay.out_h), (lay.image_w + 2 * frame, lay.image_h + 2 * frame));
     }
 
-    /// Paper, table 4: place = 0 is the run that never had
-    /// the step; the same recipe twice is the same picture; paper at its
-    /// base exposure is a different picture from the neutral look.
+    /// Paper, table 4: the untouched recipe (the neutral look, place = 0,
+    /// no size) is the run that never had the steps, the negative itself
+    /// turned upright and encoded; the same recipe twice is the same picture; paper at
+    /// its base exposure is a different picture from the neutral look.
     #[test]
     fn untouched_recipe_is_bit_identical_to_neutral() {
         let (w, h) = (48, 32);
@@ -2111,9 +2112,12 @@ mod tests {
         let src =
             PrintSource { plane: &plane, mask: None, orientation: 6, name: "ramp".into(), description: None };
         let neutral = render_planes(&src, &PrintParams::default());
-        let placed_zero =
-            PrintParams { recipe: Recipe { place: 0.0, ..Recipe::default() }, ..Default::default() };
-        assert_eq!(render_planes(&src, &placed_zero).plane.data, neutral.plane.data);
+        let upright = orient(&plane, 6);
+        assert_eq!((neutral.plane.width, neutral.plane.height), (upright.width, upright.height));
+        for (v, x) in neutral.plane.data.iter().zip(&upright.data) {
+            // The print's values are the display's: the linear negative through gamma 2.2.
+            assert!((v - x.powf(1.0 / crate::zone::GAMMA)).abs() < 1e-12, "{v} from {x}");
+        }
         let paper = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
         let a = render_planes(&src, &paper);
         let b = render_planes(&src, &paper);
@@ -2181,6 +2185,11 @@ mod tests {
 
     /// The loupe is the same pixels as the full print, including a resize,
     /// a border (paper white under the kernel) and both sharpening steps.
+    /// Sharpening runs on an enlargement only, so the print is made three
+    /// times: reduced, where the resize and the border are what is
+    /// compared; enlarged, where the deconvolution and the USM are in the
+    /// pixels; and enlarged through a straighten and a window, where the
+    /// picture and the mask go through the turn with their two kernels.
     #[test]
     fn sharpen_window_matches_the_full_print() {
         let (w, h) = (36, 24);
@@ -2192,59 +2201,78 @@ mod tests {
                 mask.set(x, y, if x > 4 && x < 30 { 0.9 } else { 0.2 });
             }
         }
-        let mut recipe = Recipe::on_paper();
-        recipe.dpi = 100.0;
-        recipe.border_mm = 1.0;
-        recipe.black_mm = 0.5;
-        recipe.size = Some(PrintSize::Physical { width_in: 0.22, height_in: 0.22 });
-        recipe.resample = ResampleKernel::Lanczos3;
-        recipe.sharpen = Sharpen::Deconv { passes: 2, usm_amount: 0.6 };
-        recipe.place = 0.25;
-        let params = PrintParams { recipe, ..PrintParams::default() };
-        let full = render_planes(
-            &PrintSource {
-                plane: &plane,
-                mask: Some(&mask),
-                orientation: 1,
-                name: "t".into(),
-                description: None,
-            },
-            &params,
-        );
-        let lay = layout(w, h, 1, &params);
-        for (nx, ny) in [(0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.1, 0.85)] {
-            let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 11);
-            assert!(ex > sx && ey > sy);
-            let mut lc = Plane::zeros(ex - sx, ey - sy);
-            let mut mc = Plane::zeros(ex - sx, ey - sy);
-            for y in 0..lc.height {
-                for x in 0..lc.width {
-                    lc.set(x, y, plane.at(sx + x, sy + y));
-                    mc.set(x, y, mask.at(sx + x, sy + y));
-                }
+        let source = || PrintSource {
+            plane: &plane,
+            mask: Some(&mask),
+            orientation: 1,
+            name: "t".into(),
+            description: None,
+        };
+        let window = CropRect { x: 3, y: 2, w: 27, h: 18 };
+        for ((width_in, height_in), turn, sharpens) in
+            [((0.22, 0.22), None, false), ((1.3, 1.0), None, true), ((1.3, 1.0), Some((2.5, window)), true)]
+        {
+            let mut recipe = Recipe::on_paper();
+            if let Some((angle, crop)) = turn {
+                recipe.angle = angle;
+                recipe.crop = Some(crop);
             }
-            let got = sharpen_window(
-                PlaneWindow { plane: &lc, origin_x: sx, origin_y: sy, full_w: w, full_h: h },
-                Some(PlaneWindow { plane: &mc, origin_x: sx, origin_y: sy, full_w: w, full_h: h }),
-                &params,
-                nx,
-                ny,
-                11,
-            )
-            .expect("loupe window");
-            let g = loupe_geom(
-                &lay,
-                params.recipe.sharpen,
-                nx,
-                ny,
-                11,
-                peak_halo_px(&params.recipe, lay.enlargement),
-            );
-            for y in 0..got.height {
-                for x in 0..got.width {
-                    let expect = full.plane.at(g.view_x + x, g.view_y + y);
-                    let v = got.at(x, y);
-                    assert!((v - expect).abs() < 1e-9, "at {nx},{ny} +{x},{y}: {v} vs {expect}");
+            recipe.dpi = 100.0;
+            recipe.border_mm = 1.0;
+            recipe.black_mm = 0.5;
+            recipe.size = Some(PrintSize::Physical { width_in, height_in });
+            recipe.resample = ResampleKernel::Lanczos3;
+            recipe.sharpen = Sharpen::Deconv { passes: 2, usm_amount: 0.6 };
+            recipe.place = 0.25;
+            let params = PrintParams { recipe, ..PrintParams::default() };
+            let full = render_planes(&source(), &params);
+            let lay = layout(w, h, 1, &params);
+            assert_eq!(lay.enlargement > 1.0, sharpens);
+            // Whether the sharpening is in these pixels: the same print
+            // without it.
+            let mut unsharpened = params.clone();
+            unsharpened.recipe.sharpen = Sharpen::Off;
+            let plain = render_planes(&source(), &unsharpened);
+            let moved =
+                full.plane.data.iter().zip(&plain.plane.data).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+            assert_eq!(moved > 1e-3, sharpens, "the sharpening moved the print by {moved}");
+            for (nx, ny) in [(0.5, 0.5), (0.0, 0.0), (1.0, 1.0), (0.1, 0.85)] {
+                let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 11);
+                assert!(ex > sx && ey > sy);
+                let mut lc = Plane::zeros(ex - sx, ey - sy);
+                let mut mc = Plane::zeros(ex - sx, ey - sy);
+                for y in 0..lc.height {
+                    for x in 0..lc.width {
+                        lc.set(x, y, plane.at(sx + x, sy + y));
+                        mc.set(x, y, mask.at(sx + x, sy + y));
+                    }
+                }
+                let got = sharpen_window(
+                    PlaneWindow { plane: &lc, origin_x: sx, origin_y: sy, full_w: w, full_h: h },
+                    Some(PlaneWindow { plane: &mc, origin_x: sx, origin_y: sy, full_w: w, full_h: h }),
+                    &params,
+                    nx,
+                    ny,
+                    11,
+                )
+                .expect("loupe window");
+                let g = loupe_geom(
+                    &lay,
+                    params.recipe.sharpen,
+                    nx,
+                    ny,
+                    11,
+                    peak_halo_px(&params.recipe, lay.enlargement),
+                );
+                for y in 0..got.height {
+                    for x in 0..got.width {
+                        let expect = full.plane.at(g.view_x + x, g.view_y + y);
+                        let v = got.at(x, y);
+                        assert!(
+                            (v - expect).abs() < 1e-9,
+                            "{width_in} in, {turn:?}, at {nx},{ny} +{x},{y}: {v} vs {expect}"
+                        );
+                    }
                 }
             }
         }
@@ -2293,11 +2321,19 @@ mod tests {
         assert!((cx - 45.0).abs() < 0.05 && (cy - 20.0).abs() < 0.05, "{cx},{cy}");
         assert_eq!(out.plane.at(5, 20), plain, "far from the hole nothing changes");
         assert!(out.plane.at(45, 20) < plain - 0.05, "inside it the print is darker");
-        // The untouched recipe is untouched: no burns, the same bits as before.
-        let before = render_planes(&source(&plane), &PrintParams::default());
+        // A stroke of no stops is no stroke: the bits of the print without it.
+        let before = render_planes(
+            &source(&plane),
+            &PrintParams { recipe: Recipe::on_paper(), ..PrintParams::default() },
+        );
+        let Stroke::Hand { tip, light, points, .. } = burn.clone() else { unreachable!() };
+        let idle = Stroke::Hand { tip, stops: 0.0, light, points };
         let none = render_planes(
             &source(&plane),
-            &PrintParams { recipe: Recipe { burns: vec![], ..Recipe::default() }, ..PrintParams::default() },
+            &PrintParams {
+                recipe: Recipe { burns: vec![idle], ..Recipe::on_paper() },
+                ..PrintParams::default()
+            },
         );
         assert_eq!(before.plane.data, none.plane.data);
         // A window from (30, 10): the spot is at (15, 10) of the print.
@@ -2390,7 +2426,8 @@ mod tests {
             Sharpen::Deconv { passes: 1, usm_amount: 0.25 },
         ];
         for kernel in ResampleKernel::ALL {
-            for (dpi, width_in) in [(100.0, 0.3), (300.0, 1.2), (600.0, 0.15)] {
+            // A reduction, and two enlargements at two resolutions.
+            for (dpi, width_in) in [(100.0, 0.7), (300.0, 1.2), (600.0, 0.5)] {
                 for sharpen in sharpens {
                     let mut recipe = Recipe::on_paper();
                     recipe.dpi = dpi;
@@ -2412,6 +2449,8 @@ mod tests {
                         &params,
                     );
                     let lay = layout(w, h, 1, &params);
+                    // The rings leave a picture larger than the box.
+                    assert!(lay.image_w > 16 && lay.image_h > 16, "{}×{}", lay.image_w, lay.image_h);
                     for (nx, ny) in points {
                         let (sx, sy, ex, ey) = loupe_source_rect(w, h, &params, nx, ny, 16);
                         let (lc, mc) = if ex > sx && ey > sy {
