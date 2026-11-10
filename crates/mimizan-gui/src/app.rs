@@ -5125,11 +5125,16 @@ impl App {
                 c.distance(p) <= CROSS_GRAB
             })
         };
-        // A double click on the crosshair leaves the zoom alone. One beside
-        // it still toggles fit and 1:1.
+        // Where the button went down, while it is down: the grab below.
         let pressed_on_cross =
             ui.input(|i| i.pointer.press_origin()).is_some_and(|p| !on_dock(p) && on_cross(rect_now, p));
-        if response.double_clicked() && !pressed_on_cross {
+        // A double click on the crosshair leaves the zoom alone. One beside
+        // it still toggles fit and 1:1. The place is the response's: a
+        // click is reported when the button comes up, and by then the
+        // input no longer has where it went down.
+        let clicked_on_cross =
+            response.interact_pointer_pos().is_some_and(|p| !on_dock(p) && on_cross(rect_now, p));
+        if response.double_clicked() && !clicked_on_cross {
             let old = self.zoom;
             self.zoom = if picture_is_fitted(self.zoom) { zoom_1to1 } else { 1.0 };
             if let Some(ptr) = response.interact_pointer_pos() {
@@ -6858,6 +6863,40 @@ mod key_tests {
             seen = (typing, left);
         });
         seen
+    }
+
+    /// Why the stage asks its response where a double click was made: in
+    /// the frame that reports it the input has no press origin any more.
+    #[test]
+    fn a_double_click_has_its_place_on_the_response_alone() {
+        use egui::{pos2, PointerButton, Rect, Sense};
+        let ctx = egui::Context::default();
+        let at = pos2(120.0, 80.0);
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let mut time = 0.0;
+        let mut frame = |events: Vec<Event>| {
+            time += 0.02;
+            let screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(400.0, 300.0)));
+            let input = egui::RawInput { events, time: Some(time), screen_rect, ..Default::default() };
+            let mut seen = (false, None, None);
+            let _ = ctx.run_ui(input, |ui| {
+                let stage = Rect::from_min_size(pos2(20.0, 20.0), egui::vec2(300.0, 200.0));
+                let response = ui.allocate_rect(stage, Sense::click_and_drag());
+                let origin = ui.input(|i| i.pointer.press_origin());
+                seen = (response.double_clicked(), origin, response.interact_pointer_pos());
+            });
+            seen
+        };
+        frame(vec![Event::PointerMoved(at)]);
+        assert_eq!(frame(vec![button(true)]), (false, Some(at), Some(at)));
+        assert!(!frame(vec![button(false)]).0);
+        frame(vec![button(true)]);
+        assert_eq!(frame(vec![button(false)]), (true, None, Some(at)));
     }
 
     /// Why the shortcuts ask who had the keyboard when the frame began:
