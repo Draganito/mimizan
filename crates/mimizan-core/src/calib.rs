@@ -165,20 +165,32 @@ pub fn resolve_dir(dir: &Path) -> PathBuf {
     if dir.is_dir() || dir.is_absolute() {
         return dir.to_path_buf();
     }
-    let Some(name) = dir.file_name() else { return dir.to_path_buf() };
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(bin) = exe.parent() {
-            for base in
-                [bin.to_path_buf(), bin.join("../Resources"), bin.join("../share/mimizan"), bin.join("../..")]
-            {
-                let p = base.join(name);
-                if p.is_dir() {
-                    return p;
-                }
-            }
-        }
-    }
-    dir.to_path_buf()
+    dir.file_name().and_then(installed_dir).unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// The resource directory `name` of a program started without a path for
+/// it: the one installed with the program when there is one, and only
+/// then [`resolve_dir`]'s. A window opened from a file manager or a
+/// terminal works in whatever folder that happened to be in; a `cameras`
+/// folder of the user's there is not the program's, and with it the
+/// camera files would be missing and the same RAW would come out another
+/// picture.
+pub fn program_dir(name: &str) -> PathBuf {
+    installed_dir(std::ffi::OsStr::new(name)).unwrap_or_else(|| resolve_dir(Path::new(name)))
+}
+
+fn installed_dir(name: &std::ffi::OsStr) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    beside_program(exe.parent()?, name)
+}
+
+/// `name` as a directory where a program in `bin` has its resources:
+/// next to it, in `../Resources`, in `../share/mimizan` or two levels up.
+fn beside_program(bin: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    [bin.to_path_buf(), bin.join("../Resources"), bin.join("../share/mimizan"), bin.join("../..")]
+        .into_iter()
+        .map(|base| base.join(name))
+        .find(|p| p.is_dir())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,6 +272,35 @@ impl LookFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four places a program has its resources in: beside it (the
+    /// Windows zip and the tarball), the Mac bundle, the Debian package
+    /// and the build tree. A folder of that name anywhere else is not one.
+    #[test]
+    fn resources_are_found_where_the_program_is_installed() {
+        let root = std::env::temp_dir().join(format!("mimizan-core-beside-{}", std::process::id()));
+        let name = std::ffi::OsStr::new("cameras");
+        let layouts = [
+            ("zip/mimizan", "zip/mimizan/cameras"),
+            ("Mimizan.app/Contents/MacOS", "Mimizan.app/Contents/Resources/cameras"),
+            ("usr/bin", "usr/share/mimizan/cameras"),
+            ("repo/target/release", "repo/cameras"),
+        ];
+        for (bin, resources) in layouts {
+            let (bin, resources) = (root.join(bin), root.join(resources));
+            std::fs::create_dir_all(&bin).unwrap();
+            assert_eq!(beside_program(&bin, name), None, "{}", bin.display());
+            std::fs::create_dir_all(&resources).unwrap();
+            let found = beside_program(&bin, name).expect("the installed folder");
+            assert_eq!(found.canonicalize().unwrap(), resources.canonicalize().unwrap());
+        }
+        // A file of that name is no folder of resources.
+        let bin = root.join("file/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("cameras"), b"").unwrap();
+        assert_eq!(beside_program(&bin, name), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn camera_file_name() {

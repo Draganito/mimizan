@@ -795,8 +795,10 @@ fn colour_or_gray(size: [usize; 2], gray: &[u8], rgb: Option<&[u8]>) -> ColorIma
     }
 }
 
+/// The program's own resources, not a folder of that name in the place
+/// the window happened to be started from.
 fn resource_dir(name: &str) -> PathBuf {
-    mimizan_core::calib::resolve_dir(Path::new(name))
+    mimizan_core::calib::program_dir(name)
 }
 
 impl App {
