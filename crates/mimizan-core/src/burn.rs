@@ -416,7 +416,9 @@ impl Stroke {
     }
 
     /// How much of the stroke's time a normalised point gets, 0 to 1 for
-    /// one pass, more where the hand went back and forth.
+    /// one pass, more where the hand went back and forth. What the tests
+    /// measure a stroke by; a picture reads it through a [`Field`].
+    #[cfg(test)]
     pub fn weight(&self, x: f64, y: f64) -> f64 {
         Ready::new(self).weight(x, y)
     }

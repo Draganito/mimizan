@@ -9,7 +9,6 @@
 //! 16-bit files; that is why the export never needs to see the history.
 
 use crate::burn::Stroke;
-use crate::calib::LookFile;
 use crate::error::{Error, Result};
 use crate::mix::Weights;
 use crate::plate::{PlateFilters, PlateParams, PlateSpace};
@@ -459,11 +458,6 @@ impl CropRect {
 }
 
 impl Recipe {
-    /// A recipe with just a look, everything else default.
-    pub fn with_look(look: LookFile) -> Self {
-        Self { curve: Tone::Look(look), ..Self::default() }
-    }
-
     /// A recipe on paper at the base exposure, everything else default.
     pub fn on_paper() -> Self {
         Self { curve: Tone::paper(), ..Self::default() }

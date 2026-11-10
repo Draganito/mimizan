@@ -325,26 +325,6 @@ pub fn mix_plate_stacked(sep: &Separation, w: &PlateWeights) -> Result<Plane> {
     Plane::try_from_vec(width, 3 * h, data)
 }
 
-/// Stack the three plates into one plane, frames in [`FRAMES`] order.
-pub fn stack(rgb: &[Plane; 3]) -> Result<Plane> {
-    let [r, g, b] = rgb;
-    let (w, h) = (r.width, r.height);
-    if (g.width, g.height) != (w, h) || (b.width, b.height) != (w, h) {
-        return Err(Error::Invalid("the three plates differ in size".into()));
-    }
-    let mut data = Vec::with_capacity(3 * w * h);
-    for frame in frames_by_name(rgb) {
-        data.extend_from_slice(&frame.data);
-    }
-    Plane::try_from_vec(w, 3 * h, data)
-}
-
-/// The planes in [`FRAMES`] order.
-fn frames_by_name(rgb: &[Plane; 3]) -> [&Plane; 3] {
-    let [r, g, b] = rgb;
-    [b, g, r]
-}
-
 /// Split a stacked plate back into `[red, green, blue]`.
 pub fn split(plate: &Plane, info: &PlateInfo) -> Result<[Plane; 3]> {
     let h = info.frame_height;
@@ -383,6 +363,22 @@ pub fn split(plate: &Plane, info: &PlateInfo) -> Result<[Plane; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three plates stacked into one plane, frames in [`FRAMES`]
+    /// order: what `mix_plate_stacked` writes in one go, built the plain
+    /// way.
+    fn stack(rgb: &[Plane; 3]) -> Result<Plane> {
+        let [r, g, b] = rgb;
+        let (w, h) = (r.width, r.height);
+        if (g.width, g.height) != (w, h) || (b.width, b.height) != (w, h) {
+            return Err(Error::Invalid("the three plates differ in size".into()));
+        }
+        let mut data = Vec::with_capacity(3 * w * h);
+        for frame in [b, g, r] {
+            data.extend_from_slice(&frame.data);
+        }
+        Plane::try_from_vec(w, 3 * h, data)
+    }
 
     fn flat_sep(r: f64, g: f64, b: f64) -> Separation {
         let one = |v: f64| Plane::from_vec(2, 2, vec![v; 4]);

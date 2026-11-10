@@ -67,7 +67,7 @@ fn untouched_steps_change_nothing() {
     let neg = negative_on_disk("neutral");
     let neutral = run(&neg, Recipe::default());
     assert_eq!(run(&neg, Recipe { place: 0.0, ..Recipe::default() }), neutral);
-    assert_eq!(run(&neg, Recipe::with_look(LookFile::neutral())), neutral);
+    assert_eq!(run(&neg, Recipe { curve: Tone::Look(LookFile::neutral()), ..Recipe::default() }), neutral);
     let base = run(&neg, Recipe::on_paper());
     assert_eq!(run(&neg, on_paper(0.0, 0.0)), base);
     assert_eq!(run(&neg, Recipe { place: 0.0, ..Recipe::on_paper() }), base);

@@ -182,11 +182,6 @@ impl Framing {
     pub fn upright(orientation: u16) -> Self {
         Self { orientation, angle: 0.0, crop: None }
     }
-
-    /// Upright, cut to `crop`, no straighten.
-    pub fn cut(orientation: u16, crop: Option<CropRect>) -> Self {
-        Self { crop, ..Self::upright(orientation) }
-    }
 }
 
 /// Upright, straightened with `kernel`, then the window.
@@ -368,7 +363,7 @@ mod tests {
         let path = tmp("plate.dng");
         // Orientation 6 (90° cw) and a crop in the upright frame.
         let crop = Some(CropRect { x: 1, y: 2, w: 4, h: 3 });
-        let framing = Framing::cut(6, crop);
+        let framing = Framing { crop, ..Framing::upright(6) };
         let got = write_dng(&path, [&r, &g, &b], &framing, &meta).unwrap();
         assert_eq!(got, Written { width: 4, height: 3 });
 
@@ -509,7 +504,7 @@ mod tests {
         let mask = Plane::from_vec(w, h, (0..w * h).map(|i| if i % 2 == 0 { 1.0 } else { 0.5 }).collect());
         let path = tmp("neg.tif");
         let crop = Some(CropRect { x: 2, y: 1, w: 3, h: 4 });
-        let framing = Framing::cut(8, crop);
+        let framing = Framing { crop, ..Framing::upright(8) };
         let got = write_negative(&path, &plane, Some(&mask), &framing, r#"{"stage":"negative"}"#).unwrap();
         assert_eq!(got, Written { width: 3, height: 4 });
         let read = crate::tiffin::read_gray(&path).unwrap();

@@ -159,17 +159,16 @@ pub fn binned(
     Thumb { width, height, gray, rgb }
 }
 
-/// The grey picture alone, with the bare channels as its colour: the
-/// older entry point, kept for callers that have no plate.
-pub fn binned_gray(frame: &RawFrame, weights: Weights, wb: [f64; 3], long_edge: usize) -> Thumb {
-    binned(frame, weights, &PlateWeights::channels(), wb, long_edge)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cfa::BayerPhase;
     use crate::decode::{Exposure, RawData, Rect};
+
+    /// The grey picture alone, with the bare channels as its colour.
+    fn binned_gray(frame: &RawFrame, weights: Weights, wb: [f64; 3], long_edge: usize) -> Thumb {
+        binned(frame, weights, &PlateWeights::channels(), wb, long_edge)
+    }
 
     fn frame(w: usize, h: usize, fill: impl Fn(usize, usize) -> u16, orientation: u16) -> RawFrame {
         let mut data = vec![0u16; w * h];
