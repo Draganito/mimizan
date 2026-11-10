@@ -4441,8 +4441,12 @@ impl App {
         let dpi_changed = ui
             .horizontal(|ui| {
                 print_field_label(ui, "dpi");
+                // Taken on Enter or when the field is left, as the lengths
+                // are: "300" typed is not 36, 36 and then 300 dpi, each
+                // with a sheet that follows it.
                 ui.add(
                     egui::DragValue::new(&mut self.edit.recipe.dpi)
+                        .update_while_editing(false)
                         .range(36.0..=1200.0)
                         .clamp_existing_to_range(false)
                         .speed(1.0)
