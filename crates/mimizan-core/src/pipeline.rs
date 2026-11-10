@@ -3,7 +3,7 @@
 use crate::calib::CameraFile;
 use crate::decode::RawFrame;
 #[cfg(feature = "decode-rawler")]
-use crate::decode::{RawDecoder, RawlerDecoder};
+use crate::decode::RawlerDecoder;
 use crate::error::Result;
 use crate::ingest::{ingest, IngestParams, IngestReport, Mosaic, NoiseModel};
 use crate::mix::{mix, mix_into, ColorFilter, WeightSpace, Weights};

@@ -1,11 +1,12 @@
-//! RAW decoding behind a trait. The only file backend today is `rawler`
-//! (feature `decode-rawler`); callers may also fill a `RawFrame` directly.
+//! The raw frame the pipeline starts from, and RAW files decoded into it.
+//! The only file backend is `rawler` (feature `decode-rawler`); callers
+//! may also fill a `RawFrame` directly.
 
 use crate::cfa::BayerPhase;
 #[cfg(feature = "decode-rawler")]
-use crate::error::Error;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "decode-rawler")]
 use std::path::Path;
 
 /// A rectangle of sensor pixels: origin and size.
@@ -132,13 +133,9 @@ pub struct RawFrame {
     pub data: RawData,
 }
 
-/// A source of raw frames. The desktop and the command use `rawler`; a
-/// mobile build constructs frames from the camera API instead.
-pub trait RawDecoder {
-    fn decode(&self, path: &Path) -> Result<RawFrame>;
-}
-
-/// The `rawler` decoder: every file format rawler reads.
+/// The `rawler` decoder: every file format rawler reads. The desktop and
+/// the command read their frames through it; a mobile build constructs
+/// them from the camera API instead.
 #[cfg(feature = "decode-rawler")]
 pub struct RawlerDecoder;
 
@@ -159,8 +156,8 @@ pub(crate) fn exposure_from(md: &rawler::decoders::RawMetadata) -> Exposure {
 }
 
 #[cfg(feature = "decode-rawler")]
-impl RawDecoder for RawlerDecoder {
-    fn decode(&self, path: &Path) -> Result<RawFrame> {
+impl RawlerDecoder {
+    pub fn decode(&self, path: &Path) -> Result<RawFrame> {
         use rawler::rawimage::RawPhotometricInterpretation as P;
         let source = rawler::rawsource::RawSource::new(path).map_err(|e| Error::Decode(e.to_string()))?;
         let decoder = rawler::get_decoder(&source).map_err(|e| Error::Decode(e.to_string()))?;

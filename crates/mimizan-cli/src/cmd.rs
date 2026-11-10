@@ -4,7 +4,7 @@
 use crate::measure::{parse_list, parse_rect};
 use anyhow::{bail, Context, Result};
 use mimizan_core::calib::CameraFile;
-use mimizan_core::decode::{RawDecoder, RawlerDecoder, SensorKind};
+use mimizan_core::decode::{RawlerDecoder, SensorKind};
 use mimizan_core::icc::GrayTrc;
 use mimizan_core::ingest::{ingest, IngestParams, WhiteBalance};
 use mimizan_core::mix::{ColorFilter, WeightSpace, Weights};
