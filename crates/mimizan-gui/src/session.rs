@@ -3262,4 +3262,140 @@ mod histogram_tests {
         assert_eq!(got.gray, fresh.gray);
         assert_eq!(got.rgb, fresh.rgb);
     }
+
+    /// Contract 2 under the brush: the fitted print's window on the screen
+    /// is the picture the export writes. A Bayer negative, a weight, a
+    /// placing, the paper off its base, a straighten, a window, an
+    /// enlargement, a soft hand stroke and a card; every pixel of the
+    /// picture is compared with the 8-bit face of the file's 16-bit code.
+    /// The screen reads the paper at the 16-bit code of the placed value,
+    /// the file at the value itself, so a pixel on the edge between two
+    /// screen levels may show the neighbouring one: one level, and rarely.
+    #[test]
+    fn the_print_on_screen_with_a_brush_is_the_files_picture() {
+        use mimizan_core::burn::{Light, Tip};
+        use mimizan_core::cfa::BayerPhase;
+        use mimizan_core::decode::{RawData, Rect};
+        use mimizan_core::pipeline;
+        use mimizan_core::print::{render_planes, PrintSize, PrintSource};
+        let (w, h) = (96usize, 64usize);
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                (150.0 + 550.0 * (x as f64 / w as f64) + 90.0 * ((y / 5) % 3) as f64) as u16
+            })
+            .collect();
+        let frame = RawFrame {
+            make: "Test".into(),
+            model: "Bayer".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 14,
+            kind: SensorKind::Bayer(BayerPhase::RGGB),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        let preview = preview_planes(&neg).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let session = Session {
+            id: next_session_id(),
+            path: "bayer.dng".into(),
+            frame: Arc::new(frame),
+            negative: neg,
+            camera_file: None,
+            camera_file_path: None,
+            develop: DevelopParams::default(),
+            preview,
+            raw_hist,
+        };
+        let burns = vec![
+            Stroke::Hand {
+                tip: Tip { rx: 0.12, ry: 0.06, angle: 30.0, feather: 0.05 },
+                stops: 1.25,
+                light: Light::Both,
+                points: vec![[-0.3, -0.1], [0.0, 0.05], [0.3, -0.05]],
+            },
+            Stroke::Card {
+                x: 0.1,
+                y: 0.0,
+                angle: 20.0,
+                travel: 0.1,
+                feather: 0.05,
+                stops: -0.75,
+                light: Light::Soft,
+            },
+        ];
+        let weights = Weights { r: 0.5, g: 0.3, b: 0.2 };
+        for (angle, crop) in [(0.0, None), (2.0, Some(CropRect { x: 6, y: 4, w: 72, h: 48 }))] {
+            let recipe = Recipe {
+                angle,
+                crop,
+                size: Some(PrintSize::Physical { width_in: 0.6, height_in: 0.4 }),
+                dpi: 300.0,
+                place: 0.3,
+                curve: Tone::Paper(mimizan_core::paper::SplitGrade::new(0.4, -0.3)),
+                burns: burns.clone(),
+                ..Recipe::on_paper()
+            };
+            recipe.validate().unwrap();
+            let view = ViewParams {
+                weights,
+                tone: recipe.curve.clone(),
+                place: recipe.place,
+                rotation: 0,
+                angle,
+                crop,
+                burns: burns.clone(),
+                burn_live: false,
+                plate: None,
+            };
+            // The file, as the export worker makes it.
+            let mixed = mix(session.separation().unwrap(), &weights);
+            let print = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
+            let src = PrintSource {
+                plane: &mixed,
+                mask: None,
+                orientation: 1,
+                name: "t".into(),
+                description: None,
+            };
+            let file = render_planes(&src, &print);
+            let lay = layout(w, h, 1, &print);
+            assert!(lay.enlargement > 1.0);
+            // The screen: the whole picture as one window.
+            let table = ToneTable::build(&view.tone.compile());
+            let rect = DetailRect { x: 0, y: 0, w: lay.image_w, h: lay.image_h };
+            let shown = render_print_detail(&session, &view, &recipe, rect, &table).unwrap();
+            assert_eq!((shown.ask.w, shown.ask.h), (lay.image_w, lay.image_h));
+            let mut off_by_one = 0usize;
+            for y in 0..lay.image_h {
+                for x in 0..lay.image_w {
+                    let code = q16(file.plane.at(lay.picture_x + x, lay.picture_y + y));
+                    let face = ((code as f64 / 65535.0) * 255.0).round() as i32;
+                    let d = (i32::from(shown.gray[y * lay.image_w + x]) - face).abs();
+                    assert!(d <= 1, "angle {angle} at {x},{y}: the screen is {d} levels from the file");
+                    off_by_one += (d == 1) as usize;
+                }
+            }
+            let pixels = lay.image_w * lay.image_h;
+            assert!(off_by_one * 1000 <= pixels, "angle {angle}: {off_by_one} of {pixels} a level off");
+            // The strokes are in that picture: without them it is another one.
+            let bare = ViewParams { burns: Vec::new(), ..view.clone() };
+            let bare_recipe = Recipe { burns: Vec::new(), ..recipe.clone() };
+            let unburned = render_print_detail(&session, &bare, &bare_recipe, rect, &table).unwrap();
+            let touched = shown.gray.iter().zip(&unburned.gray).filter(|(a, b)| a != b).count();
+            assert!(touched * 4 > pixels, "angle {angle}: the strokes reach {touched} of {pixels} pixels");
+        }
+    }
 }
