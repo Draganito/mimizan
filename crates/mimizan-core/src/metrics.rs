@@ -75,13 +75,17 @@ pub fn carrier_energy(plane: &Plane, noise: &NoiseModel, region: Option<Rect>, r
             }
         }
     }
-    if reg.w < n || reg.h < n {
+    // Blocks lie where the rectangle lies on the plane; none where it
+    // reaches past it, and none at all when no whole block fits.
+    let x_end = reg.x.saturating_add(reg.w).min(plane.width);
+    let y_end = reg.y.saturating_add(reg.h).min(plane.height);
+    if reg.x.saturating_add(n) > x_end || reg.y.saturating_add(n) > y_end {
         return CarrierReport { ratio: [f64::NAN; 3], blocks: 0, radius };
     }
     let mut y0 = reg.y;
-    while y0 + n <= reg.y + reg.h {
+    while y0 + n <= y_end {
         let mut x0 = reg.x;
-        while x0 + n <= reg.x + reg.w {
+        while x0 + n <= x_end {
             let (pw, mean) = bf.power(plane, x0, y0, &mut scratch);
             let noise_bin = noise.variance(mean) * bf.window_energy;
             for k in 0..3 {
@@ -102,8 +106,8 @@ pub fn region_stats(plane: &Plane, r: Rect) -> (f64, f64) {
     let mut s = 0.0;
     let mut s2 = 0.0;
     let mut n = 0usize;
-    for y in r.y..(r.y + r.h).min(plane.height) {
-        for x in r.x..(r.x + r.w).min(plane.width) {
+    for y in r.y..r.y.saturating_add(r.h).min(plane.height) {
+        for x in r.x..r.x.saturating_add(r.w).min(plane.width) {
             let v = plane.at(x, y);
             s += v;
             s2 += v * v;
@@ -289,6 +293,37 @@ pub fn star_mtf(plane: &Plane, cx: f64, cy: f64, spokes: usize, r_min: f64, r_ma
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rectangle that reaches past the picture is measured where it
+    /// lies on it, and one that lies beside it has no block: neither
+    /// reads pixels that are not there.
+    #[test]
+    fn a_rectangle_past_the_picture_is_measured_on_the_picture() {
+        let mut plane = Plane::zeros(200, 160);
+        for (i, v) in plane.data.iter_mut().enumerate() {
+            *v = 0.2 + 0.05 * ((i % 7) as f64 - 3.0).abs();
+        }
+        let noise = NoiseModel::default();
+        let on = carrier_energy(&plane, &noise, Some(Rect { x: 40, y: 32, w: 160, h: 128 }), 0.15);
+        let past = carrier_energy(&plane, &noise, Some(Rect { x: 40, y: 32, w: 5000, h: 5000 }), 0.15);
+        assert!(on.blocks > 0);
+        assert_eq!(past.blocks, on.blocks);
+        assert_eq!(past.ratio, on.ratio);
+        for beside in [
+            Rect { x: 5000, y: 0, w: 64, h: 64 },
+            Rect { x: 0, y: 5000, w: 64, h: 64 },
+            Rect { x: usize::MAX, y: usize::MAX, w: 64, h: 64 },
+            Rect { x: 180, y: 0, w: 64, h: 64 },
+        ] {
+            let none = carrier_energy(&plane, &noise, Some(beside), 0.15);
+            assert_eq!(none.blocks, 0, "{beside:?}");
+            assert!(none.ratio.iter().all(|r| r.is_nan()), "{beside:?}");
+        }
+        // The same for the mean: to the picture's edge, however far the
+        // rectangle is said to go.
+        let to_the_edge = region_stats(&plane, Rect { x: 10, y: 8, w: 190, h: 152 });
+        assert_eq!(region_stats(&plane, Rect { x: 10, y: 8, w: usize::MAX, h: usize::MAX }), to_the_edge);
+    }
 
     #[test]
     fn wedge_fit_detects_gamma() {

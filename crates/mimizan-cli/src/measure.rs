@@ -177,6 +177,26 @@ pub fn parse_rect(s: &str) -> Result<Rect> {
     Ok(Rect { x: v[0], y: v[1], w: v[2], h: v[3] })
 }
 
+/// `r` when all of it lies on `plane`. A measurement of a rectangle that
+/// reaches past the picture would be one of another rectangle, and of
+/// nothing when it lies beside it.
+fn on_picture(r: Rect, plane: &Plane) -> Result<Rect> {
+    let inside =
+        |at: usize, len: usize, side: usize| len > 0 && at.checked_add(len).is_some_and(|end| end <= side);
+    if !inside(r.x, r.w, plane.width) || !inside(r.y, r.h, plane.height) {
+        bail!(
+            "the rectangle {},{},{},{} is empty or reaches past the picture, which is {}x{}",
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            plane.width,
+            plane.height
+        );
+    }
+    Ok(r)
+}
+
 /// `"a,b"` of a noise model, or `"none"`. Both must be zero or positive.
 fn parse_noise(s: &str) -> Result<Option<NoiseModel>> {
     if s.eq_ignore_ascii_case("none") {
@@ -352,7 +372,8 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
         }
         MeasureCmd::Carrier { tif, rect, noise } => {
             let g = read_gray(tif)?;
-            let r = rect.as_deref().map(parse_rect).transpose()?;
+            let r =
+                rect.as_deref().map(parse_rect).transpose()?.map(|r| on_picture(r, &g.plane)).transpose()?;
             let nm = parse_noise(noise)?.unwrap_or_default();
             let rep = carrier_energy(&g.plane, &nm, r, 0.15);
             let (mean, sd) =
@@ -430,7 +451,10 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
         }
         MeasureCmd::Wedge { tif, patches, exposures } => {
             let g = read_gray(tif)?;
-            let rects: Vec<Rect> = patches.split(';').map(parse_rect).collect::<Result<_>>()?;
+            let rects: Vec<Rect> = patches
+                .split(';')
+                .map(|p| parse_rect(p).and_then(|r| on_picture(r, &g.plane)))
+                .collect::<Result<_>>()?;
             let exps = parse_list(exposures)?;
             if rects.len() != exps.len() {
                 bail!("{} patches but {} exposures", rects.len(), exps.len());
