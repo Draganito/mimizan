@@ -63,19 +63,53 @@ fn snap(v: f64) -> f64 {
     ((v * 12.0).round() / 12.0).clamp(-LAMP_LIMIT, LAMP_LIMIT)
 }
 
+/// The lamp is off zero by at least half a step.
+fn is_on(v: f64) -> bool {
+    v.abs() >= STEP / 2.0
+}
+
+/// What a double click does to a lamp that stood at `rest` before its
+/// first press: `(the lamp now, what is remembered)`. A lamp that was on
+/// goes to zero and is remembered; one at zero comes back to what was
+/// remembered, or stays where it is when nothing was.
+fn double_click(rest: f64, remembered: Option<f64>) -> (f64, Option<f64>) {
+    if is_on(rest) {
+        (0.0, Some(rest))
+    } else {
+        (remembered.unwrap_or(0.0), remembered)
+    }
+}
+
 /// Draws the bar for `lamp` at `v` stops and lets the pointer move it.
 pub fn lamp_bar(ui: &mut Ui, lamp: Lamp, v: &mut f64, width: f32) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H), Sense::click_and_drag());
     let id = response.id;
-    let off = v.abs() >= STEP / 2.0;
+    let (rest_id, released_id, remembered_id) = (id.with("rest"), id.with("released"), id.with("remembered"));
+
+    // Where the lamp stood before the pointer came down. A press puts the
+    // handle under the pointer, so by the time a double click is known the
+    // lamp is already there twice over: the value to remember is the one
+    // from before the first press. A press that follows a release within
+    // the double click's time is its second one and leaves that alone.
+    let now = ui.input(|i| i.time);
+    if response.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_pressed()) {
+        let within = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+        let second = ui.data(|d| d.get_temp::<f64>(released_id)).is_some_and(|t| now - t <= within);
+        if !second {
+            ui.data_mut(|d| d.insert_temp::<f64>(rest_id, *v));
+        }
+    }
+    if response.clicked() || response.drag_stopped() {
+        ui.data_mut(|d| d.insert_temp::<f64>(released_id, now));
+    }
 
     // A double click: zero, or the value the last one left.
     if response.double_clicked() {
-        if off {
-            ui.data_mut(|d| d.insert_temp::<f64>(id.with("remembered"), *v));
-            *v = 0.0;
-        } else if let Some(r) = ui.data(|d| d.get_temp::<f64>(id.with("remembered"))) {
-            *v = r;
+        let rest = ui.data(|d| d.get_temp::<f64>(rest_id)).unwrap_or(*v);
+        let (to, remembered) = double_click(rest, ui.data(|d| d.get_temp::<f64>(remembered_id)));
+        *v = snap(to);
+        if let Some(r) = remembered {
+            ui.data_mut(|d| d.insert_temp::<f64>(remembered_id, r));
         }
     } else if let Some(p) = response.interact_pointer_pos() {
         // A click or a drag: the handle where the pointer is.
@@ -118,7 +152,7 @@ pub fn lamp_bar(ui: &mut Ui, lamp: Lamp, v: &mut f64, width: f32) {
 
     if ui.is_rect_visible(rect) {
         let painter = ui.painter_at(rect);
-        let off = v.abs() >= STEP / 2.0;
+        let off = is_on(*v);
         painter.rect_filled(rect, 3.0, ui.visuals().widgets.inactive.bg_fill);
         // The lamp's letter, at the left edge, in the lamp's colour.
         painter.text(
@@ -157,6 +191,21 @@ mod tests {
         assert!((x_of(10.0, 200.0, 0.0) - 110.0).abs() < 1e-4);
         assert!((x_of(10.0, 200.0, LAMP_LIMIT) - 210.0).abs() < 1e-4);
         assert!((x_of(10.0, 200.0, -9.0) - 10.0).abs() < 1e-4);
+    }
+
+    /// The value a double click works on is the lamp before the first
+    /// press, not the place the press put the handle.
+    #[test]
+    fn a_double_click_is_zero_and_the_next_brings_the_lamp_back() {
+        // On: zero, and the lamp is remembered.
+        assert_eq!(double_click(0.75, None), (0.0, Some(0.75)));
+        assert_eq!(double_click(-0.25, Some(0.75)), (0.0, Some(-0.25)));
+        // At zero: back to what was remembered, which stays remembered.
+        assert_eq!(double_click(0.0, Some(0.75)), (0.75, Some(0.75)));
+        // Less than half a step is zero.
+        assert_eq!(double_click(STEP / 4.0, Some(-0.5)), (-0.5, Some(-0.5)));
+        // Nothing remembered: the lamp stays at zero.
+        assert_eq!(double_click(0.0, None), (0.0, None));
     }
 
     #[test]
