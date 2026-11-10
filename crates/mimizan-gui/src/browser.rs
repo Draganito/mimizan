@@ -85,6 +85,10 @@ pub struct Entry {
     pub state: ThumbState,
     /// Created when the tile is visible, dropped when it scrolls away.
     pub texture: Option<egui::TextureHandle>,
+    /// How often the strip let the pixels go to save memory. The thumbnail
+    /// thread makes a file once for each count, so a tile that was let go
+    /// is made again when it is wanted again.
+    pub let_go: u32,
 }
 
 /// One folder's listing: its RAW files in the chosen order and its
@@ -139,6 +143,7 @@ impl Folder {
                 meta: None,
                 state: ThumbState::Pending,
                 texture: None,
+                let_go: 0,
             });
         }
         subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
@@ -354,6 +359,30 @@ pub struct ThumbJob {
     pub path: PathBuf,
     pub size: u64,
     pub modified: SystemTime,
+    /// [`Entry::let_go`] of the tile when it asked.
+    pub let_go: u32,
+}
+
+/// What the thumbnail thread has made in the folder scan it is on. The
+/// strip sends its whole list again whenever the list changes, and a list
+/// may still name a file whose result is on its way back: that one is not
+/// made twice. A tile the strip has let go since asks under a higher
+/// count and is made again; without the count it stayed "…" until the
+/// folder was read anew.
+#[derive(Default)]
+struct Made(HashSet<(u64, PathBuf, u32)>);
+
+impl Made {
+    /// A list of folder scan `generation` arrived: what was made for any
+    /// other scan is forgotten.
+    fn scan(&mut self, generation: u64) {
+        self.0.retain(|(g, _, _)| *g == generation);
+    }
+
+    /// `true` the first time `job` is seen: it is to be made.
+    fn first(&mut self, job: &ThumbJob) -> bool {
+        self.0.insert((job.generation, job.path.clone(), job.let_go))
+    }
 }
 
 /// One finished thumbnail (or the reason it failed).
@@ -422,7 +451,7 @@ fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob
         .name("mimizan-thumbs".into())
         .spawn(move || {
             let mut queue: Vec<ThumbJob> = Vec::new();
-            let mut done: HashSet<(u64, PathBuf)> = HashSet::new();
+            let mut made = Made::default();
             loop {
                 // Newest list wins; block only when there is nothing to do.
                 let newest = if queue.is_empty() {
@@ -439,13 +468,13 @@ fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob
                 }
                 if let Some(q) = latest {
                     if let Some(first) = q.first() {
-                        done.retain(|(g, _)| *g == first.generation);
+                        made.scan(first.generation);
                     }
                     queue = q;
                     queue.reverse(); // pop() takes the front
                 }
                 let Some(job) = queue.pop() else { continue };
-                if !done.insert((job.generation, job.path.clone())) {
+                if !made.first(&job) {
                     continue;
                 }
                 let t = Instant::now();
@@ -662,5 +691,34 @@ mod tests {
         assert_ne!(a, cache_key(Path::new("/b.nef"), 10, t));
         assert_ne!(a, cache_key(Path::new("/a.nef"), 11, t));
         assert_ne!(a, cache_key(Path::new("/a.nef"), 10, t + std::time::Duration::from_secs(1)));
+    }
+
+    /// A list that names a file again is not a second job; a tile the
+    /// strip let go is one, and so is the same file in a new scan.
+    #[test]
+    fn a_thumbnail_is_made_once_and_again_when_it_was_let_go() {
+        let job = |generation, name: &str, let_go| ThumbJob {
+            generation,
+            path: PathBuf::from(name),
+            size: 1,
+            modified: SystemTime::UNIX_EPOCH,
+            let_go,
+        };
+        let mut made = Made::default();
+        made.scan(1);
+        assert!(made.first(&job(1, "a.nef", 0)));
+        assert!(made.first(&job(1, "b.nef", 0)));
+        // The next list still names both: neither is made twice.
+        made.scan(1);
+        assert!(!made.first(&job(1, "a.nef", 0)));
+        assert!(!made.first(&job(1, "b.nef", 0)));
+        // `a` scrolled far away, lost its pixels and came back.
+        assert!(made.first(&job(1, "a.nef", 1)));
+        assert!(!made.first(&job(1, "a.nef", 1)));
+        assert!(!made.first(&job(1, "b.nef", 0)));
+        // The folder read anew: every file is made for the new scan.
+        made.scan(2);
+        assert!(made.first(&job(2, "a.nef", 0)));
+        assert!(made.first(&job(2, "b.nef", 0)));
     }
 }

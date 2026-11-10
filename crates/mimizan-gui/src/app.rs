@@ -5901,6 +5901,7 @@ impl App {
                         if e.state == ThumbState::Ready && dist > clip.width() * THUMB_KEEP_SCREENS {
                             e.thumb = None;
                             e.state = ThumbState::Pending;
+                            e.let_go += 1;
                         }
                         continue;
                     }
@@ -6052,7 +6053,13 @@ impl App {
                 .iter()
                 .map(|(_, i)| {
                     let e = &folder.entries[*i];
-                    ThumbJob { generation, path: e.path.clone(), size: e.size, modified: e.modified }
+                    ThumbJob {
+                        generation,
+                        path: e.path.clone(),
+                        size: e.size,
+                        modified: e.modified,
+                        let_go: e.let_go,
+                    }
                 })
                 .collect();
             self.last_wanted = jobs.iter().map(|j| j.path.clone()).collect();
