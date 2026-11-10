@@ -67,9 +67,10 @@ enum Cmd {
         /// Explicit camera file (overrides auto-pick)
         #[arg(long)]
         camera: Option<PathBuf>,
-        /// Separation mode: dubois (pixel-adaptive, default) | adaptive (block mask) | off (fixed)
-        #[arg(long, default_value = "dubois")]
-        mask: String,
+        /// Separation mode: dubois (pixel-adaptive) | adaptive (block mask) | off (fixed).
+        /// Without the flag: the recipe's (--recipe), else dubois
+        #[arg(long)]
+        mask: Option<String>,
         /// Override weights "r,g,b" (sum 1)
         #[arg(long)]
         weights: Option<String>,
@@ -79,9 +80,10 @@ enum Cmd {
         /// Contrast filter on the weights (approximate): yellow-8 | yellow-green-11 | orange-16 | red-25 | green-58 | blue-47 (or the number)
         #[arg(long)]
         filter: Option<String>,
-        /// Channel balance before separation: as-shot | gray | none | "r,g,b"
-        #[arg(long, default_value = "as-shot")]
-        wb: String,
+        /// Channel balance before separation: as-shot | gray | none | "r,g,b".
+        /// Without the flag: the recipe's (--recipe), else as-shot
+        #[arg(long)]
+        wb: Option<String>,
         /// Chrominance cut-off, c/px (adaptive and off only; dubois has its own bands)
         #[arg(long, default_value_t = 0.15)]
         cutoff: f64,
@@ -112,9 +114,10 @@ enum Cmd {
         /// Primaries the plate is projected through: srgb (default) | adobe-rgb
         #[arg(long, value_name = "SPACE", default_value = "srgb")]
         plate_space: String,
-        /// Recipe JSON as the desktop writes it next to the RAW: its mix and
-        /// its plate (process, filters, primaries) develop this negative.
-        /// --weights and --plate override them.
+        /// Recipe JSON as the desktop writes it next to the RAW: its
+        /// development (white balance, mask), its mix and its plate
+        /// (process, filters, primaries) develop this negative.
+        /// --wb, --mask, --weights and --plate override them.
         #[arg(long)]
         recipe: Option<PathBuf>,
         /// Linear DNG instead of the negative TIFF: the three balanced

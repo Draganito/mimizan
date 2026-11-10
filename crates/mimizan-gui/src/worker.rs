@@ -15,8 +15,8 @@
 //! The thumbnail thread and the folder counter live in `browser`.
 
 use crate::session::{
-    cover_detail, next_session_id, preview_planes, render_detail_linear, render_preview, render_print_linear,
-    render_sharpen_loupe, tone_tile, DetailAsk, DetailImage, DetailRect, DetailTile, DevelopParams,
+    cover_detail, negative_params, next_session_id, preview_planes, render_detail_linear, render_preview,
+    render_print_linear, render_sharpen_loupe, tone_tile, DetailAsk, DetailImage, DetailRect, DetailTile,
     HistCache, LinearTile, PlateView, PreviewImage, PreviewStages, RawHistogram, Session, SharpenLoupe,
     ToneHold, ViewParams,
 };
@@ -30,7 +30,7 @@ use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateInfo, PlateSpace, PlateWeights};
 use mimizan_core::print::{self as pr, PrintParams, PrintSource};
-use mimizan_core::recipe::{CropRect, Recipe, Sharpen};
+use mimizan_core::recipe::{CropRect, Develop, Recipe, Sharpen};
 use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -44,11 +44,11 @@ use tracing::info;
 #[allow(clippy::large_enum_variant)]
 pub enum Job {
     /// Decode and develop a file.
-    Open { path: PathBuf, develop: DevelopParams, cameras_dir: PathBuf },
+    Open { path: PathBuf, develop: Develop, cameras_dir: PathBuf },
     /// Develop the already decoded frame again with other parameters. The
     /// frame alone, not the session: the UI may let the session go while
     /// this runs, so its planes are not held beside the new ones.
-    Redevelop { source: Redevelop, develop: DevelopParams },
+    Redevelop { source: Redevelop, develop: Develop },
     /// One export, one file. The sheet is the recipe rendered in one pass
     /// against the negative: placing, paper or look, size and border. A
     /// `.jpg` path writes the 8-bit JPEG, anything else the 16-bit TIFF
@@ -341,7 +341,7 @@ fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame) -> Result<(
     ))))
 }
 
-fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
+fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
     status(format!("decoding {}", path.display()));
     let t = Instant::now();
     let frame = pipeline::decode(path).with_context(|| format!("decoding {}", path.display()))?;
@@ -364,7 +364,7 @@ fn open(path: &Path, develop: DevelopParams, cameras_dir: &Path, status: &dyn Fn
 
 /// The memory was checked by the caller, which still has the job to send
 /// back when it does not fit.
-fn redevelop(r: Redevelop, develop: DevelopParams, status: &dyn Fn(String)) -> Result<Session> {
+fn redevelop(r: Redevelop, develop: Develop, status: &dyn Fn(String)) -> Result<Session> {
     develop_frame(r.path, r.frame, r.decode_ms, r.camera_file, r.camera_file_path, develop, status)
 }
 
@@ -374,7 +374,7 @@ fn develop_frame(
     decode_ms: u128,
     camera_file: Option<CameraFile>,
     camera_file_path: Option<PathBuf>,
-    develop: DevelopParams,
+    develop: Develop,
     status: &dyn Fn(String),
 ) -> Result<Session> {
     status(if matches!(frame.kind, mimizan_core::decode::SensorKind::Mono) {
@@ -382,7 +382,7 @@ fn develop_frame(
     } else {
         "separating".into()
     });
-    let params = develop.negative_params(camera_file.clone());
+    let params = negative_params(&develop, camera_file.clone());
     let negative: Negative = pipeline::negative_from_frame(&frame, &params, decode_ms)?;
     status("building preview".into());
     let t = Instant::now();
@@ -1106,7 +1106,7 @@ mod tests {
             negative,
             camera_file: None,
             camera_file_path: None,
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             preview,
             raw_hist,
         }
@@ -1186,7 +1186,7 @@ mod tests {
         assert!(!heavy.writing());
         heavy.send(Job::Open {
             path: "none.nef".into(),
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             cameras_dir: PathBuf::new(),
         });
         assert!(!heavy.writing(), "opening a file writes none");

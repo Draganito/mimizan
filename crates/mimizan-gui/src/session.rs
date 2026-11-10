@@ -10,7 +10,6 @@ use mimizan_core::burn::{self, Field, Stroke, Times};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::cfa::Color;
 use mimizan_core::decode::{RawFrame, SensorKind};
-use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::paper::{self, PaperTable};
 use mimizan_core::pipeline::{Negative, NegativeParams};
@@ -20,11 +19,11 @@ use mimizan_core::print::{
     burn_field, layout, loupe_source_rect, orient, rotated, sharpen_window, source_window, window_plane,
     PrintParams,
 };
-use mimizan_core::recipe::{CropRect, Recipe};
+use mimizan_core::recipe::{CropRect, Develop, Recipe};
 use mimizan_core::resize::{
     fit_dims, resize, resize_rect, source_coverage, PixelRect, PlaneWindow, ResampleKernel,
 };
-use mimizan_core::separate::{MaskMode, Separation};
+use mimizan_core::separate::Separation;
 use mimizan_core::straighten::{self, Affine, PhasedKernel, STRAIGHTEN_KERNEL};
 use mimizan_core::tone::{Tone, ToneMap};
 use rayon::prelude::*;
@@ -34,36 +33,22 @@ use std::sync::{Arc, OnceLock};
 /// Longest preview edge in pixels (the texture the GUI shows).
 pub const PREVIEW_MAX: usize = 1800;
 
-/// Settings that need a new separation (ingest + separate), not just a re-mix.
+/// What the pipeline develops a frame with: the development the recipe
+/// carries (`Develop`: the settings that need a new separation, ingest
+/// and separate, not just a re-mix) and the camera file.
 ///
 /// Every photosite stays as measured: the desktop has no defect repair and
 /// no reconstruction. Defects are counted and shown in the Negative window;
 /// the command's `--repair-defects` is there for a hot pixel from a long
 /// exposure.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DevelopParams {
-    pub wb: WhiteBalance,
-    pub mask: MaskMode,
-}
-
-impl Default for DevelopParams {
-    fn default() -> Self {
-        // Pixel-adaptive Dubois separation is the default; the fixed estimator
-        // and the block mask stay available under Development.
-        Self { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois }
+pub fn negative_params(develop: &Develop, cam: Option<CameraFile>) -> NegativeParams {
+    let mut p = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+    p.ingest.wb = develop.wb;
+    p.separate.mask = develop.mask;
+    if let Some(c) = cam {
+        p = p.with_camera_file(c);
     }
-}
-
-impl DevelopParams {
-    pub fn negative_params(&self, cam: Option<CameraFile>) -> NegativeParams {
-        let mut p = NegativeParams { keep_separation: true, ..NegativeParams::default() };
-        p.ingest.wb = self.wb;
-        p.separate.mask = self.mask;
-        if let Some(c) = cam {
-            p = p.with_camera_file(c);
-        }
-        p
-    }
+    p
 }
 
 /// The upright, downscaled separation the interactive view draws.
@@ -85,7 +70,7 @@ pub struct Session {
     pub negative: Negative,
     pub camera_file: Option<CameraFile>,
     pub camera_file_path: Option<PathBuf>,
-    pub develop: DevelopParams,
+    pub develop: Develop,
     pub preview: PreviewPlanes,
     /// The four CFA channels of the frame as shot; fixed for the session.
     pub raw_hist: RawHistogram,
@@ -2518,7 +2503,7 @@ mod tests {
     /// repair, whatever the core's default says.
     #[test]
     fn the_desktop_never_repairs_defects() {
-        let p = DevelopParams::default().negative_params(None);
+        let p = negative_params(&Develop::default(), None);
         assert!(!p.ingest.repair_defects);
     }
 }
@@ -2715,7 +2700,7 @@ mod histogram_tests {
             negative: neg,
             camera_file: None,
             camera_file_path: None,
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             preview,
             raw_hist,
         };
@@ -2828,7 +2813,7 @@ mod histogram_tests {
             negative: neg,
             camera_file: None,
             camera_file_path: None,
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             preview,
             raw_hist,
         };
@@ -3036,7 +3021,7 @@ mod histogram_tests {
             negative: neg,
             camera_file: None,
             camera_file_path: None,
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             preview,
             raw_hist,
         };
@@ -3173,7 +3158,7 @@ mod histogram_tests {
             negative: neg,
             camera_file: None,
             camera_file_path: None,
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             preview,
             raw_hist,
         };
@@ -3319,7 +3304,7 @@ mod histogram_tests {
             negative: neg,
             camera_file: None,
             camera_file_path: None,
-            develop: DevelopParams::default(),
+            develop: Develop::default(),
             preview,
             raw_hist,
         };

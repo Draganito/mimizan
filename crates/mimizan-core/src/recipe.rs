@@ -10,10 +10,12 @@
 
 use crate::burn::Stroke;
 use crate::error::{Error, Result};
+use crate::ingest::WhiteBalance;
 use crate::mix::Weights;
 use crate::plate::{PlateFilters, PlateParams, PlateSpace};
 use crate::print::{PrintSize, LAMP_LIMIT};
 use crate::resize::ResampleKernel;
+use crate::separate::MaskMode;
 use crate::tone::Tone;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -263,6 +265,118 @@ pub struct Recipe {
     /// `None` is the monochrome print. Old recipes omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plate: Option<PlateRecipe>,
+    /// How the negative is developed from the RAW, for a darkroom that
+    /// develops from it: the white balance before the separation and the
+    /// separation's mode. `None` is the default development
+    /// ([`Develop::default`]). A print of a negative that is already
+    /// developed ignores it. Old recipes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub develop: Option<Develop>,
+}
+
+/// The development as the recipe carries it: what the picture's pixels
+/// depend on before the mix. In the file `wb` is `"as-shot"`,
+/// `"gray-world"`, `"none"` or the three multipliers `[r, g, b]`, and
+/// `mask` is `"dubois"`, `"adaptive"` or `"off"`, the words of the
+/// command's `--wb` and `--mask`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Develop {
+    /// Channel balance before the separation.
+    #[serde(default = "Develop::default_wb", with = "wb_in_file")]
+    pub wb: WhiteBalance,
+    /// How the band around each carrier is divided between luminance and
+    /// colour.
+    #[serde(default = "Develop::default_mask", with = "mask_in_file")]
+    pub mask: MaskMode,
+}
+
+impl Default for Develop {
+    /// As shot, and the pixel-adaptive Dubois separation: what a file
+    /// opens with and what `mimizan negative` does without flags.
+    fn default() -> Self {
+        Self { wb: Self::default_wb(), mask: Self::default_mask() }
+    }
+}
+
+impl Develop {
+    fn default_wb() -> WhiteBalance {
+        WhiteBalance::AsShot
+    }
+
+    fn default_mask() -> MaskMode {
+        MaskMode::Dubois
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let WhiteBalance::Manual(m) = self.wb {
+            if m.iter().any(|v| !(v.is_finite() && *v > 0.0)) {
+                return Err(Error::Invalid(format!(
+                    "white balance {m:?} must be three positive multipliers"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The white balance in the recipe file: a word, or the multipliers.
+mod wb_in_file {
+    use super::WhiteBalance;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(untagged)]
+    enum InFile {
+        Named(String),
+        Manual([f64; 3]),
+    }
+
+    pub fn serialize<S: Serializer>(wb: &WhiteBalance, s: S) -> Result<S::Ok, S::Error> {
+        match *wb {
+            WhiteBalance::AsShot => InFile::Named("as-shot".into()),
+            WhiteBalance::GrayWorld => InFile::Named("gray-world".into()),
+            WhiteBalance::None => InFile::Named("none".into()),
+            WhiteBalance::Manual(m) => InFile::Manual(m),
+        }
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<WhiteBalance, D::Error> {
+        match InFile::deserialize(d)? {
+            InFile::Manual(m) => Ok(WhiteBalance::Manual(m)),
+            InFile::Named(name) => match name.as_str() {
+                "as-shot" => Ok(WhiteBalance::AsShot),
+                "gray-world" => Ok(WhiteBalance::GrayWorld),
+                "none" => Ok(WhiteBalance::None),
+                other => Err(serde::de::Error::custom(format!(
+                    "white balance '{other}' is not as-shot, gray-world, none or [r, g, b]"
+                ))),
+            },
+        }
+    }
+}
+
+/// The separation's mode in the recipe file.
+mod mask_in_file {
+    use super::MaskMode;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(mask: &MaskMode, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match mask {
+            MaskMode::Dubois => "dubois",
+            MaskMode::Adaptive => "adaptive",
+            MaskMode::Off => "off",
+        })
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<MaskMode, D::Error> {
+        match String::deserialize(d)?.as_str() {
+            "dubois" => Ok(MaskMode::Dubois),
+            "adaptive" => Ok(MaskMode::Adaptive),
+            "off" => Ok(MaskMode::Off),
+            other => Err(serde::de::Error::custom(format!("mask '{other}' is not dubois, adaptive or off"))),
+        }
+    }
 }
 
 /// The plate as the recipe carries it: which process, and its two lamps.
@@ -322,6 +436,7 @@ impl Default for Recipe {
             burns: Vec::new(),
             mix: None,
             plate: None,
+            develop: None,
         }
     }
 }
@@ -577,6 +692,9 @@ impl Recipe {
         if let Some(p) = &self.plate {
             p.validate()?;
         }
+        if let Some(d) = &self.develop {
+            d.validate()?;
+        }
         self.sharpen.validate()?;
         self.peak.validate()
     }
@@ -673,6 +791,55 @@ mod tests {
         assert!(hot.validate().is_err());
         let off = Recipe { mix: Some(Weights { r: 0.5, g: 0.5, b: 0.5 }), ..Recipe::default() };
         assert!(off.validate().is_err());
+    }
+
+    #[test]
+    fn the_development_round_trips_and_is_absent_by_default() {
+        let json = serde_json::to_string(&Recipe::default()).unwrap();
+        assert!(!json.contains("develop"), "{json}");
+        assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap().develop, None);
+        // The default is what the command does without flags.
+        assert_eq!(Develop::default(), Develop { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois });
+        // Every balance and every mode, in the command's words.
+        let cases = [
+            (WhiteBalance::AsShot, MaskMode::Dubois, r#"{"wb":"as-shot","mask":"dubois"}"#),
+            (WhiteBalance::GrayWorld, MaskMode::Adaptive, r#"{"wb":"gray-world","mask":"adaptive"}"#),
+            (WhiteBalance::None, MaskMode::Off, r#"{"wb":"none","mask":"off"}"#),
+            (
+                WhiteBalance::Manual([2.125, 1.0, 1.5]),
+                MaskMode::Dubois,
+                r#"{"wb":[2.125,1.0,1.5],"mask":"dubois"}"#,
+            ),
+        ];
+        for (wb, mask, text) in cases {
+            let r = Recipe { develop: Some(Develop { wb, mask }), ..Recipe::default() };
+            r.validate().unwrap();
+            let json = serde_json::to_string(&r).unwrap();
+            assert!(json.contains(&format!(r#""develop":{text}"#)), "{json}");
+            assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap(), r);
+        }
+        // A part left out is the default's part.
+        let curve = serde_json::to_string(&Tone::paper()).unwrap();
+        let read = |develop: &str| {
+            serde_json::from_str::<Recipe>(&format!(r#"{{"curve":{curve},"develop":{develop}}}"#))
+        };
+        assert_eq!(read("{}").unwrap().develop, Some(Develop::default()));
+        assert_eq!(
+            read(r#"{"wb":"none"}"#).unwrap().develop,
+            Some(Develop { wb: WhiteBalance::None, ..Develop::default() })
+        );
+        // A word that is none of them is refused, not read as a default.
+        assert!(read(r#"{"wb":"daylight"}"#).is_err());
+        assert!(read(r#"{"mask":"on"}"#).is_err());
+        assert!(read(r#"{"wb":[1.0,1.0]}"#).is_err());
+        // Multipliers must be positive numbers.
+        for bad in [[0.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, f64::NAN]] {
+            let r = Recipe {
+                develop: Some(Develop { wb: WhiteBalance::Manual(bad), ..Develop::default() }),
+                ..Recipe::default()
+            };
+            assert!(r.validate().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

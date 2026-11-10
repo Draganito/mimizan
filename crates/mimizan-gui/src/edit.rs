@@ -3,13 +3,16 @@
 //! what the export takes beside it (the mix, the plate and its lamps).
 //! The file next to the RAW carries the mix and the plate
 //! inside the recipe (`recipe_for_file`); in memory they are fields of
-//! their own and the recipe's slots stay empty. The history is a list of
+//! their own and the recipe's slots stay empty. The white balance and
+//! the mask are in that file too and not in the edit: they are the
+//! session's, changed by developing the frame again and not by a step
+//! of the history. The history is a list of
 //! such states, never of pixels: undo and redo swap the whole state, and
 //! every state is one export.
 
 use mimizan_core::mix::Weights;
 use mimizan_core::plate::PlateParams;
-use mimizan_core::recipe::{PlateRecipe, Recipe};
+use mimizan_core::recipe::{Develop, PlateRecipe, Recipe};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
@@ -39,10 +42,13 @@ impl Edit {
     }
 
     /// The recipe as the file next to the RAW holds it: the print, plus
-    /// the mix and the plate this development runs under. `mix` is
-    /// written only for a colour sensor (`bayer`); a monochrome sensor
-    /// has no mix.
-    pub fn recipe_for_file(&self, bayer: bool) -> Recipe {
+    /// what the negative under it was made with, the white balance and
+    /// the mask it was developed with (`develop`), the mix and the plate.
+    /// Those are a colour sensor's: a monochrome sensor has no
+    /// development to choose, no mix and no plate, and `develop` is
+    /// `None` for it.
+    pub fn recipe_for_file(&self, develop: Option<Develop>) -> Recipe {
+        let bayer = develop.is_some();
         let mut r = self.recipe.clone();
         r.mix = bayer.then_some(self.weights);
         r.plate = self.plate.filter(|_| bayer).map(|p| PlateRecipe {
@@ -50,14 +56,17 @@ impl Edit {
             space: p.space,
             lamps: self.lamps,
         });
+        r.develop = develop;
         r
     }
 
     /// Take a loaded recipe apart: the print stays in `recipe`, the mix
     /// and the plate go to their fields. A recipe without a mix keeps
     /// the weights the edit had; one without a plate is the monochrome
-    /// process.
+    /// process. The development it names is not the edit's: the file was
+    /// opened with it, and the session has it.
     pub fn take_recipe(&mut self, mut r: Recipe) {
+        r.develop = None;
         if let Some(m) = r.mix.take() {
             self.weights = m;
         }
@@ -167,7 +176,9 @@ mod tests {
         e.plate = Some(PlateParams { filters: PlateFilters::Wratten, space: PlateSpace::Srgb });
         e.lamps = [0.2, -0.1];
         e.recipe.place = -0.5;
-        let r = e.recipe_for_file(true);
+        let gray = Develop { wb: mimizan_core::ingest::WhiteBalance::GrayWorld, ..Develop::default() };
+        let r = e.recipe_for_file(Some(gray));
+        assert_eq!(r.develop, Some(gray), "the development the negative was made with");
         assert_eq!(r.mix, Some(e.weights));
         assert_eq!(
             r.plate.map(|p| (p.filters, p.space, p.lamps)),
@@ -175,14 +186,14 @@ mod tests {
         );
         assert_eq!(r.place, -0.5);
         // In memory the slots stay empty.
-        assert!(e.recipe.mix.is_none() && e.recipe.plate.is_none());
+        assert!(e.recipe.mix.is_none() && e.recipe.plate.is_none() && e.recipe.develop.is_none());
         // Back into a fresh edit: everything returns, the slots stay empty.
         let mut back = Edit::new(Weights::default());
         back.take_recipe(r);
         assert_eq!(back, e);
-        // A monochrome sensor writes neither.
-        let m = e.recipe_for_file(false);
-        assert!(m.mix.is_none() && m.plate.is_none());
+        // A monochrome sensor writes none of them.
+        let m = e.recipe_for_file(None);
+        assert!(m.mix.is_none() && m.plate.is_none() && m.develop.is_none());
         // A recipe without a plate is the monochrome process, lamps off.
         let mut mono = e.clone();
         mono.take_recipe(mimizan_core::recipe::Recipe::on_paper());
@@ -197,9 +208,9 @@ mod tests {
     #[test]
     fn the_quarter_turn_is_in_the_file() {
         let mut e = Edit::new(Weights::default());
-        let upright = e.recipe_for_file(true);
+        let upright = e.recipe_for_file(Some(Develop::default()));
         e.recipe.quarter_turns = 1;
-        let turned = e.recipe_for_file(true);
+        let turned = e.recipe_for_file(Some(Develop::default()));
         assert_ne!(turned, upright, "the turn is not in the recipe");
         let mut back = Edit::new(Weights::default());
         back.take_recipe(turned);

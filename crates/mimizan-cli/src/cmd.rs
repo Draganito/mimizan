@@ -24,11 +24,13 @@ pub struct NegativeArgs {
     pub out: PathBuf,
     pub cameras: PathBuf,
     pub camera: Option<PathBuf>,
-    pub mask: String,
+    /// `None` is the recipe's mode, else the default.
+    pub mask: Option<String>,
     pub weights: Option<String>,
     pub weights_space: String,
     pub filter: Option<String>,
-    pub wb: String,
+    /// `None` is the recipe's balance, else the default.
+    pub wb: Option<String>,
     pub cutoff: f64,
     pub rounds: usize,
     pub repair_defects: bool,
@@ -38,8 +40,8 @@ pub struct NegativeArgs {
     /// `Some(filter set)` makes a three-colour plate.
     pub plate: Option<String>,
     pub plate_space: String,
-    /// A recipe whose `mix` and `plate` develop this negative; the flags
-    /// above override them.
+    /// A recipe whose `develop`, `mix` and `plate` develop this negative;
+    /// the flags above override them.
     pub recipe: Option<PathBuf>,
     /// Write a linear DNG of the channels plate instead of the negative.
     pub dng: bool,
@@ -156,10 +158,32 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         );
     }
 
+    // The desktop's file beside the RAW: its development, its mix and
+    // its plate, unless a flag says otherwise. The print half of it is
+    // `print --recipe`'s.
+    let recipe = a
+        .recipe
+        .as_ref()
+        .map(|p| {
+            mimizan_core::recipe::Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))
+        })
+        .transpose()?;
+    let develop = recipe.as_ref().and_then(|r| r.develop);
+    if let Some(d) = develop.filter(|_| a.wb.is_none() || a.mask.is_none()) {
+        info!("recipe development: white balance {:?}, mask {:?}", d.wb, d.mask);
+    }
+    let develop = develop.unwrap_or_default();
+
     let mut params = NegativeParams::default();
     params.ingest.repair_defects = a.repair_defects;
-    params.ingest.wb = parse_wb(&a.wb)?;
-    params.separate.mask = parse_mask(&a.mask)?;
+    params.ingest.wb = match &a.wb {
+        Some(wb) => parse_wb(wb)?,
+        None => develop.wb,
+    };
+    params.separate.mask = match &a.mask {
+        Some(mask) => parse_mask(mask)?,
+        None => develop.mask,
+    };
     params.separate.cutoff = a.cutoff;
     params.separate.rounds_max = a.rounds;
     warn_inert_flags(&params.separate, a.cutoff, a.rounds);
@@ -176,11 +200,7 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         }
         None => info!("no camera file for '{} {}', using defaults", frame.clean_make, frame.clean_model),
     }
-    // The desktop's file beside the RAW: its mix and its plate, unless a
-    // flag says otherwise. The print half of it is `print --recipe`'s.
-    if let Some(p) = &a.recipe {
-        let r =
-            mimizan_core::recipe::Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))?;
+    if let Some(r) = &recipe {
         if let Some(m) = r.mix.filter(|_| a.weights.is_none()) {
             params = params.with_weights(m, WeightSpace::Balanced);
             info!("recipe mix R {:.3} G {:.3} B {:.3}", m.r, m.g, m.b);
@@ -215,13 +235,6 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     // The DNG is the channels plate, nothing else: the converter does the
     // colour. It is framed as the recipe says: its 90° turns, its
     // straighten and its crop on the straightened frame.
-    let recipe_framing = a
-        .recipe
-        .as_ref()
-        .map(|p| {
-            mimizan_core::recipe::Recipe::load(p).with_context(|| format!("recipe file {}", p.display()))
-        })
-        .transpose()?;
     if a.dng {
         if frame.kind == SensorKind::Mono {
             bail!(
@@ -264,7 +277,7 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         let [r, g, b] = mimizan_core::plate::split(&neg.plane, pi)?;
         let meta = mimizan_core::linear::DngMeta::of(&frame, neg.info.wb, &desc)
             .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
-        let framing = match recipe_framing {
+        let framing = match &recipe {
             Some(recipe) => {
                 // The window and the orientation of the turned picture.
                 let (orientation, r) = recipe.with_turns_applied(neg.orientation, r.width, r.height);

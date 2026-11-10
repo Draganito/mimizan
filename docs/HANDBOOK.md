@@ -37,6 +37,8 @@ Three panels around the picture.
 
 **Negative** (left) is the file. Leave the white balance on *as shot*
 most of the time. *Apply* develops again when you have changed something.
+What you chose stays with this file, in its recipe; the next file opens
+with its own.
 
 **Enlarger** (below) is the paper.
 
