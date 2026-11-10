@@ -146,7 +146,15 @@ fn variants() -> Vec<(String, SeparateParams)> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let per_image = args.iter().any(|a| a == "--per-image");
-    let conds: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    // The conditions are the bare words, less the picture `--dump` names
+    // and the spot `--at` names: those are no conditions to build.
+    let names_a_value = |i: usize| i > 0 && matches!(args[i - 1].as_str(), "--dump" | "--at");
+    let conds: Vec<&String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with("--") && !names_a_value(*i))
+        .map(|(_, a)| a)
+        .collect();
     let native = Weights::default();
     let mut table: Vec<(String, Vec<f64>)> = Vec::new();
     let mut variants = variants();
