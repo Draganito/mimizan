@@ -12,7 +12,7 @@
 //!   `−1` halves it. Times add, not stops: two strokes of a stop each make
 //!   three times the base, not four, and a dodge takes time away, down to
 //!   none, where the paper stays white. `T = 1 + Σ wᵢ (2^{sᵢ} − 1)`, never
-//!   below 0 ([`times`]).
+//!   below 0 ([`Field::times_norm`]).
 //! * The hand ([`Stroke::Hand`]) is a [`Tip`], an ellipse with a soft
 //!   edge, moved along a path at a steady pace. A point's share of the
 //!   stroke is the time the tip covered it, and the stops are read at the
