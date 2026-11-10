@@ -10,7 +10,7 @@ authors.workspace = true
 [features]
 default = ["decode-rawler"]
 # RAW file decoding through `rawler` (`RawlerDecoder`, `pipeline::decode`,
-# `pipeline::negative`, `kodak::binned_raw`). Mobile builds construct
+# `kodak::binned_raw`). Mobile builds construct
 # `RawFrame` from Camera2 metadata and leave this off.
 decode-rawler = ["dep:rawler"]
 

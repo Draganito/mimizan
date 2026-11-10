@@ -996,26 +996,6 @@ fn paint_sheet_rect(
     }
 }
 
-/// Surround `p` with `b` pixels of `value` on every side.
-pub fn add_border(p: &Plane, b: usize, value: f64) -> Plane {
-    let (w, h) = (p.width + 2 * b, p.height + 2 * b);
-    let lay = Layout {
-        image_w: p.width,
-        image_h: p.height,
-        picture_x: b,
-        picture_y: b,
-        border_px: b,
-        black_px: 0,
-        out_w: w,
-        out_h: h,
-        viewing_mm: 0.0,
-        enlargement: 1.0,
-        resample_sigma_px: 0.0,
-        usm_radius_px: 0.0,
-    };
-    on_sheet(p, &lay, value, value)
-}
-
 /// The sheet of `lay`: `white_value` everywhere, the black edge in
 /// `black_value` around the picture, and `p` (the picture, `image_w ×
 /// image_h`) at its place, in one allocation. A sheet that is the picture

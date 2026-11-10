@@ -239,16 +239,6 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     Ok(Negative { plane, mask8, orientation, info, saturated, separation })
 }
 
-/// Decode and develop one file.
-#[cfg(feature = "decode-rawler")]
-pub fn negative(path: &Path, p: &NegativeParams) -> Result<Negative> {
-    let t = Instant::now();
-    let frame = decode(path)?;
-    let decode_ms = t.elapsed().as_millis();
-    info!("decode {} ms", decode_ms);
-    negative_from_frame(&frame, p, decode_ms)
-}
-
 /// The panchromatic emulsion behind the plate's Wratten glass, on the
 /// balanced channels: the camera file's calibrated response when there is
 /// one, else the native 0.25 / 0.50 / 0.25. A fact of the file, not a

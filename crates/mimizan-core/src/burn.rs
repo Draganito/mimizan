@@ -91,8 +91,6 @@ pub enum Light {
 }
 
 impl Light {
-    pub const ALL: [Light; 3] = [Light::Both, Light::Soft, Light::Hard];
-
     fn is_both(&self) -> bool {
         *self == Light::Both
     }
@@ -1265,7 +1263,6 @@ pub fn normalize(w: usize, h: usize) -> Affine {
 /// so is the next field of the same strokes.
 #[derive(Clone, Debug)]
 pub struct Field {
-    strokes: Arc<[Stroke]>,
     ready: Arc<[Arc<Ready>]>,
     index: Arc<Index>,
     to_norm: Affine,
@@ -1279,7 +1276,7 @@ impl Field {
         }
         let ready: Arc<[Arc<Ready>]> = strokes.iter().map(prepared).collect();
         let index = Arc::new(Index::new(&ready));
-        Some(Self { strokes: strokes.into(), ready, index, to_norm })
+        Some(Self { ready, index, to_norm })
     }
 
     /// The times at the centre of pixel `(px, py)` of the plane.
@@ -1345,10 +1342,6 @@ impl Field {
     /// one's `(dx, dy)`: a tile of the picture.
     pub fn shifted(&self, dx: usize, dy: usize) -> Self {
         self.through(&Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, tx: dx as f64, ty: dy as f64 })
-    }
-
-    pub fn strokes(&self) -> &[Stroke] {
-        &self.strokes
     }
 }
 
@@ -1467,11 +1460,6 @@ pub struct Varying {
     pub right: Times,
 }
 
-/// The time factors of `strokes` at the normalised point `(x, y)`.
-pub fn times(strokes: &[Stroke], x: f64, y: f64) -> Times {
-    Field::new(strokes, Affine::IDENTITY).map_or(Times::UNIT, |f| f.times_norm(x, y))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,6 +1474,11 @@ mod tests {
 
     fn card(x: f64, y: f64, angle: f64, travel: f64, feather: f64, stops: f64) -> Stroke {
         Stroke::Card { x, y, angle, travel, feather, stops, light: Light::Both }
+    }
+
+    /// The time factors of `strokes` at the normalised point `(x, y)`.
+    fn times(strokes: &[Stroke], x: f64, y: f64) -> Times {
+        Field::new(strokes, Affine::IDENTITY).map_or(Times::UNIT, |f| f.times_norm(x, y))
     }
 
     /// A straight pass of length 1 through `(cx, cy)` along `deg`.
@@ -2080,6 +2073,6 @@ mod tests {
         bad(card(2.5, 0.0, 0.0, 0.0, 0.0, 1.0));
         assert!(validate(&vec![c.clone(); MAX_STROKES + 1]).is_err());
         assert!(validate(&vec![c; MAX_STROKES]).is_ok());
-        assert_eq!(Light::ALL.map(Light::name), ["both", "soft", "hard"]);
+        assert_eq!([Light::Both, Light::Soft, Light::Hard].map(Light::name), ["both", "soft", "hard"]);
     }
 }

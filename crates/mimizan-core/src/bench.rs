@@ -200,11 +200,6 @@ pub fn run_scene_with(
     SceneResult { scene, width: w, height: h, synth: *sp, separate: *p, truth_star, mimizan: ours, baseline }
 }
 
-/// [`run_scene_with`] without the planes.
-pub fn run_scene(scene: Scene, w: usize, h: usize, sp: &SynthParams, p: &SeparateParams) -> SceneResult {
-    run_scene_with(scene, w, h, sp, p, |_, _| {})
-}
-
 /// Markdown table of a bench run.
 pub fn markdown(results: &[SceneResult]) -> String {
     let mut s = String::new();

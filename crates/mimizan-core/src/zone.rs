@@ -25,14 +25,6 @@ pub fn linear(k: usize) -> f64 {
     GRAY_CARD * 2f64.powi(k as i32 - 5)
 }
 
-/// Stops around the grey card, `e = log2(max(L, ε)) − log2(0.18)` (paper,
-/// equation 3). The pipeline works in linear values; this is the reading
-/// the tests check the zone table against.
-#[cfg(test)]
-pub fn stops(l: f64) -> f64 {
-    (l.max(1e-6)).log2() - GRAY_CARD.log2()
-}
-
 /// Linear scene value at the boundary between zone `k` and `k + 1`:
 /// `0.18 · 2^(k + 0.5 − 5)`.
 pub fn boundary_linear(k: usize) -> f64 {
@@ -46,12 +38,6 @@ pub fn boundaries() -> Vec<usize> {
     (0..ZONES - 1).filter(|&k| boundary_linear(k) < 1.0).collect()
 }
 
-/// Zones the bar shows: 0 … the last one with a boundary below it, plus
-/// the open-ended top zone (VII).
-pub fn bar_zones() -> usize {
-    boundaries().len() + 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -63,14 +49,10 @@ mod tests {
         assert!((linear(7) - 0.72).abs() < 1e-15);
         assert!(linear(8) > 1.0);
         assert_eq!(boundaries(), vec![0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(bar_zones(), 8);
         assert!((boundary_linear(4) - 0.18 / 2f64.sqrt()).abs() < 1e-15);
         assert!((boundary_linear(5) - 0.18 * 2f64.sqrt()).abs() < 1e-15);
         assert!(boundary_linear(7) > 1.0);
         assert_eq!(numeral(5), "V");
         assert_eq!(numeral(10), "X");
-        assert!((stops(0.18)).abs() < 1e-12);
-        assert!((stops(0.36) - 1.0).abs() < 1e-12);
-        assert!((stops(0.045) + 2.0).abs() < 1e-12);
     }
 }

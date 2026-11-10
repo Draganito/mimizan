@@ -187,14 +187,6 @@ impl Framing {
     pub fn cut(orientation: u16, crop: Option<CropRect>) -> Self {
         Self { crop, ..Self::upright(orientation) }
     }
-
-    /// Size of the file written for an `w×h` plane (before orientation).
-    pub fn size(&self, w: usize, h: usize) -> (usize, usize) {
-        let (uw, uh) = if matches!(self.orientation, 5..=8) { (h, w) } else { (w, h) };
-        let (fw, fh) = crate::straighten::frame_size(uw, uh, self.angle);
-        let (_, _, cw, ch) = crate::print::source_window(fw, fh, self.crop);
-        (cw, ch)
-    }
 }
 
 /// Upright, straightened with `kernel`, then the window.
@@ -535,8 +527,8 @@ mod tests {
     }
 
     /// With a straighten the file is the frame, then the crop on it: the
-    /// size `Framing::size` says, the mask the same size, a flag still a
-    /// flag, and a flat picture still flat.
+    /// crop's size, the mask the same size, a flag still a flag, and a
+    /// flat picture still flat.
     #[test]
     fn negative_is_straightened_before_the_cut() {
         let (w, h) = (60usize, 40usize);
@@ -547,7 +539,6 @@ mod tests {
         let framing = Framing { orientation: 6, angle: -4.0, crop };
         let (fw, fh) = crate::straighten::frame_size(h, w, -4.0);
         assert!(fw < h && fh < w, "{fw}x{fh}");
-        assert_eq!(framing.size(w, h), (30, 20));
         let got = write_negative(&path, &plane, Some(&mask), &framing, "{}").unwrap();
         assert_eq!(got, Written { width: 30, height: 20 });
         let read = crate::tiffin::read_gray(&path).unwrap();
@@ -559,6 +550,7 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 255));
         // Without a crop the file is the whole frame.
         let whole = Framing { crop: None, ..framing };
-        assert_eq!(whole.size(w, h), (fw, fh));
+        let got = write_negative(&path, &plane, Some(&mask), &whole, "{}").unwrap();
+        assert_eq!(got, Written { width: fw, height: fh });
     }
 }
