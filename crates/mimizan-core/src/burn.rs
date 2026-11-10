@@ -994,7 +994,8 @@ impl Ready {
             Ready::Moving { raster, points, tail, .. } => {
                 raster.w.len() * 4 + points.len() * 16 + tail.len() * 24 + 128
             }
-            _ => 128,
+            Ready::Card { profile: Some(p), .. } => p.w.len() * 4 + 128,
+            Ready::Card { profile: None, .. } | Ready::Still { .. } => 128,
         }
     }
 
@@ -1897,6 +1898,26 @@ mod tests {
         let other = hand(t, 0.8, Light::Soft, &path);
         assert!(Ready::grown(&a, &other).is_none());
         assert!(!Arc::ptr_eq(&prepared(&other), &a));
+    }
+
+    /// The cache lets its oldest strokes go by what they take to keep. A
+    /// soft card keeps its profile, and every place a card is dragged
+    /// through is a stroke of its own.
+    #[test]
+    fn a_soft_card_is_counted_with_its_profile() {
+        for (travel, feather) in [(0.25, 0.01), (2.0, 0.001)] {
+            let ready = Ready::new(&card(0.0, 0.0, 0.0, travel, feather, 1.0));
+            let Ready::Card { profile: Some(p), .. } = &ready else { panic!("no profile") };
+            assert!(p.w.len() > 1000);
+            assert!(
+                ready.bytes() >= p.w.len() * 4,
+                "{} samples counted as {} bytes",
+                p.w.len(),
+                ready.bytes()
+            );
+        }
+        // A hard card keeps nothing but itself.
+        assert_eq!(Ready::new(&card(0.0, 0.0, 0.0, 0.25, 0.0, 1.0)).bytes(), 128);
     }
 
     #[test]
