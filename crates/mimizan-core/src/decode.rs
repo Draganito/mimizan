@@ -166,6 +166,12 @@ impl RawDecoder for RawlerDecoder {
         let decoder = rawler::get_decoder(&source).map_err(|e| Error::Decode(e.to_string()))?;
         let params = rawler::decoders::RawDecodeParams::default();
         let img = decoder.raw_image(&source, &params, false).map_err(|e| Error::Decode(e.to_string()))?;
+        // Before the metadata is asked for: a file that is no mosaic is
+        // refused here whatever its metadata is. rawler 0.8 has none for a
+        // Sigma X3F (three components per pixel) and panics when asked.
+        if img.cpp != 1 {
+            return Err(Error::Unsupported(format!("{} components per pixel; expected a mosaic", img.cpp)));
+        }
         // Metadata is informational; a file without usable EXIF still decodes.
         let (exposure, exif_orientation) = match decoder.raw_metadata(&source, &params) {
             Ok(md) => (exposure_from(&md), md.exif.orientation.filter(|o| (1..=8).contains(o))),
@@ -174,9 +180,6 @@ impl RawDecoder for RawlerDecoder {
                 (Exposure::default(), None)
             }
         };
-        if img.cpp != 1 {
-            return Err(Error::Unsupported(format!("{} components per pixel; expected a mosaic", img.cpp)));
-        }
         let kind = match &img.photometric {
             P::Cfa(cfg) => {
                 if cfg.cfa.width != 2 || cfg.cfa.height != 2 {
