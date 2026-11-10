@@ -2825,7 +2825,11 @@ impl App {
 
     fn answer_save(&mut self, ctx: &egui::Context, leave: Leave, choice: SaveChoice) {
         match choice {
-            SaveChoice::Cancel => self.pending_leave = None,
+            SaveChoice::Cancel => {
+                self.pending_leave = None;
+                // The strip was to go to the file that is not opened now.
+                self.scroll_to_selected = false;
+            }
             SaveChoice::Discard => {
                 self.pending_leave = None;
                 self.follow_leave(ctx, leave);
@@ -5914,7 +5918,9 @@ impl App {
         let idle = self.busy.is_none();
         let current = self.current_path.clone();
         let generation = folder.generation;
-        let scroll_to = std::mem::take(&mut self.scroll_to_selected);
+        // While the question about unsaved changes is up the file asked
+        // for is not the current one yet: the mark waits for the answer.
+        let scroll_to = self.pending_leave.is_none() && std::mem::take(&mut self.scroll_to_selected);
         let mut clicked: Option<PathBuf> = None;
         let mut go_dir: Option<PathBuf> = None;
         // Names whose thumbnail buffer does not match its size. Logged once
