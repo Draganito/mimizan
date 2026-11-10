@@ -828,7 +828,7 @@ frames with the same crop, size, paper and two exposures, the lamps
 added as stops to the placing of the red and the blue pass, peak with the
 one radius on each; the three positives are the channels of a 16-bit RGB
 TIFF (or JPEG) whose profile is a matrix/TRC profile of the projection
-primaries (Adobe RGB 1998 by default, sRGB on request) with the paper's
+primaries (sRGB by default, Adobe RGB 1998 on request) with the paper's
 gamma 2.2. The file
 still records the one-arc-minute radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
@@ -1049,8 +1049,8 @@ balance gain is largest. Method, file format and limits are in
   measured on the monochrome mix, so the three positives share one
   sharpening and stay in register.
 - The output is a 16-bit RGB TIFF or JPEG whose primaries are the
-  projection filters, Adobe RGB (1998) by default (its transfer curve is
-  the gamma 2.2 of the paper encoding), sRGB on request; the embedded
+  projection filters, sRGB by default, Adobe RGB (1998) on request (its
+  transfer curve is the gamma 2.2 of the paper encoding); the embedded
   profile is a matrix/TRC display profile with D50-adapted colorants
   (`icc.rs`), built the same way as the grey profile.
 - The desktop treats the plate as a re-mix of the resident separation
@@ -1221,8 +1221,8 @@ plate (--plate [camera|wratten|channels]):                     §7.5
     `plate` object in the JSON (order, frame height, filters, W)
 15. print: steps of the monochrome print ×3, same layout/crop/paper/
     exposures; place_R += lamp_R, place_B += lamp_B; peak radius from the
-    monochrome mix; 16-bit RGB TIFF/JPEG, matrix/TRC profile (Adobe RGB
-    1998 default, sRGB on request)
+    monochrome mix; 16-bit RGB TIFF/JPEG, matrix/TRC profile (sRGB
+    default, Adobe RGB 1998 on request)
 ```
 
 Every constant in this recipe is a default of the published code and can be

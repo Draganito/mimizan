@@ -220,7 +220,7 @@ errors most.
   negative showed grey beads. Same cause; the removed nonlinear step
   reduced it, the plate shows it.
 - The chrominance carries low-frequency colour noise (19–21 % σ for the
-  red filter on the Z f, paper §6.1): colour mottle like dye clouds. No
+  red filter on the Z f, paper §5.1): colour mottle like dye clouds. No
   noise reduction, as a matter of principle; not yet measured for the plate.
 - The window, the paper and the method are those of the monochrome
   darkroom; the plate adds two lamps and nothing else. There is no
