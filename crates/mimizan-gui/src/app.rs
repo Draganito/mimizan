@@ -287,6 +287,50 @@ fn recipe_needs_saving(has_negative: bool, current: &Recipe, saved: &Recipe) -> 
     has_negative && current != saved
 }
 
+/// A recipe read from a file as the window prints it, and what that
+/// changed, in words for the log. The sharpening mode is left off: the
+/// desktop has no control for it and sharpens with the high-pass, which
+/// is kept. A look on the diagonal (the command line's default, and an
+/// older recipe's) is put on paper; any other look stays a look, and the
+/// Enlarger offers the paper instead of the bar.
+fn recipe_for_window(mut r: Recipe) -> (Recipe, Vec<String>) {
+    let mut changed = Vec::new();
+    match r.sharpen {
+        Sharpen::Off => {}
+        Sharpen::Usm { amount } => changed.push(format!("its unsharp mask ({amount}) is left off")),
+        Sharpen::Deconv { passes, usm_amount } if usm_amount > 0.0 => changed.push(format!(
+            "its Richardson–Lucy ({passes} passes) and unsharp mask ({usm_amount}) are left off"
+        )),
+        Sharpen::Deconv { passes, .. } => {
+            changed.push(format!("its Richardson–Lucy ({passes} passes) is left off"))
+        }
+    }
+    r.sharpen = Sharpen::Off;
+    if let Tone::Look(l) = &r.curve {
+        if mimizan_core::curve::Curve::from_look(l).is_identity() {
+            changed.push(format!("its look \"{}\" is put on paper", l.name));
+            r.curve = Tone::paper();
+        }
+    }
+    (r, changed)
+}
+
+/// The recipe the question on leaving compares with, for a file just
+/// opened: what the edit would write beside it (`for_file`), with the
+/// sharpening and the tone as the recipe read beside the file has them
+/// (`read`). Where the window changed those on reading
+/// (`recipe_for_window`) the edit is not the file's recipe: the export
+/// is not the print the command line makes of it, and leaving asks
+/// whether to save the recipe as the window prints it.
+fn baseline_after_open(for_file: Recipe, read: Option<&Recipe>) -> Recipe {
+    let mut baseline = for_file;
+    if let Some(read) = read {
+        baseline.sharpen = read.sharpen;
+        baseline.curve = read.curve.clone();
+    }
+    baseline
+}
+
 #[derive(Clone, Copy)]
 struct CropDrag {
     hit: CropHit,
@@ -2792,20 +2836,14 @@ impl App {
         sidecar_of(self.developed_path()?)
     }
 
-    /// Read a recipe file into the edit. The sharpening mode stays off (the
-    /// desktop has no control for it); peak in the file is kept. An older
-    /// recipe with the neutral look is put on paper; any other look stays a
-    /// look (the Enlarger offers the paper instead of the bar).
-    fn load_recipe(&mut self, path: &Path) {
+    /// Read a recipe file into the edit, as the window prints it
+    /// (`recipe_for_window`). Returns the recipe as the file has it.
+    fn load_recipe(&mut self, path: &Path) -> Option<Recipe> {
         match Recipe::load(path) {
-            Ok(mut r) => {
-                r.sharpen = Sharpen::Off;
+            Ok(read) => {
+                let (mut r, changed) = recipe_for_window(read.clone());
                 if let Tone::Look(l) = &r.curve {
-                    if mimizan_core::curve::Curve::from_look(l).is_identity() {
-                        r.curve = Tone::paper();
-                    } else {
-                        self.log(format!("recipe prints through the look \"{}\", not on paper", l.name));
-                    }
+                    self.log(format!("recipe prints through the look \"{}\", not on paper", l.name));
                 }
                 let mut e = self.edit.clone();
                 // A monochrome sensor has no mix and no plate; the file's
@@ -2820,8 +2858,19 @@ impl App {
                 self.close_crop();
                 self.note_peak_source();
                 self.log(format!("loaded recipe {}", path.display()));
+                if !changed.is_empty() {
+                    self.log(format!(
+                        "the recipe is not printed as it is written: {}. Leaving the file asks whether \
+                         to save it so",
+                        changed.join(", ")
+                    ));
+                }
+                Some(read)
             }
-            Err(e) => self.log(format!("recipe not loaded: {e}")),
+            Err(e) => {
+                self.log(format!("recipe not loaded: {e}"));
+                None
+            }
         }
     }
 
@@ -3043,8 +3092,9 @@ impl App {
                         self.loupe_size = [0, 0];
                         self.reset(true);
                         // A recipe saved next to the file comes back with it.
+                        let mut read = None;
                         if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
-                            self.load_recipe(&p);
+                            read = self.load_recipe(&p);
                             self.history = History::new(self.edit.clone());
                         }
                         if self.screenshot_to.is_some()
@@ -3097,7 +3147,7 @@ impl App {
                             self.arm_burn();
                             self.burn_locked = false;
                         }
-                        self.recipe_baseline = self.recipe_for_file();
+                        self.recipe_baseline = baseline_after_open(self.recipe_for_file(), read.as_ref());
                     }
                     // A re-development has new pixels: the measured radius
                     // belongs to the old ones.
@@ -7329,11 +7379,12 @@ mod sheet_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        develop_for_open, dress_to_hold, hit_crop, moved_crop, must_make_room, open_step, opened_is_fresh,
-        opening_memory, peak_held_after_redevelopment, picture_terms, recipe_needs_saving,
-        released_after_failure, stage_black_px, tile_must_wait, CropHit, OpenStep, PaperFormat, Released,
-        Rings, StageDress,
+        baseline_after_open, develop_for_open, dress_to_hold, hit_crop, moved_crop, must_make_room,
+        open_step, opened_is_fresh, opening_memory, peak_held_after_redevelopment, picture_terms,
+        recipe_for_window, recipe_needs_saving, released_after_failure, stage_black_px, tile_must_wait,
+        CropHit, OpenStep, PaperFormat, Released, Rings, StageDress,
     };
+    use crate::edit::Edit;
     use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
     use mimizan_core::recipe::{CropCorner, CropRect, Develop, Recipe};
     use std::path::Path;
@@ -7467,6 +7518,49 @@ mod crop_drag_tests {
         // Moved, then put back with the row's reset; or a recipe that was
         // saved with the measured numbers: the measurement's again.
         assert!(!peak_held_after_redevelopment(true, true));
+    }
+
+    /// A recipe the window does not print as it is written, one from the
+    /// command line with its unsharp mask and its neutral look, is
+    /// changed by being opened: the print on screen and the export are
+    /// not what the file beside the RAW says. That is said, and leaving
+    /// the file asks whether to save the recipe as it is printed. A
+    /// recipe the window wrote reads back as it is, and nothing is asked.
+    #[test]
+    fn a_recipe_the_window_changes_on_reading_is_unsaved() {
+        use mimizan_core::mix::Weights;
+        use mimizan_core::recipe::Sharpen;
+        use mimizan_core::tone::Tone;
+        let develop = Some(Develop::default());
+        let opened = |on_disk: &Recipe| {
+            let (taken, said) = recipe_for_window(on_disk.clone());
+            let mut edit = Edit::new(Weights::default());
+            edit.take_recipe(taken);
+            let baseline = baseline_after_open(edit.recipe_for_file(develop), Some(on_disk));
+            (edit, baseline, said)
+        };
+
+        let from_cli = Recipe { sharpen: Sharpen::Usm { amount: 0.8 }, ..Recipe::default() };
+        assert!(matches!(from_cli.curve, Tone::Look(_)), "the command line's default is the neutral look");
+        let (edit, baseline, said) = opened(&from_cli);
+        assert_eq!(edit.recipe.sharpen, Sharpen::Off);
+        assert_eq!(edit.recipe.curve, Tone::paper());
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(recipe_needs_saving(true, &edit.recipe_for_file(develop), &baseline));
+
+        // One of the two is enough.
+        let (edit, baseline, said) =
+            opened(&Recipe { sharpen: Sharpen::Usm { amount: 0.8 }, ..Recipe::on_paper() });
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(recipe_needs_saving(true, &edit.recipe_for_file(develop), &baseline));
+
+        // Saved from the window and opened again: the same recipe.
+        let own = edit.recipe_for_file(develop);
+        let (again, baseline, said) = opened(&own);
+        assert!(said.is_empty(), "{said:?}");
+        assert!(!recipe_needs_saving(true, &again.recipe_for_file(develop), &baseline));
+        // Without a recipe beside the file there is nothing to compare with.
+        assert_eq!(baseline_after_open(own.clone(), None), own);
     }
 
     #[test]
