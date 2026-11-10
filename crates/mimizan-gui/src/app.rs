@@ -6677,22 +6677,49 @@ impl App {
                 }
             }
         }
-        let (undo, redo) = ctx.input_mut(|i| {
-            let undo =
-                i.consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Z));
-            let redo = i.consume_shortcut(&egui::KeyboardShortcut::new(
-                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
-                egui::Key::Z,
-            )) || i
-                .consume_shortcut(&egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Y));
-            (undo, redo)
-        });
+        let (undo, redo) = ctx.input_mut(undo_redo_keys);
         if undo {
             self.undo();
         }
         if redo {
             self.redo();
         }
+    }
+}
+
+/// `(undo, redo)` of this frame's keys: Ctrl+Z undoes, Ctrl+Shift+Z and
+/// Ctrl+Y redo. A shortcut also matches with Shift held on top of it, so
+/// the one that names Shift is asked first; asked second, Ctrl+Z had
+/// taken Ctrl+Shift+Z for itself and it undid.
+fn undo_redo_keys(i: &mut egui::InputState) -> (bool, bool) {
+    use egui::{Key, KeyboardShortcut, Modifiers};
+    let redo = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z))
+        || i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Y));
+    let undo = i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z));
+    (undo, redo)
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::undo_redo_keys;
+    use egui::{Event, InputState, Key, Modifiers};
+
+    fn pressed(key: Key, modifiers: Modifiers) -> (bool, bool) {
+        let mut i = InputState::default();
+        i.modifiers = modifiers;
+        i.events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
+        undo_redo_keys(&mut i)
+    }
+
+    #[test]
+    fn shift_makes_the_undo_key_redo() {
+        let shifted = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert_eq!(pressed(Key::Z, Modifiers::COMMAND), (true, false));
+        assert_eq!(pressed(Key::Z, shifted), (false, true));
+        assert_eq!(pressed(Key::Y, Modifiers::COMMAND), (false, true));
+        // Neither without the command key, and no other letter.
+        assert_eq!(pressed(Key::Z, Modifiers::NONE), (false, false));
+        assert_eq!(pressed(Key::X, Modifiers::COMMAND), (false, false));
     }
 }
 
