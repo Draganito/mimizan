@@ -703,6 +703,9 @@ pub struct App {
     recipe_baseline: Recipe,
     /// A file change or a close is waiting on the save question.
     pending_leave: Option<Leave>,
+    /// An export is waiting on the question whether this file, which is
+    /// already there, is to be replaced.
+    pending_replace: Option<PathBuf>,
     /// The close question was answered; the window may go.
     close_allowed: bool,
 
@@ -875,6 +878,7 @@ impl App {
             cameras_dir,
             recipe_baseline: Recipe::on_paper(),
             pending_leave: None,
+            pending_replace: None,
             close_allowed: false,
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
@@ -2252,18 +2256,13 @@ impl App {
         self.dialog.save_file();
     }
 
-    /// The linear export's dialog: `<stem>.dng` in the plate process,
-    /// `<stem>.negative.tif` otherwise, beside the RAW.
+    /// The linear export's dialog, beside the RAW, under
+    /// [`linear_export_name`].
     fn start_linear_export(&mut self) {
-        let stem = self
-            .session
-            .as_ref()
-            .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
-            .unwrap_or_else(|| "mimizan".into());
         if let Some(dir) = self.export_directory() {
             self.dialog.config_mut().initial_directory = dir;
         }
-        let name = if self.linear_is_dng() { format!("{stem}.dng") } else { format!("{stem}.negative.tif") };
+        let name = linear_export_name(self.session.as_ref().map(|s| s.path.as_path()), self.linear_is_dng());
         self.export_kind = ExportKind::Linear;
         if self.save_with_panel(&name) {
             return;
@@ -2291,11 +2290,63 @@ impl App {
         false
     }
 
-    /// Start the export to `path`. `granted` is a path from the system
+    /// A path came from a save dialog. `granted` is a path from the system
     /// save panel: it is written as it is, extension and all, because the
     /// sandbox allows that file and no other. The egui dialog's path gets
-    /// the extension it may lack.
+    /// the extension it may lack, and with it the name may be a file the
+    /// dialog never asked about: that one waits for a yes. The RAW itself
+    /// is never the target.
     fn export_to(&mut self, path: PathBuf, granted: bool) {
+        let Some(source) = self.session.as_ref().map(|s| s.path.clone()) else { return };
+        let extensions = export_extensions(self.export_kind, self.linear_is_dng(), self.format);
+        match export_target(path, granted, extensions, &source) {
+            ExportTarget::Write(path) => self.export_now(path),
+            ExportTarget::Ask(path) => self.pending_replace = Some(path),
+            ExportTarget::Source(path) => self.log(format!(
+                "not exported: {} is the RAW this picture is developed from. Give the export another name",
+                path.display()
+            )),
+        }
+    }
+
+    /// The question [`ExportTarget::Ask`] waits on.
+    fn replace_prompt(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pending_replace.clone() else { return };
+        let name =
+            path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string());
+        let mut answer = None;
+        egui::Modal::new(egui::Id::new("replace_export")).show(ctx, |ui| {
+            ui.set_min_width(320.0);
+            ui.label(format!("{name} is already there. Replace it?"));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Replace").clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    answer = Some(false);
+                }
+            });
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                answer = Some(false);
+            }
+        });
+        if let Some(replace) = answer {
+            self.pending_replace = None;
+            if replace {
+                self.export_now(path);
+            }
+        }
+    }
+
+    /// A question is on screen and has the keyboard: no key reaches the
+    /// picture or the strip behind it.
+    fn question_open(&self) -> bool {
+        self.pending_leave.is_some() || self.pending_replace.is_some()
+    }
+
+    /// Start the export to `path`, which is settled.
+    fn export_now(&mut self, path: PathBuf) {
         if self.session.is_none() {
             return;
         }
@@ -2308,8 +2359,6 @@ impl App {
                 path.display()
             ));
         }
-        let extensions = export_extensions(self.export_kind, self.linear_is_dng(), self.format);
-        let path = if granted { path } else { with_ext(path, extensions) };
         let Some(s) = &self.session else { return };
         match self.export_kind {
             ExportKind::Print => {
@@ -5037,9 +5086,7 @@ impl App {
         // is not written down, so the next launch still opens on the strip.
         let clicked_on_picture = response.clicked()
             && response.interact_pointer_pos().is_some_and(|p| rect.contains(p) && !on_dock(p));
-        if self.pending_leave.is_none()
-            && strip_closes(self.show_strip, clicked_on_picture, crosshair_released)
-        {
+        if !self.question_open() && strip_closes(self.show_strip, clicked_on_picture, crosshair_released) {
             self.show_strip = false;
         }
         // A grey card is read where the picture is clicked while `card` is
@@ -5458,14 +5505,74 @@ fn export_extensions(kind: ExportKind, dng: bool, format: ExportFormat) -> &'sta
     }
 }
 
+/// Every extension an export can carry. One of these on a name says a
+/// format; anything else after a dot is part of the name.
+const EXPORT_EXTENSIONS: [&str; 5] = ["tif", "tiff", "jpg", "jpeg", "dng"];
+
 /// `p` with one of `allowed` as its extension: kept when it has one of
-/// them already (in any case), else given the first.
+/// them already (in any case), else given the first. Another format's
+/// extension is replaced by it; a dotted tail that is no format
+/// (`frame.v2`) stays, and the extension follows it.
 fn with_ext(p: PathBuf, allowed: &[&str]) -> PathBuf {
     let Some(first) = allowed.first() else { return p };
-    if p.extension().is_some_and(|e| allowed.iter().any(|a| e.eq_ignore_ascii_case(a))) {
+    let among = |list: &[&str]| p.extension().is_some_and(|e| list.iter().any(|a| e.eq_ignore_ascii_case(a)));
+    if among(allowed) {
         p
-    } else {
+    } else if among(&EXPORT_EXTENSIONS) || p.extension().is_some_and(|e| e.is_empty()) {
         p.with_extension(first)
+    } else {
+        let mut name = p.into_os_string();
+        name.push(".");
+        name.push(first);
+        PathBuf::from(name)
+    }
+}
+
+/// Where a named export goes.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportTarget {
+    /// The path is written.
+    Write(PathBuf),
+    /// The name got its extension after the dialog had asked about the
+    /// name as typed, and a file of the full name is there. It is
+    /// replaced only on a yes.
+    Ask(PathBuf),
+    /// The path is the file the picture was developed from. That file is
+    /// the negative, and no export writes over it.
+    Source(PathBuf),
+}
+
+/// The path an export writes for the one `picked` in a dialog, and
+/// whether it may. `granted` is a path from the system save panel, which
+/// has asked about that very path and is written as it is.
+fn export_target(picked: PathBuf, granted: bool, allowed: &[&str], source: &Path) -> ExportTarget {
+    let path = if granted { picked.clone() } else { with_ext(picked.clone(), allowed) };
+    if same_file(&path, source) {
+        ExportTarget::Source(path)
+    } else if path != picked && path.exists() {
+        ExportTarget::Ask(path)
+    } else {
+        ExportTarget::Write(path)
+    }
+}
+
+/// Both paths name one file that is there, whatever the spelling.
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+}
+
+/// The linear export's name beside the RAW: `<stem>.dng` for the plate,
+/// `<stem>.negative.tif` otherwise. A RAW that is a DNG has that first
+/// name itself, so its plate is `<stem>.linear.dng`.
+fn linear_export_name(source: Option<&Path>, dng: bool) -> String {
+    let stem = source
+        .and_then(Path::file_stem)
+        .map_or_else(|| "mimizan".into(), |f| f.to_string_lossy().to_string());
+    let source_is_dng = source.and_then(Path::extension).is_some_and(|e| e.eq_ignore_ascii_case("dng"));
+    match (dng, source_is_dng) {
+        (true, true) => format!("{stem}.linear.dng"),
+        (true, false) => format!("{stem}.dng"),
+        (false, _) => format!("{stem}.negative.tif"),
     }
 }
 
@@ -5511,7 +5618,7 @@ impl App {
     /// `B` toggles the strip; `←`/`→` open the neighbouring file when the
     /// keyboard is not in a text field, whether or not the strip is up.
     fn strip_keys(&mut self, ctx: &egui::Context) {
-        if self.pending_leave.is_some() || text_edit_focused(ctx) {
+        if self.question_open() || text_edit_focused(ctx) {
             return;
         }
         let (b, left, right) = ctx.input(|i| {
@@ -6064,6 +6171,7 @@ impl eframe::App for App {
         }
         self.strip_keys(&ctx);
         self.save_prompt(&ctx);
+        self.replace_prompt(&ctx);
     }
 }
 
@@ -6510,7 +6618,7 @@ impl App {
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
     /// every panel. Enter keeps the crop. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
-        if self.pending_leave.is_some() || text_edit_focused(ctx) {
+        if self.question_open() || text_edit_focused(ctx) {
             return;
         }
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
@@ -6569,7 +6677,8 @@ impl App {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        crumb_label, export_extensions, with_ext, without_verbatim_prefix, ExportFormat, ExportKind,
+        crumb_label, export_extensions, export_target, linear_export_name, with_ext, without_verbatim_prefix,
+        ExportFormat, ExportKind, ExportTarget,
     };
     use std::path::{Path, PathBuf};
 
@@ -6615,6 +6724,68 @@ mod path_tests {
         assert_eq!(with_ext(PathBuf::from("plate"), dng), PathBuf::from("plate.dng"));
         // The first of each list is what the save panel appends.
         assert_eq!((tiff[0], negative[0], dng[0]), ("tif", "tif", "dng"));
+    }
+
+    /// A dot in a name is not an extension: only another export format's
+    /// extension is replaced, anything else is part of the name.
+    #[test]
+    fn a_dotted_export_name_keeps_its_tail() {
+        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff);
+        let jpeg = export_extensions(ExportKind::Print, false, ExportFormat::Jpeg);
+        assert_eq!(with_ext(PathBuf::from("frame.v2"), tiff), PathBuf::from("frame.v2.tif"));
+        assert_eq!(with_ext(PathBuf::from("2026.11.10 Köln"), jpeg), PathBuf::from("2026.11.10 Köln.jpg"));
+        assert_eq!(with_ext(PathBuf::from("a.b/frame.v2"), tiff), PathBuf::from("a.b/frame.v2.tif"));
+        assert_eq!(with_ext(PathBuf::from("print."), tiff), PathBuf::from("print.tif"));
+        assert_eq!(with_ext(PathBuf::from(".hidden"), tiff), PathBuf::from(".hidden.tif"));
+    }
+
+    /// The egui dialog asks about the name as typed. The extension comes
+    /// after that, so the file it then names is asked about here, and the
+    /// RAW is refused under every spelling.
+    #[test]
+    fn an_export_replaces_no_file_unasked_and_never_the_raw() {
+        use ExportTarget::{Ask, Source, Write};
+        let dir = std::env::temp_dir().join(format!("mimizan-gui-export-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("IMG_1.dng");
+        let old = dir.join("old.tif");
+        std::fs::write(&raw, b"raw").unwrap();
+        std::fs::write(&old, b"print").unwrap();
+        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff);
+        let dng = export_extensions(ExportKind::Linear, true, ExportFormat::Tiff);
+
+        // A bare name that becomes a file which is there: asked.
+        assert_eq!(export_target(dir.join("old"), false, tiff, &raw), Ask(old.clone()));
+        assert_eq!(export_target(dir.join("old.dng"), false, tiff, &raw), Ask(old.clone()));
+        // Typed in full, the dialog has asked already; a new name is free.
+        assert_eq!(export_target(old.clone(), false, tiff, &raw), Write(old.clone()));
+        assert_eq!(export_target(dir.join("new"), false, tiff, &raw), Write(dir.join("new.tif")));
+        // The RAW: by its own name, by a bare name, by another extension,
+        // and through the system panel too.
+        assert_eq!(export_target(raw.clone(), false, dng, &raw), Source(raw.clone()));
+        assert_eq!(export_target(dir.join("IMG_1"), false, dng, &raw), Source(raw.clone()));
+        assert_eq!(export_target(dir.join("IMG_1.tif"), false, dng, &raw), Source(raw.clone()));
+        assert_eq!(
+            export_target(dir.join(".").join("IMG_1.dng"), true, dng, &raw),
+            Source(dir.join(".").join("IMG_1.dng"))
+        );
+        // The system panel's path is written as it is and was asked there.
+        assert_eq!(export_target(dir.join("old"), true, tiff, &raw), Write(dir.join("old")));
+        assert_eq!(export_target(old.clone(), true, tiff, &raw), Write(old));
+        // Nothing was written by asking.
+        assert_eq!(std::fs::read(&raw).unwrap(), b"raw");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_plate_of_a_dng_is_not_named_like_the_dng() {
+        let name = |p: &str, dng| linear_export_name(Some(Path::new(p)), dng);
+        assert_eq!(name("a/IMG_1.NEF", true), "IMG_1.dng");
+        assert_eq!(name("a/IMG_1.dng", true), "IMG_1.linear.dng");
+        assert_eq!(name("a/IMG_1.DNG", true), "IMG_1.linear.dng");
+        assert_eq!(name("a/IMG_1.dng", false), "IMG_1.negative.tif");
+        assert_eq!(name("a/IMG_1.NEF", false), "IMG_1.negative.tif");
+        assert_eq!(linear_export_name(None, true), "mimizan.dng");
     }
 }
 
