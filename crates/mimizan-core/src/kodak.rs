@@ -437,6 +437,19 @@ fn sum_inside(w: usize, h: usize, border: usize, f: impl Fn(usize, usize) -> f64
     rows.iter().sum()
 }
 
+/// PSNR in dB of a mean squared error on the 0..255 scale. No error is
+/// infinitely good; an error that is no number (a NaN in the estimate) is
+/// no figure either, not the best one.
+fn psnr_of(mse: f64) -> f64 {
+    if mse.is_nan() {
+        f64::NAN
+    } else if mse > 0.0 {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// PSNR, SSIM and linear RMSE of `est` against `truth`, `border` pixels of
 /// the edge excluded. Planes of different sizes, or a border that leaves
 /// nothing, give NaNs.
@@ -463,7 +476,7 @@ pub fn quality(est: &Plane, truth: &Plane, border: usize) -> Quality {
         d * d
     });
     let mse = se / n;
-    let psnr_db = if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY };
+    let psnr_db = psnr_of(mse);
 
     // SSIM (Wang et al. 2004) on the encoded planes.
     let mu_a = gauss(&a);
@@ -516,7 +529,7 @@ pub fn colour_quality(est: &Rgb, truth: &Rgb, border: usize) -> ColourQuality {
     if n == 0.0 {
         return nan;
     }
-    let psnr = |mse: f64| if mse > 0.0 { 10.0 * (255.0 * 255.0 / mse).log10() } else { f64::INFINITY };
+    let psnr = psnr_of;
     let mut mses = [0.0; 3];
     let mut se_lin = 0.0;
     for (k, (e, t)) in [(&est.r, &truth.r), (&est.g, &truth.g), (&est.b, &truth.b)].into_iter().enumerate() {
@@ -621,6 +634,26 @@ pub fn write_gray_png(path: &Path, p: &Plane) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An estimate with a pixel that is no number has no PSNR. It is not
+    /// the perfect one: equal pictures alone are infinitely good.
+    #[test]
+    fn an_estimate_that_is_no_number_has_no_psnr() {
+        let (w, h) = (48, 40);
+        let truth = Plane::from_vec(w, h, (0..w * h).map(|i| 0.1 + 0.5 * (i % 13) as f64 / 13.0).collect());
+        assert_eq!(quality(&truth, &truth, 4).psnr_db, f64::INFINITY);
+        let mut broken = truth.clone();
+        broken.set(20, 20, f64::NAN);
+        assert!(quality(&broken, &truth, 4).psnr_db.is_nan());
+
+        let rgb = |p: &Plane| Rgb { r: p.clone(), g: p.clone(), b: p.clone() };
+        assert_eq!(colour_quality(&rgb(&truth), &rgb(&truth), 4).cpsnr_db, f64::INFINITY);
+        let mut one = rgb(&truth);
+        one.g = broken;
+        let q = colour_quality(&one, &rgb(&truth), 4);
+        assert!(q.cpsnr_db.is_nan() && q.psnr_g_db.is_nan(), "{q:?}");
+        assert_eq!(q.psnr_r_db, f64::INFINITY);
+    }
 
     #[test]
     fn srgb_roundtrip() {
