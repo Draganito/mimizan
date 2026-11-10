@@ -5077,12 +5077,16 @@ impl App {
             if self.crop_open {
                 self.crop_interact(ui, &response, rect);
             }
-            if self.burn_on {
+            // The armed pipette has the next click on the picture. The
+            // brush under it would take the same press for a stroke, and
+            // the card would be read with a burn left in the recipe.
+            let brush_on = self.burn_on && !self.pick_card;
+            if brush_on {
                 self.burn_interact(ui, &response, rect);
             }
             // With the brush locked the first button paints, open it may hold
             // a handle; the others still pan.
-            let drawing = self.burn_on
+            let drawing = brush_on
                 && response.dragged_by(egui::PointerButton::Primary)
                 && (self.burn_locked || self.burn_drag.is_some());
             if response.dragged() && self.crop_drag.is_none() && self.line_drag.is_none() && !drawing {
@@ -5104,7 +5108,9 @@ impl App {
         // and its first preview the stage still shows the previous one,
         // and the spot clicked there is not a spot of the new negative.
         if self.pick_card {
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // The key is used up here: it puts the pipette down and is not
+            // the brush's Escape as well.
+            if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
                 self.pick_card = false;
             } else if clicked_on_picture && self.stage_shows_session() {
                 if let Some(ptr) = response.interact_pointer_pos() {
