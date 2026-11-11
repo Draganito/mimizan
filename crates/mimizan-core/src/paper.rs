@@ -338,6 +338,86 @@ impl SplitGrade {
         let p = paper();
         PaperCurve { paper: *p, soft: p.base_soft + self.soft, hard: p.base_hard + self.hard }
     }
+
+    /// The pair `notches` twelfths of a stop harder, or softer below zero,
+    /// with the print's mid-grey left where it is: a change of grade and
+    /// nothing else, as changing one speed-matched filter for another.
+    ///
+    /// A pair is read as the two things a printer sets. The grade is the
+    /// hard exposure over the soft. The exposure is what both have beyond
+    /// the pair of that same grade which prints the grey card at
+    /// [`GREY_DENSITY`] ([`matched_mean`]). Only the grade changes here,
+    /// so the tone that prints as that mid-grey keeps its place, to the
+    /// twelfth of a stop the pair is written in; at the base exposure it
+    /// is the grey card. Adding the same stops to both exposures is the
+    /// other half and changes only the exposure.
+    ///
+    /// The grade stops at [`grade_ends`], and before an exposure would
+    /// leave ±[`STOP_LIMIT`]. A pair past an end stays there on a step
+    /// outwards and comes back on one inwards. Both exposures land on
+    /// twelfths, and the same steps back give the same pair again.
+    pub fn graded(&self, notches: i32) -> Self {
+        let limit = (STOP_LIMIT * 12.0).round() as i32;
+        let twelfths =
+            |v: f64| if v.is_finite() { ((v * 12.0).round() as i32).clamp(-limit, limit) } else { 0 };
+        let (soft, hard) = (twelfths(self.soft), twelfths(self.hard));
+        // Twenty-fourths from here on: the grade's half and the mean are
+        // whole in them, and of one parity when the pair is on twelfths.
+        let grade = hard - soft;
+        let exposure = soft + hard - matched_mean(grade);
+        let (soft_end, hard_end) = grade_ends();
+        let to = grade.saturating_add(notches).clamp(soft_end.min(grade), hard_end.max(grade));
+        let pair = |g: i32| {
+            let mean = exposure + matched_mean(g);
+            (mean - g, mean + g)
+        };
+        let fits = |g: i32| {
+            let (s, h) = pair(g);
+            s.abs() <= 2 * limit && h.abs() <= 2 * limit
+        };
+        // The furthest grade on the way that both exposures can reach; the
+        // pair as it stands always does.
+        let step = if to >= grade { 1 } else { -1 };
+        let mut g = to;
+        while g != grade && !fits(g) {
+            g -= step;
+        }
+        let (s, h) = pair(g);
+        Self { soft: f64::from(s) / 24.0, hard: f64::from(h) / 24.0, paper: self.paper.clone() }
+    }
+}
+
+/// The mean of the two exposures, in twenty-fourths of a stop from the
+/// base exposure, of the pair with `grade` twelfths of hard over soft that
+/// prints the grey card at [`GREY_DENSITY`]: the speed matching of the
+/// grades. Zero at the base print. It is rounded to the twenty-fourth of
+/// the grade's own parity, so that the pair it makes lies on twelfths.
+fn matched_mean(grade: i32) -> i32 {
+    static MEANS: LazyLock<Vec<i32>> = LazyLock::new(|| {
+        let p = paper();
+        let reach = (2.0 * STOP_LIMIT * 12.0).round() as i32;
+        (-reach..=reach)
+            .map(|grade| {
+                let half = f64::from(grade) / 24.0;
+                // The density of the grey card rises with the time of both.
+                let (mut lo, mut hi) = (-16.0f64, 16.0f64);
+                for _ in 0..80 {
+                    let mid = 0.5 * (lo + hi);
+                    if p.fraction_at(GREY, p.base_soft - half + mid, p.base_hard + half + mid)
+                        < GREY_DENSITY / DMAX
+                    {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                let mean = 0.5 * (lo + hi) * 24.0;
+                grade + 2 * ((mean - f64::from(grade)) / 2.0).round() as i32
+            })
+            .collect()
+    });
+    let reach = (MEANS.len() / 2) as i32;
+    MEANS[(grade.clamp(-reach, reach) + reach) as usize]
 }
 
 /// A split-grade print ready to evaluate: both times absolute.
@@ -734,6 +814,121 @@ mod tests {
         assert!((soft..hard).all(|c| range(c + 1) < range(c)));
         // The whole way is inside what the two exposures may be.
         assert!(soft > -reach && hard < reach);
+    }
+
+    fn pair(g: &SplitGrade) -> (i32, i32) {
+        ((g.soft * 24.0).round() as i32, (g.hard * 24.0).round() as i32)
+    }
+
+    /// The grade changes and the print's mid-grey stays: at the base
+    /// exposure the grey card, a stop lighter or darker the tone that
+    /// prints where the card did.
+    #[test]
+    fn a_change_of_grade_leaves_the_mid_grey_where_it_is() {
+        let (soft_end, hard_end) = grade_ends();
+        for exposure in [-1.0, 0.0, 1.0] {
+            // The scene value that prints as mid-grey at this exposure.
+            let l = GREY * 2f64.powf(exposure / NEGATIVE_GAMMA);
+            let start = SplitGrade::new(exposure, exposure);
+            assert!((start.curve().density(l) - GREY_DENSITY).abs() < 1e-9);
+            let mut worst = 0.0f64;
+            for notches in soft_end..=hard_end {
+                let density = start.graded(notches).curve().density(l);
+                worst = worst.max((density - GREY_DENSITY).abs());
+            }
+            // The pair is written in twelfths, so the mean of a grade is
+            // off by a twenty-fourth of a stop at most; at grade 5 the
+            // paper gives 1.4 of density to the stop.
+            assert!(worst < 0.06, "exposure {exposure}: {worst}");
+        }
+    }
+
+    /// From the base print the wheel has the whole paper: grade 00 at one
+    /// end and grade 5 at the other. A lighter print has less of the soft
+    /// end, since the hard light cannot go under its limit.
+    #[test]
+    fn the_grades_within_reach() {
+        let name = |g: &SplitGrade| grade_label(g.curve().grade());
+        let base = SplitGrade::default();
+        assert_eq!((name(&base.graded(-100)).as_str(), name(&base.graded(100)).as_str()), ("00", "5"));
+        for exposure in [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0] {
+            let start = SplitGrade::new(exposure, exposure);
+            let (soft, hard) = (start.graded(-100), start.graded(100));
+            assert!(soft.validate().is_ok() && hard.validate().is_ok());
+            // From the base print and darker, the whole paper.
+            if exposure >= 0.0 {
+                assert_eq!((name(&soft).as_str(), name(&hard).as_str()), ("00", "5"), "{exposure}");
+            }
+        }
+        // A stop lighter: grade 0 at the soft end, the hard light at its limit.
+        let lighter = SplitGrade::new(-1.0, -1.0);
+        assert_eq!(lighter.graded(-100).hard, -STOP_LIMIT);
+        assert_eq!((name(&lighter.graded(-100)).as_str(), name(&lighter.graded(100)).as_str()), ("0", "5"));
+        // Two stops lighter: grade ½ to 4½.
+        let lightest = SplitGrade::new(-2.0, -2.0);
+        assert_eq!(
+            (name(&lightest.graded(-100)).as_str(), name(&lightest.graded(100)).as_str()),
+            ("½", "4½")
+        );
+        // Past an end the steps change nothing more.
+        assert_eq!(pair(&base.graded(100)), pair(&base.graded(24)));
+        assert_eq!(pair(&base.graded(-100)), pair(&base.graded(-60)));
+        // A pair from a file that stands past an end stays there on a step
+        // outwards and comes back on one inwards.
+        let past = SplitGrade::new(-1.5, 1.5);
+        assert_eq!(pair(&past.graded(1)), (-36, 36));
+        let back = past.graded(-1);
+        assert!((back.hard - back.soft - (3.0 - 1.0 / 12.0)).abs() < 1e-12);
+    }
+
+    /// Every pair on the twelfth grid: the result is on twelfths and inside
+    /// the limit, no step is the pair itself, and inside the grades as
+    /// many steps back as the pair was moved give the pair again.
+    #[test]
+    fn a_grade_step_is_undone_by_the_step_back() {
+        let limit = (STOP_LIMIT * 12.0).round() as i32;
+        let (soft_end, hard_end) = grade_ends();
+        for s in -limit..=limit {
+            for h in -limit..=limit {
+                let start = SplitGrade::new(f64::from(s) / 12.0, f64::from(h) / 12.0);
+                assert_eq!(pair(&start.graded(0)), (2 * s, 2 * h));
+                for notches in [-30, -7, -1, 1, 5, 30] {
+                    let there = start.graded(notches);
+                    let (ts, th) = pair(&there);
+                    assert!(ts % 2 == 0 && th % 2 == 0, "{s} {h} {notches}: off the twelfths");
+                    assert!(ts.abs() <= 2 * limit && th.abs() <= 2 * limit, "{s} {h} {notches}");
+                    let moved = (th - ts) / 2 - (h - s);
+                    // Never past the way asked for, never the other way.
+                    assert!(moved * notches.signum() >= 0 && moved.abs() <= notches.abs());
+                    // Never past an end the pair was inside of.
+                    if (soft_end..=hard_end).contains(&(h - s)) {
+                        assert!((soft_end..=hard_end).contains(&((th - ts) / 2)), "{s} {h} {notches}");
+                    }
+                    // Inside the grades the way back ends on the same pair.
+                    if (soft_end..=hard_end).contains(&(h - s)) {
+                        assert_eq!(pair(&there.graded(-moved)), (2 * s, 2 * h), "{s} {h} {notches}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The other half: the same stops on both exposures change the
+    /// exposure and not the grade, so the two commute where neither is
+    /// stopped.
+    #[test]
+    fn exposure_and_grade_are_set_apart() {
+        let start = SplitGrade::new(-0.25, 0.5);
+        let lighter = |g: &SplitGrade| SplitGrade::new(g.soft - 0.75, g.hard - 0.75);
+        assert_eq!(pair(&lighter(&start.graded(9))), pair(&lighter(&start).graded(9)));
+        assert_eq!(pair(&lighter(&start.graded(-20))), pair(&lighter(&start).graded(-20)));
+        // The grade's name is the same at every exposure.
+        let name = |g: &SplitGrade| grade_label(g.curve().grade());
+        assert_eq!(name(&start.graded(9)), name(&lighter(&start).graded(9)));
+        // A pair off the grid, or not a number, is taken to the grid first.
+        assert_eq!(pair(&SplitGrade::new(0.03, f64::NAN).graded(2)), pair(&SplitGrade::default().graded(2)));
+        // The base print is matched to itself.
+        assert_eq!(matched_mean(0), 0);
     }
 
     /// The time tables are as close as they claim, over the times a field

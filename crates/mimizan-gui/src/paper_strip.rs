@@ -10,9 +10,10 @@
 //! card, its right quarter past the clip.) A
 //! drag moves both exposures together, the whole print lighter or darker,
 //! as one more or less second under the enlarger. The wheel over the strip
-//! is the grade: hard light against soft, with the mean exposure fixed,
-//! one twelfth of a stop per notch, from grade 00 to grade 5 and no
-//! further. A double click is the base print, and
+//! is the grade: hard light against soft, one twelfth of a stop per
+//! notch, from grade 00 to grade 5 and no further, with the print's
+//! mid-grey left where it is (`SplitGrade::graded`): the ramp turns
+//! round that tone, steeper or flatter, and does not slide. A double click is the base print, and
 //! a second one brings the pair back: the pair of this picture, another
 //! picture has its own. The strip says nothing in words: the pair it
 //! stands for is in the recipe file.
@@ -22,7 +23,7 @@
 //! grid of twelfths, inside the same `STOP_LIMIT`.
 
 use egui::{pos2, vec2, Color32, CursorIcon, Event, Id, MouseWheelUnit, Rect, Sense, Shape, Stroke, Ui};
-use mimizan_core::paper::{grade_ends, SplitGrade, STOP_LIMIT};
+use mimizan_core::paper::{SplitGrade, STOP_LIMIT};
 use mimizan_core::zone;
 
 /// Height of the strip, points.
@@ -134,9 +135,7 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32)
             let notches = acc.trunc();
             ui.data_mut(|d| d.insert_temp::<f32>(id.with("wheel"), acc - notches));
             if notches != 0.0 {
-                let (s, h) = turn(split.soft, split.hard, f64::from(notches), STOP_LIMIT);
-                split.soft = s;
-                split.hard = h;
+                *split = split.graded(notches as i32);
             }
         }
     }
@@ -181,9 +180,10 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32)
     }
 }
 
-// The grade arithmetic, the same on the phone (`GradeMath` on Android,
-// `Prefs` on iOS): every pair lands on the twelfth grid inside ±`limit`.
-// The phone's pinch does not stop at the grades' ends yet; `turn` does.
+// The drag's arithmetic, the same on the phone (`GradeMath` on Android,
+// `Prefs` on iOS). The wheel's is the core's, `SplitGrade::graded`; the
+// phone's pinch still keeps the mean of the two exposures and runs past
+// the grades' ends.
 
 fn finite_or_zero(v: f64) -> f64 {
     if v.is_finite() {
@@ -191,11 +191,6 @@ fn finite_or_zero(v: f64) -> f64 {
     } else {
         0.0
     }
-}
-
-/// Twelfths of a stop, inside ±`limit`; a non-finite value snaps to zero.
-pub fn snap_stops(v: f64, limit: f64) -> f64 {
-    ((finite_or_zero(v) * 12.0).round() / 12.0).clamp(-limit, limit)
 }
 
 /// Add `delta` stops to both exposures, snapped to a twelfth, and stop at
@@ -208,48 +203,6 @@ pub fn shift_grade(soft: f64, hard: f64, delta: f64, limit: f64) -> (f64, f64) {
     (soft + d, hard + d)
 }
 
-/// The grade as one number: hard light against soft, in stops. Zero is the
-/// paper's grade 2.
-pub fn contrast(soft: f64, hard: f64) -> f64 {
-    hard - soft
-}
-
-/// The pair with `contrast` stops between hard and soft and the same
-/// exposure (the mean of the two, what a drag on the strip moves). Done in
-/// twenty-fourths so both land on the twelfth grid: when the mean sits
-/// between two twelfths the pair goes a twenty-fourth lighter, once.
-/// `contrast` is clamped so neither exposure leaves ±`limit`.
-pub fn with_contrast(soft: f64, hard: f64, contrast: f64, limit: f64) -> (f64, f64) {
-    let m24 = ((snap_stops(soft, limit) + snap_stops(hard, limit)) * 12.0).round() as i64;
-    let lim24 = (limit * 24.0).round() as i64;
-    let room = lim24 - m24.abs();
-    let wanted = finite_or_zero(contrast).clamp(-2.0 * limit, 2.0 * limit);
-    let c12 = ((wanted * 12.0).round() as i64).clamp(-room, room);
-    let mut s24 = m24 - c12;
-    if s24.rem_euclid(2) != 0 {
-        s24 -= 1;
-    }
-    if s24 < -lim24 {
-        s24 += 2;
-    }
-    (s24 as f64 / 24.0, (s24 + 2 * c12) as f64 / 24.0)
-}
-
-/// The pair after `notches` of the wheel, a twelfth of a stop each, up is
-/// harder. The wheel sets the grade, so it stops where the paper has no
-/// further grade to give ([`grade_ends`]): more hard light past grade 5,
-/// or more soft past grade 00, is exposure and belongs to the drag. A
-/// pair that already stands past an end (from a file) is left there by a
-/// notch outwards and comes back in by one inwards.
-pub fn turn(soft: f64, hard: f64, notches: f64, limit: f64) -> (f64, f64) {
-    let now = contrast(soft, hard);
-    let (soft_end, hard_end) = grade_ends();
-    let lo = (f64::from(soft_end) / 12.0).min(now);
-    let hi = (f64::from(hard_end) / 12.0).max(now);
-    let c = (now + finite_or_zero(notches) / 12.0).max(lo).min(hi);
-    with_contrast(soft, hard, c, limit)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,16 +212,6 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < EPS
-    }
-
-    #[test]
-    fn snap_stops_rounds_to_twelfths_and_clamps() {
-        assert!(close(snap_stops(0.09, LIMIT), 1.0 / 12.0));
-        assert!(close(snap_stops(0.04, LIMIT), 0.0));
-        assert!(close(snap_stops(7.0, LIMIT), 3.0));
-        assert!(close(snap_stops(-3.4, LIMIT), -3.0));
-        assert!(close(snap_stops(f64::NAN, LIMIT), 0.0));
-        assert!(close(snap_stops(f64::INFINITY, LIMIT), 0.0));
     }
 
     #[test]
@@ -297,81 +240,62 @@ mod tests {
         assert!(close(s, 1.1) && close(h, 1.1));
     }
 
-    #[test]
-    fn with_contrast_keeps_the_mean_and_sets_the_gap() {
-        let (s, h) = with_contrast(-1.0, 0.5, 2.5, LIMIT);
-        assert!(close(h - s, 2.5));
-        assert!(close((s + h) / 2.0, -0.25));
-        assert!(close(s, -1.5) && close(h, 1.0));
-    }
-
-    #[test]
-    fn with_contrast_is_the_identity_on_every_pair_on_the_grid() {
-        for s in -36..=36 {
-            for h in -36..=36 {
-                let (soft, hard) = (s as f64 / 12.0, h as f64 / 12.0);
-                let (a, b) = with_contrast(soft, hard, hard - soft, LIMIT);
-                assert!(close(a, soft) && close(b, hard), "soft {soft} hard {hard}");
-            }
-        }
-    }
-
-    #[test]
-    fn with_contrast_lands_on_the_twelfth_grid_inside_the_limit() {
-        for s in -36..=36 {
-            for h in -36..=36 {
-                for c in -72..=72 {
-                    let (a, b) = with_contrast(s as f64 / 12.0, h as f64 / 12.0, c as f64 / 12.0, LIMIT);
-                    assert!(close(a, (a * 12.0).round() / 12.0));
-                    assert!(close(b, (b * 12.0).round() / 12.0));
-                    assert!((-LIMIT - EPS..=LIMIT + EPS).contains(&a), "soft {a}");
-                    assert!((-LIMIT - EPS..=LIMIT + EPS).contains(&b), "hard {b}");
-                    let mean = (s + h) as f64 / 24.0;
-                    assert!(((a + b) / 2.0 - mean).abs() <= 1.0 / 24.0 + EPS, "mean");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn with_contrast_clamps_so_neither_exposure_leaves_the_limit() {
-        let (s, h) = with_contrast(2.0, 2.0, 5.0, LIMIT);
-        assert!(close(s, 1.0) && close(h, 3.0));
-        let (s, h) = with_contrast(2.0, 2.0, -5.0, LIMIT);
-        assert!(close(s, 3.0) && close(h, 1.0));
-        let (s, h) = with_contrast(0.0, 1.0 / 12.0, 2.0 / 12.0, LIMIT);
-        assert!(close(h - s, 2.0 / 12.0));
-        assert!(close(s, -1.0 / 12.0) && close(h, 1.0 / 12.0));
-        assert!(close(with_contrast(0.0, 0.0, f64::NAN, LIMIT).1, 0.0));
-    }
-
-    /// The wheel sets the grade and stops where the grades end. Before, it
-    /// went on to the limit of the two exposures: past grade 5 and past
-    /// grade 00 every further notch left the grade where it was and made
-    /// the print darker.
-    #[test]
-    fn the_wheel_stops_where_the_grades_end() {
-        use mimizan_core::paper::grade_label;
-        use mimizan_core::zone::GRAY_CARD;
-        let at = |notches: f64| {
-            let (s, h) = turn(0.0, 0.0, notches, LIMIT);
-            let curve = SplitGrade::new(s, h).curve();
-            (contrast(s, h), grade_label(curve.grade()), curve.density(GRAY_CARD))
+    /// The strip in a window without a screen, with the wheel turned over it.
+    fn wheel_on_strip(ctx: &egui::Context, time: &mut f64, lines: f32, split: &mut SplitGrade) {
+        let at = pos2(160.0, 26.0);
+        let wheel = Event::MouseWheel {
+            unit: MouseWheelUnit::Line,
+            delta: vec2(0.0, lines),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
         };
-        // Up: grade 5 is reached, and forty more notches change nothing.
-        let (c, grade, density) = at(24.0);
-        assert_eq!(grade, "5");
-        assert_eq!(at(64.0), (c, grade, density), "past grade 5");
-        // Down: grade 00 is reached, and twenty more notches change nothing.
-        let (c, grade, density) = at(-44.0);
-        assert_eq!(grade, "00");
-        assert_eq!(at(-64.0), (c, grade, density), "past grade 00");
-        // A pair from a file that stands past an end stays where it is on
-        // a notch further out, and comes back in on a notch inwards.
-        let (s, h) = turn(-1.5, 1.5, 1.0, LIMIT);
-        assert!(close(s, -1.5) && close(h, 1.5), "{s} {h}");
-        let (s, h) = turn(-1.5, 1.5, -1.0, LIMIT);
-        assert!(close(h - s, 3.0 - 1.0 / 12.0), "{s} {h}");
+        // The pointer comes to rest on the strip, then the wheel turns.
+        for events in [vec![Event::PointerMoved(at)], vec![], vec![wheel], vec![]] {
+            *time += 0.02;
+            let screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0)));
+            let input = egui::RawInput { events, time: Some(*time), screen_rect, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                let strip = Rect::from_min_size(pos2(10.0, 8.0), vec2(300.0, STRIP_H));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
+                    paper_strip(ui, Id::new("a.nef"), split, 300.0)
+                });
+            });
+        }
+    }
+
+    /// The wheel is the grade and nothing else. Before, it kept the mean
+    /// of the two times and ran to their limit: by grade 5 the grey card
+    /// had gone from density 0.67 to 1.33, so every change of grade had to
+    /// be followed by a drag, and past grade 5 forty-eight more notches
+    /// only made the print darker.
+    #[test]
+    fn the_wheel_turns_the_grade_and_leaves_the_grey_card_at_its_tone() {
+        use mimizan_core::paper::{grade_label, GREY_DENSITY};
+        use mimizan_core::zone::GRAY_CARD;
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut split = SplitGrade::default();
+        let mut worst = 0.0f64;
+        let mut names = vec![grade_label(split.curve().grade())];
+        // Up, a notch at a time, well past the hard end.
+        for _ in 0..40 {
+            wheel_on_strip(&ctx, &mut time, 1.0, &mut split);
+            worst = worst.max((split.curve().density(GRAY_CARD) - GREY_DENSITY).abs());
+            names.push(grade_label(split.curve().grade()));
+        }
+        assert!(worst < 0.06, "the grey card moved by {worst:.3} of density");
+        assert_eq!(names.last().map(String::as_str), Some("5"));
+        // It is the core's step, and it stopped at the end of the grades.
+        assert_eq!(split, SplitGrade::default().graded(40));
+        assert_eq!(split, SplitGrade::default().graded(24));
+        // Down again by as many notches as it went up: the base print.
+        for _ in 0..24 {
+            wheel_on_strip(&ctx, &mut time, -1.0, &mut split);
+        }
+        assert_eq!((split.soft, split.hard), (0.0, 0.0));
+        // Three lines in one turn are three notches.
+        wheel_on_strip(&ctx, &mut time, -3.0, &mut split);
+        assert_eq!(split, SplitGrade::default().graded(-3));
     }
 
     /// The strip in a window without a screen, with a double click on it.
