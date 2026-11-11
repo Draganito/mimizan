@@ -6,8 +6,7 @@
 //! slice is the paper's value for that grey under the current pair of
 //! exposures. So the strip is the print of a grey wedge, every slice of
 //! it a grey of its own, and the two exposures only move the greys along
-//! it. (The phone's strip still runs five stops to either side of the
-//! card, its right quarter past the clip.) A
+//! it. The phone's strip has the same axis. A
 //! drag moves both exposures together, the whole print lighter or darker,
 //! as one more or less second under the enlarger. The wheel over the strip
 //! is the grade: hard light against soft, one twelfth of a stop per
@@ -182,8 +181,7 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32)
 
 // The drag's arithmetic, the same on the phone (`GradeMath` on Android,
 // `Prefs` on iOS). The wheel's is the core's, `SplitGrade::graded`; the
-// phone's pinch still keeps the mean of the two exposures and runs past
-// the grades' ends.
+// phone's spread of two fingers takes the same step.
 
 fn finite_or_zero(v: f64) -> f64 {
     if v.is_finite() {
