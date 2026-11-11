@@ -4327,6 +4327,12 @@ impl App {
         ui.advance_cursor_after_rect(used);
     }
 
+    /// The picture on the stage, as a name for what the strip and the lamp
+    /// bars remember of it: its file.
+    fn picture_id(&self) -> egui::Id {
+        egui::Id::new(self.session.as_ref().map(|s| s.path.as_path()))
+    }
+
     /// The filter as one row, what it leaves to say, the paper strip, the
     /// pair it stands for and the paper's ends.
     fn zones_column(&mut self, ui: &mut egui::Ui, width: f32) {
@@ -4366,7 +4372,7 @@ impl App {
             return;
         };
         let mut split = split;
-        paper_strip(ui, &mut split, width);
+        paper_strip(ui, self.picture_id(), &mut split, width);
         if self.edit.recipe.curve.as_paper() != Some(&split) {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }
@@ -4410,9 +4416,10 @@ impl App {
     fn lamp_bars(&mut self, ui: &mut egui::Ui, width: f32) {
         ui.add_space(6.0);
         let [mut red, mut blue] = self.edit.lamps;
-        lamp_bar(ui, Lamp::Red, &mut red, width);
+        let picture = self.picture_id();
+        lamp_bar(ui, picture, Lamp::Red, &mut red, width);
         ui.add_space(4.0);
-        lamp_bar(ui, Lamp::Blue, &mut blue, width);
+        lamp_bar(ui, picture, Lamp::Blue, &mut blue, width);
         let lamps = [red.clamp(-LAMP_LIMIT, LAMP_LIMIT), blue.clamp(-LAMP_LIMIT, LAMP_LIMIT)];
         if lamps != self.edit.lamps {
             self.edit.lamps = lamps;

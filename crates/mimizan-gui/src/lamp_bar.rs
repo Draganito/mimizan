@@ -5,14 +5,15 @@
 //! colour, says which lamp. What the lamp does to the colour is in the
 //! picture. A click or a drag puts the handle there; the wheel is a
 //! twelfth a notch; a double click is zero, and a second one brings the
-//! lamp back. The frame is amber off zero, as the paper strip's is.
+//! lamp back, this picture's lamp. The frame is amber off zero, as the
+//! paper strip's is.
 //!
 //! The value is the same `lamps[k]` the two sliders set, on the twelfth
 //! grid inside ±`LAMP_LIMIT`; nothing behind the bar changes.
 
 use crate::paper_strip::AMBER;
 use egui::{
-    pos2, vec2, Align2, Color32, CursorIcon, Event, FontId, MouseWheelUnit, Sense, Shape, Stroke, Ui,
+    pos2, vec2, Align2, Color32, CursorIcon, Event, FontId, Id, MouseWheelUnit, Sense, Shape, Stroke, Ui,
 };
 use mimizan_core::print::LAMP_LIMIT;
 
@@ -81,10 +82,13 @@ fn double_click(rest: f64, remembered: Option<f64>) -> (f64, Option<f64>) {
 }
 
 /// Draws the bar for `lamp` at `v` stops and lets the pointer move it.
-pub fn lamp_bar(ui: &mut Ui, lamp: Lamp, v: &mut f64, width: f32) {
+/// `picture` names the picture the lamp belongs to: what a double click
+/// remembers is kept under it, so it is not handed to the next picture.
+pub fn lamp_bar(ui: &mut Ui, picture: Id, lamp: Lamp, v: &mut f64, width: f32) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, BAR_H), Sense::click_and_drag());
     let id = response.id;
-    let (rest_id, released_id, remembered_id) = (id.with("rest"), id.with("released"), id.with("remembered"));
+    let (rest_id, released_id) = (id.with("rest"), id.with("released"));
+    let remembered_id = id.with("remembered").with(picture);
 
     // Where the lamp stood before the pointer came down. A press puts the
     // handle under the pointer, so by the time a double click is known the
@@ -206,6 +210,54 @@ mod tests {
         assert_eq!(double_click(STEP / 4.0, Some(-0.5)), (-0.5, Some(-0.5)));
         // Nothing remembered: the lamp stays at zero.
         assert_eq!(double_click(0.0, None), (0.0, None));
+    }
+
+    /// The bar in a window without a screen, with a double click on its middle.
+    fn double_click_on_bar(ctx: &egui::Context, time: &mut f64, picture: &str, v: &mut f64) {
+        use egui::{Modifiers, PointerButton, Rect};
+        let at = pos2(160.0, 18.0);
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        for events in [
+            vec![Event::PointerMoved(at)],
+            vec![button(true)],
+            vec![button(false)],
+            vec![button(true)],
+            vec![button(false)],
+        ] {
+            *time += 0.02;
+            let screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0)));
+            let input = egui::RawInput { events, time: Some(*time), screen_rect, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                let bar = Rect::from_min_size(pos2(10.0, 8.0), vec2(300.0, BAR_H));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+                    lamp_bar(ui, Id::new(picture), Lamp::Red, v, 300.0)
+                });
+            });
+        }
+    }
+
+    /// The lamp a double click brings back is this picture's, as the
+    /// paper strip's pair is.
+    #[test]
+    fn a_double_click_does_not_bring_back_another_pictures_lamp() {
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut first = 0.75;
+        double_click_on_bar(&ctx, &mut time, "a.nef", &mut first);
+        assert_eq!(first, 0.0, "the lamp at zero");
+        time += 5.0;
+        let mut second = 0.0;
+        double_click_on_bar(&ctx, &mut time, "b.nef", &mut second);
+        assert_eq!(second, 0.0, "the next picture");
+        // Back on the first picture its lamp is still there.
+        time += 5.0;
+        double_click_on_bar(&ctx, &mut time, "a.nef", &mut first);
+        assert_eq!(first, 0.75, "the first picture's lamp");
     }
 
     #[test]

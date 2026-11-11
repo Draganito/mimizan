@@ -8,14 +8,15 @@
 //! as one more or less second under the enlarger. The wheel over the strip
 //! is the grade: hard light against soft, with the mean exposure fixed,
 //! one twelfth of a stop per notch. A double click is the base print, and
-//! a second one brings the pair back. The strip says nothing in words:
-//! the pair it stands for is in the recipe file.
+//! a second one brings the pair back: the pair of this picture, another
+//! picture has its own. The strip says nothing in words: the pair it
+//! stands for is in the recipe file.
 //!
 //! Nothing here touches the paper's arithmetic: the pair the strip hands
 //! back is the same two numbers the two sliders used to set, on the same
 //! grid of twelfths, inside the same `STOP_LIMIT`.
 
-use egui::{pos2, vec2, Color32, CursorIcon, Event, MouseWheelUnit, Rect, Sense, Shape, Stroke, Ui};
+use egui::{pos2, vec2, Color32, CursorIcon, Event, Id, MouseWheelUnit, Rect, Sense, Shape, Stroke, Ui};
 use mimizan_core::paper::{SplitGrade, STOP_LIMIT};
 use mimizan_core::zone;
 
@@ -42,21 +43,24 @@ fn linear_at(frac: f64) -> f64 {
     (zone::GRAY_CARD * (frac * ZONES - ZONES / 2.0).exp2()).clamp(0.0, 1.0)
 }
 
-/// Draws the strip for `split` and lets the pointer move it.
-pub fn paper_strip(ui: &mut Ui, split: &mut SplitGrade, width: f32) {
+/// Draws the strip for `split` and lets the pointer move it. `picture`
+/// names the picture the pair belongs to: what a double click remembers
+/// is kept under it, so it is not handed to the next picture.
+pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, STRIP_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let id = response.id;
+    let remembered = id.with("remembered").with(picture);
     let off = split.soft.abs() >= 1.0 / 24.0 || split.hard.abs() >= 1.0 / 24.0;
 
     // A double click: the base print, or the pair the last one left.
     type Pair = (f64, f64);
     if response.double_clicked() {
         if off {
-            ui.data_mut(|d| d.insert_temp::<Pair>(id.with("remembered"), (split.soft, split.hard)));
+            ui.data_mut(|d| d.insert_temp::<Pair>(remembered, (split.soft, split.hard)));
             split.soft = 0.0;
             split.hard = 0.0;
-        } else if let Some((s, h)) = ui.data(|d| d.get_temp::<Pair>(id.with("remembered"))) {
+        } else if let Some((s, h)) = ui.data(|d| d.get_temp::<Pair>(remembered)) {
             split.soft = s;
             split.hard = h;
         }
@@ -300,6 +304,56 @@ mod tests {
         assert!(close(h - s, 2.0 / 12.0));
         assert!(close(s, -1.0 / 12.0) && close(h, 1.0 / 12.0));
         assert!(close(with_contrast(0.0, 0.0, f64::NAN, LIMIT).1, 0.0));
+    }
+
+    /// The strip in a window without a screen, with a double click on it.
+    fn double_click_on_strip(ctx: &egui::Context, time: &mut f64, picture: &str, split: &mut SplitGrade) {
+        use egui::{Modifiers, PointerButton};
+        let at = pos2(160.0, 26.0);
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        for events in [
+            vec![Event::PointerMoved(at)],
+            vec![button(true)],
+            vec![button(false)],
+            vec![button(true)],
+            vec![button(false)],
+        ] {
+            *time += 0.02;
+            let screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0)));
+            let input = egui::RawInput { events, time: Some(*time), screen_rect, ..Default::default() };
+            let _ = ctx.run_ui(input, |ui| {
+                let strip = Rect::from_min_size(pos2(10.0, 8.0), vec2(300.0, STRIP_H));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
+                    paper_strip(ui, Id::new(picture), split, 300.0)
+                });
+            });
+        }
+    }
+
+    /// The pair a double click brings back is this picture's. Before, the
+    /// strip kept one pair for the window, and the first double click on
+    /// the next picture gave it the last picture's exposures.
+    #[test]
+    fn a_double_click_does_not_bring_back_another_pictures_pair() {
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut first = SplitGrade::new(-0.75, 0.5);
+        double_click_on_strip(&ctx, &mut time, "a.nef", &mut first);
+        assert_eq!((first.soft, first.hard), (0.0, 0.0), "the base print");
+        // The next picture, at its base print: nothing of its own to bring back.
+        time += 5.0;
+        let mut second = SplitGrade::default();
+        double_click_on_strip(&ctx, &mut time, "b.nef", &mut second);
+        assert_eq!((second.soft, second.hard), (0.0, 0.0), "the next picture");
+        // Back on the first picture its pair is still there.
+        time += 5.0;
+        double_click_on_strip(&ctx, &mut time, "a.nef", &mut first);
+        assert_eq!((first.soft, first.hard), (-0.75, 0.5), "the first picture's pair");
     }
 
     #[test]
