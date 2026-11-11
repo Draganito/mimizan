@@ -6,11 +6,14 @@
 #   Mimizan Lab.app/Contents/Resources/cameras
 #   Mimizan Lab.app/Contents/Resources/look
 #   Mimizan Lab.app/Contents/Resources/AppIcon.icns
+#   Mimizan Lab.app/Contents/Resources/third-party
 #
 # cameras and look sit in Resources. MacOS holds only the two programs, which
 # is what a store signature accepts. The programs look next to themselves,
 # then in ../Resources. A double click on the bundle does not open Terminal.
-# The icon is the letter M.
+# The icon is the letter M. third-party names the libraries of others the
+# programs link (dist/third-party), with the license text one of them asks
+# to travel with every copy. It is the only license text in the bundle.
 #
 # Usage: dist/assemble_macos_app.sh <mimizan> <mimizan-gui> <dest.app> <version>
 #
@@ -40,7 +43,7 @@ RESOURCES="$DEST/Contents/Resources"
 mkdir -p "$MACOS" "$RESOURCES"
 cp "$CLI" "$GUI" "$MACOS/"
 chmod 755 "$MACOS/mimizan" "$MACOS/mimizan-gui"
-cp -R "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$RESOURCES/"
+cp -R "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$PROJECT_DIR/dist/third-party" "$RESOURCES/"
 
 cat > "$DEST/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -101,6 +104,8 @@ test ! -e "$MACOS/cameras"
 test ! -e "$MACOS/look"
 test -f "$RESOURCES/cameras/nikon_z_f.json"
 test -f "$RESOURCES/look/neutral.json"
+test -s "$RESOURCES/third-party/THIRD-PARTY.txt"
+test -s "$RESOURCES/third-party/LGPL-2.1.txt"
 test -s "$DEST/Contents/Resources/AppIcon.icns"
 test "$(plutil -extract CFBundleIconFile raw "$DEST/Contents/Info.plist")" = "AppIcon"
 echo "==> $DEST"

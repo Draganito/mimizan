@@ -1,0 +1,15 @@
+Third-party software
+
+Mimizan Lab uses the libraries below. Each is the work of its own authors
+and stays under its own license. This file is about those libraries only.
+
+rawler
+    RAW decoding. By Daniel Vogelbacher and Pedro Côrte-Real.
+    rawler and its use are covered by the GNU Lesser General Public
+    License, version 2.1. The text is in LGPL-2.1.txt, next to this file.
+    Source: https://github.com/dnglab/dnglab
+
+option-ext
+    By Simon Ochsenreither.
+    Mozilla Public License 2.0: https://www.mozilla.org/MPL/2.0/
+    Source: https://github.com/soc/option-ext

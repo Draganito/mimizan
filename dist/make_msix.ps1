@@ -135,7 +135,10 @@ try {
     Copy-Item -LiteralPath $Cli, $Gui -Destination $Layout
     Copy-Item -LiteralPath (Join-Path $ProjectDir "cameras") -Destination $Layout -Recurse
     Copy-Item -LiteralPath (Join-Path $ProjectDir "look") -Destination $Layout -Recurse
-    foreach ($rel in @("cameras\nikon_z_f.json", "look\neutral.json")) {
+    # The libraries of others the programs link, and the license text one
+    # of them asks to travel with every copy. No other license text ships.
+    Copy-Item -LiteralPath (Join-Path $ProjectDir "dist\third-party") -Destination $Layout -Recurse
+    foreach ($rel in @("cameras\nikon_z_f.json", "look\neutral.json", "third-party\THIRD-PARTY.txt", "third-party\LGPL-2.1.txt")) {
         if (-not (Test-Path -LiteralPath (Join-Path $Layout $rel))) {
             throw "ERROR: layout is missing $rel"
         }
@@ -237,7 +240,7 @@ try {
     $installed = Get-AppxPackage -Name $IdentityName
     if (-not $installed) { throw "ERROR: $IdentityName did not install" }
     $PackageFullName = $installed.PackageFullName
-    foreach ($rel in @("mimizan-gui.exe", "mimizan.exe", "cameras\nikon_z_f.json", "look\neutral.json")) {
+    foreach ($rel in @("mimizan-gui.exe", "mimizan.exe", "cameras\nikon_z_f.json", "look\neutral.json", "third-party\THIRD-PARTY.txt", "third-party\LGPL-2.1.txt")) {
         if (-not (Test-Path -LiteralPath (Join-Path $installed.InstallLocation $rel))) {
             throw "ERROR: installed package is missing $rel"
         }
