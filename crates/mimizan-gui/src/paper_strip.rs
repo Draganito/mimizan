@@ -1,9 +1,13 @@
 //! The paper strip: the one control the paper has, as on the phone.
 //!
-//! The axis is the scene, ten stops of linear grey with the grey card in
-//! the middle, one zone per stop; each slice is the paper's value for that
-//! grey under the current pair of exposures. So the strip is the print of
-//! a grey wedge, and the two exposures only move the greys along it. A
+//! The axis is the scene, one zone per stop, from five stops under the
+//! grey card up to the clip, two and a half stops above it, where the
+//! negative ends; the card stands at the mark, two thirds along. Each
+//! slice is the paper's value for that grey under the current pair of
+//! exposures. So the strip is the print of a grey wedge, every slice of
+//! it a grey of its own, and the two exposures only move the greys along
+//! it. (The phone's strip still runs five stops to either side of the
+//! card, its right quarter past the clip.) A
 //! drag moves both exposures together, the whole print lighter or darker,
 //! as one more or less second under the enlarger. The wheel over the strip
 //! is the grade: hard light against soft, with the mean exposure fixed,
@@ -23,8 +27,8 @@ use mimizan_core::zone;
 
 /// Height of the strip, points.
 const STRIP_H: f32 = 36.0;
-/// Stops of linear grey the strip spans; the grey card in the middle.
-const ZONES: f64 = 10.0;
+/// Stops of the scene the strip shows under the grey card.
+const BELOW: f64 = 5.0;
 /// Slices the ramp is drawn in.
 const SAMPLES: usize = 192;
 /// Stops of exposure a drag across the whole strip moves, as on the phone.
@@ -39,9 +43,28 @@ fn grey(v: f64) -> Color32 {
     Color32::from_gray((v.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
-/// Linear grey at `x` of the strip's width, the grey card at the middle.
+/// Stops of the scene over the grey card: up to the clip, linear 1.
+fn above() -> f64 {
+    -zone::GRAY_CARD.log2()
+}
+
+/// Where a grey `stops` from the grey card stands, as a part of the
+/// strip's width. The card itself is at `frac_of(0.0)`.
+fn frac_of(stops: f64) -> f64 {
+    (stops + BELOW) / (BELOW + above())
+}
+
+/// Linear grey at `frac` of the strip's width: [`BELOW`] stops under the
+/// grey card at the left edge, the clip at the right.
 fn linear_at(frac: f64) -> f64 {
-    (zone::GRAY_CARD * (frac * ZONES - ZONES / 2.0).exp2()).clamp(0.0, 1.0)
+    (zone::GRAY_CARD * (frac * (BELOW + above()) - BELOW).exp2()).clamp(0.0, 1.0)
+}
+
+/// The whole stops from the grey card that lie inside the strip, the
+/// edges left out: the ticks.
+fn zone_ticks() -> impl Iterator<Item = f64> {
+    let first = 1 - BELOW.ceil() as i32;
+    (first..).map(f64::from).take_while(|&stops| stops < above())
 }
 
 /// Draws the strip for `split` and lets the pointer move it. `picture`
@@ -135,17 +158,17 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32)
                 Rect::from_min_size(pos2(rect.left() + i as f32 * w, rect.top()), vec2(w + 0.5, STRIP_H));
             painter.rect_filled(slice, 0.0, grey(curve.eval(l)));
         }
-        // The zones, one stop apart, as ticks from the top edge.
+        // The zones, whole stops from the grey card, as ticks from the top edge.
         let tick = Color32::from_rgba_unmultiplied(128, 128, 128, 150);
-        for z in 1..ZONES as usize {
-            let x = rect.left() + rect.width() * z as f32 / ZONES as f32;
+        for stops in zone_ticks() {
+            let x = rect.left() + rect.width() * frac_of(stops) as f32;
             painter.line_segment(
                 [pos2(x, rect.top()), pos2(x, rect.top() + STRIP_H * 0.3)],
                 Stroke::new(1.0, tick),
             );
         }
         // The mark: the grey card's place, never moving.
-        let mx = rect.center().x;
+        let mx = rect.left() + rect.width() * frac_of(0.0) as f32;
         let ink = if off { AMBER } else { Color32::WHITE };
         painter.add(Shape::convex_polygon(
             vec![pos2(mx - 5.0, rect.bottom()), pos2(mx + 5.0, rect.bottom()), pos2(mx, rect.bottom() - 7.0)],
@@ -401,11 +424,29 @@ mod tests {
         assert_eq!((first.soft, first.hard), (-0.75, 0.5), "the first picture's pair");
     }
 
+    /// Every slice of the strip is a grey of its own. Before, the strip
+    /// ran five stops above the grey card, but the scene ends at the clip,
+    /// two and a half above it: the right quarter was one flat tone under
+    /// every pair.
     #[test]
-    fn the_strip_spans_ten_stops_round_the_grey_card() {
-        assert!(close(linear_at(0.5), zone::GRAY_CARD));
-        assert!(close(linear_at(0.6), zone::GRAY_CARD * 2.0));
+    fn every_slice_of_the_strip_is_its_own_grey() {
+        let greys: Vec<f64> = (0..SAMPLES).map(|i| linear_at((i as f64 + 0.5) / SAMPLES as f64)).collect();
+        let flat = greys.windows(2).filter(|w| w[1] <= w[0]).count();
+        assert_eq!(flat, 0, "{flat} of {SAMPLES} slices repeat the one before");
+    }
+
+    #[test]
+    fn the_strip_runs_from_five_stops_under_the_card_to_the_clip() {
         assert!(close(linear_at(0.0), zone::GRAY_CARD / 32.0));
+        assert!(close(linear_at(frac_of(0.0)), zone::GRAY_CARD));
+        assert!(close(linear_at(frac_of(1.0)), zone::GRAY_CARD * 2.0));
+        assert!(close(linear_at(frac_of(-3.0)), zone::GRAY_CARD / 8.0));
         assert!(close(linear_at(1.0), 1.0));
+        assert!(close(frac_of(above()), 1.0) && close(frac_of(-BELOW), 0.0));
+        // The card stands two thirds along, and the ticks are the whole
+        // stops between the edges: four under the card, the card, two over.
+        assert!((frac_of(0.0) - 0.669).abs() < 1e-3, "{}", frac_of(0.0));
+        let ticks: Vec<f64> = zone_ticks().collect();
+        assert_eq!(ticks, [-4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0]);
     }
 }
