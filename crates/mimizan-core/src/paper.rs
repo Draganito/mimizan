@@ -631,6 +631,30 @@ pub fn log2_time(time: f64) -> f64 {
     }
 }
 
+/// Where the grades end, as the contrast of the pair: hard light over
+/// soft, in twelfths of a stop, at the softest grade and at the hardest.
+/// The grade is a matter of that difference alone, whatever the exposure.
+/// Past the soft end the hard light no longer shows and the print is
+/// grade 00, the soft emulsion on its own; past the hard end it is grade
+/// 5. More of the same light there is not a grade but exposure, so a
+/// control that sets the grade stops here. The ends are the first
+/// twelfths, counted from the base print, at which the pair's ISO range
+/// reads as the paper's own, [`ISO_R_SOFT`] and [`ISO_R_HARD`], to the
+/// whole number the datasheet gives them in.
+pub fn grade_ends() -> (i32, i32) {
+    static ENDS: LazyLock<(i32, i32)> = LazyLock::new(|| {
+        let reach = (2.0 * STOP_LIMIT * 12.0).round() as i32;
+        let range = |c12: i32| {
+            let half = f64::from(c12) / 24.0;
+            SplitGrade::new(-half, half).curve().iso_range().round()
+        };
+        let soft = (-reach..=0).rev().find(|&c| range(c) >= ISO_R_SOFT).unwrap_or(-reach);
+        let hard = (0..=reach).find(|&c| range(c) <= ISO_R_HARD).unwrap_or(reach);
+        (soft, hard)
+    });
+    *ENDS
+}
+
 /// A grade as the darkroom writes it: 00, 0, ½, 1 … 5.
 pub fn grade_label(g: f64) -> String {
     if g < -0.75 {
@@ -683,6 +707,33 @@ mod tests {
             assert_eq!(table.eval_timed(0.5, 0.0, 0.0), curve.white());
             assert_eq!(table.eval_timed(0.0, 1.0, 1.0), curve.eval(0.0));
         }
+    }
+
+    /// The grades end where the pair's ISO range reads as the paper's own:
+    /// a step short of each end it does not yet, and from each end on the
+    /// grade's name no longer changes, however far the pair is pushed.
+    #[test]
+    fn the_grades_end_where_the_range_is_the_papers() {
+        let (soft, hard) = grade_ends();
+        let range = |c12: i32| {
+            let half = f64::from(c12) / 24.0;
+            SplitGrade::new(-half, half).curve().iso_range()
+        };
+        let name = |c12: i32| {
+            let half = f64::from(c12) / 24.0;
+            grade_label(SplitGrade::new(-half, half).curve().grade())
+        };
+        assert!(soft < 0 && hard > 0, "{soft} {hard}");
+        assert_eq!(range(soft).round(), ISO_R_SOFT);
+        assert_eq!(range(hard).round(), ISO_R_HARD);
+        assert!(range(soft + 1).round() < ISO_R_SOFT && range(hard - 1).round() > ISO_R_HARD);
+        let reach = (2.0 * STOP_LIMIT * 12.0).round() as i32;
+        assert!((-reach..=soft).all(|c| name(c) == "00"));
+        assert!((hard..=reach).all(|c| name(c) == "5"));
+        // Between the ends the range falls with every twelfth: each notch is a grade.
+        assert!((soft..hard).all(|c| range(c + 1) < range(c)));
+        // The whole way is inside what the two exposures may be.
+        assert!(soft > -reach && hard < reach);
     }
 
     /// The time tables are as close as they claim, over the times a field

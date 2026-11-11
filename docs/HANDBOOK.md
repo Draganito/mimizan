@@ -50,7 +50,7 @@ with its own.
    Drag it and both lights move together, like one more second under
    the enlarger, or one less.
 4. The wheel over the strip is the grade. Up is harder, down is softer.
-   The exposure stays.
+   The exposure stays. The wheel stops at grade 00 and at grade 5.
 5. Double click: the base print. Double click again: back where you were.
 
 The line under the strip names the grade the pair equals. The pair
