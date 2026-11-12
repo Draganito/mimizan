@@ -217,6 +217,89 @@ the luminance plus Ĉ1' only, not interpolated. The blue trails, as it does
 in every method: one photosite in four, and the sRGB encoding weights its
 errors most.
 
+## The moiré net (testing)
+
+A testing option, off by default: *moiré net (testing)* under the mask in
+the Negative window, `--moire-net` on `negative`, `"moire_net": true` in
+the recipe's `develop`. Off, nothing of it runs and the picture is the
+one it was, to the bit. It belongs to the Dubois mask and is not read
+under the other two.
+
+Why. Near the Nyquist frequency the mosaic cannot tell fine neutral
+structure from colour: a grey chequerboard at the pixel pitch and a flat
+green field are the same photosite values, bit for bit, and so are grey
+threads at two pixels' pitch and flat orange under fine green lines. No
+rule removes that false colour completely. The Dubois estimate decides
+between its measurements by fixed rules, and on a fine fabric or a wound
+string those rules leave a moiré.
+
+What. A small network (ten inputs, two layers of 32, 1 738 weights in
+all, `moire_net.rs`) reads ten local statistics of the separation per
+pixel and gives mixing weights, summing to one, over estimates the
+separation already has: the Dubois result, its elongated and its square
+narrow copies, and the mean of the Dubois result over the neighbourhood.
+Each of them is a linear filter of the measured photosites. The net
+computes no pixel; it chooses how much of which measurement to trust.
+The weights were trained on twelve Kodak pictures (kodim01 to 12, as
+RGGB mosaics: sharp, behind a lens, at twice the size) and sixty random
+synthetic scenes, with a penalty on every pixel made worse than Dubois.
+The training is not in this repository.
+
+Measured on the twelve pictures it was not trained on,
+`mimizan bench plate --moire-net --only kodim13,…,kodim24` with
+`--blur 0.75` and `--scale 2` (CPSNR in dB, RGGB; on the other three
+Bayer phases the mean differences are within 0.02 dB of these and the
+worst picture within 0.06 dB):
+
+| | plate | + net | above the plate | worst picture |
+|---|---|---|---|---|
+| pixel-sharp | 32.83 | 33.33 | 12/12 | +0.04 |
+| behind a lens | 44.26 | 44.23 | 8/12 | −0.46 (kodim19) |
+| twice the size | 46.01 | 46.01 | 6/12 | −0.03 |
+
+Synthetic scenes with a known truth, 384 px, behind a lens of σ 0.6 px,
+colour error ×1000 (a bench outside the repository; the first row is
+also a test in `dubois.rs`, on all four phases):
+
+| Scene | plate | + net |
+|---|---|---|
+| neutral weave, two gratings near Nyquist | 38.6 | 5.9 |
+| neutral curtain in folds | 17.6 | 9.7 |
+| luminance zone plate | 8.8 | 2.2 |
+| wound strings, after the moiré of a real guitar file | 8.6 | 6.7 |
+| plain thin strings | 2.6 | 2.6 |
+| coloured threads on colour | 31.1 | 31.4 |
+| colour patches | 14.8 | 14.8 |
+| colour zone plate, pure colour up to 0.25 c/px | 114.0 | 141.1 |
+
+Reading. It does what it was made for on fabrics, the weave down to a
+sixth and the curtain to a little over half, and on pixel-sharp
+pictures; behind a lens and at twice the size the mean of normal
+pictures stays where it was, within a few hundredths of a decibel. It is
+not better everywhere:
+
+- One picture of the twelve loses 0.46 dB behind a lens.
+- A fine pattern of pure colour loses contrast: the colour zone plate is
+  24 % worse. The net cannot tell it from a moiré either; it was taught
+  that a moiré is the likelier.
+- It leans on the neighbourhood mean (at the mean of its features, 46 %
+  of the Ĉ2 weight): in flat areas it evens out the colour noise. On the
+  Z f studio scene at ISO 100, 4 % of the pixels change by more than a
+  thousandth of full scale; on the guitar file at ISO 2000, 31 %. That
+  is a noise reduction of the colour nobody asked for, and the item on
+  noise under *Where it stands* does not hold with the option on.
+- On the guitar file the strings' moiré is weaker, not gone.
+- The decision is learned from other pictures. The values stay measured;
+  which of them a pixel is made of is no longer a rule one can read.
+- It has seen no real camera's file and no noise above twice the default
+  model. It was trained on RGGB alone; the other three phases were
+  measured afterwards and behave the same.
+- Twelve planes at the peak instead of nine (24 MP: 2.4 GB instead of
+  1.9, measured), and the separation takes nearly three times as long
+  (24 MP on a Ryzen 7 5700U: 7.5 s instead of 2.7).
+- A version without the option reads the recipe and develops without
+  the net (0.18.8 does, run). The phone has no such option.
+
 ## Where it stands
 
 - The colour is on the carriers and band-limited to about 0.25 c/px: the

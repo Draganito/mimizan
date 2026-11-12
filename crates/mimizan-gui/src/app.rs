@@ -602,13 +602,13 @@ fn open_step(held: Option<&Path>, released: Option<&Path>, path: &Path, unsaved:
 /// names, else the default. The panel still shows what the file before
 /// was developed with, and that is not this file's. Only the file the
 /// edit already belongs to (`own_file`: opened again after its picture
-/// was lost) comes back as the panel has it.
+/// was lost) comes back as the panel has it. A recipe that names the
+/// moiré net under a mask it does not belong to opens without it, as the
+/// panel would write it: the net is part of a development only where it
+/// runs.
 fn develop_for_open(panel: Develop, own_file: bool, beside: Option<&Recipe>) -> Develop {
-    if own_file {
-        panel
-    } else {
-        beside.and_then(|r| r.develop).unwrap_or_default()
-    }
+    let develop = if own_file { panel } else { beside.and_then(|r| r.develop).unwrap_or_default() };
+    Develop { moire_net: develop.runs_moire_net(), ..develop }
 }
 
 /// What a session was developed with, as its recipe file carries it.
@@ -628,8 +628,8 @@ fn sidecar_of(raw: &Path) -> Option<PathBuf> {
 /// size when the strip has read it, else the current session's own, the
 /// next file being most often from the same camera. Nothing to go by
 /// without either.
-fn opening_memory(target: Option<(usize, usize)>, current: Option<u64>) -> Option<u64> {
-    target.map(|(w, h)| develop_memory_of_size(w, h)).or(current)
+fn opening_memory(target: Option<(usize, usize)>, current: Option<u64>, develop: &Develop) -> Option<u64> {
+    target.map(|(w, h)| develop_memory_of_size(w, h, develop)).or(current)
 }
 
 /// The print box has a newer exposure than the picture on screen.
@@ -786,6 +786,8 @@ pub struct App {
     wb_choice: WbChoice,
     wb_manual: [f64; 3],
     mask_mode: MaskMode,
+    /// The testing option beside the mask: the moiré net (Dubois only).
+    moire_net: bool,
     /// The plate's taking filters for the current edit, or why there are none.
     plate_resolved: Option<PlateResolved>,
 
@@ -1007,6 +1009,7 @@ impl App {
             wb_choice: WbChoice::AsShot,
             wb_manual: [2.0, 1.0, 1.5],
             mask_mode: Develop::default().mask,
+            moire_net: Develop::default().moire_net,
             plate_resolved: None,
             texture: None,
             tex_size: [0, 0],
@@ -1442,6 +1445,7 @@ impl App {
     /// as the panel keeps them.
     fn show_development(&mut self, d: Develop) {
         self.mask_mode = d.mask;
+        self.moire_net = d.runs_moire_net();
         self.wb_choice = match d.wb {
             WhiteBalance::AsShot => WbChoice::AsShot,
             WhiteBalance::GrayWorld => WbChoice::GrayWorld,
@@ -1453,7 +1457,9 @@ impl App {
         };
     }
 
-    /// The development the panel asks for.
+    /// The development the panel asks for. The moiré net belongs to the
+    /// Dubois mask: under another the tick is not part of the development,
+    /// so it neither asks for an Apply nor reaches the recipe.
     fn develop_params(&self) -> Develop {
         let wb = match self.wb_choice {
             WbChoice::AsShot => WhiteBalance::AsShot,
@@ -1461,7 +1467,7 @@ impl App {
             WbChoice::None => WhiteBalance::None,
             WbChoice::Manual => WhiteBalance::Manual(self.wb_manual),
         };
-        Develop { wb, mask: self.mask_mode }
+        Develop { wb, mask: self.mask_mode, moire_net: self.moire_net && self.mask_mode == MaskMode::Dubois }
     }
 
     /// Read a grey card at `(nx, ny)`, a fraction of the picture on the
@@ -2658,10 +2664,6 @@ impl App {
             .and_then(|f| f.entries.iter().find(|e| e.path == path))
             .and_then(|e| e.meta.as_ref())
             .map(|m| (m.width, m.height));
-        let current = self.session.as_ref().map(|s| develop_memory(&s.frame));
-        if let Some(need) = opening_memory(target, current) {
-            self.make_room(need);
-        }
         // The file's own development, read from the recipe beside it
         // before the frame is developed. A recipe that does not read is
         // said when it is loaded, once the picture is there.
@@ -2669,6 +2671,11 @@ impl App {
         let beside =
             sidecar_of(&path).filter(|p| !own_file && p.is_file()).and_then(|p| Recipe::load(&p).ok());
         let develop = develop_for_open(self.develop_params(), own_file, beside.as_ref());
+        // The room that development needs: the moiré net holds more.
+        let current = self.session.as_ref().map(|s| develop_memory(&s.frame, &develop));
+        if let Some(need) = opening_memory(target, current, &develop) {
+            self.make_room(need);
+        }
         self.heavy.send(Job::Open { path, develop, cameras_dir: self.cameras_dir.clone() });
     }
 
@@ -2744,7 +2751,7 @@ impl App {
             self.busy = None;
             return;
         };
-        let need = develop_memory(&source.frame);
+        let need = develop_memory(&source.frame, &develop);
         self.make_room(need);
         self.heavy.send(Job::Redevelop { source, develop });
     }
@@ -3096,6 +3103,13 @@ impl App {
                         if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
                             read = self.load_recipe(&p);
                             self.history = History::new(self.edit.clone());
+                        }
+                        if self.screenshot_to.is_some()
+                            && std::env::var_os("MIMIZAN_SCREENSHOT_DEVELOPMENT").is_some()
+                        {
+                            // The Negative window, where the development
+                            // is, in the unattended capture.
+                            self.panels[0] = true;
                         }
                         if self.screenshot_to.is_some()
                             && std::env::var_os("MIMIZAN_SCREENSHOT_ZONES").is_some()
@@ -3935,7 +3949,8 @@ impl App {
                 val(ui, "none: the sensor has no colour filter");
             } else {
                 ui.label("mask");
-                val(ui, format!("{:?}, {} round(s)", info.mask, info.rounds));
+                let net = if info.moire_net { ", moiré net (testing)" } else { "" };
+                val(ui, format!("{:?}, {} round(s){net}", info.mask, info.rounds));
             }
             ui.end_row();
             ui.label("timing");
@@ -3969,7 +3984,10 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.histogram_section(ui);
-        ui.collapsing("Development", |ui| {
+        // `MIMIZAN_SCREENSHOT_DEVELOPMENT`: open in the unattended capture.
+        let open =
+            self.screenshot_to.is_some() && std::env::var_os("MIMIZAN_SCREENSHOT_DEVELOPMENT").is_some();
+        egui::CollapsingHeader::new("Development").default_open(open).show(ui, |ui| {
             if s.is_mono() {
                 ui.label(
                     RichText::new(
@@ -4030,8 +4048,19 @@ impl App {
                     ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
                 },
             );
+            ui.add_enabled(
+                self.mask_mode == MaskMode::Dubois,
+                egui::Checkbox::new(&mut self.moire_net, "moiré net (testing)"),
+            )
+            .on_hover_text(MOIRE_NET_HINT)
+            .on_disabled_hover_text("The moiré net belongs to the Dubois mask.");
             let differs = self.develop_params() != s.develop;
-            if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
+            let apply = ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply"));
+            if open {
+                // The whole section in the capture, down to its button.
+                apply.scroll_to_me_animation(Some(egui::Align::BOTTOM), egui::style::ScrollAnimation::none());
+            }
+            if apply.clicked() {
                 // Sent at the start of the next frame, when this panel's
                 // clone of the session is gone and `make_room` can free it.
                 self.busy = Some("re-developing".into());
@@ -6505,6 +6534,9 @@ fn enlarger_content_width(ui: &egui::Ui) -> f32 {
 
 /// The first field of the monochrome mix: the Bayer luminance. The others
 /// are the glasses by their short names, the panchromatic one first.
+/// What the testing option beside the mask does, and what it costs.
+const MOIRE_NET_HINT: &str = "Testing. A small trained network decides, pixel by pixel, how the      separation's own estimates of the colour are mixed; every value stays a weighted sum of      measured photosites. It takes most of the false colour from fine fabrics and less from      strings. It also evens out colour noise in flat areas, and a fine pattern of pure colour      loses contrast. A third more memory, and the separation takes nearly three times as long.      Apply recomputes.";
+
 const MIX_NATIVE: &str = "Native";
 
 /// Gap between the stage edge and a panel.
@@ -7433,6 +7465,7 @@ mod crop_drag_tests {
             6048,
             4032,
             mimizan_core::decode::SensorKind::Bayer(mimizan_core::cfa::BayerPhase::RGGB),
+            false,
         );
         assert!(must_make_room(need, 2_000_000_000));
         assert!(!must_make_room(need, 6_000_000_000));
@@ -7448,11 +7481,19 @@ mod crop_drag_tests {
         // The strip knows the next file is 61 MP: that is the need, not the
         // 24 MP picture on the stage. Without the strip's size the session's
         // own stands in; without either there is nothing to go by.
-        let small = develop_memory_of_size(6048, 4032);
-        let big = opening_memory(Some((9504, 6336)), Some(small)).unwrap();
+        let plain = Develop::default();
+        let small = develop_memory_of_size(6048, 4032, &plain);
+        let big = opening_memory(Some((9504, 6336)), Some(small), &plain).unwrap();
         assert!(big > small * 2, "{big} vs {small}");
-        assert_eq!(opening_memory(None, Some(small)), Some(small));
-        assert_eq!(opening_memory(None, None), None);
+        assert_eq!(opening_memory(None, Some(small), &plain), Some(small));
+        assert_eq!(opening_memory(None, None, &plain), None);
+        // A file whose recipe asks for the moiré net needs a third more,
+        // and only under the mask the net belongs to.
+        let net = Develop { moire_net: true, ..plain };
+        let with_net = opening_memory(Some((6048, 4032)), None, &net).unwrap();
+        assert!(with_net > small + small / 4, "{with_net} vs {small}");
+        let inert = Develop { mask: mimizan_core::separate::MaskMode::Off, ..net };
+        assert_eq!(opening_memory(Some((6048, 4032)), None, &inert), Some(small));
     }
 
     /// A re-development the machine cannot hold takes the picture with
@@ -7498,14 +7539,22 @@ mod crop_drag_tests {
     fn a_file_opens_with_its_own_development() {
         use mimizan_core::ingest::WhiteBalance;
         use mimizan_core::separate::MaskMode;
-        let card = Develop { wb: WhiteBalance::Manual([2.2, 1.0, 1.4]), mask: MaskMode::Off };
+        let card =
+            Develop { wb: WhiteBalance::Manual([2.2, 1.0, 1.4]), mask: MaskMode::Off, moire_net: false };
         assert_eq!(develop_for_open(card, false, None), Develop::default());
-        let gray = Develop { wb: WhiteBalance::GrayWorld, mask: MaskMode::Adaptive };
+        let gray = Develop { wb: WhiteBalance::GrayWorld, mask: MaskMode::Adaptive, moire_net: false };
         let beside = Recipe { develop: Some(gray), ..Recipe::on_paper() };
         assert_eq!(develop_for_open(card, false, Some(&beside)), gray);
         // An older recipe names none.
         assert_eq!(develop_for_open(card, false, Some(&Recipe::on_paper())), Develop::default());
         assert_eq!(develop_for_open(card, true, Some(&beside)), card);
+        // The moiré net comes with the file under the Dubois mask, and is
+        // left out under another, where it would not run.
+        let net = Develop { moire_net: true, ..Develop::default() };
+        let beside = Recipe { develop: Some(net), ..Recipe::on_paper() };
+        assert_eq!(develop_for_open(card, false, Some(&beside)), net);
+        let beside = Recipe { develop: Some(Develop { moire_net: true, ..gray }), ..Recipe::on_paper() };
+        assert_eq!(develop_for_open(card, false, Some(&beside)), gray);
     }
 
     /// Developed again (another white balance, another mask) the file has

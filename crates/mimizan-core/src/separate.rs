@@ -56,6 +56,12 @@ impl Default for SeparateParams {
 }
 
 impl SeparateParams {
+    /// Whether the moiré net runs: it is asked for and the mode is the one
+    /// it belongs to. The other modes do not read the flag.
+    pub fn runs_moire_net(&self) -> bool {
+        self.mask == MaskMode::Dubois && self.dubois.moire_net
+    }
+
     /// The Kaiser low-pass of the `Off` and `Adaptive` modes.
     pub fn lowpass_spec(&self) -> LowpassSpec {
         LowpassSpec { cutoff: self.cutoff, transition: self.transition, attenuation_db: self.attenuation_db }

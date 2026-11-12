@@ -26,6 +26,8 @@ pub struct NegativeArgs {
     pub camera: Option<PathBuf>,
     /// `None` is the recipe's mode, else the default.
     pub mask: Option<String>,
+    /// The moiré net, a testing option; off, the recipe's.
+    pub moire_net: bool,
     pub weights: Option<String>,
     pub weights_space: String,
     pub filter: Option<String>,
@@ -143,21 +145,6 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     let decode_ms = t.elapsed().as_millis();
     info!("decode {} ms", decode_ms);
 
-    // Past the machine's whole memory the separation ends in the OOM
-    // killer, not in an error; below it, it is only slow.
-    let need = pipeline::develop_memory_of(&frame);
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    if sys.total_memory() > 0 && need > sys.total_memory() {
-        bail!(
-            "{}x{} would hold about {} while separating, this machine has {} in all",
-            frame.width,
-            frame.height,
-            mimizan_core::print::memory_text(need),
-            mimizan_core::print::memory_text(sys.total_memory())
-        );
-    }
-
     // The desktop's file beside the RAW: its development, its mix and
     // its plate, unless a flag says otherwise. The print half of it is
     // `print --recipe`'s.
@@ -170,7 +157,12 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         .transpose()?;
     let develop = recipe.as_ref().and_then(|r| r.develop);
     if let Some(d) = develop.filter(|_| a.wb.is_none() || a.mask.is_none()) {
-        info!("recipe development: white balance {:?}, mask {:?}", d.wb, d.mask);
+        info!(
+            "recipe development: white balance {:?}, mask {:?}{}",
+            d.wb,
+            d.mask,
+            if d.moire_net { ", moiré net (testing)" } else { "" }
+        );
     }
     let develop = develop.unwrap_or_default();
 
@@ -184,9 +176,28 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
         Some(mask) => parse_mask(mask)?,
         None => develop.mask,
     };
+    params.separate.dubois.moire_net = a.moire_net || develop.moire_net;
     params.separate.cutoff = a.cutoff;
     params.separate.rounds_max = a.rounds;
     warn_inert_flags(&params.separate, a.cutoff, a.rounds);
+    if a.moire_net && !params.separate.runs_moire_net() {
+        warn!("--moire-net has no effect without --mask dubois");
+    }
+
+    // Past the machine's whole memory the separation ends in the OOM
+    // killer, not in an error; below it, it is only slow.
+    let need = pipeline::develop_memory_of(&frame, params.separate.runs_moire_net());
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    if sys.total_memory() > 0 && need > sys.total_memory() {
+        bail!(
+            "{}x{} would hold about {} while separating, this machine has {} in all",
+            frame.width,
+            frame.height,
+            mimizan_core::print::memory_text(need),
+            mimizan_core::print::memory_text(sys.total_memory())
+        );
+    }
 
     let cam_path = match &a.camera {
         Some(p) => Some(p.clone()),

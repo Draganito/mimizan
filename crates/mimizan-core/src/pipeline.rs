@@ -84,6 +84,10 @@ pub struct NegativeInfo {
     /// the illuminant-independent form.
     pub weights_raw: Weights,
     pub mask: MaskMode,
+    /// The moiré net mixed the Dubois estimates (`moire_net.rs`, a testing
+    /// option). Absent from the description when it did not.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub moire_net: bool,
     /// Refinement rounds the separation ran.
     pub rounds: usize,
     /// Chroma cutoff of the Kaiser low-pass. The `dubois` mask has its own
@@ -164,6 +168,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         filter: p.filter,
         weights_raw: weights.balanced_to_raw(mosaic.wb),
         mask: p.separate.mask,
+        moire_net: false,
         rounds: 0,
         cutoff: p.separate.cutoff,
         report: mosaic.report.clone(),
@@ -203,7 +208,13 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             let sep = separate(&mosaic, &p.separate)?;
             info.timing.separate_ms = t.elapsed().as_millis();
             info.rounds = sep.rounds;
-            info!("separate {} ms, {} rounds", info.timing.separate_ms, sep.rounds);
+            info.moire_net = p.separate.runs_moire_net();
+            info!(
+                "separate {} ms, {} rounds{}",
+                info.timing.separate_ms,
+                sep.rounds,
+                if info.moire_net { ", moiré net (testing)" } else { "" }
+            );
             // The mosaic plane is no longer needed: free it before mixing.
             let Mosaic { saturated, plane: mosaic_plane, .. } = mosaic;
             drop(mosaic_plane);
@@ -265,31 +276,39 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Bytes a development of `frame` holds at its widest point. Bayer: the
-/// Dubois estimate at its peak, nine f64 planes (`dubois::estimate`), over
-/// the frame as decoded (two bytes a sample, four for a float file), the
-/// saturation map and the colour gate, a byte each. Mono: the normalised
-/// plane beside the measured one, over the frame and the saturation map.
-/// A guide for refusing a file the machine cannot hold, measured to about
-/// a tenth; what it does not see is the allocator and whatever else the
-/// process has open.
-pub fn develop_memory_of(frame: &RawFrame) -> u64 {
+/// Dubois estimate at its peak, nine f64 planes (`dubois::estimate`), or
+/// with `moire_net` the twelve of `moire_net::PEAK_PLANES`, over the frame
+/// as decoded (two bytes a sample, four for a float file), the saturation
+/// map and the colour gate, a byte each. Mono: the normalised plane beside
+/// the measured one, over the frame and the saturation map; there is no
+/// separation and no net. A guide for refusing a file the machine cannot
+/// hold, measured to about a tenth; what it does not see is the allocator
+/// and whatever else the process has open.
+pub fn develop_memory_of(frame: &RawFrame, moire_net: bool) -> u64 {
     let sample = match frame.data {
         crate::decode::RawData::Integer(_) => 2,
         crate::decode::RawData::Float(_) => 4,
     };
-    develop_memory_for(frame.width, frame.height, frame.kind, sample)
+    develop_memory_for(frame.width, frame.height, frame.kind, sample, moire_net)
 }
 
 /// [`develop_memory_of`] for a frame of `w×h` with 16-bit samples, the
 /// common case: the figure before the file is decoded, or for a caller
 /// that holds the size and not the frame.
-pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind) -> u64 {
-    develop_memory_for(w, h, kind, 2)
+pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind, moire_net: bool) -> u64 {
+    develop_memory_for(w, h, kind, 2, moire_net)
 }
 
-fn develop_memory_for(w: usize, h: usize, kind: crate::decode::SensorKind, sample: u64) -> u64 {
+fn develop_memory_for(
+    w: usize,
+    h: usize,
+    kind: crate::decode::SensorKind,
+    sample: u64,
+    moire_net: bool,
+) -> u64 {
     let px = w as u64 * h as u64;
     let (planes, maps) = match kind {
+        crate::decode::SensorKind::Bayer(_) if moire_net => (crate::moire_net::PEAK_PLANES, 2),
         crate::decode::SensorKind::Bayer(_) => (9, 2),
         crate::decode::SensorKind::Mono => (2, 1),
     };
@@ -304,11 +323,16 @@ mod tests {
     fn develop_memory_is_the_dubois_peak() {
         // 24 MP Bayer: nine planes of 195 MB plus the frame, measured 2.1 GB
         // over the process baseline. Mono is a fraction of that.
-        let bayer =
-            develop_memory(6048, 4032, crate::decode::SensorKind::Bayer(crate::cfa::BayerPhase::RGGB));
+        let rggb = crate::decode::SensorKind::Bayer(crate::cfa::BayerPhase::RGGB);
+        let bayer = develop_memory(6048, 4032, rggb, false);
         assert!((1.8e9..2.0e9).contains(&(bayer as f64)), "{bayer}");
-        let mono = develop_memory(6048, 4032, crate::decode::SensorKind::Mono);
+        let mono = develop_memory(6048, 4032, crate::decode::SensorKind::Mono, false);
         assert!(mono * 3 < bayer, "{mono} vs {bayer}");
+        // The moiré net holds three planes more; a mono sensor has no
+        // separation for it to sit in.
+        let net = develop_memory(6048, 4032, rggb, true);
+        assert_eq!(net - bayer, 3 * 8 * 6048 * 4032);
+        assert_eq!(develop_memory(6048, 4032, crate::decode::SensorKind::Mono, true), mono);
         // A float file holds two more bytes a sample; an integer one is
         // the figure above.
         let (w, h) = (6048usize, 4032usize);
@@ -332,9 +356,10 @@ mod tests {
             data,
         };
         let integer = frame(crate::decode::RawData::Integer(Vec::new()));
-        assert_eq!(develop_memory_of(&integer), bayer);
+        assert_eq!(develop_memory_of(&integer, false), bayer);
+        assert_eq!(develop_memory_of(&integer, true), net);
         let float = frame(crate::decode::RawData::Float(Vec::new()));
-        assert_eq!(develop_memory_of(&float), bayer + 2 * (w * h) as u64);
+        assert_eq!(develop_memory_of(&float, false), bayer + 2 * (w * h) as u64);
     }
 
     /// The mix is one negative's filter and does not reach the plate: the
