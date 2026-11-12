@@ -148,8 +148,8 @@ impl RawHistogram {
         // Tile position t = (y & 1) * 2 + (x & 1) in absolute sensor coordinates.
         match frame.kind {
             SensorKind::Bayer(phase) => {
-                for t in 0..4 {
-                    out.colors[t] = phase.color_at(t & 1, t >> 1);
+                for (t, color) in out.colors.iter_mut().enumerate() {
+                    *color = phase.color_at(t & 1, t >> 1);
                 }
             }
             SensorKind::Mono => out.mono = true,
