@@ -278,8 +278,7 @@ pub struct Recipe {
 /// depend on before the mix. In the file `wb` is `"as-shot"`,
 /// `"gray-world"`, `"none"` or the three multipliers `[r, g, b]`, and
 /// `mask` is `"dubois"`, `"adaptive"` or `"off"`, the words of the
-/// command's `--wb` and `--mask`. `moire_net` is written only when it is
-/// on, so a recipe without the testing option is the file it always was.
+/// command's `--wb` and `--mask`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Develop {
     /// Channel balance before the separation.
@@ -289,27 +288,17 @@ pub struct Develop {
     /// colour.
     #[serde(default = "Develop::default_mask", with = "mask_in_file")]
     pub mask: MaskMode,
-    /// Testing: the moiré net mixes the Dubois estimates (`moire_net.rs`).
-    /// Read only with the `dubois` mask.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub moire_net: bool,
 }
 
 impl Default for Develop {
     /// As shot, and the pixel-adaptive Dubois separation: what a file
     /// opens with and what `mimizan negative` does without flags.
     fn default() -> Self {
-        Self { wb: Self::default_wb(), mask: Self::default_mask(), moire_net: false }
+        Self { wb: Self::default_wb(), mask: Self::default_mask() }
     }
 }
 
 impl Develop {
-    /// Whether the moiré net runs under this development: it is asked for
-    /// and the mask is the one it belongs to.
-    pub fn runs_moire_net(&self) -> bool {
-        self.mask == MaskMode::Dubois && self.moire_net
-    }
-
     fn default_wb() -> WhiteBalance {
         WhiteBalance::AsShot
     }
@@ -810,10 +799,7 @@ mod tests {
         assert!(!json.contains("develop"), "{json}");
         assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap().develop, None);
         // The default is what the command does without flags.
-        assert_eq!(
-            Develop::default(),
-            Develop { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois, moire_net: false }
-        );
+        assert_eq!(Develop::default(), Develop { wb: WhiteBalance::AsShot, mask: MaskMode::Dubois });
         // Every balance and every mode, in the command's words.
         let cases = [
             (WhiteBalance::AsShot, MaskMode::Dubois, r#"{"wb":"as-shot","mask":"dubois"}"#),
@@ -826,18 +812,12 @@ mod tests {
             ),
         ];
         for (wb, mask, text) in cases {
-            let r = Recipe { develop: Some(Develop { wb, mask, moire_net: false }), ..Recipe::default() };
+            let r = Recipe { develop: Some(Develop { wb, mask }), ..Recipe::default() };
             r.validate().unwrap();
             let json = serde_json::to_string(&r).unwrap();
             assert!(json.contains(&format!(r#""develop":{text}"#)), "{json}");
             assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap(), r);
         }
-        // The testing option is in the file only when it is on.
-        let net =
-            Recipe { develop: Some(Develop { moire_net: true, ..Develop::default() }), ..Recipe::default() };
-        let json = serde_json::to_string(&net).unwrap();
-        assert!(json.contains(r#""develop":{"wb":"as-shot","mask":"dubois","moire_net":true}"#), "{json}");
-        assert_eq!(serde_json::from_str::<Recipe>(&json).unwrap(), net);
         // A part left out is the default's part.
         let curve = serde_json::to_string(&Tone::paper()).unwrap();
         let read = |develop: &str| {

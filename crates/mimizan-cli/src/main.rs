@@ -71,11 +71,6 @@ enum Cmd {
         /// Without the flag: the recipe's (--recipe), else dubois
         #[arg(long)]
         mask: Option<String>,
-        /// Testing: let the moiré net mix the Dubois estimates (dubois only). Less false
-        /// colour on fine fabrics; a third more memory, and the separation takes nearly
-        /// three times as long. Without the flag: the recipe's (--recipe), else off
-        #[arg(long)]
-        moire_net: bool,
         /// Override weights "r,g,b" (sum 1)
         #[arg(long)]
         weights: Option<String>,
@@ -120,9 +115,9 @@ enum Cmd {
         #[arg(long, value_name = "SPACE", default_value = "srgb")]
         plate_space: String,
         /// Recipe JSON as the desktop writes it next to the RAW: its
-        /// development (white balance, mask, moiré net), its mix and its plate
+        /// development (white balance, mask), its mix and its plate
         /// (process, filters, primaries) develop this negative.
-        /// --wb, --mask, --weights and --plate override them; --moire-net adds the net.
+        /// --wb, --mask, --weights and --plate override them.
         #[arg(long)]
         recipe: Option<PathBuf>,
         /// Linear DNG instead of the negative TIFF: the three balanced
@@ -260,7 +255,6 @@ fn main() -> Result<()> {
             cameras,
             camera,
             mask,
-            moire_net,
             weights,
             weights_space,
             filter,
@@ -281,7 +275,6 @@ fn main() -> Result<()> {
             cameras,
             camera,
             mask,
-            moire_net,
             weights,
             weights_space,
             filter,

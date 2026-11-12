@@ -50,10 +50,6 @@ pub struct PlateBenchArgs {
     /// Real RAW files instead of pictures (2x2 binned truth, see `bench kodak`)
     #[arg(long, num_args = 1.., conflicts_with = "only")]
     pub raw: Vec<PathBuf>,
-    /// Also develop the plate with the moiré net (testing) and report it
-    /// against the plate, picture by picture
-    #[arg(long)]
-    pub moire_net: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -65,9 +61,6 @@ struct ImageResult {
     demosaic: Vec<Option<ColourQuality>>,
     /// The plate, default separation.
     plate: ColourQuality,
-    /// The plate with the moiré net, when `--moire-net` asked for it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    plate_net: Option<ColourQuality>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -175,41 +168,6 @@ fn markdown(r: &Report) -> String {
         }
         s.push_str(&format!(" {:.2} |\n", img.plate.cpsnr_db));
     }
-    s.push_str(&moire_net_section(r));
-    s
-}
-
-/// The plate with the moiré net against the plate, when the bench ran it:
-/// the means, then every picture with its difference. Empty otherwise.
-fn moire_net_section(r: &Report) -> String {
-    let pairs: Vec<(&str, ColourQuality, ColourQuality)> =
-        r.images.iter().filter_map(|i| i.plate_net.map(|n| (i.stem.as_str(), i.plate, n))).collect();
-    if pairs.is_empty() {
-        return String::new();
-    }
-    let mut s =
-        String::from("\n## The moiré net (testing)\n\n| | CPSNR | R | G | B |\n|---|---|---|---|---|\n");
-    for (name, pick) in [("plate", 1usize), ("plate + moiré net", 2)] {
-        let of = |f: fn(&ColourQuality) -> f64| {
-            fmt(mean(pairs.iter().map(|p| f(if pick == 1 { &p.1 } else { &p.2 }))))
-        };
-        s.push_str(&format!(
-            "| {name} | {} | {} | {} | {} |\n",
-            of(|q| q.cpsnr_db),
-            of(|q| q.psnr_r_db),
-            of(|q| q.psnr_g_db),
-            of(|q| q.psnr_b_db)
-        ));
-    }
-    let gain = |p: &(&str, ColourQuality, ColourQuality)| p.2.cpsnr_db - p.1.cpsnr_db;
-    let above = pairs.iter().filter(|p| gain(p) > 0.0).count();
-    s.push_str(&format!(
-        "\nThe net is above the plate on {above} of {} pictures.\n\n| Picture | plate | + net | difference |\n|---|---|---|---|\n",
-        pairs.len()
-    ));
-    for p in &pairs {
-        s.push_str(&format!("| {} | {:.2} | {:.2} | {:+.2} |\n", p.0, p.1.cpsnr_db, p.2.cpsnr_db, gain(p)));
-    }
     s
 }
 
@@ -258,8 +216,6 @@ pub fn plate_bench(a: &PlateBenchArgs) -> Result<()> {
     }
 
     let default = SeparateParams::default();
-    let mut with_net = default;
-    with_net.dubois.moire_net = true;
     let mut images = Vec::new();
     for file in &files {
         let stem = stem_of(file)?;
@@ -305,18 +261,7 @@ pub fn plate_bench(a: &PlateBenchArgs) -> Result<()> {
             "{stem}: plate {:.2} dB (R {:.2} G {:.2} B {:.2}), best demosaicer {:.2} dB",
             plate.cpsnr_db, plate.psnr_r_db, plate.psnr_g_db, plate.psnr_b_db, best_ext
         );
-        let plate_net = match a.moire_net {
-            true => Some(colour_quality(&plate_rgb(&fb.mosaic, &with_net)?, &rgb, a.border)),
-            false => None,
-        };
-        if let Some(n) = &plate_net {
-            eprintln!(
-                "{stem}: with the moiré net {:.2} dB ({:+.2})",
-                n.cpsnr_db,
-                n.cpsnr_db - plate.cpsnr_db
-            );
-        }
-        images.push(ImageResult { stem, width: w, height: h, demosaic, plate, plate_net });
+        images.push(ImageResult { stem, width: w, height: h, demosaic, plate });
     }
 
     let report = Report {
@@ -334,62 +279,4 @@ pub fn plate_bench(a: &PlateBenchArgs) -> Result<()> {
     std::fs::write(a.out.join("report.md"), &md)?;
     print!("{md}");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn quality(cpsnr_db: f64) -> ColourQuality {
-        ColourQuality {
-            cpsnr_db,
-            psnr_r_db: cpsnr_db,
-            psnr_g_db: cpsnr_db,
-            psnr_b_db: cpsnr_db,
-            rmse_lin: 0.0,
-        }
-    }
-
-    fn report(net: [Option<f64>; 2]) -> Report {
-        let image = |stem: &str, plate: f64, net: Option<f64>| ImageResult {
-            stem: stem.into(),
-            width: 768,
-            height: 512,
-            demosaic: Vec::new(),
-            plate: quality(plate),
-            plate_net: net.map(quality),
-        };
-        Report {
-            phase: "RGGB".into(),
-            border: 16,
-            scale: 1,
-            blur: 0.0,
-            from_raw: false,
-            tools: Vec::new(),
-            methods: Vec::new(),
-            images: vec![image("a", 30.0, net[0]), image("b", 40.0, net[1])],
-        }
-    }
-
-    /// Without `--moire-net` the report is the one it was: no section, and
-    /// no field in the JSON.
-    #[test]
-    fn the_report_has_no_net_unless_it_ran() {
-        let r = report([None, None]);
-        assert_eq!(moire_net_section(&r), "");
-        assert!(!markdown(&r).contains("moiré"));
-        assert!(!serde_json::to_string(&r).unwrap().contains("plate_net"));
-    }
-
-    /// With it, the means of both and every picture's difference, the
-    /// losses with their sign.
-    #[test]
-    fn the_net_is_reported_against_the_plate_picture_by_picture() {
-        let md = markdown(&report([Some(31.0), Some(39.5)]));
-        assert!(md.contains("| plate | 35.00 |"), "{md}");
-        assert!(md.contains("| plate + moiré net | 35.25 |"), "{md}");
-        assert!(md.contains("above the plate on 1 of 2 pictures"), "{md}");
-        assert!(md.contains("| a | 30.00 | 31.00 | +1.00 |"), "{md}");
-        assert!(md.contains("| b | 40.00 | 39.50 | -0.50 |"), "{md}");
-    }
 }

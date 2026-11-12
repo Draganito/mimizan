@@ -36,9 +36,7 @@ ARW, DNG, RAF, and the usual Bayer formats.
 Three panels around the picture.
 
 **Negative** (left) is the file. Leave the white balance on *as shot*
-most of the time. *moiré net (testing)* under the mask is an experiment
-against false colour on fine fabrics; it is off unless you tick it.
-*Apply* develops again when you have changed something.
+most of the time. *Apply* develops again when you have changed something.
 What you chose stays with this file, in its recipe; the next file opens
 with its own.
 

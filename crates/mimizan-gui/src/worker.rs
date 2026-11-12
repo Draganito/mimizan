@@ -239,7 +239,7 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
             }),
             Err(e) => Err(e),
         },
-        Job::Redevelop { source, develop } => match check_memory(&source.path, &source.frame, &develop) {
+        Job::Redevelop { source, develop } => match check_memory(&source.path, &source.frame) {
             Ok(()) => redevelop(source, develop, &status).map(|s| Event::Opened(Arc::new(s))),
             Err(e) => Ok(Event::Refused {
                 job: Box::new(Job::Redevelop { source, develop }),
@@ -284,17 +284,16 @@ pub fn available_memory() -> u64 {
     sys.available_memory()
 }
 
-/// Bytes the development of this frame holds at its peak, developed as
-/// `develop` says: the moiré net holds more than the separation alone.
-pub fn develop_memory(frame: &mimizan_core::decode::RawFrame, develop: &Develop) -> u64 {
-    pipeline::develop_memory_of(frame, develop.runs_moire_net())
+/// Bytes the development of this frame holds at its peak.
+pub fn develop_memory(frame: &mimizan_core::decode::RawFrame) -> u64 {
+    pipeline::develop_memory_of(frame)
 }
 
 /// The peak of a development of a `width`×`height` file that is not
 /// decoded yet, so its sensor kind is unknown: the Bayer figure, which
 /// is the larger. The strip's thumbnail metadata gives the size.
-pub fn develop_memory_of_size(width: usize, height: usize, develop: &Develop) -> u64 {
-    pipeline::develop_memory(width, height, SensorKind::Bayer(BayerPhase::RGGB), develop.runs_moire_net())
+pub fn develop_memory_of_size(width: usize, height: usize) -> u64 {
+    pipeline::develop_memory(width, height, SensorKind::Bayer(BayerPhase::RGGB))
 }
 
 /// How much of the free memory a development may take: a third is kept
@@ -327,8 +326,8 @@ impl std::error::Error for Refused {}
 /// panic catcher sees nothing of it. The UI lets the picture it holds go
 /// and sends the job again; the message states the figures, and the UI
 /// adds what to do when that was not enough.
-fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame, develop: &Develop) -> Result<()> {
-    let (need, available) = (develop_memory(frame, develop), available_memory());
+fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame) -> Result<()> {
+    let (need, available) = (develop_memory(frame), available_memory());
     if memory_fits(need, available) {
         return Ok(());
     }
@@ -347,7 +346,7 @@ fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(Strin
     let t = Instant::now();
     let frame = pipeline::decode(path).with_context(|| format!("decoding {}", path.display()))?;
     let decode_ms = t.elapsed().as_millis();
-    check_memory(path, &frame, &develop)?;
+    check_memory(path, &frame)?;
     let frame = Arc::new(frame);
 
     // The camera file only supplies suggested weights and the USM amount;

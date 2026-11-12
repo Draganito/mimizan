@@ -45,7 +45,6 @@ pub fn negative_params(develop: &Develop, cam: Option<CameraFile>) -> NegativePa
     let mut p = NegativeParams { keep_separation: true, ..NegativeParams::default() };
     p.ingest.wb = develop.wb;
     p.separate.mask = develop.mask;
-    p.separate.dubois.moire_net = develop.moire_net;
     if let Some(c) = cam {
         p = p.with_camera_file(c);
     }
@@ -2368,21 +2367,6 @@ pub fn render_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The development reaches the separation whole: the mask, and the
-    /// moiré net with it, which runs under the Dubois mask alone.
-    #[test]
-    fn the_moire_net_reaches_the_separation_under_dubois_only() {
-        use mimizan_core::separate::MaskMode;
-        assert!(!negative_params(&Develop::default(), None).separate.runs_moire_net());
-        let net = Develop { moire_net: true, ..Develop::default() };
-        assert!(negative_params(&net, None).separate.runs_moire_net());
-        for mask in [MaskMode::Adaptive, MaskMode::Off] {
-            let other = negative_params(&Develop { mask, ..net }, None).separate;
-            assert_eq!(other.mask, mask);
-            assert!(!other.runs_moire_net());
-        }
-    }
 
     /// Orienting a sensor-frame crop must equal cropping the oriented image,
     /// for every TIFF orientation and a rectangle off-centre in both axes.

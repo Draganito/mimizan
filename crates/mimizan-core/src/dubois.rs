@@ -32,7 +32,6 @@ use crate::filter::{
     convolve_cols_signed, convolve_cols_signed_into, convolve_rows_mod_into, gaussian_kernel, LowpassSpec,
 };
 use crate::ingest::Mosaic;
-use crate::moire_net::MoireNet;
 use crate::plane::Plane;
 use crate::separate::{luminance, sign_x, Separation, FIXED_MASK_VALUE};
 use rayon::prelude::*;
@@ -81,11 +80,6 @@ pub struct DuboisParams {
     /// `min(1, γ |2t − 1|)` times that copy's weight. 0 = off.
     #[serde(default = "DuboisParams::default_ring_tensor")]
     pub ring_tensor: f64,
-    /// Testing: a small trained network decides per pixel how the
-    /// estimates above are mixed, instead of the fixed rules alone
-    /// (`moire_net.rs`). Off by default; off, nothing of it runs.
-    #[serde(default)]
-    pub moire_net: bool,
 }
 
 impl DuboisParams {
@@ -126,36 +120,35 @@ impl Default for DuboisParams {
             tensor_band: Self::default_tensor_band(),
             tensor_sigma: Self::default_tensor_sigma(),
             ring_tensor: Self::default_ring_tensor(),
-            moire_net: false,
         }
     }
 }
 
 /// The low-passes of one separation, built once.
-pub(crate) struct Kernels {
+struct Kernels {
     /// C1 narrow and wide bands.
-    pub(crate) k1n: Vec<f64>,
-    pub(crate) k1w: Vec<f64>,
+    k1n: Vec<f64>,
+    k1w: Vec<f64>,
     /// C2 narrow and wide bands.
-    pub(crate) kn: Vec<f64>,
-    pub(crate) kw: Vec<f64>,
+    kn: Vec<f64>,
+    kw: Vec<f64>,
     /// Outer edge of the coherence ring; `None` without the coherence step.
     kr: Option<Vec<f64>>,
     /// Gaussian of the local energy.
-    pub(crate) g: Vec<f64>,
+    g: Vec<f64>,
     /// Baseband low-pass and Gaussian window of the structure tensor;
     /// `None` when neither tensor term is used.
     tensor: Option<(Vec<f64>, Vec<f64>)>,
 }
 
 /// Separable low-pass of `p` in place; `scratch` holds the row pass.
-pub(crate) fn lowpass_in_place(p: &mut Plane, k: &[f64], scratch: &mut Plane) {
+fn lowpass_in_place(p: &mut Plane, k: &[f64], scratch: &mut Plane) {
     convolve_rows_mod_into(p, k, |_, _| 1.0, scratch);
     convolve_cols_signed_into(scratch, k, |_| 1.0, p);
 }
 
 /// `p := G_σ * p²` in place.
-pub(crate) fn local_energy_in_place(p: &mut Plane, g: &[f64], scratch: &mut Plane) {
+fn local_energy_in_place(p: &mut Plane, g: &[f64], scratch: &mut Plane) {
     p.data.par_iter_mut().for_each(|v| *v *= *v);
     lowpass_in_place(p, g, scratch);
 }
@@ -212,15 +205,10 @@ fn orientation(m: &Plane, kb: &[f64], g: &[f64], scratch: &mut Plane) -> Plane {
 /// planes (mosaic included) with the coherence step and the tensor, eight
 /// without the tensor, seven without either. `pipeline::develop_memory`
 /// quotes this figure.
-///
-/// With `moire_net` the estimate is the same to the bit, and the net then
-/// mixes it with the estimates it was made from. Its features ride along
-/// as single-precision planes and the peak is `moire_net::PEAK_PLANES`.
 fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Plane, Plane) {
     let c = phase.carriers();
     let (w, h) = (m.width, m.height);
     let mut row = Plane::zeros(w, h);
-    let mut net = p.moire_net.then(|| MoireNet::start(m, c, k, &mut row));
 
     // Orientation of the chroma-free baseband, before the copies: its own
     // peak lies below the later one.
@@ -329,9 +317,6 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
         }
         kappa
     });
-    if let Some(net) = net.as_mut() {
-        net.orientation(orient.as_ref(), w * h);
-    }
     drop(orient);
     blend_in_place(&mut c2, &c2b, &wa);
     drop(c2b);
@@ -343,9 +328,6 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
         let c1v = convolve_cols_signed(&row, &k.k1n, |y| c.eps * sign_x(y));
         blend_in_place(&mut c1, &c1v, &wa);
     }
-    if let Some(net) = net.as_mut() {
-        net.weight(&wa);
-    }
     drop(wa);
     if let (Some(kappa), Some(kr)) = (&kappa, &k.kr) {
         if p.ring_c1 {
@@ -354,10 +336,7 @@ fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Pla
             open_in_place(&mut c1, &c1w, kappa);
         }
     }
-    match net {
-        Some(net) => net.mix(m, phase, k, kappa, (c1, c2), &mut row),
-        None => (c1, c2),
-    }
+    (c1, c2)
 }
 
 /// The pixel-adaptive separation: two hypotheses about the local structure,
@@ -391,15 +370,7 @@ mod tests {
     use crate::ingest::{CameraInfo, IngestReport, NoiseModel};
 
     fn mosaic_of(w: usize, h: usize, rgb: impl Fn(usize, usize) -> (f64, f64, f64)) -> Mosaic {
-        mosaic_in(BayerPhase::RGGB, w, h, rgb)
-    }
-
-    fn mosaic_in(
-        phase: BayerPhase,
-        w: usize,
-        h: usize,
-        rgb: impl Fn(usize, usize) -> (f64, f64, f64),
-    ) -> Mosaic {
+        let phase = BayerPhase::RGGB;
         let mut m = Plane::zeros(w, h);
         for y in 0..h {
             for x in 0..w {
@@ -452,8 +423,7 @@ mod tests {
     fn flat_colour_is_exact() {
         let (r, g, b) = (0.6, 0.3, 0.1);
         let m = mosaic_of(192, 160, |_, _| (r, g, b));
-        let net = DuboisParams { moire_net: true, ..DuboisParams::default() };
-        for p in [DuboisParams::default(), DuboisParams::without_tensor(), net] {
+        for p in [DuboisParams::default(), DuboisParams::without_tensor()] {
             let s = separate_dubois(&m, BayerPhase::RGGB, &p);
             let l = (r + 2.0 * g + b) / 4.0;
             for y in 40..120 {
@@ -533,54 +503,6 @@ mod tests {
             let s = separate_dubois(&m, BayerPhase::RGGB, &p);
             let e_d = err(&s.lum);
             assert!(e_d < 0.1 * e_f, "dubois {e_d} fixed {e_f}");
-        }
-    }
-
-    /// The net is a testing option: off unless asked for, and parameters
-    /// written before it existed read as off.
-    #[test]
-    fn the_moire_net_is_off_unless_asked_for() {
-        assert!(!DuboisParams::default().moire_net);
-        assert!(!DuboisParams::without_tensor().moire_net);
-        let mut old = serde_json::to_value(DuboisParams::default()).unwrap();
-        old.as_object_mut().unwrap().remove("moire_net").unwrap();
-        assert_eq!(serde_json::from_value::<DuboisParams>(old).unwrap(), DuboisParams::default());
-    }
-
-    /// A neutral weave, two gratings near the Nyquist frequency a few
-    /// degrees off the axes: every colour in the estimate is false. The
-    /// fixed rules leave a moiré; the net must take most of it away, on
-    /// each of the four Bayer phases (it was trained on one), and the
-    /// luminance must gain with it.
-    #[test]
-    fn the_moire_net_takes_false_colour_from_a_neutral_weave() {
-        let (w, h) = (192, 192);
-        let (c, s) = (3.0f64.to_radians().cos(), 3.0f64.to_radians().sin());
-        let tau = 2.0 * std::f64::consts::PI;
-        let grey = |x: usize, y: usize| {
-            let (x, y) = (x as f64, y as f64);
-            let (u, v) = (c * x + s * y, -s * x + c * y);
-            0.5 + 0.12 * (tau * 0.43 * u).cos() + 0.12 * (tau * 0.41 * v).cos()
-        };
-        let net = DuboisParams { moire_net: true, ..DuboisParams::default() };
-        for phase in BayerPhase::ALL {
-            let m = mosaic_in(phase, w, h, |x, y| (grey(x, y), grey(x, y), grey(x, y)));
-            let errors = |p: &DuboisParams| {
-                let sep = separate_dubois(&m, phase, p);
-                let (mut chroma, mut lum) = (0.0, 0.0);
-                for y in 32..h - 32 {
-                    for x in 32..w - 32 {
-                        chroma += sep.c1.at(x, y).powi(2) + sep.c2.at(x, y).powi(2);
-                        lum += (sep.lum.at(x, y) - grey(x, y)).powi(2);
-                    }
-                }
-                let n = ((h - 64) * (w - 64)) as f64;
-                ((chroma / n).sqrt(), (lum / n).sqrt())
-            };
-            let (c_d, l_d) = errors(&DuboisParams::default());
-            let (c_n, l_n) = errors(&net);
-            assert!(c_n < 0.5 * c_d, "{phase:?}: chroma {c_n} with the net, {c_d} without");
-            assert!(l_n < 0.5 * l_d, "{phase:?}: luminance {l_n} with the net, {l_d} without");
         }
     }
 }
