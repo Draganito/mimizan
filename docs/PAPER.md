@@ -37,7 +37,10 @@ The same separation, mixed three times through three taking filters and
 printed through one paper, gives a three-colour plate in Prokudin-Gorsky's
 sense: colour without demosaicing, in register by construction, with the
 colour band-limited to the carriers and the drawing that of the negative
-(§7.5). On a
+(§7.5). The print is made on a model of a variable-contrast paper exposed
+in two passes through the negative, with the two exposures as its only
+tone controls and dodging and burning as times under a hand or a card
+(§6.5–6.6). On a
 24-picture Kodak benchmark re-mosaicked at lens-like sharpness the
 default reaches 51.6 dB luminance PSNR against 51.5 dB for the best of
 sixteen demosaicers (DCB, RawTherapee); band-limited at 2× it reaches
@@ -85,8 +88,9 @@ the measurements of §7 forced:
    coloured edge both copies carry the chrominance and the ratio tends to
    one half exactly where the leak is largest.
 
-The remainder of the pipeline — mixing (§5) and encoding (§6) — is
-deliberately simple; the method's claim rests on §§2–4. The colour plate
+The remainder of the way to the negative — mixing (§5) and the file
+(§6.1–6.3) — is deliberately simple; the method's claim rests on §§2–4.
+The print (§6.4–6.6) is a piece of work of its own. The colour plate
 (§7.5) adds nothing to the separation: it is the mixing of §5 run three
 times, which is why it inherits every guarantee of §4.6 and every limit
 of §9.
@@ -140,6 +144,19 @@ first draft (`docs/whitepaper_v1.pdf`) had the decomposition, a block
 mask over a full FFT and a POCS loop; the mask is Appendix A, the loop is
 gone, and the estimator of §4.3–4.4 is what the measurements of §7 left
 standing.
+
+The print is the second thing built here, and it takes nothing from the
+two papers. Its tone is not a curve but a paper (§6.5): a variable-contrast
+paper exposed in a soft and a hard pass through a straight-line negative,
+the soft pass the measured grade-00 curve of a real paper, the hard one
+set by the ISO range of grade 5, the two sharing the silver. The two
+exposures, in stops of time, are all there is to set. Dodging and burning
+(§6.6) are times as well: a hand or a card over the paper, with the
+penumbra of a lens that is a disc of light and not a point, in closed
+form. What
+is taken there is sensitometry as the standard defines it (ISO 6846, the
+speed point and the range) and the maker's data sheet; the model of the
+two passes, its constants and the strokes are built here.
 
 ---
 
@@ -728,13 +745,13 @@ carries orientation 1. `ImageDescription` holds the negative's JSON with
 the plate object. The monochrome counterpart of this export is the
 negative TIFF of §6.1 framed the same way, with its mask sidecar.
 
-### 6.4 Output stage (for completeness)
+### 6.4 Output stage
 
 Order (one pass over the f64 planes, driven by a *recipe* that the TIFF
 carries as JSON): mix → orientation → crop window (whole pixels of the
 upright negative; omitted, the full frame) → size → placing, the strokes
 and tone in one step (multiplicative exposure, $L' = L\cdot 2^{p}$, the
-local time of each pass, then the paper) →
+local time of each pass, then the paper; §6.5, §6.6) →
 sheet (with a size, the file is that sheet turned the picture's way, the
 picture fitted into what the black edge and the paper border leave and
 centred, the border being the least paper; without one, the picture's
@@ -745,19 +762,129 @@ shrinking; the kernel is a parameter (B-spline default, Lanczos-3,
 Mitchell, Catmull-Rom, or area). Area is the overlap of the pixel
 rectangles: the mean of the covered samples when shrinking, the sample
 held when enlarging, mixed only where an output pixel crosses a source
-edge. The tone is a *paper*, not a curve: a
-variable-contrast paper exposed in two passes (split grade), modelled as
-two emulsion components. The hard pass is a normal CDF in log exposure,
-$b = \Phi((\log_{10}E - \mu)/\sigma)$, with $\sigma$ from ISO R 50 (grade 5).
-The soft pass is the measured grade-00 curve of Ilford Multigrade RC Deluxe:
-the logit of the separated stroke, with the toe set so the range is R 160.
-$\mu$ of each pass comes from speed matching at the ISO speed point. They share the silver,
-$D/D_{\max} = 1 - (1-a)(1-b)$, behind a straight-line negative of
-$\gamma_n = 0.6$, so $\log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L)$
-for a scene value $L$ and an exposure time of $t$ stops. The print value
-is the reflectance $10^{-D}$ relative to the base with $D_{\max} = 2.0$
-taken to black, encoded $x^{1/2.2}$. The two times are the only global
-tone parameters; the local ones are the darkroom's *dodging and
+edge.
+
+Scale compensation of an enlargement uses
+$\sigma = k\,s$ print pixels, $s$ the long-side scale and $k$ fitted per
+kernel to the 10–90 % ramp of a step (Lanczos-3 0.281, Catmull–Rom 0.275,
+Mitchell 0.330, B-spline 0.515; area is 0, a hold rather than a fitted
+ramp). USM is
+$x + a(x - G_\sigma \ast x)$, masked as in 6.2; Richardson–Lucy inverts
+that same Gaussian, 1–10 passes, every pixel, before the USM. At native
+size, when shrinking, and for an area enlargement, $\sigma = 0$ and that
+pass is a copy. *Peak*, the desktop's sharpening, is a high-pass on the
+print after the paper, $x + a\,(x - G_r \ast x)$; the recipe stores $r$ in
+pixels of the negative (0.3–8) and $a$ up to 4, and the print applies
+$r \cdot s$ with $s$ the long-side scale, so the radius on the sheet may
+exceed 8. The desktop measures them
+once on the native-size print: short edge profiles across the picture,
+the soft ones dropped, the sharpest tenth averaged, and the smallest
+$(r, a)$ that bring that edge to MTF50 = 0.35 c/px without the contrast at
+0.25 c/px passing 0.70 (`peak.rs`); a picture without such an edge keeps
+the default radius and $a = 0$. The radius is then multiplied by the
+print's scale; the paper border is left out. A plate is printed by running this pass three times over its three
+frames with the same crop, size, paper and two exposures, the lamps
+added as stops to the placing of the red and the blue pass, peak with the
+one radius on each; the three positives are the channels of a 16-bit RGB
+TIFF (or JPEG) whose profile is a matrix/TRC profile of the projection
+primaries (sRGB by default, Adobe RGB 1998 on request) with the paper's
+gamma 2.2. The file
+still records the one-arc-minute radius
+$r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
+that number is not applied. There is no
+output for screens: the display's losses are not known to the printer,
+and the print is one file.
+
+### 6.5 The paper
+
+The tone is a *paper*, not a curve: a variable-contrast paper exposed in
+two passes (split grade), modelled as two emulsion components behind a
+straight-line negative. A print has two numbers, the soft and the hard
+exposure, in stops of time; there is nothing to draw. What the darkroom
+can do to a tone scale (place it, stretch it, compress it, give it a toe
+and a shoulder) follows from the two; what it cannot do (a kink, a local
+steepening, a zone squeezed to nothing) cannot be said here either.
+
+**The negative** is a straight line of $\gamma_n = 0.6$ (normal
+development). A scene value $L$ (grey card 0.18, clip 1) gives the paper,
+at an exposure time of $t$ stops,
+
+$$ \log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L) . $$
+
+A stop of time is worth $1/\gamma_n$ scene stops: the negative has
+compressed the scene. Values above 1 are taken as 1; $L \le 0$ is a clear
+negative and prints the paper's black.
+
+**The hard pass** (filter 5) is a normal CDF in log exposure,
+
+$$ b = \Phi\!\left(\frac{\log_{10}E_h - \mu_h}{\sigma_h}\right), \qquad
+   \sigma_h = \frac{R_h/100}{\Phi^{-1}(0.9) - \Phi^{-1}(0.02)} = 0.150 , \quad R_h = 50 , $$
+
+its width set by the ISO range of grade 5 (ISO 6846): the log exposure
+between a density of 0.04 above the base (the fraction
+$0.04/D_{\max} = 0.02$) and 90 % of $D_{\max}$.
+
+**The soft pass** (filter 00) is the measured grade-00 curve of Ilford
+Multigrade RC Deluxe, as the logit of the silver fraction:
+
+$$ a = \frac{1}{1 + e^{-z(h)}}, \qquad h = h_s + 2\,(\log_{10}E_s - \mu_s), \qquad
+   z(h) = c_0 + c_1 h + c_2 h^2 + c_3 h^3 \quad (h_1 \le h \le h_2) , $$
+
+with $c_0 = -0.054165$, $c_1 = 1.144778$, $c_2 = 0.042942$,
+$c_3 = 0.177084$, $h_1 = -0.853383$, $h_2 = 2.048872$; $h$ counts half
+units of $\log_{10}E$. Between $h_1$ and $h_2$ lies the stroke of the data
+sheet's chart on which grade 00 runs apart from the other grades; it is
+the measurement. Above $h_2$ the logit goes on in a straight line of slope
+$z'(h_2)$. Below $h_1$ the grades share one line on the chart, so the toe
+is not a measurement: it is the quadratic
+$z(h_1) + z'(h_1)\,u + \tau u^2$, $u = h - h_1$, with $\tau$ set so that
+the fraction 0.02 lies 1.60 in $\log_{10}E$ below the fraction 0.9, the
+ISO range R 160 of grade 00 ($\tau = -1.7405$).
+
+**Speed matching.** Each pass alone at $t = 0$ puts the grey card at the
+ISO speed point, a density of 0.6 above the base, the fraction 0.3:
+
+$$ \mu_h = \log_{10}E(0.18,\, 0) - \Phi^{-1}(0.3)\,\sigma_h , \qquad
+   \mu_s = \log_{10}E(0.18,\, 0) , \quad a(h_s) = 0.3 . $$
+
+**The silver.** The two passes expose the same sheet and share its silver,
+
+$$ \frac{D}{D_{\max}} = 1 - (1 - a)(1 - b) , \qquad D_{\max} = 2.0 . $$
+
+The soft pass, with its long toe, is what the highlights see first; the
+hard pass, steep, is what fills the shadows. That is the darkroom's rule
+of thumb, and here it is the arithmetic.
+
+**The print value** is the reflectance $10^{-D}$ relative to the base,
+with the paper's black taken to the output's black, encoded with the
+gamma of the rest of the pipeline:
+
+$$ v = \left( \frac{10^{-D} - 10^{-D_{\max}}}{1 - 10^{-D_{\max}}} \right)^{1/2.2} . $$
+
+Unexposed paper is 1.
+
+**The base exposure** is the pair of times that puts the grey card at
+$D = 0.67$ and the clip ($L = 1$) at $D = 0.10$, a textured white, solved
+once from the constants above by two nested bisections (the density rises
+with either time). The two exposures of a print are stops of time from
+that pair, each within ±3 stops; they are the only global tone
+parameters. A pair is read as a printer reads it: the grade is the hard
+exposure over the soft, the exposure is what both have beyond the pair of
+that grade which prints the grey card at $D = 0.67$. The grade is changed
+in twelfths of a stop with that mid-grey held (`SplitGrade::graded`), as
+changing one speed-matched filter for another does; the same stops added
+to both change the exposure alone.
+
+The print evaluates the paper exactly at every pixel; the desktop reads
+it from tables of each pass's exposure, within a thousandth. Beside the
+paper, a look (monotone PCHIP through points in $[0,1]^2$
+after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a
+grey wedge against a monochrome camera's JPEG) remains for the
+measurement pipeline.
+
+### 6.6 Dodging and burning
+
+The local tone parameters are the darkroom's *dodging and
 burning*, a list of strokes in the recipe (`burns`): movements of the
 hand, or of a card, over the upright negative, in coordinates
 normalised to its long side (origin at the centre, $x$ right, $y$ down,
@@ -807,9 +934,7 @@ that grows keeps the samples it had; a moving stroke's dwell is then
 summed once on a grid a sixteenth of the half-axis apart and read
 bilinearly, which is within a part of a percent of the sum where the
 edge is softer than the grid and softens a harder one by less than a
-sixteenth of the tip. The print evaluates the paper exactly at every pixel; the
-desktop reads it from tables of each pass's exposure, within a
-thousandth. The *card* is a straight edge pushed a distance
+sixteenth of the tip. The *card* is a straight edge pushed a distance
 $\ell$ along its normal: the paper beyond where it ends up had the
 light the whole time, the paper behind where it started none of it, and
 between them the edge's shadow averaged over the push, in closed form
@@ -819,41 +944,12 @@ antiderivative of $P$, $Q(\tau) = [\tau\arccos\tau - \sqrt{1 -
 above; a card held still ($\ell = 0$) is the edge's penumbra. The
 strokes are read through the same affine map as the pixels, so the
 fitted print, the desktop's 1:1 window, its preview and its histogram
-all show the same stroke. The base
-exposure is the pair that puts the grey card at $D = 0.67$ and the clip
-at $D = 0.10$, and a look (monotone PCHIP through points in $[0,1]^2$
-after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a
-grey wedge against a monochrome camera's JPEG) remains for the
-measurement pipeline. Scale compensation of an enlargement uses
-$\sigma = k\,s$ print pixels, $s$ the long-side scale and $k$ fitted per
-kernel to the 10–90 % ramp of a step (Lanczos-3 0.281, Catmull–Rom 0.275,
-Mitchell 0.330, B-spline 0.515; area is 0, a hold rather than a fitted
-ramp). USM is
-$x + a(x - G_\sigma \ast x)$, masked as in 6.2; Richardson–Lucy inverts
-that same Gaussian, 1–10 passes, every pixel, before the USM. At native
-size, when shrinking, and for an area enlargement, $\sigma = 0$ and that
-pass is a copy. *Peak*, the desktop's sharpening, is a high-pass on the
-print after the paper, $x + a\,(x - G_r \ast x)$; the recipe stores $r$ in
-pixels of the negative (0.3–8) and $a$ up to 4, and the print applies
-$r \cdot s$ with $s$ the long-side scale, so the radius on the sheet may
-exceed 8. The desktop measures them
-once on the native-size print: short edge profiles across the picture,
-the soft ones dropped, the sharpest tenth averaged, and the smallest
-$(r, a)$ that bring that edge to MTF50 = 0.35 c/px without the contrast at
-0.25 c/px passing 0.70 (`peak.rs`); a picture without such an edge keeps
-the default radius and $a = 0$. The radius is then multiplied by the
-print's scale; the paper border is left out. A plate is printed by running this pass three times over its three
-frames with the same crop, size, paper and two exposures, the lamps
-added as stops to the placing of the red and the blue pass, peak with the
-one radius on each; the three positives are the channels of a 16-bit RGB
-TIFF (or JPEG) whose profile is a matrix/TRC profile of the projection
-primaries (sRGB by default, Adobe RGB 1998 on request) with the paper's
-gamma 2.2. The file
-still records the one-arc-minute radius
-$r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
-that number is not applied. There is no
-output for screens: the display's losses are not known to the printer,
-and the print is one file. None of this is part of the method's claim.
+all show the same stroke.
+
+The claim about the negative rests on §§2–4 and does not depend on
+§§6.4–6.6. The paper and the strokes are a second piece of work built here
+(§1.1): a model of the darkroom's sensitometry, fixed, with two exposures
+and the hand as its only controls.
 
 ---
 
@@ -1152,6 +1248,11 @@ balance gain is largest. Method, file format and limits are in
   function", ISCAS 1974 (the $\beta$ and $N$ formulas of §4.1).
 - W. H. Richardson, "Bayesian-based iterative method of image restoration",
   JOSA 62(1), 1972; L. B. Lucy, Astron. J. 79, 1974.
+- ISO 6846:1992, "Photography — Black-and-white continuous-tone papers —
+  Determination of ISO speed and ISO range for printing" (the speed point
+  and the range of §6.5).
+- Ilford Photo, technical information for Multigrade RC Deluxe paper (the
+  characteristic curves; grade 00 is the soft pass of §6.5).
 - D. Bojovic, `docs/whitepaper_v1.pdf` (the original idea). Where this text
   and the code disagree, the code and its tests are right.
 
