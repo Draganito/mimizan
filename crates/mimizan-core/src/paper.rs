@@ -52,7 +52,9 @@ pub const NEGATIVE_GAMMA: f64 = 0.6;
 /// ISO speed point of the paper, density above base: the grey card lands
 /// here when one pass alone is exposed for its matched time.
 pub const SPEED_DENSITY: f64 = 0.6;
-/// Density of the grey card at the base exposure: 18 % reflectance.
+/// Density above base at which the 18 % grey card of the scene prints at
+/// the base exposure. On the paper that is a reflectance of 21 % of the
+/// base (`10^−0.67`); 18 % would be a density of 0.745.
 pub const GREY_DENSITY: f64 = 0.67;
 /// Density of the clip (linear 1) at the base exposure: Zone VIII, the
 /// lightest textured white.
