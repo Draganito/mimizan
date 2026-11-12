@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, October 2026. Version of record for Mimizan 0.16.5
+Dragan Bojovic, November 2026. Version of record for Mimizan 0.18.11
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
@@ -16,26 +16,29 @@ components ride on carriers at the Nyquist frequency. A monochrome
 photograph needs only the luminance. Mimizan therefore never demosaics:
 it demodulates and low-pass-filters the chrominance, subtracts it from the
 mosaic, and keeps what is left as the negative. Every output pixel is a
-weighted sum of measured sensor values with weights that do not depend on
-the picture content at that pixel, so there is no interpolation, no
-directional guess and no zipper. The chrominance estimate is made directional
+weighted sum of measured sensor values, the photosite itself minus low-pass
+filters of the demodulated mosaic, so no missing sample is interpolated and
+there is no zipper. The chrominance estimate is made directional
 by a two-hypothesis scheme after Dubois (2005), extended here to both
 chrominance components, to a coherence test between the two carrier copies
 that opens the chroma band wherever it demonstrably carries no luminance,
 and to a structure tensor of the chroma-free base band that decides the
 orientation where the chrominance itself is too strong for the energy ratio
-to decide it.
+to decide it. In that estimator the weights are read from the picture: from
+local energy, from the agreement of the two copies and from the orientation
+of the base band. They blend measured estimates and never produce a value
+(§4.6).
 The weighting of the three colour responses (the "mix" — panchromatic,
 filter emulation, or a fitted copy of a monochrome sensor) is applied after
 separation and is band-limited, so resolution and grain are those of the
-luminance estimate for every mix. Every output pixel is a fixed-weight
-sum of measured photosites; the pipeline has no computed pixel anywhere.
+luminance estimate for every mix. Every output pixel is a sum of measured
+photosites; the pipeline has no computed pixel anywhere.
 The same separation, mixed three times through three taking filters and
 printed through one paper, gives a three-colour plate in Prokudin-Gorsky's
 sense: colour without demosaicing, in register by construction, with the
 colour band-limited to the carriers and the drawing that of the negative
 (§7.5). On a
-24-picture Kodak benchmark re-mosaicked at lens-like sharpness the linear
+24-picture Kodak benchmark re-mosaicked at lens-like sharpness the
 default reaches 51.6 dB luminance PSNR against 51.5 dB for the best of
 sixteen demosaicers (DCB, RawTherapee); band-limited at 2× it reaches
 51.8 dB against 49.1 dB; on four Nikon Z f files at the camera's own band
@@ -198,9 +201,11 @@ $$ G = L + C_1, \qquad R = L - C_1 + 2 C_2, \qquad B = L - C_1 - 2 C_2 . $$
 
 The carrier $s_x s_y$ moves $C_1$ to $(u, v) = (0.5, 0.5)$. The carrier
 $s_x + s_y$ places *two copies* of $C_2$, at $(0.5, 0)$ (the $s_x$ copy,
-"copy a") and at $(0, 0.5)$ (the $s_y$ copy, "copy b"). Each colour is
-sampled on a lattice of pitch 2, so chrominance is physically band-limited
-to $|f| \le 0.25$ c/px around its carrier. Luminance occupies the whole
+"copy a") and at $(0, 0.5)$ (the $s_y$ copy, "copy b"). Red and blue are
+each sampled on a lattice of pitch 2, so the mosaic holds chrominance
+unambiguously only within $|f| \le 0.25$ c/px of its carrier. The sampling
+does not limit the chrominance to that band; that pictures have little of
+it beyond is an assumption about pictures. Luminance occupies the whole
 plane; whatever of it lies within the chroma pass bands is irrecoverably
 mixed with chrominance — that overlap is the only information loss of the
 method and the subject of §4.3–4.4.
@@ -249,7 +254,8 @@ $$ \sigma(s) = \mathrm{noise\_a} \sqrt{\max(s, 0)} + \mathrm{noise\_b}, \qquad
    \mathrm{noise\_a} = 0.005, \quad \mathrm{noise\_b} = 2\cdot 10^{-4} $$
 
 until a dark-frame fit replaces the defaults (a 24-MP camera at base ISO
-measures ≈ 28 DN at 14 bit; the model gives ≈ 34 DN; `noise_b` is ≈ 3 DN).
+measures ≈ 28 DN at 14 bit; the model gives ≈ 34 DN at a level of 0.14; the
+level of the measurement is not recorded here; `noise_b` is ≈ 3 DN).
 After white balance (3.5) a photosite of colour $c$ with balanced level $s$
 has variance $k_c^2\,\sigma^2(s / k_c)$. The mean variance of a block is the
 Bayer-weighted mean $\tfrac14 \mathrm{Var}_R + \tfrac12 \mathrm{Var}_G +
@@ -292,7 +298,7 @@ estimator of §4.3 can leave luminance alone (Siemens star MTF10 0.405 →
 
 ---
 
-## 4. Linear separation (the default path)
+## 4. The separation (the default path)
 
 ### 4.1 The low-pass kernel
 
@@ -315,7 +321,10 @@ $$ h_i = \mathrm{sinc}_{f_c}(t) \cdot \frac{I_0\!\left(\beta \sqrt{1 - (2t/(N-1)
    \qquad \mathrm{sinc}_{f_c}(t) = \begin{cases} 2 f_c & t = 0 \\ \dfrac{\sin(2\pi f_c t)}{\pi t} & t \ne 0 \end{cases} $$
 
 ($I_0$ the modified Bessel function of order zero, power series
-$\sum_k (x^2/4)^k / (k!)^2$).
+$\sum_k (x^2/4)^k / (k!)^2$). The formula for $N$ is Kaiser's estimate of
+the filter *order*; it is used here as the tap count, so the kernels are
+two taps shorter than his length rounded up to odd, and $A$ and $\Delta f$
+are nominal in that sense.
 
 **Exact DC and Nyquist constraints.** The kernel is then corrected by a
 constant plus an alternating constant so that its sum is exactly 1 and its
@@ -350,7 +359,7 @@ resolution.)
 
 The separable product has a *square* pass band ($|f_x| < f_c$ and
 $|f_y| < f_c$). For $f_c = 0.15$ the corners lie at 0.21 c/px, inside the
-physical chroma limit of 0.25.
+chroma limit of 0.25.
 
 ### 4.2 The fixed estimator (`--mask off`)
 
@@ -511,7 +520,8 @@ $$ \kappa_a = \kappa + (1 - \kappa)\, c\, w_H, \qquad \kappa_b = \kappa + (1 - \
 
 $\hat C_{2a}$ is opened with $\kappa_a$, $\hat C_{2b}$ with $\kappa_b$, and
 $\hat C_1$ with $w_H \kappa_a + (1 - w_H) \kappa_b$. This step is a trade:
-on flat-luminance pictures it changes nothing, on neutral pictures it costs
+on flat-luminance pictures it changes less than 0.1 dB (61.13 → 61.19), on
+neutral pictures it costs
 1.2 dB (a neutral oriented edge is never perfectly one-dimensional, and the
 opened ring takes some luminance with it); on the pictures the coloured
 edges outweigh that in every condition of §7.2. $\gamma$ swept 0.3–2:
@@ -546,12 +556,15 @@ and two Gaussian passes. Peak nine full f64 planes including the mosaic
 step are convolved a second time where the bands are opened rather than
 held across the step (the same bits, 1.5 % of the time).
 
-### 4.6 What the linear path guarantees
+### 4.6 What the separation guarantees
 
 Every operation in §4 is a convolution with a fixed kernel, a per-pixel
 product, or a per-pixel convex combination of two such results with weights
 that depend on *local energy* and on the *orientation of the base band*,
-never on the value being estimated. The orientation term is a model of the
+never on the value being estimated. With those weights the default path is
+not a linear filter, as the fixed estimator of §4.2 is: the weights are
+functions of the mosaic. Every output is still a blend of linear filter
+outputs of the mosaic. The orientation term is a model of the
 picture (structure is locally one-dimensional) and in that sense a step
 towards a prior; but it never produces a value, it only chooses between two
 measured estimates, and where the base band is flat it is silent. Hence:
@@ -863,7 +876,7 @@ RGB pixel, the 3024×2016 result is the truth and is re-mosaicked with the
 camera's noise model, at 1× (twice as sharp as the camera saw it) and
 upscaled 2× ("soft", the camera's own band limit).
 
-### 7.2 Linear path
+### 7.2 The separation
 
 Mean luminance PSNR (dB). The columns are the three stages of §4.3–4.4,
 each reachable with the parameters of §4.5: the energy weight on the
@@ -889,9 +902,10 @@ the camera's own band limit all four are above RCD (+2.4, +3.0, +4.3,
 files at twice the camera's sharpness behave like the pixel-sharp set,
 0.5–1.9 dB behind RCD.
 
-Why the fixed estimator trailed by 4–6 dB — three defects, all in the
-separation: (1) the two $C_2$ copies were averaged although luminance leaks
-into only one; (2) an earlier block-wise texture/chroma mask (Appendix A)
+Why the fixed estimator trails the best demosaicer by 5.1 to 8.5 dB (first
+column against the last) — three defects, all in the separation: (1) the
+two $C_2$ copies were averaged although luminance leaks into only one;
+(2) an earlier block-wise texture/chroma mask (Appendix A)
 could not distinguish a line pattern inside the band from chrominance and
 reduced to the average almost everywhere; (3) the square band wasted chroma
 bandwidth along the carrier. 4.3 fixes (1) and (2), 4.4 fixes (3).
@@ -903,7 +917,7 @@ weights: no effect in any condition.
 
 ### 7.3 Design sweep for the base-band tensor
 
-Mean luminance PSNR of the linear path, lens-like / band-limited 2×,
+Mean luminance PSNR of the default path, lens-like / band-limited 2×,
 against the estimator without the tensor at 50.21 / 50.80. The two
 decompositions used
 above: *neutral* replaces every picture by its luminance (every error is
@@ -920,6 +934,12 @@ chrominance (every error is chrominance the estimate missed).
 | — first differences; band-pass 0.15–0.30 | 51.19; 51.24 | 51.41; 51.42 | | |
 | **+ clean copy's ring, $\gamma$ 0.5 (default)** | **51.59** | **51.83** | 56.10 | 61.19 |
 | — $\gamma$ 0.3 / 0.7 / 1.0 / 2.0 | 51.58 / 51.52 / 51.27 / 50.63 | 51.71 / 51.90 / 51.88 / 51.73 | | |
+
+Open: in the lens-like column the $\beta$ row and the band row do not join
+the row above them. $\beta$ 0.5 stands at 51.40 between 50.91 (0.3) and
+51.04 (0.7), band 0.30 at 51.40 between 51.17 (0.25) and 51.19 (0.35); the
+2× column joins. The two rows were probably taken from another starting
+point than the row above. They have not been re-measured.
 
 Rejected, all measured against the same baseline:
 
@@ -1072,7 +1092,7 @@ balance gain is largest. Method, file format and limits are in
 
 ## 9. Limitations
 
-- The information loss of the linear path is the luminance inside the chroma
+- The information loss of the method is the luminance inside the chroma
   pass bands; it shows as a faint periodic residue on achromatic Nyquist
   texture. The directional estimator, the coherence ring and the base-band
   tensor shrink that region; what remains inside the chroma bands no
@@ -1159,8 +1179,11 @@ $$ M_k = \begin{cases}
 
 (The factors 16 and 8 are the measured excess fluctuation of Hann-windowed
 Bayer noise sums over independent $\chi^2$ bins; 0.3 is the share of ring
-energy a $1/f^2$ edge spectrum puts into the band, $\int_{0.35}^{0.5} f^{-2} /
-\int_{0.15}^{0.35} f^{-2} \approx 0.225$ with some slack.) Blocks with
+energy a $1/f^2$ edge spectrum puts into the band and the core,
+$\int_{0.35}^{0.5} f^{-2} / \int_{0.15}^{0.35} f^{-2} \approx 0.225$, with
+some slack; for the band alone, 0.35 to 0.45, it is 0.167. The square-root
+cap applies only where $E_C > 0.3\,E_L$; otherwise it is 1 and $M_k = 1$.)
+Blocks with
 > 25 % saturated photosites get $M_k = 0$. The block grid is eroded with a
 3×3 minimum, then bilinearly interpolated to pixels (clamped outside the
 outermost block centres). Each chroma estimate is split into core (low-pass
