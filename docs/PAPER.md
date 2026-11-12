@@ -79,7 +79,7 @@ the measurements of §7 forced:
    orientation of structure and the two are combined by local energy;
 3. a *coherence test* between the two carrier copies of the red-blue
    chrominance opens the chroma pass band wherever both copies agree, since
-   luminance leakage can only ever reach one of them;
+   any one luminance component can only ever reach one of them;
 4. a *structure tensor* of the base band, which is free of chrominance,
    supplies the orientation where the energy ratio of (2) cannot: at a
    coloured edge both copies carry the chrominance and the ratio tends to
@@ -109,11 +109,12 @@ the remainder interpolated as chrominance — and is a demosaicer.
 
 Dubois supplied the lever. He wrote the model in the compact form of §2.2
 and saw that $C_2$ is present twice, at $(0.5, 0)$ and $(0, 0.5)$, and
-that luminance leaks into one copy at a time. From that he built two
-estimators: asymmetric filters that take the vertical band of $C_2$ from
-one copy and the horizontal band from the other, and an adaptive weight
-$w = e_y / (e_x + e_y)$ from local energies of the CFA signal near the
-carriers. $C_1$ he filtered once, fixed; the luminance he took as the
+that in any one place luminance mostly leaks into only one of them. From
+that he built two estimators: asymmetric filters that take the vertical
+band of $C_2$ from one copy and the horizontal band from the other, and an
+adaptive weight $w = e_y / (e_x + e_y)$ from local energies of the CFA
+signal on the two axes at 0.375 c/px, between the base band and each
+carrier. $C_1$ he filtered once, fixed; the luminance he took as the
 mosaic minus the remodulated chrominance. His algorithm too reconstructs
 RGB.
 
@@ -126,8 +127,8 @@ estimators are run as one: the elongated bands of the first under the
 weight of the second, with the energy taken from the filtered copies
 themselves rather than from band-passes on the mosaic, and $C_1$ made
 directional with the same weight (§4.3). The coherence test (§4.4) turns
-his observation around: if a leak can only reach one copy, then whatever
-the two copies share in the ring outside the narrow band is chrominance,
+his observation around: any one luminance component can reach only one
+copy, so whatever the two copies share in the ring outside the narrow band is chrominance,
 and the band can be opened there — that is the step that returns the
 detail the elongated bands had given up. The structure tensor of the
 chroma-free base band (§4.3) answers the case the energy ratio cannot,
@@ -191,7 +192,9 @@ $$ \boxed{\, m(x,y) = L + \varepsilon\, s_x s_y\, C_1 + C_2\,(a\, s_x + b\, s_y)
 
 (For a general phase write $p_R = \tfrac14(1 + r_x s_x)(1 + r_y s_y)$ with
 $r_x, r_y = \pm 1$ according to where R sits, $p_B$ with the opposite signs,
-$p_G = 1 - p_R - p_B$, and read off the coefficients.)
+$p_G = 1 - p_R - p_B$, and read off the coefficients. Dubois writes the
+same model for the GRBG phase with $C_2$ of the opposite sign,
+$(B - R)/4$; his eq. 5 is the GRBG row of the table.)
 
 The inverse, needed for the mix:
 
@@ -372,12 +375,15 @@ $$ \hat C_1 = \mathrm{LP}(\varepsilon\, s_x s_y\, m), \qquad
 
 $$ \hat L = m - \varepsilon\, s_x s_y\, \hat C_1 - (a\, s_x + b\, s_y)\, \hat C_2 . $$
 
-This is the baseline of Alleysson et al. in space-domain form (the carriers
-are fixed, so the "full FFT" of the original idea is a convolution with a
-fixed kernel: faster, deterministic, identical up to rounding). It is kept as
+For the luminance this is one fixed kernel on the mosaic, as in Alleysson et
+al., reached from the other side: they design the luminance filter and take
+the chrominance as the remainder; here the chrominance is filtered and the
+luminance is the remainder (the carriers are fixed, so the "full FFT" of
+the original idea is a convolution with a fixed kernel: faster,
+deterministic, identical up to rounding). It is kept as
 an option and as the reference that the tests compare against. Its defect,
-measured in §7, is that it averages the two $C_2$ copies although luminance
-only ever leaks into one of them, and that it cannot widen the chroma band
+measured in §7, is that it averages the two $C_2$ copies although in most
+places luminance leaks into only one of them, and that it cannot widen the chroma band
 along the carrier where the only neighbour is the other chroma component.
 
 ### 4.3 The directional estimator (default, `--mask dubois`)
@@ -474,9 +480,9 @@ error of the estimator without the tensor
 ### 4.4 The coherence ring
 
 The elongated bands of 4.3 pay with chroma bandwidth everywhere, also where
-no luminance lies near the carrier. Luminance can leak into only one $C_2$
-copy; chrominance is in both. So where the *ring* between the narrow square
-band and a wider square band carries the same content in both copies, that
+no luminance lies near the carrier. A luminance component can leak into only
+one $C_2$ copy; chrominance is in both. So where the *ring* between the
+narrow square band and a wider square band carries the same content in both copies, that
 ring is chrominance and the band may be opened to the wide square shape.
 
 Let $\mathrm{LP}_r$ be the square low-pass at `ring_wide` = 0.25 c/px (same
@@ -904,7 +910,7 @@ files at twice the camera's sharpness behave like the pixel-sharp set,
 
 Why the fixed estimator trails the best demosaicer by 5.1 to 8.5 dB (first
 column against the last) — three defects, all in the separation: (1) the
-two $C_2$ copies were averaged although luminance leaks into only one;
+two $C_2$ copies were averaged although luminance mostly leaks into only one;
 (2) an earlier block-wise texture/chroma mask (Appendix A)
 could not distinguish a line pattern inside the band from chrominance and
 reduced to the average almost everywhere; (3) the square band wasted chroma
