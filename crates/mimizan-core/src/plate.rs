@@ -72,8 +72,10 @@ impl PlateFilters {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlateSpace {
-    /// sRGB primaries (with the paper's gamma 2.2, not the sRGB curve).
-    /// The standard: a gallery shows the file as it is.
+    /// sRGB primaries. The positives are encoded with the paper's gamma
+    /// 2.2 like every print; the file is written on the sRGB curve under
+    /// the sRGB profile (`print::write_as`). The standard: a gallery and
+    /// a print service show the file as it is.
     #[default]
     Srgb,
     /// Adobe RGB (1998): its transfer curve is exactly the gamma 2.2 of

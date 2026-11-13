@@ -17,7 +17,7 @@ use crate::resize::{
     ResampleKernel,
 };
 use crate::tiffin::{read_gray, read_mask8};
-use crate::tiffout::{write_gray16, TiffMeta};
+use crate::tiffout::TiffMeta;
 use crate::usm::{kernel_radius, radius_px, unsharp, USM_K};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -137,7 +137,9 @@ pub struct PrintInfo {
     pub source_description: Option<serde_json::Value>,
     /// Name of the tone (paper or look).
     pub look: String,
-    /// `"gamma22"` or `"none"`: the TRC of the embedded ICC profile.
+    /// The curve of the embedded ICC profile: `"gamma22"` or `"none"` as
+    /// the print is encoded, `"srgb"` in a file written on the sRGB curve
+    /// (`write_as`).
     pub look_encoding: String,
     /// Output file size, pixels.
     pub width: usize,
@@ -1270,25 +1272,157 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     PrintOutput { plane, info, plate: None }
 }
 
-/// Write the print: a 16-bit TIFF (grey ICC; RGB ICC for a plate) unless
-/// `path` ends in `.jpg`/`.jpeg`, in which case an 8-bit JPEG is written
-/// (the mobile app's album; the desktop writes TIFF).
-pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
-    let desc = serde_json::to_string(&out.info)?;
-    let trc = match p.recipe.curve.encoding() {
+/// How the sheet is put into its file. The default is the file the
+/// archive keeps: 16 bits a sample in a TIFF, a grey sheet as one grey
+/// channel. The other two are what a print service asks for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileOptions {
+    /// A TIFF of 8 bits a sample instead of 16. The JPEG is 8 bits either
+    /// way.
+    pub eight_bit: bool,
+    /// A grey sheet as RGB with three equal channels, in sRGB, for a
+    /// service that prints no greyscale file. A plate is RGB either way.
+    pub rgb: bool,
+}
+
+/// The colour space of the file `write_as` writes for a plate of `plate`
+/// or a grey sheet: the plate's primaries, sRGB for a grey sheet asked
+/// for as RGB, none for a grey file.
+fn file_space(
+    plate: Option<crate::plate::PlateSpace>,
+    file: FileOptions,
+) -> Option<crate::plate::PlateSpace> {
+    plate.or(file.rgb.then_some(crate::plate::PlateSpace::Srgb))
+}
+
+/// The curve the print's values are encoded with.
+fn look_trc(recipe: &Recipe) -> GrayTrc {
+    match recipe.curve.encoding() {
         crate::calib::LookEncoding::Gamma22 => GrayTrc::Gamma(2.2),
         crate::calib::LookEncoding::None => GrayTrc::Linear,
-    };
-    let meta = TiffMeta { description: &desc, trc, orientation: 1, dpi: Some(p.recipe.dpi) };
-    match (&out.plate, is_jpeg_path(path)) {
-        (Some(sheet), true) => {
-            write_rgb_jpeg(sheet.rgb(&out.plane), sheet.space, path, trc, Some(p.recipe.dpi))?
-        }
-        (Some(sheet), false) => crate::tiffout::write_rgb16(path, sheet.rgb(&out.plane), sheet.space, &meta)?,
-        (None, true) => write_jpeg(&out.plane, path, trc, Some(p.recipe.dpi))?,
-        (None, false) => write_gray16(path, &out.plane, &meta)?,
     }
-    Ok(())
+}
+
+/// The description of the profile [`write_as`] embeds in the print of
+/// `recipe`: a plate of `plate`, or the grey sheet when that is `None`.
+pub fn profile_name(
+    recipe: &Recipe,
+    plate: Option<crate::plate::PlateSpace>,
+    file: FileOptions,
+) -> &'static str {
+    let space = file_space(plate, file);
+    let trc = file_trc(space, look_trc(recipe));
+    match space {
+        Some(space) => crate::icc::rgb_profile_name(space, trc),
+        None => crate::icc::gray_profile_name(trc),
+    }
+}
+
+/// The curve the file's samples are encoded with, for print values
+/// encoded `look` in a file of `space`. An sRGB file carries the sRGB
+/// curve, so it is sRGB to a program that reads the profile and to one
+/// that only assumes it; every other file keeps the print's own encoding.
+fn file_trc(space: Option<crate::plate::PlateSpace>, look: GrayTrc) -> GrayTrc {
+    match (space, look) {
+        (Some(crate::plate::PlateSpace::Srgb), GrayTrc::Gamma(_)) => GrayTrc::Srgb,
+        _ => look,
+    }
+}
+
+/// A print value as the file's sample, both in [0, 1]. The print is
+/// encoded with the plain power 1/2.2; for a file on the sRGB curve the
+/// light it stands for is encoded again with that curve, so the print a
+/// colour-managed program shows is the same.
+fn file_value(v: f64, trc: GrayTrc) -> f64 {
+    let v = v.clamp(0.0, 1.0);
+    match trc {
+        GrayTrc::Srgb => crate::kodak::srgb_encode(v.powf(crate::zone::GAMMA)),
+        GrayTrc::Gamma(_) | GrayTrc::Linear => v,
+    }
+}
+
+/// `look_encoding` of the description: the curve of the embedded profile.
+fn encoding_name(trc: GrayTrc) -> &'static str {
+    match trc {
+        GrayTrc::Linear => "none",
+        GrayTrc::Gamma(_) => "gamma22",
+        GrayTrc::Srgb => "srgb",
+    }
+}
+
+/// The planes row by row as the file's samples, `channels` to a pixel,
+/// each value through `q`. One plane into three channels is that value
+/// three times.
+fn interleaved<T>(planes: &[&Plane], channels: usize, q: impl Fn(f64) -> T + Sync) -> Vec<T>
+where
+    T: Copy + Default + Send + Sync,
+{
+    let (w, h) = (planes[0].width, planes[0].height);
+    let mut data = vec![T::default(); channels * w * h];
+    data.par_chunks_mut((channels * w).max(1)).enumerate().for_each(|(y, row)| {
+        if let [one] = planes {
+            for (px, &v) in row.chunks_exact_mut(channels).zip(one.row(y)) {
+                px.fill(q(v));
+            }
+        } else {
+            for (c, plane) in planes.iter().enumerate() {
+                for (px, &v) in row.chunks_exact_mut(channels).zip(plane.row(y)) {
+                    px[c] = q(v);
+                }
+            }
+        }
+    });
+    data
+}
+
+/// Write the print as the archive keeps it: a 16-bit TIFF, grey for a
+/// grey sheet and RGB for a plate, unless `path` ends in `.jpg`/`.jpeg`,
+/// in which case an 8-bit JPEG is written. [`write_as`] with the defaults.
+pub fn write(out: &PrintOutput, path: &Path, p: &PrintParams) -> Result<()> {
+    write_as(out, path, p, FileOptions::default())
+}
+
+/// Write the print into the file `file` asks for. A TIFF of 16 or 8 bits,
+/// or an 8-bit JPEG at quality 100 without chroma subsampling when `path`
+/// ends in `.jpg`/`.jpeg`. One grey channel with the grey profile, or RGB
+/// with the profile of its primaries: a plate, and a grey sheet when
+/// `file.rgb` asks for it. The TIFF carries the description, both carry
+/// the profile and the dpi.
+pub fn write_as(out: &PrintOutput, path: &Path, p: &PrintParams, file: FileOptions) -> Result<()> {
+    use crate::tiffout::Samples;
+    let space = file_space(out.plate.as_ref().map(|sheet| sheet.space), file);
+    let trc = file_trc(space, look_trc(&p.recipe));
+    let icc = match space {
+        Some(space) => crate::icc::rgb_profile(space, trc),
+        None => crate::icc::gray_profile(trc),
+    };
+    let planes: Vec<&Plane> = match &out.plate {
+        Some(sheet) => sheet.rgb(&out.plane).to_vec(),
+        None => vec![&out.plane],
+    };
+    let (w, h) = (out.plane.width, out.plane.height);
+    if planes.iter().any(|p| (p.width, p.height) != (w, h)) {
+        return Err(Error::Invalid("the three print planes differ in size".into()));
+    }
+    let channels = if space.is_some() { 3 } else { 1 };
+    let dpi = Some(p.recipe.dpi);
+    let q8 = |v: f64| (file_value(v, trc) * 255.0).round() as u8;
+    let q16 = |v: f64| (file_value(v, trc) * 65535.0).round() as u16;
+    if is_jpeg_path(path) {
+        return write_jpeg_samples(path, w, h, &interleaved(&planes, channels, q8), channels, icc, dpi);
+    }
+    // The description says the curve of the profile beside it.
+    let mut info = out.info.clone();
+    info.look_encoding = encoding_name(trc).to_string();
+    let desc = serde_json::to_string(&info)?;
+    let meta = TiffMeta { description: &desc, trc, orientation: 1, dpi };
+    let write = |samples: Samples<'_>| crate::tiffout::write_samples(path, w, h, samples, &icc, &meta);
+    match (file.eight_bit, channels) {
+        (true, 1) => write(Samples::Gray8(&interleaved(&planes, 1, q8))),
+        (true, _) => write(Samples::Rgb8(&interleaved(&planes, 3, q8))),
+        (false, 1) => write(Samples::Gray16(&interleaved(&planes, 1, q16))),
+        (false, _) => write(Samples::Rgb16(&interleaved(&planes, 3, q16))),
+    }
 }
 
 /// The JFIF density of a print: its dpi, whole, when there is one and it
@@ -1301,40 +1435,6 @@ fn jpeg_density(dpi: Option<f64>) -> image::codecs::jpeg::PixelDensity {
     }
 }
 
-/// JPEG of a plate print: 8-bit RGB, quality 100, no chroma subsampling
-/// (every block carries its own colour), the RGB ICC embedded, the dpi in
-/// the JFIF header.
-pub fn write_rgb_jpeg(
-    rgb: [&Plane; 3],
-    space: crate::plate::PlateSpace,
-    path: &Path,
-    trc: GrayTrc,
-    dpi: Option<f64>,
-) -> Result<()> {
-    use image::ImageEncoder;
-    let [r, g, b] = rgb;
-    if (g.width, g.height) != (r.width, r.height) || (b.width, b.height) != (r.width, r.height) {
-        return Err(Error::Invalid("the three print planes differ in size".into()));
-    }
-    let q = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let mut buf = vec![0u8; 3 * r.data.len()];
-    buf.par_chunks_mut(3 * r.width).enumerate().for_each(|(y, row)| {
-        let (rr, gr, br) = (r.row(y), g.row(y), b.row(y));
-        for x in 0..r.width {
-            row[3 * x] = q(rr[x]);
-            row[3 * x + 1] = q(gr[x]);
-            row[3 * x + 2] = q(br[x]);
-        }
-    });
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
-    enc.set_pixel_density(jpeg_density(dpi));
-    enc.set_icc_profile(crate::icc::rgb_profile(space, trc))
-        .map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
-    enc.write_image(&buf, r.width as u32, r.height as u32, image::ExtendedColorType::Rgb8)?;
-    Ok(())
-}
-
 /// `.jpg` or `.jpeg`, any case.
 pub fn is_jpeg_path(path: &Path) -> bool {
     matches!(
@@ -1343,18 +1443,25 @@ pub fn is_jpeg_path(path: &Path) -> bool {
     )
 }
 
-/// JPEG of an already encoded plane: full print resolution, 8-bit grey (one
-/// channel, so no chroma subsampling), quality 100, the same grey ICC as
-/// the TIFF embedded, the dpi in the JFIF header.
-pub fn write_jpeg(plane: &Plane, path: &Path, trc: GrayTrc, dpi: Option<f64>) -> Result<()> {
+/// JPEG of quantised samples at full print resolution: quality 100, one
+/// grey channel or RGB without chroma subsampling (every block carries
+/// its own colour), the profile embedded, the dpi in the JFIF header.
+fn write_jpeg_samples(
+    path: &Path,
+    width: usize,
+    height: usize,
+    samples: &[u8],
+    channels: usize,
+    icc: Vec<u8>,
+    dpi: Option<f64>,
+) -> Result<()> {
     use image::ImageEncoder;
-    let buf: Vec<u8> = plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
+    let colour = if channels == 3 { image::ExtendedColorType::Rgb8 } else { image::ExtendedColorType::L8 };
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
     enc.set_pixel_density(jpeg_density(dpi));
-    enc.set_icc_profile(crate::icc::gray_profile(trc))
-        .map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
-    enc.write_image(&buf, plane.width as u32, plane.height as u32, image::ExtendedColorType::L8)?;
+    enc.set_icc_profile(icc).map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
+    enc.write_image(samples, width as u32, height as u32, colour)?;
     Ok(())
 }
 
@@ -2997,6 +3104,247 @@ mod tests {
                     assert!((v - expect).abs() < 1e-9, "at {nx},{ny} +{xx},{yy}: {v} vs {expect}");
                 }
             }
+        }
+    }
+
+    /// A small print on paper with both rings, so the sheet holds paper
+    /// white, the black edge and a ramp between them, and where it is
+    /// written.
+    fn ringed_print(name: &str) -> (PrintOutput, PrintParams, PathBuf) {
+        let mut plane = Plane::zeros(48, 32);
+        for (i, v) in plane.data.iter_mut().enumerate() {
+            *v = 0.002 + 0.9 * (i % 48) as f64 / 47.0;
+        }
+        let recipe = Recipe { border_mm: 1.0, black_mm: 0.5, dpi: 254.0, ..Recipe::on_paper() };
+        let p = PrintParams { recipe, ..Default::default() };
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "t".into(), description: None };
+        let out = render_planes(&src, &p);
+        assert_eq!((out.plane.width, out.plane.height), (48 + 30, 32 + 30));
+        let dir = std::env::temp_dir().join(format!("mimizan-print-files-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (out, p, dir)
+    }
+
+    /// The same sheet as a plate of `space`: its green and blue positives
+    /// a little apart from the red one, so the channels can be told apart.
+    fn as_plate(out: &PrintOutput, space: crate::plate::PlateSpace) -> PrintOutput {
+        let shifted = |by: f64| {
+            let mut p = out.plane.clone();
+            p.data.iter_mut().for_each(|v| *v = (*v * by).clamp(0.0, 1.0));
+            p
+        };
+        PrintOutput {
+            plane: out.plane.clone(),
+            info: out.info.clone(),
+            plate: Some(PlateSheet { green: shifted(0.9), blue: shifted(0.8), space }),
+        }
+    }
+
+    /// A TIFF as it lies on the disk: channels, bits, samples scaled to
+    /// [0, 1], the profile and the description.
+    struct ReadBack {
+        channels: usize,
+        bits: u8,
+        samples: Vec<f64>,
+        icc: Vec<u8>,
+        description: serde_json::Value,
+    }
+
+    fn read_back(path: &Path) -> ReadBack {
+        use tiff::decoder::{Decoder, DecodingResult};
+        use tiff::tags::Tag;
+        let mut dec = Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+        let (channels, bits) = match dec.colortype().unwrap() {
+            tiff::ColorType::Gray(b) => (1, b),
+            tiff::ColorType::RGB(b) => (3, b),
+            other => panic!("unexpected colour type {other:?}"),
+        };
+        let samples = match dec.read_image().unwrap() {
+            DecodingResult::U8(v) => v.iter().map(|&s| f64::from(s) / 255.0).collect(),
+            DecodingResult::U16(v) => v.iter().map(|&s| f64::from(s) / 65535.0).collect(),
+            _ => panic!("unexpected sample type"),
+        };
+        let icc = dec.get_tag_u8_vec(Tag::IccProfile).unwrap();
+        let description =
+            serde_json::from_str(&dec.get_tag_ascii_string(Tag::ImageDescription).unwrap()).unwrap();
+        ReadBack { channels, bits, samples, icc, description }
+    }
+
+    /// The light a print value stands for.
+    fn light(v: f64) -> f64 {
+        v.powf(crate::zone::GAMMA)
+    }
+
+    /// The file the archive keeps is what it was: one grey channel of 16
+    /// bits, the print's values as they are, the grey gamma 2.2 profile.
+    #[test]
+    fn the_default_file_is_the_sixteen_bit_grey_sheet() {
+        let (out, p, dir) = ringed_print("default");
+        let path = dir.join("print.tif");
+        write(&out, &path, &p).unwrap();
+        let back = read_back(&path);
+        assert_eq!((back.channels, back.bits), (1, 16));
+        assert_eq!(back.icc, crate::icc::gray_profile(GrayTrc::Gamma(2.2)));
+        assert_eq!(back.description["look_encoding"], "gamma22");
+        for (s, v) in back.samples.iter().zip(&out.plane.data) {
+            assert!((s - v).abs() <= 0.5 / 65535.0 + 1e-12, "{s} for {v}");
+        }
+        // Paper white at the sheet's corner, the black edge inside the border.
+        assert_eq!(back.samples[0], 1.0);
+        assert_eq!(back.samples[12 * out.plane.width + 12], 0.0);
+    }
+
+    /// A grey sheet for a service that prints no greyscale file: three
+    /// equal channels on the sRGB curve under the sRGB profile, and the
+    /// light each sample stands for is the light of the grey print. In 8
+    /// bits the same, to that depth.
+    #[test]
+    fn a_grey_sheet_as_rgb_is_three_equal_channels_in_srgb() {
+        let (out, p, dir) = ringed_print("rgb");
+        let srgb = crate::icc::rgb_profile(crate::plate::PlateSpace::Srgb, GrayTrc::Srgb);
+        for (eight_bit, bits, step) in [(false, 16, 1.0 / 65535.0), (true, 8, 1.0 / 255.0)] {
+            let path = dir.join(format!("rgb{bits}.tif"));
+            write_as(&out, &path, &p, FileOptions { eight_bit, rgb: true }).unwrap();
+            let back = read_back(&path);
+            assert_eq!((back.channels, back.bits), (3, bits));
+            assert_eq!(back.samples.len(), 3 * out.plane.data.len());
+            assert_eq!(back.icc, srgb);
+            assert_eq!(back.description["look_encoding"], "srgb");
+            assert_eq!(
+                profile_name(&p.recipe, None, FileOptions { eight_bit, rgb: true }),
+                "sRGB IEC61966-2.1"
+            );
+            for (px, v) in back.samples.as_chunks::<3>().0.iter().zip(&out.plane.data) {
+                assert!(px[0] == px[1] && px[1] == px[2], "not grey: {px:?}");
+                let want = crate::kodak::srgb_encode(light(*v));
+                assert!((px[0] - want).abs() <= 0.5 * step + 1e-12, "{} for {want}", px[0]);
+            }
+            // White stays the paper and black stays black.
+            assert_eq!(back.samples[0], 1.0);
+            assert_eq!(back.samples[3 * (12 * out.plane.width + 12)], 0.0);
+        }
+        // At 16 bits the light read through the sRGB curve is the print's.
+        let back = read_back(&dir.join("rgb16.tif"));
+        for (px, v) in back.samples.as_chunks::<3>().0.iter().zip(&out.plane.data) {
+            assert!((crate::kodak::srgb_decode(px[0]) - light(*v)).abs() < 2e-5);
+        }
+    }
+
+    /// The 8-bit TIFF of a grey sheet stays one grey channel with the
+    /// grey profile and the print's own values.
+    #[test]
+    fn an_eight_bit_tiff_is_the_same_sheet_in_eight_bits() {
+        let (out, p, dir) = ringed_print("eight");
+        let path = dir.join("print.tif");
+        write_as(&out, &path, &p, FileOptions { eight_bit: true, rgb: false }).unwrap();
+        let back = read_back(&path);
+        assert_eq!((back.channels, back.bits), (1, 8));
+        assert_eq!(back.icc, crate::icc::gray_profile(GrayTrc::Gamma(2.2)));
+        assert_eq!(back.description["recipe"]["border_mm"], 1.0);
+        for (s, v) in back.samples.iter().zip(&out.plane.data) {
+            assert!((s - v).abs() <= 0.5 / 255.0 + 1e-12, "{s} for {v}");
+        }
+        // The file is a third of the 16-bit RGB one and half the grey one.
+        let grey16 = dir.join("grey16.tif");
+        write(&out, &grey16, &p).unwrap();
+        let size = |p: &Path| std::fs::metadata(p).unwrap().len();
+        assert!(size(&path) < size(&grey16));
+    }
+
+    /// A plate in sRGB is a true sRGB file: the sRGB curve in the samples
+    /// and in the profile. A plate in the Adobe space keeps the print's
+    /// values, which are that space's own gamma, under the profile that
+    /// says it is compatible.
+    #[test]
+    fn a_plate_is_written_in_the_curve_of_its_space() {
+        use crate::plate::PlateSpace;
+        let (grey, p, dir) = ringed_print("plate");
+        let n = grey.plane.data.len();
+
+        let out = as_plate(&grey, PlateSpace::Srgb);
+        let sheet = out.plate.as_ref().unwrap();
+        let path = dir.join("srgb.tif");
+        write(&out, &path, &p).unwrap();
+        let back = read_back(&path);
+        assert_eq!((back.channels, back.bits), (3, 16));
+        assert_eq!(back.icc, crate::icc::rgb_profile(PlateSpace::Srgb, GrayTrc::Srgb));
+        assert_eq!(back.description["look_encoding"], "srgb");
+        for i in 0..n {
+            for (c, plane) in [&out.plane, &sheet.green, &sheet.blue].into_iter().enumerate() {
+                let want = crate::kodak::srgb_encode(light(plane.data[i]));
+                assert!((back.samples[3 * i + c] - want).abs() <= 0.5 / 65535.0 + 1e-12);
+            }
+        }
+
+        let out = as_plate(&grey, PlateSpace::AdobeRgb);
+        let sheet = out.plate.as_ref().unwrap();
+        let path = dir.join("adobe.tif");
+        write_as(&out, &path, &p, FileOptions { eight_bit: true, rgb: false }).unwrap();
+        let back = read_back(&path);
+        assert_eq!((back.channels, back.bits), (3, 8));
+        assert_eq!(back.icc, crate::icc::rgb_profile(PlateSpace::AdobeRgb, GrayTrc::Gamma(2.2)));
+        assert_eq!(back.description["look_encoding"], "gamma22");
+        let file = FileOptions::default();
+        assert_eq!(
+            profile_name(&p.recipe, Some(PlateSpace::AdobeRgb), file),
+            "compatible with Adobe RGB (1998)"
+        );
+        assert_eq!(profile_name(&p.recipe, Some(PlateSpace::Srgb), file), "sRGB IEC61966-2.1");
+        assert_eq!(profile_name(&p.recipe, None, file), "mimizan gray gamma 2.2");
+        // A look without an encoding stays linear in either file.
+        let look = crate::calib::LookFile {
+            encoding: crate::calib::LookEncoding::None,
+            ..crate::calib::LookFile::neutral()
+        };
+        let linear = Recipe { curve: crate::tone::Tone::Look(look), ..Recipe::default() };
+        assert_eq!(
+            profile_name(&linear, Some(PlateSpace::Srgb), file),
+            "mimizan plate sRGB primaries, linear"
+        );
+        for i in 0..n {
+            for (c, plane) in [&out.plane, &sheet.green, &sheet.blue].into_iter().enumerate() {
+                assert!((back.samples[3 * i + c] - plane.data[i]).abs() <= 0.5 / 255.0 + 1e-12);
+            }
+        }
+    }
+
+    /// The JPEG follows the same choice: grey with the grey profile, or
+    /// RGB in sRGB when the sheet is asked for as RGB.
+    #[test]
+    fn the_jpeg_is_grey_or_rgb_as_asked() {
+        use image::ImageDecoder;
+        let (out, p, dir) = ringed_print("jpeg");
+        let open = |path: &Path| {
+            let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+            let mut dec = image::codecs::jpeg::JpegDecoder::new(file).unwrap();
+            let icc = dec.icc_profile().unwrap().expect("a profile");
+            let colour = dec.color_type();
+            let mut buf = vec![0u8; dec.total_bytes() as usize];
+            dec.read_image(&mut buf).unwrap();
+            (colour, icc, buf)
+        };
+        let grey = dir.join("grey.jpg");
+        write(&out, &grey, &p).unwrap();
+        let (colour, icc, buf) = open(&grey);
+        assert_eq!(colour, image::ColorType::L8);
+        assert_eq!(icc, crate::icc::gray_profile(GrayTrc::Gamma(2.2)));
+        assert_eq!(buf.len(), out.plane.data.len());
+
+        let rgb = dir.join("rgb.jpg");
+        // The JPEG is 8 bits whatever the TIFF's depth is set to.
+        write_as(&out, &rgb, &p, FileOptions { eight_bit: false, rgb: true }).unwrap();
+        let (colour, icc, buf) = open(&rgb);
+        assert_eq!(colour, image::ColorType::Rgb8);
+        assert_eq!(icc, crate::icc::rgb_profile(crate::plate::PlateSpace::Srgb, GrayTrc::Srgb));
+        assert_eq!(buf.len(), 3 * out.plane.data.len());
+        // Quality 100 without subsampling: grey within a few steps, and
+        // close to the sRGB value of the print.
+        for (px, v) in buf.as_chunks::<3>().0.iter().zip(&out.plane.data) {
+            let (lo, hi) = (px.iter().min().unwrap(), px.iter().max().unwrap());
+            assert!(hi - lo <= 2, "not grey: {px:?}");
+            let want = crate::kodak::srgb_encode(light(*v)) * 255.0;
+            assert!((f64::from(px[1]) - want).abs() <= 4.0, "{} for {want}", px[1]);
         }
     }
 }

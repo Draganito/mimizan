@@ -29,7 +29,7 @@ use mimizan_core::mix::{mix, Weights};
 use mimizan_core::pipeline::{self, Negative};
 use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateInfo, PlateSpace, PlateWeights};
-use mimizan_core::print::{self as pr, PrintParams, PrintSource};
+use mimizan_core::print::{self as pr, FileOptions, PrintParams, PrintSource};
 use mimizan_core::recipe::{CropRect, Develop, Recipe, Sharpen};
 use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
@@ -51,8 +51,8 @@ pub enum Job {
     Redevelop { source: Redevelop, develop: Develop },
     /// One export, one file. The sheet is the recipe rendered in one pass
     /// against the negative: placing, paper or look, size and border. A
-    /// `.jpg` path writes the 8-bit JPEG, anything else the 16-bit TIFF
-    /// (`print::write`).
+    /// `.jpg` path writes the 8-bit JPEG, anything else the TIFF, in the
+    /// depth and the channels `file` asks for (`print::write_as`).
     /// The desktop GUI sends the sharpening mode off; peak, when the recipe
     /// has it on, is part of that same pass. The recipe is the edit's own:
     /// its 90° turns are carried out by the print, on the file's
@@ -63,6 +63,8 @@ pub enum Job {
         /// Three positives into one RGB file instead of the grey print.
         plate: Option<PlateView>,
         recipe: Recipe,
+        /// The TIFF's depth, and a grey sheet as RGB: the program's settings.
+        file: FileOptions,
         path: PathBuf,
     },
     /// The linear export: the separation for another program, no print.
@@ -246,9 +248,9 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
                 message: format!("{e:#}"),
             }),
         },
-        Job::Export { session, weights, plate, recipe, path } => match plate {
-            Some(plate) => export_plate(&session, weights, &plate, recipe, &path, &status),
-            None => export(&session, weights, recipe, &path, &status),
+        Job::Export { session, weights, plate, recipe, file, path } => match plate {
+            Some(plate) => export_plate(&session, weights, &plate, recipe, file, &path, &status),
+            None => export(&session, weights, recipe, file, &path, &status),
         },
         Job::ExportLinear { session, weights, plate, framing, path } => {
             export_linear(&session, weights, plate, &framing, &path, &status)
@@ -505,6 +507,7 @@ fn export(
     s: &Session,
     weights: Weights,
     recipe: Recipe,
+    file: FileOptions,
     path: &Path,
     status: &dyn Fn(String),
 ) -> Result<Event> {
@@ -531,7 +534,7 @@ fn export(
     status("rendering".into());
     let out = pr::render_planes(&src, &params);
     status(format!("writing {}", path.display()));
-    pr::write(&out, path, &params)?;
+    pr::write_as(&out, path, &params, file)?;
     Ok(Event::Exported {
         path: path.to_path_buf(),
         width: out.info.width,
@@ -549,6 +552,7 @@ fn export_plate(
     weights: Weights,
     plate: &PlateView,
     recipe: Recipe,
+    file: FileOptions,
     path: &Path,
     status: &dyn Fn(String),
 ) -> Result<Event> {
@@ -578,7 +582,7 @@ fn export_plate(
     status("rendering the three positives".into());
     let out = pr::render_plate(sources, &pi, &params);
     status(format!("writing {}", path.display()));
-    pr::write(&out, path, &params)?;
+    pr::write_as(&out, path, &params, file)?;
     Ok(Event::Exported {
         path: path.to_path_buf(),
         width: out.info.width,
@@ -1169,6 +1173,7 @@ mod tests {
             weights: Weights::default(),
             plate: None,
             recipe: Recipe::on_paper(),
+            file: FileOptions::default(),
             path,
         }
     }
@@ -1253,13 +1258,15 @@ mod tests {
         let quiet = |_s: String| {};
         let grey = dir.join("grey.tif");
         let recipe = Recipe::on_paper();
-        let ev = export(&session, Weights::default(), recipe.clone(), &grey, &quiet).unwrap();
+        let file = FileOptions::default();
+        let ev = export(&session, Weights::default(), recipe.clone(), file, &grey, &quiet).unwrap();
         let Event::Exported { width, height, .. } = ev else { panic!("not exported") };
 
         let plate =
             PlateView { weights: PlateWeights::channels(), space: PlateSpace::AdobeRgb, lamps: [0.0; 3] };
         let path = dir.join("plate.tif");
-        let ev = export_plate(&session, Weights::default(), &plate, recipe.clone(), &path, &quiet).unwrap();
+        let ev =
+            export_plate(&session, Weights::default(), &plate, recipe.clone(), file, &path, &quiet).unwrap();
         let Event::Exported { width: pw, height: ph, .. } = ev else { panic!("not exported") };
         assert_eq!((pw, ph), (width, height));
         let [r, g, b] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
@@ -1271,12 +1278,28 @@ mod tests {
 
         let lit = PlateView { lamps: [0.0, 0.0, 0.5], ..plate };
         let path = dir.join("plate_blue.tif");
-        export_plate(&session, Weights::default(), &lit, recipe, &path, &quiet).unwrap();
+        export_plate(&session, Weights::default(), &lit, recipe.clone(), file, &path, &quiet).unwrap();
         let [r2, g2, b2] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
         assert_eq!(r2.data, r.data);
         assert_eq!(g2.data, g.data);
         assert!(b2.data.iter().zip(&b.data).all(|(x, y)| x >= y));
         assert!(b2.data.iter().zip(&b.data).any(|(x, y)| x > y));
+
+        // The grey print asked for as RGB, for a print service: the same
+        // sheet with three equal channels, on the sRGB curve, standing
+        // for the light of the grey print.
+        let path = dir.join("grey_rgb.tif");
+        let as_rgb = FileOptions { eight_bit: false, rgb: true };
+        let ev = export(&session, Weights::default(), recipe, as_rgb, &path, &quiet).unwrap();
+        let Event::Exported { width: rw, height: rh, .. } = ev else { panic!("not exported") };
+        assert_eq!((rw, rh), (width, height));
+        let [r3, g3, b3] = mimizan_core::tiffin::read_rgb16(&path).unwrap();
+        assert_eq!(r3.data, g3.data);
+        assert_eq!(g3.data, b3.data);
+        for (rgb, grey) in g3.data.iter().zip(&mono.plane.data) {
+            let light = mimizan_core::kodak::srgb_decode(*rgb);
+            assert!((light - grey.powf(2.2)).abs() < 1e-4, "{rgb} for {grey}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

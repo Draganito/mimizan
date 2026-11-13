@@ -27,7 +27,9 @@ use mimizan_core::ingest::WhiteBalance;
 use mimizan_core::mix::{ColorFilter, Weights};
 use mimizan_core::paper::{self, SplitGrade};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace, PlateWeights};
-use mimizan_core::print::{memory_estimate, memory_text, peak_print_radius, PrintSize, LAMP_LIMIT};
+use mimizan_core::print::{
+    memory_estimate, memory_text, peak_print_radius, FileOptions, PrintSize, LAMP_LIMIT,
+};
 use mimizan_core::recipe::{CropCorner, CropRect, Develop, Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
 use mimizan_core::separate::MaskMode;
@@ -36,7 +38,8 @@ use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Which side of the sheet the user typed. The other follows the picture.
+/// Which side of the sheet the user typed. The other follows the picture,
+/// unless the sheet is free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SheetSide {
     Width,
@@ -472,6 +475,25 @@ struct PlateResolved {
 /// orientation, point, box side in print pixels.
 type LoupeKey = (u64, Weights, Option<PlateView>, Recipe, u16, [f64; 2], usize);
 
+/// The file the Export button writes, as its box names it: the container
+/// and, for the TIFF, its depth.
+fn file_kind_name(format: ExportFormat, tiff_eight_bit: bool) -> &'static str {
+    match (format, tiff_eight_bit) {
+        (ExportFormat::Tiff, false) => "TIFF 16 bit",
+        (ExportFormat::Tiff, true) => "TIFF 8 bit",
+        (ExportFormat::Jpeg, _) => "JPEG",
+    }
+}
+
+/// The channels a grey sheet is written in, as their box names them.
+fn grey_channels_name(as_rgb: bool) -> &'static str {
+    if as_rgb {
+        "RGB"
+    } else {
+        "grey"
+    }
+}
+
 /// The primaries as the window names them.
 fn space_name(space: PlateSpace) -> &'static str {
     match space {
@@ -517,6 +539,23 @@ fn sheet_for_side(uw: usize, uh: usize, dpi: f64, typed_cm: f64, side: SheetSide
         SheetSide::Height => ((typed_px * uw as f64 / uh as f64).round().max(1.0), typed_px),
     };
     Some(sheet_px(bw, bh, dpi))
+}
+
+/// The sheet with both sides as typed, centimetres, each to the nearest
+/// pixel at `dpi`: a paper size of its own, whatever the picture's
+/// proportion. Absent without a dpi.
+fn sheet_as_typed(typed_cm: [f64; 2], dpi: f64) -> Option<PrintSize> {
+    if dpi <= 0.0 {
+        return None;
+    }
+    let px = |cm: f64| (cm / 2.54 * dpi).round().max(1.0);
+    Some(sheet_px(px(typed_cm[0]), px(typed_cm[1]), dpi))
+}
+
+/// Whether the black edge lies at the sheet's edge, where a print service
+/// trims: there is one, and no white border outside it.
+fn black_edge_is_trimmed(border_px: usize, black_px: usize) -> bool {
+    black_px > 0 && border_px == 0
 }
 
 /// `sheet` in the proportion of a `uw`×`uh` picture, its long side held:
@@ -725,6 +764,13 @@ pub struct App {
     ruler: Ruler,
     /// The file the Export button writes, TIFF or JPEG.
     format: ExportFormat,
+    /// The TIFF is written in 8 bits a sample, not 16.
+    tiff_eight_bit: bool,
+    /// A grey print is written as RGB with three equal channels.
+    grey_as_rgb: bool,
+    /// The sheet's two sides are typed apart: a paper size of its own,
+    /// not the picture's proportion.
+    sheet_free: bool,
     /// The export estimate the user was warned about. A second click with
     /// the same estimate goes ahead; a different one warns again.
     export_warned: Option<u64>,
@@ -981,6 +1027,9 @@ impl App {
             sheet_cm: [30.0, 40.0],
             ruler: persisted.ruler.unwrap_or_default(),
             format: persisted.format.unwrap_or_default(),
+            tiff_eight_bit: persisted.tiff_eight_bit.unwrap_or(false),
+            grey_as_rgb: persisted.grey_as_rgb.unwrap_or(false),
+            sheet_free: persisted.sheet_free.unwrap_or(false),
             sharpen_at: None,
             pick_card: false,
             card_status: None,
@@ -1093,6 +1142,9 @@ impl App {
             plate_space: Some(self.plate_last.space),
             ruler: Some(self.ruler),
             format: Some(self.format),
+            tiff_eight_bit: Some(self.tiff_eight_bit),
+            grey_as_rgb: Some(self.grey_as_rgb),
+            sheet_free: Some(self.sheet_free),
             brush: self.brush_set.then_some(self.brush),
             folder_bookmark: self.saved_bookmark(),
         }
@@ -1376,21 +1428,35 @@ impl App {
         }
     }
 
-    /// Write the sheet whose `side` is the field the user typed, exactly;
-    /// the other side follows the picture's proportion, so the sheet is
-    /// always the crop's shape. The rings are taken from inside it, so
-    /// with rings the picture sits centred with paper left over on two
-    /// sides. Then show the sheet the file has.
+    /// Write the sheet whose `side` is the field the user typed, exactly.
+    /// The other side follows the picture's proportion, so the sheet is
+    /// the crop's shape; on a free sheet it stays as its field shows it,
+    /// and the sheet is that paper. The rings are taken from inside it
+    /// and the picture sits centred with paper left over on two sides
+    /// where the shapes differ. Then show the sheet the file has: turned
+    /// the picture's way, so a side typed across the picture is shown in
+    /// the other field.
     fn apply_sheet(&mut self, side: SheetSide) {
         let (uw, uh) = self.picture_size();
-        let typed = match side {
-            SheetSide::Width => self.sheet_cm[0],
-            SheetSide::Height => self.sheet_cm[1],
+        let dpi = self.edit.recipe.dpi;
+        let sheet = if self.sheet_free {
+            sheet_as_typed(self.sheet_cm, dpi)
+        } else {
+            let typed = match side {
+                SheetSide::Width => self.sheet_cm[0],
+                SheetSide::Height => self.sheet_cm[1],
+            };
+            sheet_for_side(uw, uh, dpi, typed, side)
         };
-        if let Some(sheet) = sheet_for_side(uw, uh, self.edit.recipe.dpi, typed, side) {
+        if let Some(sheet) = sheet {
             self.edit.recipe.size = Some(sheet);
         }
         self.show_sheet();
+    }
+
+    /// How the sheet goes into its file: the program's settings.
+    fn file_options(&self) -> FileOptions {
+        FileOptions { eight_bit: self.tiff_eight_bit, rgb: self.grey_as_rgb }
     }
 
     /// The dpi moved from `dpi_before`. With the px ruler the pixels the
@@ -1849,9 +1915,12 @@ impl App {
         // A new window is a new picture, and the sheet takes its
         // proportion. No sheet set yet (1:1 lit): the window's pixels,
         // still 1:1. A sheet set: its long side stays, the short side
-        // follows the crop.
+        // follows the crop. A free sheet is the paper and stays; the new
+        // picture is fitted into it.
         if was_one_to_one {
             self.set_one_to_one();
+        } else if self.sheet_free {
+            self.show_sheet();
         } else {
             self.sheet_follows_crop();
         }
@@ -2582,6 +2651,7 @@ impl App {
                     // 90° turns a number: the print carries them out on
                     // the file's orientation and says this recipe.
                     recipe: self.edit.recipe.clone(),
+                    file: self.file_options(),
                     path,
                 });
             }
@@ -4501,77 +4571,118 @@ impl App {
     /// high-pass. The 1:1 box is the print pixels.
     fn print_section(&mut self, ui: &mut egui::Ui, width: f32) {
         // The file the export writes, first: it is the process's. The
-        // format is the program's: the same sheet, 16-bit TIFF or 8-bit
-        // JPEG, remembered across files. The row has to fit the window
-        // with "Adobe RGB" in the box, so the bits are in the hover texts.
-        let format_changed = ui
+        // container, its depth and the grey sheet's channels are the
+        // program's, remembered across files: the same sheet as the file
+        // the archive keeps or as the file a print service takes. Two
+        // boxes, so the row fits the window with "Adobe RGB" in the second.
+        let bits = self.export_bits();
+        let settings_changed = ui
             .horizontal(|ui| {
                 print_field_label(ui, "file");
                 let mut changed = false;
-                for f in ExportFormat::ALL {
-                    changed |= ui
-                        .selectable_value(&mut self.format, f, f.name())
-                        .on_hover_text(match f {
-                            ExportFormat::Tiff => {
-                                "16 bit, the ICC profile embedded, the recipe in the description. The print \
-                                 for the printer and the archive."
+                let kinds = [
+                    (
+                        ExportFormat::Tiff,
+                        false,
+                        "65 536 steps a channel, the ICC profile embedded, the recipe in the description.                          The print for the archive and one's own printer.",
+                    ),
+                    (
+                        ExportFormat::Tiff,
+                        true,
+                        "256 steps a channel, half the file, the ICC profile embedded, the recipe in the                          description. What most print services ask for.",
+                    ),
+                    (
+                        ExportFormat::Jpeg,
+                        self.tiff_eight_bit,
+                        "8 bit at quality 100, no chroma subsampling, the same ICC profile and the dpi                          embedded, no description. The print for the screen, the web, and a print service                          with a limit on the file's size.",
+                    ),
+                ];
+                egui::ComboBox::from_id_salt("export-file")
+                    .selected_text(file_kind_name(self.format, self.tiff_eight_bit))
+                    .show_ui(ui, |ui| {
+                        for (format, eight_bit, hover) in kinds {
+                            let chosen = self.format == format
+                                && (format == ExportFormat::Jpeg || self.tiff_eight_bit == eight_bit);
+                            if ui
+                                .selectable_label(chosen, file_kind_name(format, eight_bit))
+                                .on_hover_text(hover)
+                                .clicked()
+                                && !chosen
+                            {
+                                self.format = format;
+                                self.tiff_eight_bit = eight_bit;
+                                changed = true;
                             }
-                            ExportFormat::Jpeg => {
-                                "8 bit at quality 100, no chroma subsampling, the same ICC profile and the \
-                                 dpi embedded, no description. The print for the screen and the web."
-                            }
-                        })
-                        .changed();
-                }
-                let bits = match self.format {
-                    ExportFormat::Tiff => "16 bit",
-                    ExportFormat::Jpeg => "8 bit",
-                };
+                        }
+                    })
+                    .response
+                    .on_hover_text("The file the Export button writes.");
                 match self.edit.plate {
                     Some(mut params) => {
-                        ui.label(RichText::new("RGB ·").weak()).on_hover_text(format!(
-                            "The three positives as the channels of one {bits} RGB file, with a matrix/TRC \
-                             profile of the primaries beside and the paper's gamma 2.2."
-                        ));
                         // The primaries the plates are projected through: the file's profile.
                         egui::ComboBox::from_id_salt("plate-space")
-                        .selected_text(space_name(params.space))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB")
-                                .on_hover_text(
-                                    "Adobe RGB (1998): its curve is exactly the paper's gamma 2.2 and its \
-                                     gamut holds the saturated primaries. The file carries the profile.",
+                            .selected_text(space_name(params.space))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut params.space, PlateSpace::AdobeRgb, "Adobe RGB")
+                                    .on_hover_text(
+                                        "The primaries and the gamma of Adobe RGB (1998): its curve is the                                          paper's gamma 2.2 and its gamut holds the saturated primaries. The                                          profile in the file is made here and says \"compatible with Adobe \
+                                         RGB (1998)\"; a print service that looks for Adobe's own profile by \
+                                         its name may not know it.",
+                                    );
+                                ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
+                                    "sRGB, primaries and curve, under the profile sRGB IEC61966-2.1: the                                      file every print service and every screen reads. The print's values                                      are encoded again on the sRGB curve; the light they stand for is the                                      same.",
                                 );
-                            ui.selectable_value(&mut params.space, PlateSpace::Srgb, "sRGB").on_hover_text(
-                                "sRGB primaries with the paper's gamma 2.2 (not the sRGB curve). The file \
-                                 carries the profile.",
-                            );
-                        })
+                            })
                             .response
-                            .on_hover_text("The projection primaries, and the profile of the file.");
+                            .on_hover_text(format!(
+                                "The three positives as the channels of one {bits} RGB file. These are the                                  projection primaries, and the profile of the file."
+                            ));
                         if self.edit.plate != Some(params) {
                             self.edit.plate = Some(params);
                         }
                     }
                     None => {
-                        ui.label(RichText::new("grey · gamma 2.2").weak()).on_hover_text(format!(
-                            "The sheet as one {bits} grey channel with a gamma 2.2 profile."
-                        ));
+                        let channels = [
+                            (
+                                false,
+                                "The sheet as one grey channel with a gamma 2.2 profile: the smallest file,                                  for the archive and a printer driven as grey.",
+                            ),
+                            (
+                                true,
+                                "The sheet as RGB with three equal channels, in sRGB under the profile sRGB                                  IEC61966-2.1, for a print service that takes no greyscale file. Three                                  times the file, the same print.",
+                            ),
+                        ];
+                        egui::ComboBox::from_id_salt("grey-channels")
+                            .selected_text(grey_channels_name(self.grey_as_rgb))
+                            .show_ui(ui, |ui| {
+                                for (rgb, hover) in channels {
+                                    changed |= ui
+                                        .selectable_value(&mut self.grey_as_rgb, rgb, grey_channels_name(rgb))
+                                        .on_hover_text(hover)
+                                        .changed();
+                                }
+                            })
+                            .response
+                            .on_hover_text(format!(
+                                "The channels of the {bits} file. Its profile: {}.",
+                                self.export_profile()
+                            ));
                     }
                 }
                 changed
             })
             .inner;
-        if format_changed {
-            // The format is a setting of the program, not of the recipe.
+        if settings_changed {
+            // These are settings of the program, not of the recipe.
             self.persist();
         }
-        // One rule for the sheet: the fields are the sheet in the printer,
-        // always in the crop's proportion. Type one side and the other
-        // follows the picture; the rings are taken from inside the sheet
-        // and the picture fills what they leave, centred. 1:1 is the sheet
-        // that is the picture's pixels, nothing more: the start, lit while
-        // the file is still that.
+        // One rule for the sheet: the fields are the sheet in the printer.
+        // It has the crop's proportion: type one side and the other
+        // follows the picture. Or it is free: both sides as typed, a
+        // paper a print service offers. Either way the rings are taken
+        // from inside the sheet and the picture fills what they leave,
+        // centred. 1:1 is the sheet that is the picture's pixels, nothing
+        // more: the start, lit while the file is still that.
         let has_file = self.session.is_some();
         let one_to_one_now = self.is_one_to_one();
         let row_h = ui.spacing().interact_size.y;
@@ -4624,17 +4735,18 @@ impl App {
         }
         let dpi_before = self.edit.recipe.dpi;
         let rings_before = (self.edit.recipe.border_px(), self.edit.recipe.black_px());
-        let (width_changed, height_changed) = ui
+        let (width_changed, height_changed, free_clicked) = ui
             .horizontal(|ui| {
                 print_field_label(ui, "");
                 let ruler = self.ruler;
                 let dpi = self.edit.recipe.dpi;
                 // The rings must leave the picture at least a millimetre.
                 let least = 2.0 * self.edit.recipe.frame_px() as f64 / dpi.max(1.0) * 2.54 + 0.1;
-                let hover = "The sheet in the printer, in the crop's proportion: type one side, the other \
-                             follows the picture. Shown the picture's way, the long side where the \
-                             picture's long side is. The border and the black edge are taken from inside \
-                             it and the picture fills what they leave, centred.";
+                let hover = if self.sheet_free {
+                    "The sheet in the printer, each side as typed: a paper size of its own. Shown the                      picture's way, the long side where the picture's long side is. The border and the                      black edge are taken from inside it and the picture is fitted into what they leave,                      centred, with paper left over on two sides."
+                } else {
+                    "The sheet in the printer, in the crop's proportion: type one side, the other                      follows the picture. Shown the picture's way, the long side where the                      picture's long side is. The border and the black edge are taken from inside                      it and the picture fills what they leave, centred."
+                };
                 let width =
                     length_field(ui, &mut self.sheet_cm[0], Base::Cm, ruler, dpi, least..=2000.0, has_file)
                         .on_hover_text(hover);
@@ -4642,9 +4754,25 @@ impl App {
                 let height =
                     length_field(ui, &mut self.sheet_cm[1], Base::Cm, ruler, dpi, least..=2000.0, has_file)
                         .on_hover_text(hover);
-                (width.changed(), height.changed())
+                let free = ui
+                    .add(egui::Button::selectable(self.sheet_free, "free"))
+                    .on_hover_text(
+                        "Off: the sheet has the picture's proportion, and one side follows the other. On:                          the two sides are typed apart, for a paper a print service offers, such as                          30 × 40 cm for a picture of 2:3. The picture is fitted into it and centred; a                          new crop leaves the sheet as it is.",
+                    )
+                    .clicked();
+                (width.changed(), height.changed(), free)
             })
             .inner;
+        if free_clicked {
+            // A setting of the program, as the ruler is. Back to the
+            // picture's proportion the sheet follows at once, its long
+            // side held, as it does under a new crop.
+            self.sheet_free = !self.sheet_free;
+            self.persist();
+            if !self.sheet_free && !self.is_one_to_one() {
+                self.sheet_follows_crop();
+            }
+        }
         let dpi_changed = ui
             .horizontal(|ui| {
                 print_field_label(ui, "dpi");
@@ -4692,6 +4820,13 @@ impl App {
             length_field(ui, &mut self.edit.recipe.black_mm, Base::Mm, ruler, dpi, 0.0..=100.0, true).on_hover_text(
                 "Black film edge against the picture, inside the white border when there is one, taken from the sheet. Either ring stands on its own. Zero is off.",
             );
+            // The black edge is the outermost ring: it lies where a print
+            // service cuts. Said on the row, which wraps when it is full.
+            if black_edge_is_trimmed(self.edit.recipe.border_px(), self.edit.recipe.black_px()) {
+                ui.label(RichText::new("at the trim").color(ui.visuals().warn_fg_color)).on_hover_text(
+                    "The black edge reaches the sheet's edge. A print service prints a little larger                      than the paper and trims: about 2 mm on every side, and never quite evenly, so the                      edge comes back thinner and of unequal width. A white border outside it keeps it                      whole; or leave the rings off and let the service add its own.",
+                );
+            }
         });
         ui.horizontal(|ui| {
             print_field_label(ui, "resample");
@@ -4927,6 +5062,20 @@ impl App {
         }
     }
 
+    /// The depth of the file the Export button writes.
+    fn export_bits(&self) -> &'static str {
+        match (self.format, self.tiff_eight_bit) {
+            (ExportFormat::Tiff, false) => "16 bit",
+            (ExportFormat::Tiff, true) | (ExportFormat::Jpeg, _) => "8 bit",
+        }
+    }
+
+    /// The description of the profile the export embeds.
+    fn export_profile(&self) -> &'static str {
+        let plate = self.plate_view().map(|p| p.space);
+        mimizan_core::print::profile_name(&self.edit.recipe, plate, self.file_options())
+    }
+
     /// What one export writes, for the Export button in the Print window.
     fn export_hover_text(&self) -> String {
         if self.session.is_none() {
@@ -4954,16 +5103,14 @@ impl App {
             ", no sharpening".to_string()
         };
         // The JPEG has no description: the recipe stays in the file beside the RAW.
-        let (ext, bits, described) = match self.format {
-            ExportFormat::Tiff => ("tif", "16 bit", true),
-            ExportFormat::Jpeg => ("jpg", "8 bit, quality 100", false),
+        let (ext, bits, described) = match (self.format, self.tiff_eight_bit) {
+            (ExportFormat::Tiff, false) => ("tif", "16 bit", true),
+            (ExportFormat::Tiff, true) => ("tif", "8 bit", true),
+            (ExportFormat::Jpeg, _) => ("jpg", "8 bit, quality 100", false),
         };
+        let profile = self.export_profile();
         match self.plate_view() {
             Some(p) => {
-                let space = match p.space {
-                    PlateSpace::AdobeRgb => "Adobe RGB (1998)",
-                    PlateSpace::Srgb => "sRGB",
-                };
                 let lamps = if p.lamps[0] != 0.0 || p.lamps[2] != 0.0 {
                     format!(", lamps R {:+.2} B {:+.2}", p.lamps[0], p.lamps[2])
                 } else {
@@ -4972,15 +5119,16 @@ impl App {
                 let desc = if described { ", recipe and plate in the description" } else { "" };
                 format!(
                     "Writes the three-colour plate on the {look}{rot}{local}{lamps}:\n\
-                     <name>.{ext}  {ow} x {oh} px, {bits} RGB, {space} gamma 2.2 ICC, {} filters{sharpen}{desc}",
+                     <name>.{ext}  {ow} x {oh} px, {bits} RGB, profile \"{profile}\", {} filters{sharpen}{desc}",
                     p.weights.filters.name()
                 )
             }
             None => {
                 let desc = if described { ", recipe in the description" } else { "" };
+                let channels = if self.grey_as_rgb { "RGB, three equal channels" } else { "grey" };
                 format!(
                     "Writes the print on the {look}{rot}{local}:\n\
-                     <name>.{ext}  {ow} x {oh} px, {bits}, gamma 2.2 grey ICC{sharpen}{desc}"
+                     <name>.{ext}  {ow} x {oh} px, {bits} {channels}, profile \"{profile}\"{sharpen}{desc}"
                 )
             }
         }
@@ -7272,11 +7420,11 @@ mod path_tests {
 #[cfg(test)]
 mod sheet_tests {
     use super::{
-        mm_of_pixels, ruler_factor, sheet_following, sheet_for_side, sheet_keeping_pixels,
-        sheet_of_pixels_at, Base, SheetSide,
+        black_edge_is_trimmed, mm_of_pixels, ruler_factor, sheet_as_typed, sheet_following, sheet_for_side,
+        sheet_keeping_pixels, sheet_of_pixels_at, Base, SheetSide,
     };
     use crate::browser::Ruler;
-    use mimizan_core::print::PrintSize;
+    use mimizan_core::print::{layout, PrintParams, PrintSize};
     use mimizan_core::recipe::Recipe;
 
     fn px(sheet: PrintSize, dpi: f64) -> (usize, usize) {
@@ -7342,6 +7490,42 @@ mod sheet_tests {
         assert_eq!(bw, long);
         assert_eq!(bh, (long as f64 * 3000.0 / 4000.0).round() as usize);
         assert_eq!(sheet_following(sheet, 0, 3000, dpi), None);
+    }
+
+    /// A free sheet is the paper as typed, each side to the pixel,
+    /// whatever the picture's shape. The print turns it the picture's
+    /// way, takes the rings from inside it and centres the picture, with
+    /// paper left over on two sides; the field left alone, which shows
+    /// the file's centimetres, is the same pixels typed again.
+    #[test]
+    fn a_free_sheet_is_the_paper_as_typed() {
+        let dpi = 300.0;
+        let sheet = sheet_as_typed([30.0, 40.0], dpi).unwrap();
+        assert_eq!(px(sheet, dpi), (3543, 4724));
+        // A 3:2 landscape picture on it, with a centimetre of border.
+        let recipe = Recipe { size: Some(sheet), dpi, border_mm: 10.0, ..Recipe::on_paper() };
+        let lay = layout(6000, 4000, 1, &PrintParams { recipe, ..Default::default() });
+        assert_eq!((lay.out_w, lay.out_h), (4724, 3543));
+        assert_eq!((lay.image_w, lay.image_h), (4724 - 2 * 118, 2992));
+        assert_eq!((lay.picture_x, lay.picture_y), (118, (3543 - 2992) / 2));
+        let shown = [lay.out_w as f64 / dpi * 2.54, lay.out_h as f64 / dpi * 2.54];
+        assert_eq!(px(sheet_as_typed(shown, dpi).unwrap(), dpi), (4724, 3543));
+        // The sheet's own shape is kept where one side follows the picture
+        // it is not: 30 cm wide gives 20 cm, not 40.
+        let followed = sheet_for_side(6000, 4000, dpi, 30.0, SheetSide::Height).unwrap();
+        assert_eq!(px(followed, dpi), (5315, 3543));
+        assert_eq!(sheet_as_typed([30.0, 40.0], 0.0), None);
+    }
+
+    /// The trim is named when the black edge is the outermost ring: with
+    /// a white border outside it, or without a black edge, there is
+    /// nothing to say.
+    #[test]
+    fn the_trim_is_named_when_the_black_edge_is_at_the_sheets_edge() {
+        assert!(black_edge_is_trimmed(0, 30));
+        assert!(!black_edge_is_trimmed(118, 30));
+        assert!(!black_edge_is_trimmed(118, 0));
+        assert!(!black_edge_is_trimmed(0, 0));
     }
 
     /// With the px ruler a dpi change keeps the pixels: the sheet's and the

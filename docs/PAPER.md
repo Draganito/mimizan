@@ -785,10 +785,16 @@ the default radius and $a = 0$. The radius is then multiplied by the
 print's scale; the paper border is left out. A plate is printed by running this pass three times over its three
 frames with the same crop, size, paper and two exposures, the lamps
 added as stops to the placing of the red and the blue pass, peak with the
-one radius on each; the three positives are the channels of a 16-bit RGB
+one radius on each; the three positives are the channels of an RGB
 TIFF (or JPEG) whose profile is a matrix/TRC profile of the projection
-primaries (sRGB by default, Adobe RGB 1998 on request) with the paper's
-gamma 2.2. The file
+primaries (sRGB by default, Adobe RGB 1998 on request). The Adobe RGB
+file keeps the paper's gamma 2.2, which is that space's own curve. The
+sRGB file is written on the sRGB curve, each value $v$ as the sRGB
+encoding of the light $v^{2.2}$ it stands for, under the profile of that
+name: the light is the same, and the file is sRGB to a reader that only
+assumes it. The TIFF has 16 bits a sample, or 8 on request, and a grey
+sheet can be written as RGB with three equal channels, in sRGB by the
+same encoding, for a print service that takes no greyscale file. The file
 still records the one-arc-minute radius
 $r_{\mathrm{px}} = 1.15\cdot 10^{-5}\, d_{\mathrm{mm}}\, \mathrm{DPI}$;
 that number is not applied. There is no
@@ -1170,11 +1176,16 @@ balance gain is largest. Method, file format and limits are in
   Peak (the high-pass of the print) runs on each positive with the radius
   measured on the monochrome mix, so the three positives share one
   sharpening and stay in register.
-- The output is a 16-bit RGB TIFF or JPEG whose primaries are the
-  projection filters, sRGB by default, Adobe RGB (1998) on request (its
-  transfer curve is the gamma 2.2 of the paper encoding); the embedded
-  profile is a matrix/TRC display profile with D50-adapted colorants
-  (`icc.rs`), built the same way as the grey profile.
+- The output is an RGB TIFF (16 bit, or 8) or JPEG whose primaries are
+  the projection filters, sRGB by default, Adobe RGB (1998) on request
+  (its transfer curve is the gamma 2.2 of the paper encoding); the
+  embedded profile is a matrix/TRC display profile with D50-adapted
+  colorants (`icc.rs`), built the same way as the grey profile. The sRGB
+  file is encoded again on the sRGB curve when it is written
+  (`print::write_as`) and its profile, `sRGB IEC61966-2.1`, carries that
+  curve as a parametric curve; the Adobe RGB file's profile is named
+  `compatible with Adobe RGB (1998)`, the wording Adobe asks for on a
+  profile that is not its own.
 - The desktop treats the plate as a re-mix of the resident separation
   (`ViewParams.plate`): the fitted view, the 100 % view and the print box
   carry an RGB buffer next to the grey one and go through the same tone
@@ -1351,8 +1362,8 @@ plate (--plate [camera|wratten|channels]):                     §7.5
     `plate` object in the JSON (order, frame height, filters, W)
 15. print: steps of the monochrome print ×3, same layout/crop/paper/
     exposures; place_R += lamp_R, place_B += lamp_B; peak radius from the
-    monochrome mix; 16-bit RGB TIFF/JPEG, matrix/TRC profile (sRGB
-    default, Adobe RGB 1998 on request)
+    monochrome mix; RGB TIFF/JPEG, matrix/TRC profile (sRGB on the
+    sRGB curve by default, Adobe RGB 1998 with gamma 2.2 on request)
 ```
 
 Every constant in this recipe is a default of the published code and can be

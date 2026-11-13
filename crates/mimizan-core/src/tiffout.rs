@@ -1,4 +1,5 @@
-//! 16-bit grey TIFF output with embedded ICC and JSON description.
+//! TIFF output with embedded ICC and JSON description: the 16-bit grey
+//! negative and print, and the print's other files (RGB, 8 bit).
 
 use crate::error::Result;
 use crate::icc::{gray_profile, GrayTrc};
@@ -107,6 +108,43 @@ pub fn write_rgb16(
         &Image { width, height, rows_per_strip: 64, data: &data },
         &meta.tags(&icc),
     )
+}
+
+/// The samples of a print as they stand in its file: one channel or three
+/// interleaved, 8 or 16 bits each.
+pub enum Samples<'a> {
+    Gray8(&'a [u8]),
+    Gray16(&'a [u16]),
+    Rgb8(&'a [u8]),
+    Rgb16(&'a [u16]),
+}
+
+/// A print's samples, already quantised, with the profile `icc` that says
+/// what they are, in strips of 64 rows. `meta.trc` is not read here: the
+/// profile is the caller's.
+pub fn write_samples(
+    path: &Path,
+    width: usize,
+    height: usize,
+    samples: Samples<'_>,
+    icc: &[u8],
+    meta: &TiffMeta<'_>,
+) -> Result<()> {
+    let tags = meta.tags(icc);
+    match samples {
+        Samples::Gray8(data) => {
+            write_image::<colortype::Gray8>(path, &Image { width, height, rows_per_strip: 64, data }, &tags)
+        }
+        Samples::Gray16(data) => {
+            write_image::<colortype::Gray16>(path, &Image { width, height, rows_per_strip: 64, data }, &tags)
+        }
+        Samples::Rgb8(data) => {
+            write_image::<colortype::RGB8>(path, &Image { width, height, rows_per_strip: 64, data }, &tags)
+        }
+        Samples::Rgb16(data) => {
+            write_image::<colortype::RGB16>(path, &Image { width, height, rows_per_strip: 64, data }, &tags)
+        }
+    }
 }
 
 /// 8-bit grey TIFF (mask sidecar).

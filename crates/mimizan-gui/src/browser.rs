@@ -562,29 +562,22 @@ impl Ruler {
 
 /// The file the Export button writes. A setting of the program, not of
 /// the recipe: the recipe is the development, the format is the export's.
-/// The pixels are the same sheet either way; only the container differs.
+/// The sheet is the same either way; only the container differs. The
+/// TIFF's depth and a grey sheet as RGB are two more settings beside it
+/// (`Persisted::tiff_eight_bit`, `Persisted::grey_as_rgb`).
 #[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
-    /// 16-bit TIFF, the recipe in the description, the ICC profile embedded.
+    /// TIFF of 16 or 8 bits, the recipe in the description, the ICC
+    /// profile embedded.
     #[default]
     Tiff,
-    /// 8-bit JPEG at quality 100, the same ICC profile embedded. Grey is one
-    /// channel, so no chroma subsampling; the plate is RGB.
+    /// 8-bit JPEG at quality 100, the same ICC profile embedded, no
+    /// chroma subsampling.
     Jpeg,
 }
 
 impl ExportFormat {
-    pub const ALL: [ExportFormat; 2] = [ExportFormat::Tiff, ExportFormat::Jpeg];
-
-    /// The label on the switch.
-    pub fn name(self) -> &'static str {
-        match self {
-            ExportFormat::Tiff => "TIFF",
-            ExportFormat::Jpeg => "JPEG",
-        }
-    }
-
     /// The extension a name without one is given.
     pub fn extension(self) -> &'static str {
         match self {
@@ -623,6 +616,14 @@ pub struct Persisted {
     pub ruler: Option<Ruler>,
     /// The file the Export button writes. `None` means TIFF.
     pub format: Option<ExportFormat>,
+    /// The exported TIFF has 8 bits a sample, not 16. `None` means 16.
+    pub tiff_eight_bit: Option<bool>,
+    /// A grey print is written as RGB with three equal channels, in sRGB.
+    /// `None` means one grey channel.
+    pub grey_as_rgb: Option<bool>,
+    /// The sheet's two sides are typed apart instead of one following the
+    /// picture's proportion. `None` means the sheet follows the picture.
+    pub sheet_free: Option<bool>,
     /// The dodging brush: the hand and the card as last set. `None` on a
     /// fresh install means the defaults, and that the brush is still to
     /// be set.
@@ -730,9 +731,20 @@ mod tests {
         assert_eq!(p.strip_height, None);
         assert_eq!(p.brush, None);
         // What is whole reads as before, and what is no JSON is the defaults.
-        let whole =
-            Persisted { folder: Some("/a".into()), ruler: Some(Ruler::default()), ..Persisted::default() };
+        let whole = Persisted {
+            folder: Some("/a".into()),
+            ruler: Some(Ruler::default()),
+            tiff_eight_bit: Some(true),
+            grey_as_rgb: Some(true),
+            sheet_free: Some(true),
+            ..Persisted::default()
+        };
         assert_eq!(Persisted::from_json(&serde_json::to_vec(&whole).unwrap()), whole);
+        // A file from before the print service's settings: the archive's
+        // file and the sheet in the picture's proportion.
+        let older = Persisted::from_json(br#"{"format": "jpeg", "ruler": "pixels"}"#);
+        assert_eq!(older.format, Some(ExportFormat::Jpeg));
+        assert_eq!((older.tiff_eight_bit, older.grey_as_rgb, older.sheet_free), (None, None, None));
         assert_eq!(Persisted::from_json(b"not json"), Persisted::default());
         assert_eq!(Persisted::from_json(b"[1, 2]"), Persisted::default());
     }

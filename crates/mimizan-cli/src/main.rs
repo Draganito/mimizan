@@ -131,13 +131,22 @@ enum Cmd {
     },
     /// Negative TIFF -> print file in one pass: size, place, paper or look, border,
     /// [Richardson-Lucy,] USM; 16-bit TIFF (gamma 2.2 grey ICC), or an 8-bit JPEG
-    /// at quality 100 with the same profile when -o ends in .jpg. Every print
-    /// decision can come from a recipe file (--recipe); explicit flags override its fields.
+    /// at quality 100 with the same profile when -o ends in .jpg. --bits 8 and
+    /// --rgb make the file a print service takes. Every print decision can come
+    /// from a recipe file (--recipe); explicit flags override its fields.
     Print {
         negative: PathBuf,
-        /// The print: a .tif for 16 bit, a .jpg for 8 bit.
+        /// The print: a .tif, or a .jpg for the 8-bit JPEG.
         #[arg(short, long)]
         out: PathBuf,
+        /// Bits a sample of the TIFF: 16, or 8 for a print service that
+        /// takes no 16-bit file. The JPEG is 8 bits either way.
+        #[arg(long, default_value_t = 16, value_parser = tiff_bits)]
+        bits: u8,
+        /// A grey print as RGB with three equal channels, in sRGB, for a
+        /// print service that takes no greyscale file. A plate is RGB already.
+        #[arg(long)]
+        rgb: bool,
         /// Recipe JSON (as written by --write-recipe or the GUI); flags override
         #[arg(long)]
         recipe: Option<PathBuf>,
@@ -239,6 +248,15 @@ enum BenchCmd {
     Plate(plate_bench::PlateBenchArgs),
 }
 
+/// `--bits` of `print`: the two depths a print's TIFF is written in.
+fn tiff_bits(s: &str) -> Result<u8, String> {
+    match s.trim() {
+        "8" => Ok(8),
+        "16" => Ok(16),
+        other => Err(format!("{other} is not a depth of the print's TIFF: 8 or 16")),
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let filter = tracing_subscriber::EnvFilter::try_new(&cli.log)
@@ -293,6 +311,8 @@ fn main() -> Result<()> {
         Cmd::Print {
             negative,
             out,
+            bits,
+            rgb,
             recipe,
             write_recipe,
             look,
@@ -315,6 +335,7 @@ fn main() -> Result<()> {
         } => cmd::print(&cmd::PrintArgs {
             negative,
             out,
+            file: mimizan_core::print::FileOptions { eight_bit: bits == 8, rgb },
             recipe,
             write_recipe,
             look,

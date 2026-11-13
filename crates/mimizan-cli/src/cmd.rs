@@ -342,6 +342,8 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
 pub struct PrintArgs {
     pub negative: PathBuf,
     pub out: PathBuf,
+    /// The TIFF's depth and a grey print as RGB.
+    pub file: mimizan_core::print::FileOptions,
     pub recipe: Option<PathBuf>,
     pub write_recipe: Option<PathBuf>,
     pub look: Option<PathBuf>,
@@ -498,8 +500,14 @@ pub fn print(a: &PrintArgs) -> Result<()> {
     if let Some(pp) = &out.info.plate {
         info!("plate print: {} filters, {} primaries", pp.filters.name(), pp.space.name());
     }
+    if a.file.rgb && out.plate.is_some() {
+        info!("--rgb changes nothing: a plate print is RGB already");
+    }
+    if a.file.eight_bit && pr::is_jpeg_path(&a.out) {
+        info!("--bits 8 changes nothing: the JPEG is 8 bits already");
+    }
     let t = Instant::now();
-    pr::write(&out, &a.out, &p)?;
+    pr::write_as(&out, &a.out, &p, a.file)?;
     if out.info.deconvolution_iterations > 0 {
         info!(
             "richardson-lucy: {} passes, scale sigma {:.2} px, picture area",
