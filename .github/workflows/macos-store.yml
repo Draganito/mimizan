@@ -1,6 +1,10 @@
 # Signs the desktop darkroom for the Mac App Store. The unsigned zip from
 # the release workflow is a separate build and is not sandboxed.
 #
+# This build alone sells: the JPEG at full size is free, the TIFF and the
+# negative are the non-consumable ch.bojovic.mimizanlab.fullres, the one
+# the iPhone sells. The zip, Linux and Windows are built without it.
+#
 # Repository secrets:
 #   MAC_DISTRIBUTION_P12            Apple Distribution certificate, base64 PKCS#12
 #   MAC_DISTRIBUTION_P12_PASSWORD
@@ -35,8 +39,10 @@ jobs:
         with:
           shared-key: dist
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The window with the App Store purchase (the `store` feature). The
+      # release workflow builds the download without it.
       - name: Build
-        run: bash dist/make_release_macos.sh
+        run: bash dist/make_release_macos.sh --store
       - name: Sign the store package
         env:
           MAC_DISTRIBUTION_P12: ${{ secrets.MAC_DISTRIBUTION_P12 }}

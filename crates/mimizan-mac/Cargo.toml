@@ -1,11 +1,17 @@
 [package]
 name = "mimizan-mac"
-description = "macOS folder grants for the sandboxed darkroom"
+description = "macOS folder grants and the App Store purchase for the sandboxed darkroom"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+[features]
+# The Mac App Store build alone: the purchase that unlocks the TIFF and the
+# negative, through StoreKit 2 (swift/store.swift, compiled by build.rs).
+# The download on GitHub is built without it and asks for nothing.
+store = []
 
 [dependencies]
 

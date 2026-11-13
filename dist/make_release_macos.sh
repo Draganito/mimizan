@@ -9,7 +9,14 @@
 # The two programs link only the frameworks that ship with macOS.
 # cameras/ and look/ sit in Contents/Resources. MacOS holds the two programs.
 #
-# Usage:  dist/make_release_macos.sh [--skip-build]
+# Usage:  dist/make_release_macos.sh [--skip-build] [--store]
+#
+# --store builds the window for the Mac App Store instead (the workflow
+# macos-store.yml, then dist/sign_macos_appstore.sh): the `store` feature,
+# which sells the TIFF and the negative through the App Store, for
+# macOS 12, where its StoreKit begins. That build is no download and no
+# zip is made of it. Without the flag nothing is sold and nothing is
+# locked, and the script refuses a window that carries the purchase.
 
 set -euo pipefail
 
@@ -23,9 +30,25 @@ if [[ "$(uname -m)" != "arm64" ]]; then
     exit 1
 fi
 
-if [[ "${1:-}" != "--skip-build" ]]; then
-    echo "==> cargo build --profile dist"
-    (cd "$PROJECT_DIR" && cargo build --profile dist -p mimizan-cli -p mimizan-gui)
+BUILD=1
+STORE=0
+for arg in "$@"; do
+    case "$arg" in
+        --skip-build) BUILD=0 ;;
+        --store) STORE=1 ;;
+        *) echo "ERROR: unknown argument $arg"; exit 2 ;;
+    esac
+done
+
+if [[ "$BUILD" == 1 ]]; then
+    if [[ "$STORE" == 1 ]]; then
+        echo "==> cargo build --profile dist, the Mac App Store window"
+        (cd "$PROJECT_DIR" && MACOSX_DEPLOYMENT_TARGET=12.0 \
+            cargo build --profile dist -p mimizan-cli -p mimizan-gui --features mimizan-gui/store)
+    else
+        echo "==> cargo build --profile dist"
+        (cd "$PROJECT_DIR" && cargo build --profile dist -p mimizan-cli -p mimizan-gui)
+    fi
 fi
 for b in "$CLI" "$GUI"; do
     [[ -x "$b" ]] || { echo "ERROR: $b missing"; exit 1; }
@@ -33,6 +56,14 @@ for b in "$CLI" "$GUI"; do
 done
 
 "$PROJECT_DIR/dist/check_macos_links.sh" "$CLI" "$GUI"
+
+# The purchase is in the Mac App Store window and in no other. StoreKit
+# among the window's frameworks is the sign of it.
+if grep -q 'StoreKit\.framework' <<<"$(otool -L "$GUI")"; then
+    [[ "$STORE" == 1 ]] || { echo "ERROR: $GUI carries the App Store purchase; the download is built without it"; exit 1; }
+else
+    [[ "$STORE" == 0 ]] || { echo "ERROR: $GUI was built without the App Store purchase"; exit 1; }
+fi
 
 VERSION=$("$CLI" --version | awk '{print $2}')
 [[ -n "$VERSION" ]] || { echo "ERROR: could not read version"; exit 1; }
@@ -43,6 +74,11 @@ echo "==> version $VERSION"
 SMOKE=$("$CLI" measure synth --scene wedge --size 512 --json) || { echo "ERROR: measure synth failed"; exit 1; }
 if grep -qiE '"rmse[a-z_]*":\s*(null|"?NaN"?)' <<<"$SMOKE"; then
     echo "ERROR: measure synth reported NaN"; exit 1
+fi
+
+if [[ "$STORE" == 1 ]]; then
+    echo "==> the Mac App Store window is built; dist/sign_macos_appstore.sh makes its package"
+    exit 0
 fi
 
 STAGE=$(mktemp -d)

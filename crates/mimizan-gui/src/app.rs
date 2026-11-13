@@ -14,6 +14,7 @@ use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::lamp_bar::{lamp_bar, Lamp};
 use crate::paper_strip::paper_strip;
 use crate::session::{DetailAsk, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
+use crate::unlock::{self, Unlock};
 use crate::worker::{
     available_memory, develop_memory, develop_memory_of_size, memory_fits, Event, Heavy, Job, Loupe,
     LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
@@ -475,6 +476,9 @@ struct PlateResolved {
 /// orientation, point, box side in print pixels.
 type LoupeKey = (u64, Weights, Option<PlateView>, Recipe, u16, [f64; 2], usize);
 
+/// Beside what the Mac App Store build writes after its purchase alone.
+const LOCKED_MARK: &str = "🔒";
+
 /// The file the Export button writes, as its box names it: the container
 /// and, for the TIFF, its depth.
 fn file_kind_name(format: ExportFormat, tiff_eight_bit: bool) -> &'static str {
@@ -931,6 +935,9 @@ pub struct App {
     /// An export is waiting on the question whether this file, which is
     /// already there, is to be replaced.
     pending_replace: Option<PathBuf>,
+    /// The Mac App Store build's one purchase, the TIFF and the negative.
+    /// Every other build has nothing behind it and locks nothing.
+    unlock: Unlock,
     /// The close question was answered; the window may go.
     close_allowed: bool,
 
@@ -1113,6 +1120,7 @@ impl App {
             recipe_baseline: Recipe::on_paper(),
             pending_leave: None,
             pending_replace: None,
+            unlock: Unlock::new(&cc.egui_ctx),
             close_allowed: false,
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
@@ -1452,6 +1460,17 @@ impl App {
             self.edit.recipe.size = Some(sheet);
         }
         self.show_sheet();
+    }
+
+    /// The format the Export button writes. The chosen one, except in
+    /// the Mac App Store build before its purchase: there it is the JPEG,
+    /// and the choice waits for the purchase.
+    fn file_format(&self) -> ExportFormat {
+        if self.unlock.locked() {
+            ExportFormat::Jpeg
+        } else {
+            self.format
+        }
     }
 
     /// How the sheet goes into its file: the program's settings.
@@ -2513,7 +2532,7 @@ impl App {
             .as_ref()
             .and_then(|s| s.path.file_stem().map(|f| f.to_string_lossy().to_string()))
             .unwrap_or_else(|| "mimizan".into());
-        let name = format!("{stem}.{}", self.format.extension());
+        let name = format!("{stem}.{}", self.file_format().extension());
         self.export_kind = ExportKind::Print;
         if self.save_with_panel(&name) {
             return;
@@ -2528,6 +2547,10 @@ impl App {
     /// The linear export's dialog, beside the RAW, under
     /// [`linear_export_name`].
     fn start_linear_export(&mut self) {
+        if self.unlock.locked() {
+            self.unlock.ask();
+            return;
+        }
         if let Some(dir) = self.export_directory() {
             self.dialog.config_mut().initial_directory = dir;
         }
@@ -2548,7 +2571,7 @@ impl App {
         if sandboxed() {
             // The panel appends the extension itself, so the path it hands
             // back is written as it is: the grant is for that path alone.
-            let extensions = export_extensions(self.export_kind, self.linear_is_dng(), self.format);
+            let extensions = self.export_extensions();
             if let Some(path) = mimizan_mac::pick_save(self.export_directory().as_deref(), name, extensions) {
                 self.export_to(path, true);
             }
@@ -2567,7 +2590,7 @@ impl App {
     /// is never the target.
     fn export_to(&mut self, path: PathBuf, granted: bool) {
         let Some(source) = self.session.as_ref().map(|s| s.path.clone()) else { return };
-        let extensions = export_extensions(self.export_kind, self.linear_is_dng(), self.format);
+        let extensions = self.export_extensions();
         match export_target(path, granted, extensions, &source) {
             ExportTarget::Write(path) => self.export_now(path),
             ExportTarget::Ask(path) => self.pending_replace = Some(path),
@@ -2576,6 +2599,11 @@ impl App {
                 path.display()
             )),
         }
+    }
+
+    /// The extensions this export's name may carry.
+    fn export_extensions(&self) -> &'static [&'static str] {
+        export_extensions(self.export_kind, self.linear_is_dng(), self.file_format(), self.unlock.locked())
     }
 
     /// The question [`ExportTarget::Ask`] waits on.
@@ -2622,12 +2650,19 @@ impl App {
     }
 
     fn question_open(&self) -> bool {
-        self.pending_leave.is_some() || self.pending_replace.is_some() || self.dialog_up
+        self.pending_leave.is_some() || self.pending_replace.is_some() || self.dialog_up || self.unlock.open()
     }
 
     /// Start the export to `path`, which is settled.
     fn export_now(&mut self, path: PathBuf) {
         if self.session.is_none() {
+            return;
+        }
+        // The last door before the file: whatever name a dialog handed
+        // back, the store build writes the TIFF and the negative after
+        // the purchase alone.
+        if self.unlock.locked() && unlock::is_paid(self.export_kind == ExportKind::Linear, &path) {
+            self.unlock.ask();
             return;
         }
         // The linear negative writes its mask beside it, a file no dialog
@@ -3184,6 +3219,13 @@ impl App {
                             // pixels plus the border.
                             self.edit.recipe.border_mm = mm.clamp(0.0, 100.0);
                             self.edit.recipe.size = self.sheet_of_pixels(self.edit.recipe.frame_px());
+                        }
+                        if self.screenshot_to.is_some()
+                            && std::env::var_os("MIMIZAN_SCREENSHOT_UNLOCK").is_some()
+                        {
+                            // The purchase question in the unattended
+                            // capture. A build without the store has none.
+                            self.unlock.ask();
                         }
                         if let Some(filters) = self
                             .screenshot_to
@@ -4531,9 +4573,17 @@ impl App {
             self.start_export();
         }
         ui.add_space(4.0);
-        let hover = self.linear_hover_text();
+        let mut hover = self.linear_hover_text();
+        // Part of the purchase in the Mac App Store build: the button
+        // says so and opens the question.
+        let negative = if self.unlock.locked() {
+            hover.push_str("\n\nPart of the one purchase that unlocks the TIFF and the negative.");
+            format!("Negative…  {LOCKED_MARK}")
+        } else {
+            "Negative…".to_string()
+        };
         if ui
-            .add_enabled(idle && has, egui::Button::new("Negative…").min_size(Vec2::new(width, 24.0)))
+            .add_enabled(idle && has, egui::Button::new(negative).min_size(Vec2::new(width, 24.0)))
             .on_disabled_hover_text(hover.clone())
             .on_hover_text(hover)
             .clicked()
@@ -4597,21 +4647,27 @@ impl App {
                         "8 bit at quality 100, no chroma subsampling, the same ICC profile and the dpi                          embedded, no description. The print for the screen, the web, and a print service                          with a limit on the file's size.",
                     ),
                 ];
+                // The Mac App Store build before its purchase writes the
+                // JPEG. A TIFF chosen there is kept as the wish and asks
+                // for the purchase; the JPEG stays the file until then.
+                let locked = self.unlock.locked();
+                let current = self.file_format();
                 egui::ComboBox::from_id_salt("export-file")
-                    .selected_text(file_kind_name(self.format, self.tiff_eight_bit))
+                    .selected_text(file_kind_name(current, self.tiff_eight_bit))
                     .show_ui(ui, |ui| {
                         for (format, eight_bit, hover) in kinds {
-                            let chosen = self.format == format
+                            let chosen = current == format
                                 && (format == ExportFormat::Jpeg || self.tiff_eight_bit == eight_bit);
-                            if ui
-                                .selectable_label(chosen, file_kind_name(format, eight_bit))
-                                .on_hover_text(hover)
-                                .clicked()
-                                && !chosen
-                            {
+                            let paid = locked && format == ExportFormat::Tiff;
+                            let name = file_kind_name(format, eight_bit);
+                            let label = if paid { format!("{name}  {LOCKED_MARK}") } else { name.to_string() };
+                            if ui.selectable_label(chosen, label).on_hover_text(hover).clicked() && !chosen {
                                 self.format = format;
                                 self.tiff_eight_bit = eight_bit;
                                 changed = true;
+                                if paid {
+                                    self.unlock.ask();
+                                }
                             }
                         }
                     })
@@ -5064,7 +5120,7 @@ impl App {
 
     /// The depth of the file the Export button writes.
     fn export_bits(&self) -> &'static str {
-        match (self.format, self.tiff_eight_bit) {
+        match (self.file_format(), self.tiff_eight_bit) {
             (ExportFormat::Tiff, false) => "16 bit",
             (ExportFormat::Tiff, true) | (ExportFormat::Jpeg, _) => "8 bit",
         }
@@ -5103,7 +5159,7 @@ impl App {
             ", no sharpening".to_string()
         };
         // The JPEG has no description: the recipe stays in the file beside the RAW.
-        let (ext, bits, described) = match (self.format, self.tiff_eight_bit) {
+        let (ext, bits, described) = match (self.file_format(), self.tiff_eight_bit) {
             (ExportFormat::Tiff, false) => ("tif", "16 bit", true),
             (ExportFormat::Tiff, true) => ("tif", "8 bit", true),
             (ExportFormat::Jpeg, _) => ("jpg", "8 bit, quality 100", false),
@@ -5933,9 +5989,17 @@ fn start_folder() -> Option<PathBuf> {
 /// to a name that has none, the rest are accepted as they are. The print
 /// is a TIFF or a JPEG, the chosen format first and the other still
 /// accepted when typed; the linear negative is a TIFF under either
-/// spelling; the linear plate is a DNG and nothing else.
-fn export_extensions(kind: ExportKind, dng: bool, format: ExportFormat) -> &'static [&'static str] {
+/// spelling; the linear plate is a DNG and nothing else. `locked` is the
+/// Mac App Store build before its purchase: the print is a JPEG there,
+/// and a TIFF typed into the dialog becomes one.
+fn export_extensions(
+    kind: ExportKind,
+    dng: bool,
+    format: ExportFormat,
+    locked: bool,
+) -> &'static [&'static str] {
     match (kind, dng, format) {
+        (ExportKind::Print, _, _) if locked => &["jpg", "jpeg"],
         (ExportKind::Linear, true, _) => &["dng"],
         (ExportKind::Linear, false, _) => &["tif", "tiff"],
         (ExportKind::Print, _, ExportFormat::Tiff) => &["tif", "tiff", "jpg", "jpeg"],
@@ -6625,6 +6689,7 @@ impl eframe::App for App {
         self.strip_keys(&ctx);
         self.save_prompt(&ctx);
         self.replace_prompt(&ctx);
+        self.unlock.show(&ctx);
         // For the keys of the next frame.
         self.typing = text_edit_focused(&ctx);
     }
@@ -7329,11 +7394,28 @@ mod path_tests {
     }
 
     #[test]
+    fn before_the_purchase_the_print_is_a_jpeg_under_any_name() {
+        for format in [ExportFormat::Tiff, ExportFormat::Jpeg] {
+            let locked = export_extensions(ExportKind::Print, false, format, true);
+            assert_eq!(with_ext(PathBuf::from("print"), locked), PathBuf::from("print.jpg"));
+            assert_eq!(with_ext(PathBuf::from("print.tif"), locked), PathBuf::from("print.jpg"));
+            assert_eq!(with_ext(PathBuf::from("print.TIFF"), locked), PathBuf::from("print.jpg"));
+            assert_eq!(with_ext(PathBuf::from("print.dng"), locked), PathBuf::from("print.jpg"));
+            assert_eq!(with_ext(PathBuf::from("print.JPEG"), locked), PathBuf::from("print.JPEG"));
+            // Every name the dialog can hand back is one the lock lets through.
+            for typed in ["print", "print.tif", "print.dng", "print.v2", "print.jpg"] {
+                let path = with_ext(PathBuf::from(typed), locked);
+                assert!(!crate::unlock::is_paid(false, &path), "{typed} -> {}", path.display());
+            }
+        }
+    }
+
+    #[test]
     fn an_export_name_gets_its_kind_of_extension() {
-        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff);
-        let jpeg = export_extensions(ExportKind::Print, false, ExportFormat::Jpeg);
-        let negative = export_extensions(ExportKind::Linear, false, ExportFormat::Jpeg);
-        let dng = export_extensions(ExportKind::Linear, true, ExportFormat::Tiff);
+        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff, false);
+        let jpeg = export_extensions(ExportKind::Print, false, ExportFormat::Jpeg, false);
+        let negative = export_extensions(ExportKind::Linear, false, ExportFormat::Jpeg, false);
+        let dng = export_extensions(ExportKind::Linear, true, ExportFormat::Tiff, false);
         // Either spelling of TIFF stands, in any case; a name without one
         // gets the first; a DNG accepts no TIFF and a TIFF no DNG.
         assert_eq!(with_ext(PathBuf::from("print.TIFF"), tiff), PathBuf::from("print.TIFF"));
@@ -7358,8 +7440,8 @@ mod path_tests {
     /// extension is replaced, anything else is part of the name.
     #[test]
     fn a_dotted_export_name_keeps_its_tail() {
-        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff);
-        let jpeg = export_extensions(ExportKind::Print, false, ExportFormat::Jpeg);
+        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff, false);
+        let jpeg = export_extensions(ExportKind::Print, false, ExportFormat::Jpeg, false);
         assert_eq!(with_ext(PathBuf::from("frame.v2"), tiff), PathBuf::from("frame.v2.tif"));
         assert_eq!(with_ext(PathBuf::from("2026.11.10 Köln"), jpeg), PathBuf::from("2026.11.10 Köln.jpg"));
         assert_eq!(with_ext(PathBuf::from("a.b/frame.v2"), tiff), PathBuf::from("a.b/frame.v2.tif"));
@@ -7379,8 +7461,8 @@ mod path_tests {
         let old = dir.join("old.tif");
         std::fs::write(&raw, b"raw").unwrap();
         std::fs::write(&old, b"print").unwrap();
-        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff);
-        let dng = export_extensions(ExportKind::Linear, true, ExportFormat::Tiff);
+        let tiff = export_extensions(ExportKind::Print, false, ExportFormat::Tiff, false);
+        let dng = export_extensions(ExportKind::Linear, true, ExportFormat::Tiff, false);
 
         // A bare name that becomes a file which is there: asked.
         assert_eq!(export_target(dir.join("old"), false, tiff, &raw), Ask(old.clone()));

@@ -23,6 +23,11 @@ jobs:
         run: cargo clippy --release --all-targets -- -D warnings
       - name: Tests
         run: cargo test --release --workspace
+      # The Mac App Store window's lock, with a store that never answers.
+      - name: Clippy, the store build
+        run: cargo clippy --release -p mimizan-gui --features store --all-targets -- -D warnings
+      - name: Tests, the store build
+        run: cargo test --release -p mimizan-gui --features store
       - name: Synthetic bench (smoke)
         run: cargo run --release -p mimizan-cli -- measure synth --size 512
 
@@ -68,8 +73,13 @@ jobs:
         run: cargo run --release -p mimizan-cli -- measure synth --size 512
       - name: Window
         run: cargo build --release -p mimizan-gui
-      - name: No libraries beyond macOS
-        run: bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui
+      - name: No libraries beyond macOS, and no purchase in the download
+        run: |
+          bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui
+          if grep -q 'StoreKit\.framework' <<<"$(otool -L target/release/mimizan-gui)"; then
+            echo "ERROR: the window built without the store feature links StoreKit"
+            exit 1
+          fi
       - name: App bundle starts the window
         run: |
           version=$(target/release/mimizan --version | awk '{print $2}')
@@ -82,3 +92,15 @@ jobs:
           bash dist/check_macos_links.sh \
             "$RUNNER_TEMP/Mimizan Lab.app/Contents/MacOS/mimizan" \
             "$RUNNER_TEMP/Mimizan Lab.app/Contents/MacOS/mimizan-gui"
+      # Last, because it replaces the window above: the Mac App Store
+      # build. Its purchase is Swift, compiled and linked here and nowhere
+      # else before the store workflow runs.
+      - name: The store build compiles, links and carries the purchase
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: |
+          cargo clippy --release -p mimizan-gui --features store --all-targets -- -D warnings
+          cargo build --release -p mimizan-gui --features store
+          bash dist/check_macos_links.sh target/release/mimizan-gui
+          otool -L target/release/mimizan-gui | grep -c 'StoreKit\.framework'
+          nm target/release/mimizan-gui | grep -c '_mimizan_store_purchase'

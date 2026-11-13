@@ -11,6 +11,14 @@ authors.workspace = true
 name = "mimizan-gui"
 path = "src/main.rs"
 
+[features]
+# The Mac App Store build alone (.github/workflows/macos-store.yml): the
+# JPEG at full size is free, the TIFF and the negative are one purchase.
+# Every other build, the Mac download on GitHub among them, is built
+# without it and locks nothing. On Linux and Windows the feature compiles
+# with a store that never answers, so the locked window can be tested.
+store = ["mimizan-mac/store"]
+
 [dependencies]
 mimizan-core = { path = "../mimizan-core" }
 anyhow.workspace = true

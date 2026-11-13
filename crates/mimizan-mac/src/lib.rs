@@ -1,4 +1,5 @@
-//! Folder access for a sandboxed Mac build.
+//! Folder access for a sandboxed Mac build, and the App Store purchase of
+//! the Mac App Store build (`store`, behind the feature of that name).
 //!
 //! The App Sandbox only lets the program read a folder the user picked in
 //! the system dialog, and only while a security-scoped bookmark for that
@@ -9,6 +10,10 @@
 mod apple;
 #[cfg(target_os = "macos")]
 pub use apple::{adopt, pick_folder, pick_save, restore, FolderGrant};
+
+/// The App Store purchase. Only the Mac App Store build has it.
+#[cfg(all(target_os = "macos", feature = "store"))]
+pub mod store;
 
 #[cfg(not(target_os = "macos"))]
 mod stub;

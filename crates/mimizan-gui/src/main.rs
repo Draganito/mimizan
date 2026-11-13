@@ -20,6 +20,7 @@ mod histogram;
 mod lamp_bar;
 mod paper_strip;
 mod session;
+mod unlock;
 mod worker;
 
 #[global_allocator]

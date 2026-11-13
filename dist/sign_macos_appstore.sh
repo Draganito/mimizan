@@ -6,7 +6,8 @@
 # entitlements, so it only sees folders the user picked in the system dialog.
 # It ships the window only. The command line stays in the unsigned zip.
 #
-# Run on macOS after the dist-profile build. The programs are taken from
+# Run on macOS after the dist-profile build of the store's window
+# (dist/make_release_macos.sh --store). The programs are taken from
 # target/dist. Passwords and files come from the environment, never from
 # the repository.
 #
@@ -41,7 +42,11 @@ GUI="$TARGET_DIR/dist/mimizan-gui"
 ENTITLEMENTS="$PROJECT_DIR/dist/macos-entitlements.plist"
 BUILD_NUMBER="${MAC_BUILD_NUMBER:-1}"
 
-[[ -x "$CLI" && -x "$GUI" ]] || { echo "ERROR: build the programs first (dist/make_release_macos.sh)" >&2; exit 1; }
+[[ -x "$CLI" && -x "$GUI" ]] || { echo "ERROR: build the programs first (dist/make_release_macos.sh --store)" >&2; exit 1; }
+# The store's window is the one with the purchase. The download's window
+# has none and gives the TIFF and the negative away: not this package.
+grep -q 'StoreKit\.framework' <<<"$(otool -L "$GUI")" \
+    || { echo "ERROR: $GUI is the download's window; build with dist/make_release_macos.sh --store" >&2; exit 1; }
 [[ -f "$ENTITLEMENTS" ]] || { echo "ERROR: $ENTITLEMENTS missing" >&2; exit 1; }
 
 VERSION=$("$CLI" --version | awk '{print $2}')
