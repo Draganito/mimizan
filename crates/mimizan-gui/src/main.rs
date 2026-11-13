@@ -63,21 +63,32 @@ fn main() -> eframe::Result {
             size.iter().all(|v| v.is_finite() && (320.0..=16384.0).contains(v)).then_some(size)
         })
         .unwrap_or([1360.0, 860.0]);
+    // Fits a 1366x768 laptop at scale 1 and an HiDPI screen at scale 2;
+    // the panels float, scroll and can be moved, Ctrl+/- zooms the whole UI.
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size(size)
+        .with_min_inner_size([820.0, 560.0])
+        .with_title(WINDOW_TITLE)
+        .with_icon(app_icon())
+        // Must match dist/mimizan-gui.desktop, or GNOME shows a generic
+        // mark in the dock while the launcher still has the letter M.
+        .with_app_id("mimizan-gui");
+    // `MIMIZAN_WINDOW_BARE=1` leaves the frame off and holds the size
+    // (unattended screenshots). A window manager shrinks a framed window
+    // until the frame fits the screen, and GNOME maximizes one that can be
+    // resized and covers most of it: the capture is then not the size
+    // `MIMIZAN_WINDOW` asked for. Smallest and largest size are both set,
+    // or the window still counts as one that can be resized.
+    if std::env::var_os("MIMIZAN_WINDOW_BARE").is_some() {
+        viewport = viewport
+            .with_decorations(false)
+            .with_resizable(false)
+            .with_min_inner_size(size)
+            .with_max_inner_size(size);
+    }
     // `mut` is only used on Windows, where the renderer is switched to DirectX 12.
     #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
-    let mut options = eframe::NativeOptions {
-        // Fits a 1366x768 laptop at scale 1 and an HiDPI screen at scale 2;
-        // the panels float, scroll and can be moved, Ctrl+/- zooms the whole UI.
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size(size)
-            .with_min_inner_size([820.0, 560.0])
-            .with_title(WINDOW_TITLE)
-            .with_icon(app_icon())
-            // Must match dist/mimizan-gui.desktop, or GNOME shows a generic
-            // mark in the dock while the launcher still has the letter M.
-            .with_app_id("mimizan-gui"),
-        ..Default::default()
-    };
+    let mut options = eframe::NativeOptions { viewport, ..Default::default() };
     // OpenGL is not part of Windows. The Store test is a virtual machine
     // without an OpenGL driver, and the window then closes at once.
     // DirectX 12 is part of Windows: the graphics card when there is one,

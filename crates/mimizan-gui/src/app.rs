@@ -3258,10 +3258,13 @@ impl App {
             }
             4 => ctx.request_repaint(),
             // One extra frame so the texture is painted before the capture.
-            1 => {
+            // An open print box is waited for as well: its own worker
+            // renders it, and it lands after the preview.
+            1 if !(self.loupe_open && self.loupe_shown != self.loupe_sent) => {
                 self.screenshot_state = 2;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             }
+            1 => ctx.request_repaint(),
             2 => {
                 let shot = ctx.input(|i| {
                     i.events.iter().find_map(|e| match e {
