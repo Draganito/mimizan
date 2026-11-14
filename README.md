@@ -197,7 +197,7 @@ mimizan print photo_plate.tif -o photo_colour.tif --recipe photo.recipe.json
 
 The file the desktop saves next to the RAW carries the whole development, white balance and mask, process, mix or filters, lamps and print; the two commands read it and reproduce the window's export. `--wb` and `--mask` on `negative` override the recipe's, as `--weights` and `--plate` do. The rest is `mimizan --help`.
 
-The window can photograph itself, for a handbook or a store page. `MIMIZAN_SCREENSHOT=shot.png mimizan-gui photo.nef` opens the file, writes the window's picture as a PNG once the print and its 1:1 box are on screen, and quits. `MIMIZAN_WINDOW=1280x800` sets the size in points, and `MIMIZAN_WINDOW_BARE=1` leaves the frame off and holds that size, so the picture has the pixels asked for: 2560 × 1600 on a screen at scale 2.
+The window can photograph itself, for a handbook or a store page. `MIMIZAN_SCREENSHOT=shot.png mimizan-gui photo.nef` opens the file, writes the window's picture as a PNG once the print and its 1:1 box are on screen, and quits. The pointer is left out of it, so no hover is in the picture, wherever the mouse rests. `MIMIZAN_WINDOW=1280x800` sets the size in points, and `MIMIZAN_WINDOW_BARE=1` leaves the frame off and holds that size, so the picture has the pixels asked for: 2560 × 1600 on a screen at scale 2.
 
 ## The method
 

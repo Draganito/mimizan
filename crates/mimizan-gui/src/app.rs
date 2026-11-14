@@ -6779,6 +6779,22 @@ impl eframe::App for App {
         self.guard_close(ctx);
     }
 
+    /// A window that photographs itself is not under the pointer: where
+    /// the mouse happens to rest, the capture would carry that control's
+    /// hover.
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        if self.screenshot_to.is_some() {
+            raw_input.events.retain(|e| {
+                !matches!(
+                    e,
+                    egui::Event::PointerMoved(_)
+                        | egui::Event::MouseMoved(_)
+                        | egui::Event::PointerButton { .. }
+                )
+            });
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.loupe_open = false;
