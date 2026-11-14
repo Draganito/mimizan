@@ -14,6 +14,7 @@ use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::lamp_bar::{lamp_bar, Lamp};
 use crate::paper_strip::paper_strip;
 use crate::session::{DetailAsk, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
+use crate::toolbar::{self, Chip, Icon};
 use crate::unlock::{self, Unlock};
 use crate::worker::{
     available_memory, develop_memory, develop_memory_of_size, memory_fits, Event, Heavy, Job, Loupe,
@@ -921,6 +922,9 @@ pub struct App {
     /// A text field had the keyboard when this frame began, which is
     /// when the last one ended.
     typing: bool,
+    /// A list was open when this frame began. The Escape that closes it
+    /// is still in the input afterwards and is not the easel's as well.
+    list_open: bool,
     /// The folder the Mac sandbox is allowed to read. Held for the whole
     /// time that folder (and its subfolders) stay open.
     #[cfg(target_os = "macos")]
@@ -1114,6 +1118,7 @@ impl App {
             dialog_up: false,
             close_waits: false,
             typing: false,
+            list_open: false,
             #[cfg(target_os = "macos")]
             folder_grant: None,
             cameras_dir,
@@ -3585,58 +3590,83 @@ impl App {
         self.export_to(path, false);
     }
 
-    /// Two rows. The first is what is shown: the windows and the process
-    /// on the left, the way back beside them, the note in what is left.
-    /// The second is what is done to the picture: the easel, the brush
-    /// and the turn, one well with a bar between the tools. Each group is
-    /// a flat well, and the bar shows between them.
+    /// Two rows of one height. The first is what is shown: the film
+    /// strip, the three panels in the order of the steps and the process
+    /// on the left, the way back on the right, the note in what is left.
+    /// The second is what is done to the picture: the turn and the two
+    /// tools, and beside them only what the tool in the hand needs. With
+    /// no tool in the hand it says what the picture carries. Neither row
+    /// changes its height, so a fitted picture stays where it is when a
+    /// tool is taken up.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing = egui::vec2(0.0, 4.0);
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        ui.spacing_mut().interact_size.y = toolbar::FIELD_H;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            tool_well(ui, |ui| {
-                self.toolbar_windows(ui);
-                ui.add_space(10.0);
-                self.toolbar_process(ui);
-            });
-            ui.add_space(16.0);
-            tool_well(ui, |ui| self.toolbar_history(ui));
-            ui.add_space(12.0);
-            // The note takes only what is left and is cut, never painted over the wells.
+            ui.set_min_height(toolbar::ROW_H);
+            self.toolbar_windows(ui);
+            toolbar::sep(ui);
+            self.toolbar_process(ui);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.set_max_width(ui.available_width());
+                self.toolbar_history(ui);
+                ui.add_space(8.0);
+                // The note takes only what is left and is cut, never painted over the controls.
                 self.toolbar_status(ui);
             });
         });
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            tool_well(ui, |ui| self.toolbar_picture(ui));
+            ui.set_min_height(toolbar::ROW_H);
+            self.toolbar_tools(ui);
+            toolbar::sep(ui);
+            if self.crop_open {
+                self.toolbar_crop(ui);
+            } else if self.burn_on {
+                self.toolbar_burn(ui);
+            } else {
+                let carries = self.picture_carries();
+                if !carries.is_empty() {
+                    toolbar::note(ui, &carries)
+                        .on_hover_text("What this picture carries: its crop, its straighten, its strokes.");
+                }
+            }
         });
     }
 
     fn toolbar_windows(&mut self, ui: &mut egui::Ui) {
         if ui
-            .selectable_label(self.show_strip, "Strip")
+            .add(Chip::toggle("Film strip", self.show_strip).icon(Icon::FilmStrip))
             .on_hover_text(
-                "Show or hide the film strip (B): the folder's RAW files, the way in. It closes when you start on an open picture. ←/→ open the neighbouring file either way.",
+                "Show or hide the film strip (B): the folder's RAW files, the way in. It closes when you \
+                 start on an open picture. The Left and Right keys open the neighbouring file either way.",
             )
             .clicked()
         {
             self.toggle_strip();
         }
+        toolbar::sep(ui);
         // Panel indices: 0 left, 1 right, 2 bottom — shown in the order
-        // of the three steps.
-        for (i, name, hover) in [
-            (0, "Negative", "1 · Judge the negative: file, histograms, development (Tab hides every panel)"),
-            (2, "Enlarger", "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)"),
-            (1, "Print", "3 · The print: size, border, export"),
+        // of the three steps, each with its number.
+        for (i, step, name, hover) in [
+            (
+                0,
+                "1",
+                "Negative",
+                "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
+            ),
+            (
+                2,
+                "2",
+                "Enlarger",
+                "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)",
+            ),
+            (1, "3", "Print", "3 · The print: size, border, export"),
         ] {
             let hover = if self.waiting[i] {
                 "No room at this size. It returns when the window is larger. Click to close it."
             } else {
                 hover
             };
-            if ui.selectable_label(self.panels[i], name).on_hover_text(hover).clicked() {
+            if ui.add(Chip::toggle(name, self.panels[i]).step(step)).on_hover_text(hover).clicked() {
                 self.panels[i] = !self.panels[i];
                 self.persist();
             }
@@ -3644,8 +3674,8 @@ impl App {
     }
 
     /// The process: the monochrome negative or the three-colour plate.
-    /// One of the two is always lit. A monochrome sensor has no plate, so
-    /// the switch is still while such a file is open.
+    /// One of the two is always lit. A monochrome sensor has no plate:
+    /// the plate is shown, not offered, and both say why.
     fn toolbar_process(&mut self, ui: &mut egui::Ui) {
         let mono_sensor = self.session.as_ref().is_some_and(|s| s.is_mono());
         let plate = self.plate_process() && !mono_sensor;
@@ -3661,181 +3691,247 @@ impl App {
                  through the same paper into one colour file, Prokudin-Gorsky's way (P switches)",
             )
         };
-        ui.add_enabled_ui(!mono_sensor, |ui| {
-            if ui.selectable_label(!plate, "Monochrome").on_hover_text(mono_tip).clicked() && plate {
-                self.set_process(false);
-            }
-            if ui.selectable_label(plate, "Plate").on_hover_text(plate_tip).clicked() && !plate {
-                self.set_process(true);
-            }
-        });
+        let options = [("Monochrome", mono_tip, false), ("Plate", plate_tip, mono_sensor)];
+        if let Some(k) = toolbar::choice(ui, "process-choice", &options, usize::from(plate)) {
+            self.set_process(k == 1);
+        }
     }
 
-    /// The tools in the recipe's order: the turn, then the straighten and
-    /// the window, then the strokes.
-    fn toolbar_picture(&mut self, ui: &mut egui::Ui) {
+    /// The turn and the two tools, in the recipe's order: the turn, then
+    /// the easel, then the brush. One tool is in the hand at a time.
+    fn toolbar_tools(&mut self, ui: &mut egui::Ui) {
+        const NO_FILE: &str = "Open a file first.";
         let has = self.session.is_some();
         if ui
-            .add_enabled(has, egui::Button::new("⟳ 90°"))
+            .add_enabled(has, Chip::action("90°").icon(Icon::Turn))
             .on_hover_text("Rotate the picture 90° clockwise (preview and export)")
+            .on_disabled_hover_text(NO_FILE)
             .clicked()
         {
             self.edit.recipe.quarter_turns = (self.rotation() + 1) % 4;
         }
-        tool_bar(ui);
-        let mut crop_on = self.crop_open;
         if ui
-            .add_enabled(has, egui::Checkbox::new(&mut crop_on, "Crop"))
-            .on_hover_text("Frame the negative. Apply makes that window the picture.")
-            .changed()
+            .add_enabled(has, Chip::tool("Crop", Icon::Crop, self.crop_open))
+            .on_hover_text(
+                "Frame the negative. Apply crop makes that window the picture; Cancel leaves the picture \
+                 as it was.",
+            )
+            .on_disabled_hover_text(NO_FILE)
+            .clicked()
         {
-            if crop_on {
-                self.arm_crop();
-            } else {
+            if self.crop_open {
                 self.close_crop();
-            }
-        }
-        ui.add_enabled_ui(has && self.crop_open, |ui| {
-            let response = egui::ComboBox::from_id_salt("crop_format")
-                .width(framed_combo_width(ui))
-                .height(280.0)
-                .selected_text(self.frame_box_label())
-                .show_ui(ui, |ui| self.crop_format_table(ui))
-                .response;
-            response
-                .on_hover_text("The sheet, and which way it stands.")
-                .on_disabled_hover_text("The sheet, and which way it stands.");
-        });
-        // The straighten: a line drawn on the picture, or a number. The
-        // frame is the largest rectangle of the negative's proportion that
-        // fits inside the turned negative.
-        ui.add_enabled_ui(has && self.crop_open, |ui| {
-            let mut on = self.straighten_on;
-            if ui
-                .toggle_value(&mut on, "Straighten")
-                .on_hover_text(
-                    "Draw a line along something that should be level or upright; the picture turns to \
-                     make it so, and the frame is the largest rectangle that fits inside the turned \
-                     negative. Drags move the window again once this is off.",
-                )
-                .on_disabled_hover_text("Open Crop first. The straighten is applied with the window.")
-                .changed()
-            {
-                self.straighten_on = on;
-                self.line_drag = None;
-                self.crop_drag = None;
-            }
-            // The draft while the easel is up; the recipe's angle when it is
-            // down, so the field never shows a turn the picture has not got.
-            let mut angle = self.view_angle();
-            if ui
-                .add(
-                    egui::DragValue::new(&mut angle)
-                        .range(-straighten::ANGLE_LIMIT..=straighten::ANGLE_LIMIT)
-                        .speed(0.05)
-                        .fixed_decimals(2)
-                        .suffix("°"),
-                )
-                .on_hover_text("The turn, degrees clockwise. Drag, or type; 0 is the negative as it is.")
-                .changed()
-            {
-                self.set_draft_angle(angle);
-            }
-            if ui
-                .add_enabled(self.view_angle() != 0.0, egui::Button::new("0°"))
-                .on_hover_text("No straighten: the whole negative is the frame again.")
-                .clicked()
-            {
-                self.set_draft_angle(0.0);
-            }
-        });
-        if ui
-            .add_enabled(has && self.crop_open, egui::Button::new("Apply"))
-            .on_hover_text(
-                "Keep this window and straighten (Enter). The print, the histograms and the export use only it.",
-            )
-            .clicked()
-        {
-            self.apply_crop();
-        }
-        // The brush: dodging and burning on the picture as it prints.
-        tool_bar(ui);
-        let mut burn_on = self.burn_on;
-        if ui
-            .add_enabled(has, egui::Checkbox::new(&mut burn_on, "Burn"))
-            .on_hover_text(
-                "Dodge and burn with the brush. Set it on the picture, lock it (Enter), then paint: a drag of \
-                 the hand, a push of the card. The strokes print at once; Alt shows them.",
-            )
-            .changed()
-        {
-            if burn_on {
-                self.arm_burn();
             } else {
-                self.close_burn();
+                self.arm_crop();
             }
-        }
-        ui.add_enabled_ui(has && self.burn_on, |ui| {
-            let tools = [
-                (Tool::Hand, "Hand", "The hand: an ellipse with a soft edge, painted along a path."),
-                (
-                    Tool::Card,
-                    "Card",
-                    "The card: a straight edge with a soft shadow, pushed from one place to another.",
-                ),
-            ];
-            for (tool, label, hint) in tools {
-                if ui.selectable_label(self.brush.tool == tool, label).on_hover_text(hint).clicked()
-                    && self.brush.tool != tool
-                {
-                    self.brush.tool = tool;
-                    self.burn_drag = None;
-                }
-            }
-            if ui
-                .selectable_label(!self.burn_locked, "Set")
-                .on_hover_text(
-                    "Open the brush: its handles on the picture, nothing in the picture changes (Escape).",
-                )
-                .clicked()
-            {
-                self.open_brush();
-            }
-            if ui
-                .selectable_label(self.burn_locked, "Paint")
-                .on_hover_text(
-                    "Lock the brush and paint with it (Enter). The brush is kept for every picture.",
-                )
-                .clicked()
-            {
-                self.lock_brush();
-            }
-        });
-        // The strokes the picture has, and the way to take them all away.
-        let n = self.edit.recipe.burns.len();
-        ui.add_space(6.0);
-        if n > 0 {
-            ui.label(RichText::new(format!("{n} stroke{}", if n == 1 { "" } else { "s" })).weak());
-            ui.add_space(2.0);
         }
         if ui
-            .add_enabled(has && n > 0, egui::Button::new("Clear"))
-            .on_hover_text("Take every stroke away. The brush stays as it is; Undo brings them back.")
-            .on_disabled_hover_text("No strokes on this picture.")
+            .add_enabled(has, Chip::tool("Dodge & burn", Icon::Dodge, self.burn_on))
+            .on_hover_text(
+                "Dodge and burn with the brush. Shape it on the picture, lock it (Enter), then paint: a drag \
+                 of the hand, a push of the card. The strokes print at once; Alt shows them.",
+            )
+            .on_disabled_hover_text(NO_FILE)
             .clicked()
         {
-            self.edit.recipe.burns.clear();
-            self.burn_drag = None;
+            if self.burn_on {
+                self.close_burn();
+            } else {
+                self.arm_burn();
+            }
         }
     }
 
-    /// What the closed box shows. Papers keep their names; the picture is read from its pixels.
-    fn frame_box_label(&self) -> String {
-        if self.crop_format != PaperFormat::Image {
-            return self.crop_format.framed(self.crop_turned).to_owned();
+    /// The easel is up: the sheet, the straighten, and at the right the
+    /// two ways out, with a mark while the window is not the picture yet.
+    fn toolbar_crop(&mut self, ui: &mut egui::Ui) {
+        toolbar::caption(ui, "Sheet");
+        egui::ComboBox::from_id_salt("crop_format")
+            .width(framed_combo_width(ui))
+            .height(280.0)
+            .selected_text(self.frame_label(self.crop_format, self.crop_turned))
+            .show_ui(ui, |ui| self.crop_format_table(ui))
+            .response
+            .on_hover_text("The sheet, and which way it stands.");
+        toolbar::sep(ui);
+        // The straighten: a line drawn on the picture, or a number. The
+        // frame is the largest rectangle of the negative's proportion that
+        // fits inside the turned negative.
+        if ui
+            .add(Chip::toggle("Straighten", self.straighten_on))
+            .on_hover_text(
+                "Draw a line along something that should be level or upright; the picture turns to \
+                 make it so, and the frame is the largest rectangle that fits inside the turned \
+                 negative. Drags move the window again once this is off.",
+            )
+            .clicked()
+        {
+            self.straighten_on = !self.straighten_on;
+            self.line_drag = None;
+            self.crop_drag = None;
+        }
+        let mut angle = self.view_angle();
+        if ui
+            .add(
+                egui::DragValue::new(&mut angle)
+                    .range(-straighten::ANGLE_LIMIT..=straighten::ANGLE_LIMIT)
+                    .speed(0.05)
+                    .fixed_decimals(2)
+                    .suffix("°"),
+            )
+            .on_hover_text("The turn, degrees clockwise. Drag, or type; 0 is the negative as it is.")
+            .changed()
+        {
+            self.set_draft_angle(angle);
+        }
+        if ui
+            .add_enabled(self.view_angle() != 0.0, Chip::icon_only(Icon::Cross, "No straighten"))
+            .on_hover_text("No straighten: the whole negative is the frame again.")
+            .on_disabled_hover_text("No straighten on the easel.")
+            .clicked()
+        {
+            self.set_draft_angle(0.0);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // In a narrow window the keys go first, then the mark; the two
+            // buttons stay.
+            const PENDING: &str = "not applied";
+            let gap = ui.spacing().item_spacing.x;
+            let room = ui.available_width();
+            let pending = self.crop_pending();
+            let buttons = |keys: bool| {
+                Chip::keep("Apply crop").key(keys.then_some("Enter")).width(ui)
+                    + gap
+                    + Chip::action("Cancel").key(keys.then_some("Esc")).width(ui)
+            };
+            let mark = if pending { gap + toolbar::pending_width(ui, PENDING) } else { 0.0 };
+            let keys = room >= buttons(true) + mark;
+            let marked = pending && room >= buttons(keys) + mark;
+            if ui
+                .add(Chip::keep("Apply crop").key(keys.then_some("Enter")))
+                .on_hover_text(
+                    "Keep this window and straighten (Enter). The print, the histograms and the export \
+                     use only it.",
+                )
+                .clicked()
+            {
+                self.apply_crop();
+            }
+            if ui
+                .add(Chip::action("Cancel").key(keys.then_some("Esc")))
+                .on_hover_text("Put the easel down (Escape). The picture stays as it was.")
+                .clicked()
+            {
+                self.close_crop();
+            }
+            if marked {
+                toolbar::pending(ui, PENDING).on_hover_text(
+                    "The window on the easel is not the picture yet. Undo, Reset all, the brush and \
+                     another file put the easel down without keeping it.",
+                );
+            }
+        });
+    }
+
+    /// The brush is in the hand: its tip, whether it is being shaped or
+    /// paints, and at the right the strokes the picture has and the way
+    /// to take them all away.
+    fn toolbar_burn(&mut self, ui: &mut egui::Ui) {
+        toolbar::caption(ui, "Tip");
+        let tips = [
+            ("Hand", "The hand: an ellipse with a soft edge, painted along a path.", false),
+            (
+                "Card",
+                "The card: a straight edge with a soft shadow, pushed from one place to another.",
+                false,
+            ),
+        ];
+        let tip = usize::from(self.brush.tool == Tool::Card);
+        if let Some(k) = toolbar::choice(ui, "tip-choice", &tips, tip) {
+            self.brush.tool = if k == 1 { Tool::Card } else { Tool::Hand };
+            self.burn_drag = None;
+        }
+        toolbar::sep(ui);
+        toolbar::caption(ui, "Brush");
+        let states = [
+            (
+                "Shape",
+                "Open the brush: its handles on the picture, nothing in the picture changes (Escape).",
+                false,
+            ),
+            (
+                "Paint",
+                "Lock the brush and paint with it (Enter). The brush is kept for every picture.",
+                false,
+            ),
+        ];
+        match toolbar::choice(ui, "brush-choice", &states, usize::from(self.burn_locked)) {
+            Some(0) => self.open_brush(),
+            Some(_) => self.lock_brush(),
+            None => {}
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let n = self.edit.recipe.burns.len();
+            if ui
+                .add_enabled(n > 0, Chip::action("Clear strokes"))
+                .on_hover_text("Take every stroke away. The brush stays as it is; Undo brings them back.")
+                .on_disabled_hover_text("No strokes on this picture.")
+                .clicked()
+            {
+                self.edit.recipe.burns.clear();
+                self.burn_drag = None;
+            }
+            if n > 0 {
+                toolbar::note(ui, &strokes_text(n));
+            }
+        });
+    }
+
+    /// Whether the easel holds what the picture has not got: another
+    /// window than the recipe's, or another straighten.
+    fn crop_pending(&self) -> bool {
+        if !self.crop_open {
+            return false;
+        }
+        let (fw, fh) = self.file_size();
+        if fw == 0 || fh == 0 {
+            return false;
+        }
+        let whole = CropRect { x: 0, y: 0, w: fw, h: fh };
+        let kept = self.edit.recipe.crop.map_or(whole, |c| c.sanitized(fw, fh));
+        self.angle_draft != self.edit.recipe.angle || self.crop_draft.sanitized(fw, fh) != kept
+    }
+
+    /// What the picture carries, for the second row while no tool is in
+    /// the hand: the crop by its sheet, the straighten, the strokes.
+    /// Empty for a picture that has none of them.
+    fn picture_carries(&self) -> String {
+        let recipe = &self.edit.recipe;
+        let mut parts = Vec::new();
+        if let Some(c) = recipe.crop {
+            let (fw, fh) = self.frame_at(recipe.angle);
+            if fw > 0 && fh > 0 {
+                let c = c.sanitized(fw, fh);
+                let (format, turned) = PaperFormat::match_window(fw, fh, c.w, c.h, self.crop_format);
+                parts.push(format!("crop {}", self.frame_label(format, turned)));
+            }
+        }
+        if recipe.angle != 0.0 {
+            parts.push(format!("straighten {:.2}°", recipe.angle));
+        }
+        if !recipe.burns.is_empty() {
+            parts.push(strokes_text(recipe.burns.len()));
+        }
+        parts.join(" · ")
+    }
+
+    /// A sheet by its name. Papers keep theirs; the picture is read from its pixels.
+    fn frame_label(&self, format: PaperFormat, turned: bool) -> String {
+        if format != PaperFormat::Image {
+            return format.framed(turned).to_owned();
         }
         let (w, h) = self.export_size();
-        let (a, b) = if self.crop_turned { (h, w) } else { (w, h) };
+        let (a, b) = if turned { (h, w) } else { (w, h) };
         let (a, b) = picture_terms(a as u32, b as u32);
         format!("{a}:{b}")
     }
@@ -3914,30 +4010,38 @@ impl App {
         self.reinscribe();
     }
 
+    /// The way back, laid from the right edge inwards: the reset stands
+    /// apart from the two steps, behind a bar, because it takes
+    /// everything.
     fn toolbar_history(&mut self, ui: &mut egui::Ui) {
-        let (pos, len) = self.history.position();
         if ui
-            .add_enabled(self.history.can_undo(), egui::Button::new("↺"))
-            .on_hover_text(format!("Undo (Ctrl+Z) — step {pos} of {len}"))
+            .add(Chip::action("Reset all"))
+            .on_hover_text(
+                "Every control back to its default, the crop and the strokes with them; the negative \
+                 stays. Undo brings them back. Closing, or opening another file, still asks whether to \
+                 keep this.",
+            )
             .clicked()
         {
-            self.undo();
+            self.reset(false);
         }
+        toolbar::sep(ui);
+        let (pos, len) = self.history.position();
         if ui
-            .add_enabled(self.history.can_redo(), egui::Button::new("↻"))
-            .on_hover_text("Redo (Ctrl+Shift+Z / Ctrl+Y)")
+            .add_enabled(self.history.can_redo(), Chip::icon_only(Icon::Redo, "Redo"))
+            .on_hover_text(format!("Redo ({COMMAND_KEY}+Shift+Z / {COMMAND_KEY}+Y)"))
+            .on_disabled_hover_text("Nothing to redo.")
             .clicked()
         {
             self.redo();
         }
         if ui
-            .button("Reset")
-            .on_hover_text(
-                "Controls back to defaults; the negative stays. Closing, or opening another file, still asks whether to keep this.",
-            )
+            .add_enabled(self.history.can_undo(), Chip::icon_only(Icon::Undo, "Undo"))
+            .on_hover_text(format!("Undo ({COMMAND_KEY}+Z) — step {pos} of {len}"))
+            .on_disabled_hover_text("Nothing to undo.")
             .clicked()
         {
-            self.reset(false);
+            self.undo();
         }
     }
 
@@ -5947,31 +6051,14 @@ fn frame_cell(ui: &mut egui::Ui, label: &str, active: bool, width: f32) -> egui:
     ui.add_sized([width, ui.spacing().interact_size.y], button)
 }
 
-/// One flat tray. The bar stays visible around it, so the three groups separate.
-/// The bar between two tools in a well.
-fn tool_bar(ui: &mut egui::Ui) {
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(8.0);
+/// The strokes a picture has, counted.
+fn strokes_text(n: usize) -> String {
+    format!("{n} stroke{}", if n == 1 { "" } else { "s" })
 }
 
-fn tool_well(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) -> egui::Response {
-    let panel = ui.visuals().panel_fill;
-    let fill = Color32::from_rgb(
-        panel.r().saturating_add(16),
-        panel.g().saturating_add(16),
-        panel.b().saturating_add(16),
-    );
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(6)
-        .inner_margin(egui::Margin::symmetric(8, 3))
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            add(ui);
-        })
-        .response
-}
+/// The key the undo and redo shortcuts are written with: they are read
+/// with the platform's command key, which a Mac calls Cmd.
+const COMMAND_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
 
 /// Where the strip starts when nothing is remembered: the pictures folder
 /// if there is one, else home.
@@ -6692,6 +6779,7 @@ impl eframe::App for App {
         self.unlock.show(&ctx);
         // For the keys of the next frame.
         self.typing = text_edit_focused(&ctx);
+        self.list_open = egui::Popup::is_any_open(&ctx);
     }
 }
 
@@ -7174,13 +7262,23 @@ impl App {
     }
 
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
-    /// every panel. Enter keeps the crop. Not while a text field has the keyboard.
+    /// every panel. Enter keeps the crop, Escape cancels it. Not while a
+    /// text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
         if self.keys_are_taken(ctx) {
             return;
         }
+        // The easel: Enter keeps the window, Escape puts the easel down
+        // and the picture stays as it was. An Escape that closed the list
+        // of sheets has done its work.
         if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
             self.apply_crop();
+        }
+        if self.crop_open
+            && !self.list_open
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.close_crop();
         }
         // The burn tool: Enter locks the brush, Escape opens it, and puts
         // the tool down when it is open. Not while the pointer holds it.
@@ -7316,6 +7414,47 @@ mod key_tests {
             assert_eq!(frame_with_field(&ctx, &mut value, None), (true, false), "{key:?}");
             assert_eq!(frame_with_field(&ctx, &mut value, Some(key)), (false, true), "{key:?}");
         }
+    }
+
+    /// Why Escape asks whether a list was open when the frame began: the
+    /// key closes the list and is still in the input after it, and
+    /// would put the easel down as well.
+    #[test]
+    fn the_escape_that_closes_a_list_is_still_there_after_the_list() {
+        let ctx = egui::Context::default();
+        // Whether a list is open once the frame is drawn, and whether
+        // the key is still there for a shortcut to take.
+        let frame = |key: Option<Key>, open: bool| -> (bool, bool) {
+            let mut input = egui::RawInput::default();
+            if let Some(key) = key {
+                let modifiers = Modifiers::NONE;
+                input.events.push(Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                });
+            }
+            let mut seen = (false, false);
+            let _ = ctx.run_ui(input, |ui| {
+                let list = egui::ComboBox::from_id_salt("sheet")
+                    .selected_text("8×10")
+                    .show_ui(ui, |ui| {
+                        ui.label("4×5");
+                    })
+                    .response;
+                if open {
+                    egui::Popup::open_id(ui.ctx(), egui::Popup::default_response_id(&list));
+                }
+                let left = key.is_some_and(|key| ui.input_mut(|i| i.consume_key(Modifiers::NONE, key)));
+                seen = (egui::Popup::is_any_open(ui.ctx()), left);
+            });
+            seen
+        };
+        assert_eq!(frame(None, true), (true, false));
+        assert_eq!(frame(None, false), (true, false));
+        assert_eq!(frame(Some(Key::Escape), false), (false, true));
     }
 
     fn pressed(key: Key, modifiers: Modifiers) -> (bool, bool) {

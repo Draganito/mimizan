@@ -76,17 +76,18 @@ is amber whenever you are away from it.
   written as a BigTIFF, which a classic TIFF cannot hold; not every
   older program opens one.
 
-Crop: *Crop* at the top, pick a format (4×5, 5×7, square…), *Apply*.
+Crop: *Crop* at the top, pick a format (4×5, 5×7, square…), *Apply crop*.
 Straighten: with *Crop* open, *Straighten*, then draw a line along
 something that should be level or upright; the picture turns and the
-frame shrinks to what fits. Or type the degrees; 0° undoes it. *Apply*
-keeps both.
+frame shrinks to what fits. Or type the degrees; 0°, or the × beside
+the number, undoes it. *Apply crop* or Enter keeps both; *Cancel* or
+Escape keeps neither.
 90° turns the picture.
 
-Dodge and burn: *Burn* at the top. The brush is yours, not the
+Dodge and burn: *Dodge & burn* at the top. The brush is yours, not the
 picture's: set it once, lock it, and paint every negative with it.
 *Hand* is an ellipse with a soft edge, *Card* a straight edge with a
-soft shadow. *Set* shows the tip in the middle of the picture, and
+soft shadow. *Shape* shows the tip in the middle of the picture, and
 nothing in the picture changes while you shape it: the dots size it,
 the ring turns it, the square is the penumbra, the number is the stops
 (drag up and down, hundredths; Shift slows it), and the row beneath
@@ -96,7 +97,7 @@ Locked, the tip follows the pointer: drag the hand along the picture,
 or push the card from where you press to where you let go (the side it
 ends up on had the light all along). +1 is twice the time where the
 pass went through (darker), −1 half (lighter); passing twice adds.
-Alt shows the strokes; *Clear* at the top takes them away. Escape
+Alt shows the strokes; *Clear strokes* at the top takes them away. Escape
 opens the brush again, and a second Escape puts the tool down. Orange
 burns, blue dodges.
 
@@ -165,8 +166,8 @@ it back, and the strip is white again.
 | Darker or lighter before the shot (Android, Pro iPhone) | Drag the strip under the finder |
 | More contrast | Wheel up over the strip; on the phone, pinch it |
 | Less contrast | Wheel down; on the phone, spread it |
-| Crop | *Crop* → format → *Apply* |
-| Straighten a tilted horizon | *Crop* → *Straighten* → draw a line along it → *Apply* |
+| Crop | *Crop* → format → *Apply crop* |
+| Straighten a tilted horizon | *Crop* → *Straighten* → draw a line along it → *Apply crop* |
 | Save | *Export* on the computer or on the phone |
 | Colour | *Plate*; on the phone, *Color* |
 
