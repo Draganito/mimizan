@@ -33,7 +33,8 @@ ARW, DNG, RAF, and the usual Bayer formats.
 
 ![The window: the picture in the middle, Negative on the left, Enlarger below, Print on the right](gui.jpg)
 
-Three panels around the picture.
+Three panels around the picture. The keys 1, 2 and 3 show or hide
+them: Negative, Enlarger, Print.
 
 **Negative** (left) is the file. Leave the white balance on *as shot*
 most of the time. *Apply* develops again when you have changed something.

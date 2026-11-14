@@ -3651,15 +3651,17 @@ impl App {
                 0,
                 "1",
                 "Negative",
-                "1 · Judge the negative: file, histograms, development (Tab hides every panel)",
+                "1 · Judge the negative: file, histograms, development. The key 1 shows or hides it; Tab \
+                 hides every panel.",
             ),
             (
                 2,
                 "2",
                 "Enlarger",
-                "2 · Expose: mix (the filter), placing, the two paper exposures (the grade)",
+                "2 · Expose: mix (the filter), placing, the two paper exposures (the grade). The key 2 \
+                 shows or hides it.",
             ),
-            (1, "3", "Print", "3 · The print: size, border, export"),
+            (1, "3", "Print", "3 · The print: size, border, export. The key 3 shows or hides it."),
         ] {
             let hover = if self.waiting[i] {
                 "No room at this size. It returns when the window is larger. Click to close it."
@@ -7348,8 +7350,8 @@ impl App {
     }
 
     /// Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y: undo and redo; Tab hides or shows
-    /// every panel. Enter keeps the crop, Escape cancels it. Not while a
-    /// text field has the keyboard.
+    /// every panel, and 1, 2 and 3 the one with that number. Enter keeps
+    /// the crop, Escape cancels it. Not while a text field has the keyboard.
     fn edit_keys(&mut self, ctx: &egui::Context) {
         if self.keys_are_taken(ctx) {
             return;
@@ -7384,6 +7386,13 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
             self.set_process(!self.plate_process());
         }
+        let numbered = ctx.input_mut(panel_keys);
+        if numbered.contains(&true) {
+            for (shown, pressed) in self.panels.iter_mut().zip(numbered) {
+                *shown ^= pressed;
+            }
+            self.persist();
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
             let any = self.panels.iter().any(|&p| p);
             self.panels = [!any; 3];
@@ -7407,6 +7416,16 @@ impl App {
     }
 }
 
+/// The panels this frame's keys show or hide, in the order `panels`
+/// keeps them: the number a panel carries in the toolbar is its key, 1 the
+/// Negative, 2 the Enlarger, 3 the Print. With Ctrl or Cmd held the key is
+/// not this one.
+fn panel_keys(i: &mut egui::InputState) -> [bool; 3] {
+    use egui::{Key, Modifiers};
+    // Indices: 0 the Negative, left; 1 the Print, right; 2 the Enlarger.
+    [Key::Num1, Key::Num3, Key::Num2].map(|key| i.consume_key(Modifiers::NONE, key))
+}
+
 /// `(undo, redo)` of this frame's keys: Ctrl+Z undoes, Ctrl+Shift+Z and
 /// Ctrl+Y redo. A shortcut also matches with Shift held on top of it, so
 /// the one that names Shift is asked first; asked second, Ctrl+Z had
@@ -7421,7 +7440,7 @@ fn undo_redo_keys(i: &mut egui::InputState) -> (bool, bool) {
 
 #[cfg(test)]
 mod key_tests {
-    use super::{text_edit_focused, undo_redo_keys};
+    use super::{panel_keys, text_edit_focused, undo_redo_keys};
     use egui::{Event, InputState, Key, Modifiers};
 
     /// One frame with a number field in it and `key` pressed: whether a
@@ -7541,6 +7560,39 @@ mod key_tests {
         assert_eq!(frame(None, true), (true, false));
         assert_eq!(frame(None, false), (true, false));
         assert_eq!(frame(Some(Key::Escape), false), (false, true));
+    }
+
+    /// The number on a panel's name in the toolbar is its key, and the
+    /// panels are kept left, right, bottom: 2 is the third of them.
+    #[test]
+    fn a_panel_is_shown_and_hidden_by_its_number() {
+        let panels = |key: Key, modifiers: Modifiers| {
+            let mut i = InputState::default();
+            i.modifiers = modifiers;
+            i.events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers });
+            let first = panel_keys(&mut i);
+            // Taken: a second reader of the same frame finds nothing.
+            assert_eq!(panel_keys(&mut i), [false; 3]);
+            first
+        };
+        assert_eq!(panels(Key::Num1, Modifiers::NONE), [true, false, false]);
+        assert_eq!(panels(Key::Num2, Modifiers::NONE), [false, false, true]);
+        assert_eq!(panels(Key::Num3, Modifiers::NONE), [false, true, false]);
+        assert_eq!(panels(Key::Num4, Modifiers::NONE), [false; 3]);
+        assert_eq!(panels(Key::Num1, Modifiers::COMMAND), [false; 3]);
+        assert_eq!(panels(Key::Num1, Modifiers::CTRL), [false; 3]);
+    }
+
+    /// Why the number keys ask who had the keyboard when the frame began,
+    /// as every shortcut does: a digit typed into a number is in the
+    /// input for a shortcut to take as well.
+    #[test]
+    fn a_digit_typed_into_a_number_is_still_in_the_input() {
+        let ctx = egui::Context::default();
+        let mut value = 3.0;
+        frame_with_field(&ctx, &mut value, None);
+        assert_eq!(frame_with_field(&ctx, &mut value, None), (true, false));
+        assert_eq!(frame_with_field(&ctx, &mut value, Some(Key::Num2)), (true, true));
     }
 
     fn pressed(key: Key, modifiers: Modifiers) -> (bool, bool) {

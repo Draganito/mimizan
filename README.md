@@ -102,7 +102,7 @@ In the window the plate is the second process: *Plate* in the toolbar, next to *
 
 ## A session
 
-Drop a RAW file or a folder on the window, or open one. The folder lies along the bottom as a strip of film: negatives in the monochrome process, slides in the plate, either one inverted on request. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. Tab hides the three panels.
+Drop a RAW file or a folder on the window, or open one. The folder lies along the bottom as a strip of film: negatives in the monochrome process, slides in the plate, either one inverted on request. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. Tab hides the three panels; 1, 2 and 3 show or hide the one that carries that number in the toolbar.
 
 *Monochrome* and *Plate* in the toolbar, or P, are the process. The choice is the darkroom's: the strip, the Enlarger and the print follow it, and the next file opens in it. A file with a recipe beside it opens in the process the recipe was saved in. Scroll zooms the print about the pointer; a double click switches between fitted and 1:1. Undo is Ctrl+Z, redo is Ctrl+Shift+Z or Ctrl+Y. *Reset all* puts every control back to its default, the crop and the strokes with them, and leaves the negative where it is; undo brings them back.
 
