@@ -68,8 +68,9 @@ is amber whenever you are away from it.
   trim* beside them says the black edge is at the sheet's edge, where a
   print service cuts about 2 mm off every side; a white border outside it
   keeps it whole.
-- *Export* writes the sheet, the same as the preview: a TIFF of 16 or
-  8 bits, or an 8-bit JPEG. The file line chooses it, and beside it grey
+- *Export*, at the foot, writes the sheet, the same as the preview: a
+  TIFF of 16 or 8 bits, or an 8-bit JPEG, and the button names which.
+  The file line at the top chooses it, and beside it grey
   or RGB for a monochrome print; the program remembers both. Most print
   services want 8 bits and RGB.
   A sheet of more than 4 GiB (a colour print past 715 megapixels) is

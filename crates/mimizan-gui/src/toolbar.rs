@@ -3,7 +3,8 @@
 //! a grey field, a tool in the hand is amber, an action is plain, and the
 //! one button that keeps something is filled. One of several is the
 //! filter strip's underline. The icons are drawn here: the fonts that
-//! come with egui have no crop, no brush and no film strip.
+//! come with egui have no crop, no brush and no film strip. The Print
+//! window uses the same looks for what is the same kind of thing there.
 
 use crate::filter_strip::{self, filter_strip, Field};
 use crate::paper_strip::AMBER;
@@ -79,11 +80,13 @@ pub struct Chip<'a> {
     label: &'a str,
     key: Option<&'a str>,
     name: Option<&'a str>,
+    height: f32,
+    least: f32,
 }
 
 impl<'a> Chip<'a> {
     fn new(look: Look, label: &'a str) -> Self {
-        Self { look, icon: None, step: None, label, key: None, name: None }
+        Self { look, icon: None, step: None, label, key: None, name: None, height: ROW_H, least: 0.0 }
     }
 
     pub fn toggle(label: &'a str, shown: bool) -> Self {
@@ -126,8 +129,21 @@ impl<'a> Chip<'a> {
         self
     }
 
+    /// As high as the row it stands in, where that is not the toolbar's.
+    pub fn height(mut self, height: f32) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// At least this wide, the words at its left: a button that fills
+    /// the row it stands in.
+    pub fn wide(mut self, width: f32) -> Self {
+        self.least = width;
+        self
+    }
+
     pub fn width(&self, ui: &Ui) -> f32 {
-        self.lay(ui).width
+        self.lay(ui).width.max(self.least)
     }
 
     fn lay(&self, ui: &Ui) -> Laid {
@@ -162,7 +178,8 @@ fn galley(ui: &Ui, text: &str, size: f32) -> Arc<Galley> {
 impl Widget for Chip<'_> {
     fn ui(self, ui: &mut Ui) -> Response {
         let laid = self.lay(ui);
-        let (rect, response) = ui.allocate_exact_size(vec2(laid.width, ROW_H), Sense::click());
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(laid.width.max(self.least), self.height), Sense::click());
         let enabled = ui.is_enabled();
         let name = self.name.unwrap_or(self.label);
         response.widget_info(|| match self.look {
@@ -352,6 +369,15 @@ mod tests {
             let drawn = ui.add(Chip::action("Cancel").key(Some("Esc"))).rect;
             assert!((drawn.width() - keyed).abs() < 1.0, "{} drawn, {keyed} said", drawn.width());
             assert!((drawn.height() - ROW_H).abs() < 1.0);
+            // In a panel: as high as its row, and as wide as it is told.
+            let wide = Chip::keep("Export JPEG…").wide(280.0).height(30.0);
+            assert!((wide.width(ui) - 280.0).abs() < 1.0);
+            let drawn = ui.add(wide).rect;
+            assert!((drawn.width() - 280.0).abs() < 1.0 && (drawn.height() - 30.0).abs() < 1.0);
+            let narrow = Chip::toggle("1:1", true).wide(4.0).height(18.0);
+            let said = narrow.width(ui);
+            let drawn = ui.add(narrow).rect;
+            assert!(said > 4.0 && (drawn.width() - said).abs() < 1.0 && (drawn.height() - 18.0).abs() < 1.0);
             // Every icon, in every look that carries one.
             for icon in
                 [Icon::FilmStrip, Icon::Turn, Icon::Crop, Icon::Dodge, Icon::Undo, Icon::Redo, Icon::Cross]

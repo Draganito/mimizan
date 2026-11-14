@@ -4645,7 +4645,33 @@ impl App {
         }
     }
 
-    /// Right window, step 3: the print and its export.
+    /// Right window, step 3: the print and its export. The export stands
+    /// at the foot and stays there; the print's controls are above it and
+    /// scroll when the window is short. A window too short to hold both
+    /// scrolls as one, the export last.
+    fn print_dock(&mut self, ui: &mut egui::Ui) {
+        if ui.available_height() < PRINT_FOOT_ROOM {
+            dock_scroll(ui, |ui| {
+                let width = ui.available_width();
+                self.print_panel(ui);
+                ui.add_space(6.0);
+                self.print_foot(ui, width, false);
+            });
+            return;
+        }
+        let width = ui.available_width();
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            self.print_foot(ui, width, true);
+            let above = ui.available_rect_before_wrap();
+            ui.scope_builder(
+                egui::UiBuilder::new().max_rect(above).layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| dock_scroll(ui, |ui| self.print_panel(ui)),
+            );
+        });
+    }
+
+    /// The print's controls: the file, the sheet, the print box and the
+    /// sharpening.
     fn print_panel(&mut self, ui: &mut egui::Ui) {
         // The window's width, taken once. egui widens a ui to hold a row
         // that runs past it, and every later row would then be laid out
@@ -4656,54 +4682,102 @@ impl App {
         let width = ui.available_width();
         let left = ui.max_rect().left();
         self.print_section(ui, width);
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(6.0);
-        self.peak_controls(ui);
-        ui.add_space(6.0);
+        ui.add_space(8.0);
+        self.peak_controls(ui, width);
+        self.note_print_overflow(ui, left, width);
+    }
+
+    /// The export, at the foot of the Print window: a line, the button
+    /// that writes the print, named by its file; the negative for another
+    /// program; and what the export holds in memory. `upward` is the foot
+    /// that stays: laid from the floor up, so the last comes first.
+    fn print_foot(&mut self, ui: &mut egui::Ui, width: f32, upward: bool) {
+        let left = ui.max_rect().left();
         let idle = self.busy.is_none();
         let has = self.session.is_some();
-        let hover = self.export_hover_text();
-        if ui
-            .add_enabled(
-                idle && has,
-                egui::Button::new(RichText::new("Export…").strong()).min_size(Vec2::new(width, 30.0)),
+        let mut parts = [Foot::Line, Foot::Export, Foot::Negative, Foot::Memory];
+        if upward {
+            parts.reverse();
+        }
+        for part in parts {
+            match part {
+                Foot::Line => {
+                    ui.separator();
+                }
+                Foot::Export => {
+                    let hover = self.export_hover_text();
+                    let label =
+                        format!("Export {}…", file_kind_name(self.file_format(), self.tiff_eight_bit));
+                    if ui
+                        .add_enabled(idle && has, Chip::keep(&label).wide(width).height(30.0))
+                        .on_disabled_hover_text(hover.clone())
+                        .on_hover_text(hover)
+                        .clicked()
+                        && self.export_memory_allows()
+                    {
+                        self.start_export();
+                    }
+                }
+                Foot::Negative => {
+                    let mut hover = self.linear_hover_text();
+                    // Part of the purchase in the Mac App Store build: the
+                    // button says so and opens the question.
+                    let negative = if self.unlock.locked() {
+                        hover
+                            .push_str("\n\nPart of the one purchase that unlocks the TIFF and the negative.");
+                        format!("Negative…  {LOCKED_MARK}")
+                    } else {
+                        "Negative…".to_string()
+                    };
+                    if ui
+                        .add_enabled(
+                            idle && has,
+                            egui::Button::new(negative).min_size(Vec2::new(width, 24.0)),
+                        )
+                        .on_disabled_hover_text(hover.clone())
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.start_linear_export();
+                    }
+                }
+                Foot::Memory => self.print_memory_line(ui),
+            }
+        }
+        self.note_print_overflow(ui, left, width);
+    }
+
+    /// What the export holds at once, by its name: beside a picture's
+    /// pixels the bare figure read as the size of the file. Red once the
+    /// machine cannot; and the note of a first click that was held back,
+    /// while the estimate it was about is the current one.
+    fn print_memory_line(&self, ui: &mut egui::Ui) {
+        let Some(need) = self.export_memory() else { return };
+        let (text, colour) = if self.export_warned == Some(need) {
+            (
+                format!("About {} at once, more than is free. Export again to go ahead.", memory_text(need)),
+                ui.visuals().warn_fg_color,
             )
-            .on_disabled_hover_text(hover.clone())
-            .on_hover_text(hover)
-            .clicked()
-            && self.export_memory_allows()
-        {
-            self.start_export();
-        }
-        ui.add_space(4.0);
-        let mut hover = self.linear_hover_text();
-        // Part of the purchase in the Mac App Store build: the button
-        // says so and opens the question.
-        let negative = if self.unlock.locked() {
-            hover.push_str("\n\nPart of the one purchase that unlocks the TIFF and the negative.");
-            format!("Negative…  {LOCKED_MARK}")
+        } else if self.ram_total > 0 && need > self.ram_total {
+            (
+                format!("the export holds about {} of memory, more than this machine has", memory_text(need)),
+                ui.visuals().error_fg_color,
+            )
         } else {
-            "Negative…".to_string()
+            (
+                format!("the export holds about {} of memory", memory_text(need)),
+                ui.visuals().weak_text_color(),
+            )
         };
-        if ui
-            .add_enabled(idle && has, egui::Button::new(negative).min_size(Vec2::new(width, 24.0)))
-            .on_disabled_hover_text(hover.clone())
-            .on_hover_text(hover)
-            .clicked()
-        {
-            self.start_linear_export();
-        }
-        // The note stays while the estimate it was about is the current one.
-        if let Some(need) = self.export_warned.filter(|n| Some(*n) == self.export_memory()) {
-            ui.label(
-                RichText::new(format!(
-                    "About {} at once, more than is free. Export again to go ahead.",
-                    memory_text(need)
-                ))
-                .color(ui.visuals().warn_fg_color),
-            );
-        }
+        ui.add(egui::Label::new(RichText::new(text).color(colour)).wrap()).on_hover_text(
+            "Memory the export holds at its widest point. \
+             Above what the machine has, the export is refused; \
+             above what is free, it asks twice.",
+        );
+    }
+
+    /// A row that runs past the window's right edge is said once, in the log.
+    fn note_print_overflow(&mut self, ui: &egui::Ui, left: f32, width: f32) {
         let over = ui.min_rect().right() - (left + width);
         if over > 0.5 && !self.print_overflow_logged {
             self.print_overflow_logged = true;
@@ -4853,11 +4927,11 @@ impl App {
                 |ui| {
                     print_field_label(ui, "size");
                     let one = ui
-                        .add_enabled(has_file, egui::Button::selectable(one_to_one_now, "1:1"))
+                        .add_enabled(has_file, Chip::toggle("1:1", one_to_one_now).height(row_h))
                         .on_hover_text(
                             "The sheet is the picture's pixels: no border, no black edge, no scaling. \
-                         The start; the sheet typed from here stands, and rings, crop and dpi \
-                         fit the picture inside it.",
+                         The start, lit while the sheet is that; the sheet typed from here stands, \
+                         and rings, crop and dpi fit the picture inside it.",
                         )
                         .clicked();
                     // The ruler, at the right of the same row: the unit every
@@ -4865,20 +4939,24 @@ impl App {
                     // and millimetres whichever is chosen.
                     let ruler_changed = ui
                         .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let mut changed = false;
-                            for r in Ruler::ALL.iter().rev() {
-                                let response = ui
-                                .selectable_value(&mut self.ruler, *r, r.name())
-                                .on_hover_text(match r {
-                                Ruler::Metric => {
-                                    "Centimetres for the sheet, millimetres for the border and the black edge"
-                                }
-                                Ruler::Imperial => "Inches",
-                                Ruler::Pixels => "Pixels of the file, at the dpi below",
+                            let rulers = Ruler::ALL.map(|r| {
+                                let hover = match r {
+                                    Ruler::Metric => {
+                                        "Centimetres for the sheet, millimetres for the border and the black edge"
+                                    }
+                                    Ruler::Imperial => "Inches",
+                                    Ruler::Pixels => "Pixels of the file, at the dpi below",
+                                };
+                                (r.name(), hover, false)
                             });
-                                changed |= response.changed();
+                            let now = Ruler::ALL.iter().position(|r| *r == self.ruler).unwrap_or(0);
+                            match toolbar::choice(ui, "ruler-choice", &rulers, now) {
+                                Some(k) => {
+                                    self.ruler = Ruler::ALL[k];
+                                    true
+                                }
+                                None => false,
                             }
-                            changed
                         })
                         .inner;
                     (one, ruler_changed)
@@ -4914,12 +4992,13 @@ impl App {
                 let height =
                     length_field(ui, &mut self.sheet_cm[1], Base::Cm, ruler, dpi, least..=2000.0, has_file)
                         .on_hover_text(hover);
+                let mut free = self.sheet_free;
                 let free = ui
-                    .add(egui::Button::selectable(self.sheet_free, "free"))
+                    .checkbox(&mut free, "free")
                     .on_hover_text(
                         "Off: the sheet has the picture's proportion, and one side follows the other. On:                          the two sides are typed apart, for a paper a print service offers, such as                          30 × 40 cm for a picture of 2:3. The picture is fitted into it and centred; a                          new crop leaves the sheet as it is.",
                     )
-                    .clicked();
+                    .changed();
                 (width.changed(), height.changed(), free)
             })
             .inner;
@@ -4963,7 +5042,6 @@ impl App {
         } else {
             self.show_sheet();
         }
-        self.print_sheet_line(ui);
         // border and black share the row. Wrapped, so a long value breaks
         // inside the column instead of widening the dock. The sheet stands
         // under a changed ring; the picture refits inside it.
@@ -4988,6 +5066,9 @@ impl App {
                 );
             }
         });
+        // What the sheet and its rings leave the picture, under them.
+        self.print_sheet_line(ui);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
             print_field_label(ui, "resample");
             let r = &mut self.edit.recipe.resample;
@@ -5010,8 +5091,9 @@ impl App {
         self.sharpen_loupe(ui);
     }
 
-    /// The picture inside the sheet, its scale from the negative's pixels,
-    /// and the export's memory. Absent until a file is open.
+    /// The picture inside the sheet and its scale from the negative's
+    /// pixels, as a row of its own under the rings that leave it. Absent
+    /// until a file is open.
     fn print_sheet_line(&self, ui: &mut egui::Ui) {
         let Some(l) = self.print_layout() else { return };
         let dpi = self.edit.recipe.dpi;
@@ -5027,37 +5109,22 @@ impl App {
             Ruler::Imperial => format!("{:.2} × {:.2} in · ", inches(l.image_w), inches(l.image_h)),
             Ruler::Pixels => String::new(),
         };
-        // The scale, so a sheet that resamples says so at a glance.
+        // The scale, so a sheet that resamples says so at a glance. It
+        // stands here alone: the print box below is this scale's pixels.
         let (uw, uh) = self.picture_size();
         let scale = if l.image_w == uw && l.image_h == uh {
             "1:1".to_string()
         } else {
             format!("×{:.2}", l.image_w as f64 / uw.max(1) as f64)
         };
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            ui.label(
-                RichText::new(format!("picture {physical}{} × {} px · {scale} · ", l.image_w, l.image_h))
-                    .weak(),
-            )
-            .on_hover_text(
+        ui.horizontal(|ui| {
+            print_field_label(ui, "picture");
+            // A long one breaks inside its column.
+            let text = format!("{physical}{} × {} px · {scale}", l.image_w, l.image_h);
+            ui.add(egui::Label::new(RichText::new(text).weak()).wrap()).on_hover_text(
                 "The picture inside the rings, and its scale from the negative's pixels. \
-                     The fields above are the whole file.",
+                 The fields above are the whole file.",
             );
-            // What the export holds at once, red once the machine cannot.
-            if let Some(need) = self.export_memory() {
-                let text = RichText::new(memory_text(need));
-                let text = if self.ram_total > 0 && need > self.ram_total {
-                    text.color(ui.visuals().error_fg_color)
-                } else {
-                    text.weak()
-                };
-                ui.label(text).on_hover_text(
-                    "Memory the export holds at its widest point. \
-                     Above what the machine has, the export is refused; \
-                     above what is free, it asks twice.",
-                );
-            }
         });
     }
 
@@ -5124,19 +5191,6 @@ impl App {
         let ppp = ui.pixels_per_point().max(f32::MIN_POSITIVE);
         let side = (ui.available_width() * ppp).round() as usize;
         self.loupe_px = side.clamp(64, 960);
-        if let Some(scale) = self.loupe_layout().map(|l| l.enlargement) {
-            // The same scale the line under the size fields shows; a
-            // reduction is a scale too.
-            let mut text = if (scale - 1.0).abs() < 1e-9 {
-                "1:1 · no scaling".to_string()
-            } else {
-                format!("×{scale:.2}")
-            };
-            if self.loupe_shown != self.loupe_sent {
-                text.push_str(" · updating");
-            }
-            ui.label(RichText::new(text).weak());
-        }
         let mut drag = None;
         if self.session.is_none() {
             print_frame(ui, "Open a RAW file.");
@@ -5165,6 +5219,15 @@ impl App {
             }
         } else {
             print_frame(ui, "rendering the print box…");
+        }
+        if self.session.is_some() {
+            // What the box is and that it moves, where it was said in the
+            // hover alone. The scale is the picture row's.
+            let mut text = "the print's pixels · drag to move".to_string();
+            if self.loupe_shown != self.loupe_sent {
+                text.push_str(" · updating");
+            }
+            ui.label(RichText::new(text).weak());
         }
         if let Some((delta, ppp)) = drag {
             // The picture follows the hand. One screen pixel is one print pixel.
@@ -5410,30 +5473,41 @@ impl App {
     /// automatic measurement are on the panel, not only in a hover. Radius
     /// and amount share a row. The fields stay editable while the checkbox
     /// is off. The tile and the TIFF sharpen only while it is on.
-    fn peak_controls(&mut self, ui: &mut egui::Ui) {
+    fn peak_controls(&mut self, ui: &mut egui::Ui, width: f32) {
         let has = self.session.is_some();
-        ui.horizontal_wrapped(|ui| {
-            print_field_label(ui, "sharpen");
-            let mut on = self.edit.recipe.peak.on;
-            let response = ui
-                .add_enabled(has, egui::Checkbox::new(&mut on, ""))
-                .on_hover_text(
-                    "Sharpen this print. The tile and the TIFF use the radius and the amount. Off leaves both as they were.",
+        let row_h = ui.spacing().interact_size.y;
+        // The word is the checkbox's, and the way back to the measurement
+        // stands at the right of the same row.
+        ui.allocate_ui_with_layout(
+            Vec2::new(width, row_h),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                print_field_label(ui, "sharpen");
+                let mut on = self.edit.recipe.peak.on;
+                let response = ui.add_enabled(has, egui::Checkbox::new(&mut on, "high-pass")).on_hover_text(
+                    "Sharpen this print with a high-pass: the print plus an amount of itself minus a \
+                     Gaussian blur. The radius is that blur. The print box and the file use the radius \
+                     and the amount. Off leaves both as they were.",
                 );
-            if response.changed() {
-                self.edit.recipe.peak.on = on;
-            }
-            ui.label("high-pass").on_hover_text(
-                "High-pass sharpening: the print plus an amount of itself minus a Gaussian blur. The radius is that blur.",
-            );
-        });
+                if response.changed() {
+                    self.edit.recipe.peak.on = on;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.peak_reset(ui, has);
+                });
+            },
+        );
+        // The two numbers are the sharpening's: with it off they are
+        // shown, not offered.
+        let on = has && self.edit.recipe.peak.on;
+        let off_hint = if has { "Sharpening is off." } else { "Open a RAW file first." };
         let scale = self.peak_scale();
         ui.horizontal_wrapped(|ui| {
             print_field_label(ui, "radius");
             let mut shown = self.edit.recipe.peak.radius * scale;
             let response = ui
                 .add_enabled(
-                    has,
+                    on,
                     egui::DragValue::new(&mut shown)
                         .range(
                             mimizan_core::recipe::PEAK_RADIUS_MIN * scale
@@ -5445,7 +5519,8 @@ impl App {
                 )
                 .on_hover_text(
                     "Radius of the Gaussian blur, in print pixels. The print's scale multiplies the radius measured on the negative; the amount stays.",
-                );
+                )
+                .on_disabled_hover_text(off_hint);
             if response.changed() {
                 let stored = (shown / scale)
                     .clamp(mimizan_core::recipe::PEAK_RADIUS_MIN, mimizan_core::recipe::PEAK_RADIUS_MAX);
@@ -5457,7 +5532,7 @@ impl App {
             ui.label(RichText::new("amount").weak());
             let response = ui
                 .add_enabled(
-                    has,
+                    on,
                     egui::DragValue::new(&mut self.edit.recipe.peak.amount)
                         .range(0.0..=mimizan_core::recipe::PEAK_AMOUNT_MAX)
                         .clamp_existing_to_range(false)
@@ -5466,12 +5541,12 @@ impl App {
                 )
                 .on_hover_text(
                     "How much of the high-pass is added back. The print's scale does not change it. Zero leaves the picture as it was.",
-                );
+                )
+                .on_disabled_hover_text(off_hint);
             if response.changed() {
                 self.peak_held = true;
             }
         });
-        self.peak_reset_row(ui, has);
     }
 
     fn peak_at_measured(&self) -> bool {
@@ -5494,27 +5569,25 @@ impl App {
         }
     }
 
-    /// The measurement is named on the row, and reset returns to it.
-    /// The checkbox stays.
-    fn peak_reset_row(&mut self, ui: &mut egui::Ui, has: bool) {
-        let status = if self.peak_measure.is_some() { "measuring" } else { "measured automatically" };
-        ui.horizontal_wrapped(|ui| {
-            print_field_label(ui, "");
-            ui.label(RichText::new(status).weak()).on_hover_text(
-                "An algorithm measured the radius and the amount on this negative. Reset returns to those values.",
-            );
-            let ready = has && self.peak_measured.is_some() && !self.peak_at_measured();
-            let response = ui
-                .add_enabled(ready, egui::Button::new("reset"))
-                .on_hover_text("Back to the radius and amount the algorithm measured. The checkbox stays as it is.")
-                .on_disabled_hover_text(self.peak_reset_hint(has));
-            if response.clicked() {
-                if let Some((radius, amount)) = self.peak_measured {
-                    self.edit.recipe.peak.radius = radius;
-                    self.edit.recipe.peak.amount = amount;
-                }
+    /// The way back to the measurement, and the word that it is still
+    /// being made. The checkbox stays.
+    fn peak_reset(&mut self, ui: &mut egui::Ui, has: bool) {
+        let measuring = self.peak_measure.is_some();
+        let label = if measuring { "measuring…" } else { "Reset to measured" };
+        let ready = has && !measuring && self.peak_measured.is_some() && !self.peak_at_measured();
+        let response = ui
+            .add_enabled(ready, egui::Button::new(label))
+            .on_hover_text(
+                "Back to the radius and the amount an algorithm measured on this negative. The checkbox \
+                 stays as it is.",
+            )
+            .on_disabled_hover_text(self.peak_reset_hint(has));
+        if response.clicked() {
+            if let Some((radius, amount)) = self.peak_measured {
+                self.edit.recipe.peak.radius = radius;
+                self.edit.recipe.peak.amount = amount;
             }
-        });
+        }
     }
 
     /// `stage` is the opening between the windows, and the fit is measured
@@ -6815,6 +6888,19 @@ const MIX_NATIVE: &str = "Native";
 const PANEL_GAP: f32 = 12.0;
 /// Shortest outer height that still holds the name and the ×.
 const DOCK_MIN_H: f32 = 48.0;
+/// Room under the Print window's name below which its foot no longer
+/// stays: the export takes about 90 points of it, and what is left
+/// above that is less than four rows, no place to scroll in.
+const PRINT_FOOT_ROOM: f32 = 200.0;
+
+/// The parts of the Print window's foot, from the top.
+#[derive(Clone, Copy)]
+enum Foot {
+    Line,
+    Export,
+    Negative,
+    Memory,
+}
 /// Narrowest enlarger that still holds its name and the ×.
 const ENLARGER_MIN_W: f32 = 64.0;
 /// Grab radius of the crosshair, points. Covers its arms.
@@ -7234,7 +7320,7 @@ impl App {
         }
         if let Some(r) = docks.right {
             hide[1] = show_dock(ui, "dock-print", r, "Print", |ui| {
-                dock_scroll(ui, |ui| self.print_panel(ui));
+                self.print_dock(ui);
             })
             .0;
         }
