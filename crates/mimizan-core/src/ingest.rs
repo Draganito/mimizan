@@ -60,16 +60,6 @@ pub struct IngestParams {
     pub sat_margin: f64,
     /// Radius, in pixels, the saturation mask grows by.
     pub sat_dilate: usize,
-    /// Half-width, in pixels, of the chrominance low-pass the colour gate
-    /// is sized for: the narrow band of the default `dubois` separation
-    /// (0.15 c/px, transition 0.15, 40 dB → 15 taps). The gate falls off
-    /// over it: a pixel whose chrominance support reaches into burnt-out
-    /// green photosites gets that share of its colour taken away
-    /// ([`Mosaic::chroma_gate`]). The `off` and `adaptive` modes low-pass
-    /// with a longer kernel (0.05 transition, 60 dB, 73 taps), so
-    /// there the gate opens inside the real support; the value is not
-    /// adjusted to the mode.
-    pub colour_reach: usize,
     /// A sample this many sigma outside its same-colour neighbours is a defect.
     pub defect_sigma: f64,
     /// Replace the defects by their neighbours' median. Off by default:
@@ -87,7 +77,6 @@ impl Default for IngestParams {
         Self {
             sat_margin: SAT_MARGIN,
             sat_dilate: 2,
-            colour_reach: 7,
             defect_sigma: 8.0,
             repair_defects: false,
             noise: NoiseModel::default(),
@@ -116,11 +105,15 @@ pub struct IngestReport {
     pub saturated_raw: usize,
     /// Photosites inside the dilated saturation mask.
     pub saturated_dilated: usize,
-    /// Green photosites at or above the saturation level: where the
-    /// colour differences are false and the chrominance is gated out
-    /// ([`Mosaic::chroma_gate`]). 0 on a monochrome sensor.
+    /// The balanced level above which a reading counts as light and not
+    /// as colour ([`Mosaic::colour_ceiling`]). `None` on a monochrome
+    /// sensor.
     #[serde(default)]
-    pub saturated_green: usize,
+    pub colour_ceiling: Option<f64>,
+    /// Photosites that read above that level, burnt out or not. 0 on a
+    /// monochrome sensor.
+    #[serde(default)]
+    pub above_ceiling: usize,
     /// Photosites the defect rule flags: more than `defect_sigma` sigma
     /// outside the range of their same-colour neighbours. Counted always;
     /// replaced only when `defects_repaired`.
@@ -147,22 +140,19 @@ pub struct Mosaic {
     pub phase: Option<BayerPhase>,
     /// 1 where saturated (after dilation), else 0. Same size as `plane`.
     pub saturated: Vec<u8>,
-    /// How much of its chrominance each pixel keeps, 255 = all, 0 = none;
-    /// same size as `plane`. `None` when no green photosite is burnt out
-    /// (or on a monochrome sensor): the separation then takes the colour
-    /// as estimated.
+    /// The balanced level at which the first of the three channels counts
+    /// as burnt out ([`colour_ceiling`]); `None` on a monochrome sensor.
     ///
-    /// Green has the lowest clip of the three balanced channels (its
-    /// multiplier is one; red and blue are raised above it), so where a
-    /// green photosite is burnt out every colour difference around it is
-    /// false, and false in the same direction whatever the scene: towards
-    /// magenta. Where only red or blue burn out, the difference is a lower
-    /// bound in the right direction and stays. The gate is 0 on the
-    /// dilated set of burnt-out green photosites and rises to 255 over
-    /// [`IngestParams::colour_reach`] pixels, by the share of the
-    /// chrominance support that is not burnt out. The luminance is not
-    /// touched: a gated pixel prints as the monochrome print shows it.
-    pub chroma_gate: Option<Vec<u8>>,
+    /// The balance sets where each channel clips: a burnt-out photosite of
+    /// colour `c` reads its multiplier `k_c`, so a burnt-out neutral enters
+    /// as `(k_R, 1, k_B)`, a colour no scene had. Up to this level every
+    /// channel can still be told from the others; above it a difference
+    /// between two channels may be one clip against another. So the
+    /// chrominance is estimated from the mosaic held to this level
+    /// (`separate::separate`): what a photosite reads above it counts as
+    /// light and not as colour. The luminance is estimated from the
+    /// mosaic as it is and is not touched.
+    pub colour_ceiling: Option<f64>,
     /// Noise model in raw normalised units (before balance).
     pub noise: NoiseModel,
     /// Multipliers R,G,B applied to `plane` (G = 1).
@@ -480,10 +470,6 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
     }
 
     let (saturated, sat_dilated_count) = dilate_counted(&sat_raw, w, h, p.sat_dilate);
-    let (chroma_gate, sat_green_count) = match phase {
-        Some(ph) => chroma_gate(&sat_raw, w, h, ph, p.sat_dilate, p.colour_reach),
-        None => (None, 0),
-    };
     drop(sat_raw);
     let step = if phase.is_some() { 2usize } else { 1usize };
     let (plane_data, defects, hot_rows) = scan_defects(norm, &saturated, w, h, step, p);
@@ -508,12 +494,14 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             apply_balance(&mut plane, ph, wb);
         }
     }
+    let ceiling = colour_ceiling(frame, wb, p.sat_margin);
+    let above_ceiling = ceiling.map_or(0, |c| plane.data.par_iter().filter(|&&v| v > c).count());
 
     Ok(Mosaic {
         plane,
         phase,
         saturated,
-        chroma_gate,
+        colour_ceiling: ceiling,
         noise: p.noise,
         wb,
         orientation: frame.orientation,
@@ -530,7 +518,8 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
             crop,
             saturated_raw: sat_raw_count,
             saturated_dilated: sat_dilated_count,
-            saturated_green: sat_green_count,
+            colour_ceiling: ceiling,
+            above_ceiling,
             defects,
             defects_repaired: p.repair_defects,
             defect_hot_rows: hot_rows,
@@ -542,71 +531,24 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
     })
 }
 
-/// The colour gate of [`Mosaic::chroma_gate`] from the raw saturation map:
-/// `(gate, burnt-out green photosites)`. `None` when no green photosite is
-/// saturated. The gate is 0 on the burnt-out green photosites dilated by
-/// `dilate` pixels, and outside that set `255 · (1 − f)`, where `f` is the
-/// share of the `(2·reach + 1)²` window around the pixel that lies in the
-/// dilated set: the share of its chrominance support that was not
-/// measured. The window is a separable box, so `f` is exact and the same
-/// on any machine.
-fn chroma_gate(
-    sat_raw: &[u8],
-    w: usize,
-    h: usize,
-    phase: BayerPhase,
-    dilate: usize,
-    reach: usize,
-) -> (Option<Vec<u8>>, usize) {
-    let mut green = vec![0u8; w * h];
-    let count: usize = green
-        .par_chunks_mut(w)
-        .zip(sat_raw.par_chunks(w))
-        .enumerate()
-        .map(|(y, (row, src))| {
-            let mut n = 0usize;
-            for (x, (o, &s)) in row.iter_mut().zip(src).enumerate() {
-                if s != 0 && phase.color_at(x, y) == Color::G {
-                    *o = 1;
-                    n += 1;
-                }
-            }
-            n
+/// The balanced level at which the first of the three channels counts as
+/// burnt out: the lowest, over the four photosites of the Bayer tile, of
+/// `k_c · (white · (1 − sat_margin) − black) / (white − black)`, the
+/// saturation rule in the units of the balanced mosaic. With green at
+/// multiplier one and red and blue above it, that is green's, a little
+/// under 1; under a balance that puts red or blue below green it is
+/// theirs. `None` on a monochrome sensor, and where the levels give no
+/// positive finite figure.
+pub fn colour_ceiling(frame: &RawFrame, wb: [f64; 3], sat_margin: f64) -> Option<f64> {
+    let SensorKind::Bayer(phase) = frame.kind else { return None };
+    let level = [(0, 0), (1, 0), (0, 1), (1, 1)]
+        .into_iter()
+        .map(|(x, y)| {
+            let (black, white) = (frame.black_at(x, y), frame.white_at(x, y));
+            wb[phase.color_at(x, y) as usize] * (white * (1.0 - sat_margin) - black) / (white - black)
         })
-        .sum();
-    if count == 0 {
-        return (None, 0);
-    }
-    let (blind, _) = dilate_counted(&green, w, h, dilate);
-    drop(green);
-    // Separable box sums of the dilated set: rows first, as u16 counts.
-    let span = 2 * reach + 1;
-    let mut rows = vec![0u16; w * h];
-    rows.par_chunks_mut(w).zip(blind.par_chunks(w)).for_each(|(out, src)| {
-        for (x, o) in out.iter_mut().enumerate() {
-            let lo = x.saturating_sub(reach);
-            let hi = (x + reach).min(w - 1);
-            *o = src[lo..=hi].iter().map(|&v| u16::from(v)).sum();
-        }
-    });
-    let mut gate = vec![255u8; w * h];
-    gate.par_chunks_mut(w).zip(blind.par_chunks(w)).enumerate().for_each(|(y, (out, src))| {
-        let lo = y.saturating_sub(reach);
-        let hi = (y + reach).min(h - 1);
-        for (x, o) in out.iter_mut().enumerate() {
-            if src[x] != 0 {
-                *o = 0;
-                continue;
-            }
-            let inside: u32 = (lo..=hi).map(|yy| u32::from(rows[yy * w + x])).sum();
-            // The window is cut at the frame; the share counts what it holds.
-            let window = (hi - lo + 1) as u32 * ((x + reach).min(w - 1) - x.saturating_sub(reach) + 1) as u32;
-            debug_assert!(window > 0 && window <= (span * span) as u32);
-            let keep = 1.0 - f64::from(inside) / f64::from(window);
-            *o = (255.0 * keep).round() as u8;
-        }
-    });
-    (Some(gate), count)
+        .fold(f64::INFINITY, f64::min);
+    (level.is_finite() && level > 0.0).then_some(level)
 }
 
 /// Chebyshev dilation of a 0/1 mask by `r` pixels (separable max filter).
@@ -877,12 +819,11 @@ mod tests {
         assert!(err.to_string().contains("not a number"), "{err}");
     }
 
-    /// A burnt-out patch of a neutral field: the colour gate is closed on
-    /// the green photosites of the patch and their neighbours, falls off
-    /// over `colour_reach`, and is open far away. Only green photosites
-    /// close it: a patch that burns out red alone leaves no gate at all.
+    /// The colour ceiling is the lowest balanced level at which a channel
+    /// counts as burnt out, and the report counts what reads above it,
+    /// burnt out or not.
     #[test]
-    fn colour_gate_closes_on_burnt_out_green_only() {
+    fn colour_ceiling_is_the_first_channel_to_burn_out() {
         let (w, h) = (64usize, 64usize);
         let full = Rect { x: 0, y: 0, w, h };
         let phase = BayerPhase::RGGB;
@@ -890,30 +831,32 @@ mod tests {
         // The whole patch at white (every colour), the field at a fifth.
         let raw: Vec<u16> = (0..w * h).map(|i| if patch(i % w, i / w) { 1000 } else { 200 }).collect();
         let p = IngestParams { wb: WhiteBalance::Manual([2.0, 1.0, 1.5]), ..IngestParams::default() };
-        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw), &p).unwrap();
-        assert_eq!(m.report.saturated_green, 32, "8×8 patch: half its photosites are green");
-        let gate = m.chroma_gate.as_ref().expect("a burnt-out green photosite closes the gate");
-        assert_eq!(gate.len(), w * h);
-        // Closed on the patch and the two pixels of dilation around it.
-        for (x, y) in [(20, 20), (27, 27), (18, 24), (29, 24), (24, 18), (24, 29)] {
-            assert_eq!(gate[y * w + x], 0, "({x},{y})");
-        }
-        // Rising with the distance from the patch, open at the reach.
-        let row: Vec<u8> = (30..40).map(|x| gate[24 * w + x]).collect();
-        assert!(row.windows(2).all(|p| p[0] <= p[1]), "{row:?}");
-        assert!(row[0] > 0 && row[0] < 255, "{row:?}");
-        assert!(gate[24 * w + 29 + p.colour_reach] < 255, "{row:?}");
-        assert_eq!(gate[24 * w + 30 + p.colour_reach], 255, "{row:?}");
-        assert_eq!(gate[5 * w + 5], 255);
-        assert_eq!(gate[(h - 1) * w + w - 1], 255);
-        // The same patch burnt out in red alone: no gate.
-        let raw: Vec<u16> = (0..w * h)
-            .map(|i| if patch(i % w, i / w) && phase.color_at(i % w, i / w) == Color::R { 1000 } else { 200 })
-            .collect();
-        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw), &p).unwrap();
-        assert!(m.report.saturated_raw > 0);
-        assert_eq!(m.report.saturated_green, 0);
-        assert!(m.chroma_gate.is_none());
+        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw.clone()), &p).unwrap();
+        // Green has the lowest clip: black 0, white 1000, margin 0.02.
+        let ceiling = m.colour_ceiling.expect("a Bayer mosaic has a ceiling");
+        assert!((ceiling - 0.98).abs() < 1e-12, "{ceiling}");
+        assert_eq!(m.report.colour_ceiling, Some(ceiling));
+        assert_eq!(m.report.above_ceiling, 64, "the 8×8 patch and nothing of the field");
+        // A red that is measured, not burnt out, and balanced above the
+        // ceiling: counted too, since the count is of the reading.
+        let bright: Vec<u16> =
+            (0..w * h).map(|i| if phase.color_at(i % w, i / w) == Color::R { 600 } else { 200 }).collect();
+        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, bright), &p).unwrap();
+        assert_eq!(m.report.saturated_raw, 0);
+        assert_eq!(m.report.above_ceiling, w * h / 4);
+        // A balance that puts blue under green: blue burns out first.
+        let p = IngestParams { wb: WhiteBalance::Manual([2.0, 1.0, 0.5]), ..IngestParams::default() };
+        let m = ingest(&frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw.clone()), &p).unwrap();
+        assert!((m.colour_ceiling.unwrap() - 0.49).abs() < 1e-12);
+        // A black level moves it: (980 − 100) / (1000 − 100).
+        let mut f = frame(w, h, SensorKind::Bayer(phase), 1000.0, full, raw.clone());
+        f.black_tile = [100.0; 4];
+        let m = ingest(&f, &IngestParams { wb: WhiteBalance::None, ..IngestParams::default() }).unwrap();
+        assert!((m.colour_ceiling.unwrap() - 880.0 / 900.0).abs() < 1e-12);
+        // A monochrome sensor has no colour and no ceiling.
+        let m = ingest(&frame(w, h, SensorKind::Mono, 1000.0, full, raw), &IngestParams::default()).unwrap();
+        assert_eq!(m.colour_ceiling, None);
+        assert_eq!(m.report.above_ceiling, 0);
     }
 
     #[test]

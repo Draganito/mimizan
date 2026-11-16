@@ -73,18 +73,25 @@ burnt-out photosite reads its multiplier: green 1, red and blue 1.6 to
 `(k_R, 1, k_B)`, a strong magenta no scene had, and the camera matrix,
 with its negative coefficients, sends the green plate below paper white
 while red and blue go over it. Up to 0.15.5 that printed as pink
-highlights. Since 0.15.6 the separation gates the chrominance where a
-green photosite is burnt out: green has the lowest clip of the three, so
-there every colour difference is false, and false in the same direction
-whatever the scene was. Where only red or blue burn out, the difference is
-a lower bound in the right direction and stays; a poppy stays red. The
-gate is closed on the burnt-out green photosites and the two pixels around
-them, and opens over the seven pixels of the chrominance kernel by the
-share of the support that was measured. Where it is closed the three
-plates are the luminance, which is what the monochrome print shows there:
-the highlight goes to paper white in all three, like the shoulder of a
-slide. Nothing is reconstructed, and the luminance, and with it the native
-negative, does not see the gate.
+highlights. From 0.15.6 to 0.18.14 a gate removed the chrominance where
+a green photosite was burnt out; a neutral highlight was right, but a sky
+that burnt out one channel after the other lost all its colour at the
+first burnt-out green, with a hard edge.
+
+Now the separation has a colour ceiling: the lowest balanced level at
+which a photosite of any colour counts as saturated, about 0.98 on a
+daylight file, where green clips first. What a photosite reads above it counts as
+light and not as colour. The luminance is estimated from the mosaic as it
+is; the chrominance is the estimate of the mosaic held to the ceiling. A
+burnt-out neutral is held to one level in all three channels and has no
+colour: the three plates are the luminance there and go to paper white
+together, like the shoulder of a slide. A channel that is still measured
+below the ceiling keeps its distance to the burnt-out ones, so a sunset
+keeps its yellow until blue burns out too. A channel that goes over the
+ceiling alone is held there and its excess is light in all three plates:
+a burnt-out red stays red and pales towards white with the exposure.
+Nothing is reconstructed, and the luminance, and with it the native
+negative, does not see the ceiling (PAPER §5.5).
 
 **The file.** One 16-bit linear grey TIFF with the three frames stacked,
 blue at the top, green, red at the bottom, in the sensor orientation; the

@@ -8,7 +8,7 @@
 
 use crate::cfa::Color;
 use crate::decode::{RawFrame, SensorKind};
-use crate::ingest::SAT_MARGIN;
+use crate::ingest::{colour_ceiling, SAT_MARGIN};
 use crate::mix::Weights;
 use crate::plane::Plane;
 use crate::plate::{PlateSpace, PlateWeights};
@@ -46,6 +46,11 @@ pub fn browser_plate(frame: &RawFrame) -> PlateWeights {
 /// with `weights` (balanced space), the colour the three rows of `plate`.
 /// A monochrome sensor averages everything and is grey in both. Values
 /// above 1 are clipped, like the negative's saturated pixels.
+///
+/// A bin with a photosite above the colour ceiling
+/// (`ingest::colour_ceiling`) is mixed as the developed picture is: its
+/// luminance from the readings as they are, its colour from the readings
+/// held to the ceiling.
 pub fn binned(
     frame: &RawFrame,
     weights: Weights,
@@ -61,26 +66,23 @@ pub fn binned(
     }
     let ow = (c.w / f).max(1);
     let oh = (c.h / f).max(1);
-    // Four planes: the balanced R, G, B means of each bin, and the mono
-    // sensor's one channel in G.
-    // The fourth marks bins with a burnt-out green photosite: there the
-    // colour is false (towards magenta, `ingest::Mosaic::chroma_gate`)
-    // and the plate shows the luminance, as the developed picture does.
-    let mut chan = [Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh)];
-    let (r, gbs) = chan.split_at_mut(1);
-    let (g, bs) = gbs.split_at_mut(1);
-    let (b, s) = bs.split_at_mut(1);
+    let ceiling = colour_ceiling(frame, wb, SAT_MARGIN).unwrap_or(f64::INFINITY);
+    // Three planes: the balanced R, G, B of each bin as the mixes take
+    // them, and the mono sensor's one channel in all three.
+    let mut chan = [Plane::zeros(ow, oh), Plane::zeros(ow, oh), Plane::zeros(ow, oh)];
+    let (r, gb) = chan.split_at_mut(1);
+    let (g, b) = gb.split_at_mut(1);
     r[0].data
         .par_chunks_mut(ow)
         .zip(g[0].data.par_chunks_mut(ow))
         .zip(b[0].data.par_chunks_mut(ow))
-        .zip(s[0].data.par_chunks_mut(ow))
         .enumerate()
-        .for_each(|(oy, (((rr, gg), bb), ss))| {
+        .for_each(|(oy, ((rr, gg), bb))| {
             for ox in 0..ow {
                 let mut sum = [0.0f64; 3];
+                let mut held = [0.0f64; 3];
                 let mut n = [0usize; 3];
-                let mut green_burnt = false;
+                let mut above = false;
                 let y0 = c.y + oy * f;
                 let x0 = c.x + ox * f;
                 for y in y0..(y0 + f).min(c.y + c.h) {
@@ -97,20 +99,28 @@ pub fn binned(
                             },
                             SensorKind::Mono => 1,
                         };
-                        if ch == 1 && raw >= white * (1.0 - SAT_MARGIN) {
-                            green_burnt = true;
-                        }
                         sum[ch] += v;
+                        held[ch] += (wb[ch] * v).min(ceiling);
+                        above |= wb[ch] * v > ceiling;
                         n[ch] += 1;
                     }
                 }
                 let mean = |i: usize| if n[i] > 0 { wb[i] * sum[i] / n[i] as f64 } else { 0.0 };
                 match frame.kind {
+                    SensorKind::Bayer(_) if above => {
+                        // The luminance of the readings, the colour of the
+                        // readings held to the ceiling.
+                        let h = |i: usize| if n[i] > 0 { held[i] / n[i] as f64 } else { 0.0 };
+                        let l = 0.25 * mean(0) + 0.5 * mean(1) + 0.25 * mean(2);
+                        let lh = 0.25 * h(0) + 0.5 * h(1) + 0.25 * h(2);
+                        rr[ox] = l + h(0) - lh;
+                        gg[ox] = l + h(1) - lh;
+                        bb[ox] = l + h(2) - lh;
+                    }
                     SensorKind::Bayer(_) => {
                         rr[ox] = mean(0);
                         gg[ox] = mean(1);
                         bb[ox] = mean(2);
-                        ss[ox] = f64::from(u8::from(green_burnt));
                     }
                     SensorKind::Mono => {
                         let v = if n[1] > 0 { sum[1] / n[1] as f64 } else { 0.0 };
@@ -128,7 +138,7 @@ pub fn binned(
             p.clone()
         }
     };
-    let [r, g, b, s] = [upright(&chan[0]), upright(&chan[1]), upright(&chan[2]), upright(&chan[3])];
+    let [r, g, b] = [upright(&chan[0]), upright(&chan[1]), upright(&chan[2])];
     let (width, height) = (r.width, r.height);
     let n = width * height;
     let mono = matches!(frame.kind, SensorKind::Mono);
@@ -141,14 +151,6 @@ pub fn binned(
             let v = encode(c[1]);
             *gy = v;
             px.fill(v);
-            return;
-        }
-        if s.data[i] != 0.0 {
-            // Burnt-out green: no colour, the luminance in the grey and in
-            // all three of the plate, as the separation's gate leaves them.
-            let l = encode(0.25 * c[0] + 0.5 * c[1] + 0.25 * c[2]);
-            *gy = l;
-            px.fill(l);
             return;
         }
         *gy = encode((0..3).map(|k| w[k] * c[k]).sum::<f64>());
@@ -217,24 +219,28 @@ mod tests {
 
     #[test]
     fn balance_and_weights_apply_per_colour() {
-        // Red sites at full scale, the rest dark: the grey is w_r * wb_r,
-        // and with the bare channels the colour is red alone.
-        let f = frame(32, 32, |x, y| if x % 2 == 0 && y % 2 == 0 { 4195 } else { 100 }, 1);
+        // Red sites at half scale, the rest dark: the grey is w_r * wb_r / 2,
+        // and with the bare channels the colour is red alone. (At full
+        // scale red would stand above the colour ceiling; that case is the
+        // next test.)
+        let f = frame(32, 32, |x, y| if x % 2 == 0 && y % 2 == 0 { 100 + 2048 } else { 100 }, 1);
         let t = binned_gray(&f, Weights { r: 0.5, g: 0.25, b: 0.25 }, [1.6, 1.0, 1.2], 8);
-        let expect = ((0.5f64 * 1.6).min(1.0).powf(1.0 / 2.2) * 255.0).round() as u8;
-        assert!(t.gray.iter().all(|&v| (v as i32 - expect as i32).abs() <= 1), "{:?}", &t.gray[..4]);
+        let red = 1.6f64 * 2048.0 / 4095.0;
+        let enc = |v: f64| (v.powf(1.0 / 2.2) * 255.0).round() as i32;
+        assert!(t.gray.iter().all(|&v| (v as i32 - enc(0.5 * red)).abs() <= 1), "{:?}", &t.gray[..4]);
         for px in t.rgb.as_chunks::<3>().0 {
-            assert_eq!(px[0], 255, "{px:?}");
+            assert!((px[0] as i32 - enc(red)).abs() <= 1, "{px:?}");
             assert_eq!((px[1], px[2]), (0, 0), "{px:?}");
         }
     }
 
     /// A burnt-out bin under a daylight balance reads (k_R, 1, k_B), a
-    /// magenta no scene had. The red-alone test above keeps its colour;
-    /// here green is burnt out too, and the bin is grey in the plate: the
-    /// luminance (k_R + 2 + k_B)/4, clipped to white at the encoding.
+    /// magenta no scene had. Held to the ceiling it is neutral, and the
+    /// bin is grey in the plate: the luminance (k_R + 2 + k_B)/4, clipped
+    /// to white at the encoding. Where green and red are over the ceiling
+    /// and blue is measured below it, blue keeps its distance.
     #[test]
-    fn burnt_out_green_bins_have_no_colour() {
+    fn above_the_ceiling_a_bin_keeps_only_the_colour_that_is_measured() {
         let wb = [2.0, 1.0, 1.5];
         let f = frame(32, 32, |_, _| 4195, 1);
         let t = binned_gray(&f, Weights::default(), wb, 8);
@@ -242,14 +248,28 @@ mod tests {
             assert_eq!(px, &[255, 255, 255], "{px:?}");
         }
         assert!(t.gray.iter().all(|&v| v == 255));
-        // The same bins with the channels unbalanced show the magenta the
-        // gate removes: white level but 1.0 everywhere → grey; so use a
-        // half-burnt field: green at the clip, red and blue below it.
+        // Green at the clip, red balanced just over it, blue at 0.77: the
+        // ceiling is (4195·0.98 − 100)/4095 = 0.9795, so red and green are
+        // held to it and are equal, and blue stays below. The luminance is
+        // the readings' own, (1.026 + 2 + 0.769)/4.
         let f = frame(32, 32, |x, y| if (x + y) % 2 == 1 { 4195 } else { 2200 }, 1);
         let t = binned_gray(&f, Weights::default(), wb, 8);
+        let (l, lh): (f64, f64) = ((1.0256 + 2.0 + 0.7692) / 4.0, (3.0 * 0.9795 + 0.7692) / 4.0);
+        let blue = ((l + 0.7692 - lh).powf(1.0 / 2.2) * 255.0).round() as i32;
         for px in t.rgb.as_chunks::<3>().0 {
-            assert_eq!(px[0], px[1], "{px:?}");
-            assert_eq!(px[1], px[2], "{px:?}");
+            assert_eq!((px[0], px[1]), (255, 255), "{px:?}");
+            assert!((px[2] as i32 - blue).abs() <= 1 && px[2] < 235, "{px:?} vs {blue}");
+        }
+        let grey = (l.powf(1.0 / 2.2) * 255.0).round() as i32;
+        assert!(t.gray.iter().all(|&v| (v as i32 - grey).abs() <= 1), "{:?} vs {grey}", &t.gray[..4]);
+        // A bin with nothing above the ceiling is mixed from its means.
+        let f = frame(32, 32, |x, y| if (x + y) % 2 == 1 { 3000 } else { 1500 }, 1);
+        let t = binned_gray(&f, Weights::default(), wb, 8);
+        let (r, g, b) = (2.0 * 1400.0 / 4095.0, 2900.0 / 4095.0, 1.5 * 1400.0 / 4095.0);
+        let enc = |v: f64| (v.powf(1.0 / 2.2) * 255.0).round() as i32;
+        for px in t.rgb.as_chunks::<3>().0 {
+            assert!((px[0] as i32 - enc(r)).abs() <= 1 && (px[1] as i32 - enc(g)).abs() <= 1, "{px:?}");
+            assert!((px[2] as i32 - enc(b)).abs() <= 1, "{px:?}");
         }
     }
 

@@ -266,9 +266,12 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
 
 /// Bytes a development of `frame` holds at its widest point. Bayer: the
 /// Dubois estimate at its peak, nine f64 planes (`dubois::estimate`), over
-/// the frame as decoded (two bytes a sample, four for a float file), the
-/// saturation map and the colour gate, a byte each. Mono: the normalised
-/// plane beside the measured one, over the frame and the saturation map.
+/// the frame as decoded (two bytes a sample, four for a float file) and the
+/// saturation map, a byte. The second estimate of the chrominance, below
+/// the colour ceiling, runs in windows of a megapixel beside five held
+/// planes and stays under that peak on any frame above 3 MP. Mono: the
+/// normalised plane beside the measured one, over the frame and the
+/// saturation map.
 /// A guide for refusing a file the machine cannot hold, measured to about
 /// a tenth; what it does not see is the allocator and whatever else the
 /// process has open.
@@ -290,7 +293,7 @@ pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind) -> u6
 fn develop_memory_for(w: usize, h: usize, kind: crate::decode::SensorKind, sample: u64) -> u64 {
     let px = w as u64 * h as u64;
     let (planes, maps) = match kind {
-        crate::decode::SensorKind::Bayer(_) => (9, 2),
+        crate::decode::SensorKind::Bayer(_) => (9, 1),
         crate::decode::SensorKind::Mono => (2, 1),
     };
     px * (planes * 8 + sample + maps)

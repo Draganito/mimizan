@@ -138,7 +138,7 @@ detail the elongated bands had given up. The structure tensor of the
 chroma-free base band (§4.3) answers the case the energy ratio cannot,
 where the chrominance itself is strong, and the opening of the clean
 copy's ring rests on it. The kernels, the fused demodulation, the
-deterministic arithmetic, the mixing rule of §5 with its colour gate, the
+deterministic arithmetic, the mixing rule of §5 with its colour ceiling, the
 file formats and the plate are the engineering around that core. The
 first draft (`docs/whitepaper_v1.pdf`) had the decomposition, a block
 mask over a full FFT and a POCS loop; the mask is Appendix A, the loop is
@@ -263,8 +263,9 @@ A photosite is saturated if $\mathrm{raw} \ge \mathrm{white}\,(1 -
 mask is dilated by 2 px (the same-phase neighbours share the estimation
 error). Saturated photosites keep their clipped value in the picture; they
 are excluded from every statistic and fit and marked 255 in the mask sidecar
-(§6.2). Saturated *green* photosites also close the colour gate of §5.5;
-their count is `saturated_green` in the report.
+(§6.2). The lowest balanced level at which a photosite of any colour is
+saturated is the colour ceiling of §5.5; the report carries it as
+`colour_ceiling` and the count of photosites above it as `above_ceiling`.
 
 ### 3.3 Noise model
 
@@ -672,7 +673,7 @@ deterministic, no local minima. Pass: RMSE ≤ 5 % of the mean reference
 brightness. The result is converted to raw space with the multipliers of the
 calibration shot and written to the camera file.
 
-### 5.5 The colour gate at saturation
+### 5.5 The colour ceiling at saturation
 
 The balance of §3.5 sets where each channel clips: a saturated photosite
 of colour $c$ reads $k_c$, with $k_G = 1$ and $k_R, k_B$ above it (1.6 to
@@ -684,21 +685,56 @@ plate of §7.5 shows it most, since the camera matrix's negative
 coefficients send the green plate below paper white while red and blue go
 over it (pink highlights).
 
-Let $S_G$ be the set of saturated green photosites (§3.2), $D_2$ the
-dilation by 2 px, and $W_7(x)$ the $15 \times 15$ window around $x$, the
-support of the chrominance low-pass of §4.5. The gate is
+The colour ceiling is the lowest balanced level at which a photosite of
+any colour counts as saturated (§3.2),
 
-$$ g(x) = \begin{cases} 0 & x \in D_2(S_G) \\[2pt] 1 - \dfrac{|W_7(x) \cap D_2(S_G)|}{|W_7(x)|} & \text{otherwise} \end{cases} $$
+$$ c = \min_{t} \; k_{c(t)}\, \frac{\mathrm{white}_t\,(1 - \mathrm{sat\_margin}) - \mathrm{black}_t}{\mathrm{white}_t - \mathrm{black}_t} $$
 
-and the chrominance handed to §5.1 is $g\,\hat C_1'$, $g\,\hat C_2'$. The
-luminance $\hat L$ is estimated with the full chrominance subtracted and
-is not touched, so the native mix is unchanged to the bit; every other
-mix, and each of the three plates, takes $\hat L$ alone where the gate is
-closed, and a share of the colour where the chrominance support reaches
-into burnt-out green. Only green closes the gate: where red or blue alone
-saturate, the colour difference is a lower bound in the right direction
-and stays. The window is a separable box, so $g$ is exact and the same on
-every machine; it is stored as 8 bits per pixel. Nothing is reconstructed.
+over the four positions $t$ of the Bayer tile: about 0.98 where green
+clips first, lower when a multiplier is below 1. Above $c$ two channels can no
+longer be compared, since one of them may have stopped there. The rule is:
+what a photosite reads above the ceiling counts as light and not as
+colour. The luminance $\hat L$ is estimated from the mosaic $m$ as it is.
+The chrominance handed to §5.1 is the estimate, by the same estimator, of
+the mosaic held to the ceiling, $\bar m = \min(m, c)$:
+
+$$ \mathrm{out} = \hat L + (w_G - w_R - w_B)\,\bar C_1' + 2\,(w_R - w_B)\,\bar C_2' $$
+
+What follows from it:
+
+- $\hat L$ is not touched, so the native mix is unchanged to the bit, and
+  every other mix and each of the three plates has $\hat L$ as its
+  luminance.
+- A burnt-out neutral is the constant $c$ in $\bar m$ and has no
+  chrominance: the three plates are $\hat L$ there and go to paper white
+  together.
+- A channel measured below the ceiling keeps its distance to the ones
+  that are held: beside burnt-out red and green, blue stays as far below
+  them as it was measured below $c$.
+- A channel that alone stands $e$ above the ceiling is held at $c$, and
+  its excess is light: $e/4$ for red or blue, $e/2$ for green, in all
+  three plates. A burnt-out red is still red, and paler the further it is
+  over; it goes to white with the exposure, not to a flat red.
+- $\min(m, c)$ is continuous in the scene and the estimator is the same
+  on both sides, so no edge appears where a channel crosses the ceiling,
+  and the rule is the same for every set of weights.
+
+The second estimate is run only where it differs. The frame is cut into
+tiles of 1024 px; a tile with a photosite above $c$ in it or within the
+estimator's reach (a margin of 64 px for the default estimator of §4.5,
+which reaches 16 px, 128 px for the fixed kernel and the block mask of
+Appendix A) is estimated again on its own window of $\bar m$. For the default estimator the tiles
+give the chrominance of the whole held mosaic to the bit (a test holds
+it). A file with nothing above the ceiling is separated once. On a 45 MP
+frame with 13 % of the photosites above the ceiling the second estimate
+took 17 tiles and half the time of the first.
+
+Up to 0.18.14 a gate stood here: the chrominance was multiplied by 0 on
+burnt-out green and by the measured share of its support around it. A
+neutral highlight was right, but the gate closed on green alone, so a
+sky that burnt out one channel after the other lost all its colour at the
+first burnt-out green, with a hard edge. The ceiling has no edge there.
+Nothing is reconstructed in either.
 
 ---
 
@@ -1246,11 +1282,13 @@ balance gain is largest. Method, file format and limits are in
   red filter on the Z f, §5.1), colour mottle like dye clouds. No noise
   reduction, as a matter of principle; the plate's chroma noise has not
   been measured yet.
-- Where a green photosite is burnt out the plate has no colour (§5.5): a
-  burnt-out neutral goes to paper white in all three, a subject that burns
-  out green alone prints grey, and real colour within seven pixels of a
-  burnt-out highlight is reduced by the share of its support that was
-  burnt out. There is no highlight reconstruction.
+- Above the colour ceiling (§5.5) the plate carries only the colour that
+  is still measured: a burnt-out neutral goes to paper white in all three,
+  and a channel that goes over the ceiling alone is held there and pales
+  towards white with its excess, where a brighter colour would have been
+  true. The ceiling stands where the file's white level puts it; a white
+  level set below the sensor's real clip lowers it. There is no highlight
+  reconstruction.
 - The plate has two lamps and nothing else: no saturation, no hue, no
   per-channel curve. The filter transmissions of `wratten` are the same
   approximations as the monochrome weights; the `camera` matrix is the

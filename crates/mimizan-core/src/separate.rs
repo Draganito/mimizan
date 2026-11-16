@@ -67,11 +67,11 @@ impl SeparateParams {
 pub struct Separation {
     /// Estimated luminance `L̂` (full resolution).
     pub lum: Plane,
-    /// Low-pass chrominance `Ĉ1'`, mask gain and the colour gate
-    /// ([`Mosaic::chroma_gate`]) already folded in.
+    /// Low-pass chrominance `Ĉ1'` of the mosaic held to its colour ceiling
+    /// ([`Mosaic::colour_ceiling`]), mask gain already folded in.
     pub c1: Plane,
-    /// Combined low-pass chrominance `Ĉ2'`, mask gain and the colour gate
-    /// already folded in.
+    /// Combined low-pass chrominance `Ĉ2'` of the mosaic held to its
+    /// colour ceiling, mask gain already folded in.
     pub c2: Plane,
     /// Where output sharpening is allowed, per pixel in [0,1]. `Adaptive`:
     /// `max(M_1, M_2a, M_2b)` of the block mask. `Off` and `Dubois`:
@@ -150,39 +150,141 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
 /// is a fixed-weight sum of measured values; nothing is computed from a
 /// model of the picture. A monochrome mosaic is an error.
 ///
-/// The luminance is estimated with the full chrominance subtracted. The
-/// chrominance handed on to the mixes is then gated by
-/// [`Mosaic::chroma_gate`]: where a green photosite is burnt out, the
-/// colour differences are false (towards magenta, whatever the scene), so
-/// the mixes get none of them there and the three plates of a colour
-/// print, like a filtered negative, take the luminance alone. `L̂` and the
-/// native mix are untouched.
+/// The luminance is estimated from the mosaic as it is, with its full
+/// chrominance subtracted. The chrominance handed on to the mixes is the
+/// estimate of the mosaic held to its colour ceiling
+/// ([`Mosaic::colour_ceiling`]): what a photosite reads above the level at
+/// which the first channel burns out counts as light and not as colour.
+/// A burnt-out neutral is then neutral, a channel that is still measured
+/// beside burnt-out ones keeps its distance to them, and the false colour
+/// of one clip against another never enters the estimate. `L̂` and the
+/// native mix are untouched, and every mix has `L̂` as its luminance.
 pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
     let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
     let mut sep = separate_linear(mosaic, phase, p);
-    if let Some(gate) = &mosaic.chroma_gate {
-        gate_chroma(&mut sep, gate)?;
+    if let Some(ceiling) = mosaic.colour_ceiling {
+        let t = std::time::Instant::now();
+        let tiles = chroma_below(mosaic, ceiling, phase, p, &mut sep);
+        if tiles > 0 {
+            tracing::debug!("chrominance below the ceiling: {tiles} tiles in {} ms", t.elapsed().as_millis());
+        }
     }
     Ok(sep)
 }
 
-/// `Ĉ1' ← g·Ĉ1'`, `Ĉ2' ← g·Ĉ2'` with `g = gate / 255` per pixel.
-pub fn gate_chroma(sep: &mut Separation, gate: &[u8]) -> crate::Result<()> {
-    if gate.len() != sep.c1.data.len() || gate.len() != sep.c2.data.len() {
-        return Err(crate::Error::Invalid(format!(
-            "colour gate has {} entries, the separation {}",
-            gate.len(),
-            sep.c1.data.len()
-        )));
+/// Side, in pixels, of the tiles [`chroma_below`] works in. A multiple of
+/// the block size of the `adaptive` mask and of both margins.
+const TILE: usize = 1024;
+
+/// How far outside a tile the mosaic is read to estimate the chrominance
+/// inside it. The `dubois` estimate at a pixel reads 16 pixels around it
+/// (a 15-tap band and a Gaussian of radius 9 behind it), the fixed one 36
+/// (73 taps); the `adaptive` one adds its 64-pixel blocks. Even, so a
+/// window starts on the phase of the frame.
+fn tile_margin(mask: MaskMode) -> usize {
+    match mask {
+        MaskMode::Dubois => 64,
+        MaskMode::Off | MaskMode::Adaptive => 128,
     }
-    for c in [&mut sep.c1, &mut sep.c2] {
-        c.data.par_iter_mut().zip(gate.par_iter()).for_each(|(v, &g)| {
-            if g != 255 {
-                *v *= f64::from(g) / 255.0;
+}
+
+/// Replace the chrominance of `sep` by the estimate of the mosaic held to
+/// `ceiling`: `min(m, ceiling)` through the same estimator. Returns the
+/// number of tiles estimated again.
+///
+/// The two estimates differ only as far around a photosite above the
+/// ceiling as the estimator reads, so the second one runs only on the
+/// tiles that have such a photosite inside their margin, each on its own
+/// window of the mosaic, one after the other. In the `dubois` and `off`
+/// modes every filter is finite and shorter than the margin, so the
+/// result is, to the bit, the chrominance of a separation of the whole
+/// held mosaic; in the `adaptive` mode the block mask of a window is the
+/// mask of the frame up to what its blocks see of their neighbours.
+/// A tile's window is at most `TILE + 2·margin` on a side, so the pass
+/// stays far under the peak of the first one on any frame above 3 MP; a
+/// smaller frame is one window, and holds a second estimate beside the
+/// first.
+fn chroma_below(
+    mosaic: &Mosaic,
+    ceiling: f64,
+    phase: BayerPhase,
+    p: &SeparateParams,
+    sep: &mut Separation,
+) -> usize {
+    let m = &mosaic.plane;
+    let (w, h) = (m.width, m.height);
+    let margin = tile_margin(p.mask);
+    // Cells of `margin` pixels that hold a photosite above the ceiling.
+    let (cw, ch) = (w.div_ceil(margin), h.div_ceil(margin));
+    let mut cells = vec![false; cw * ch];
+    cells.par_chunks_mut(cw).enumerate().for_each(|(cy, flags)| {
+        for y in cy * margin..((cy + 1) * margin).min(h) {
+            for (x, &v) in m.row(y).iter().enumerate() {
+                if v > ceiling {
+                    flags[x / margin] = true;
+                }
             }
-        });
+        }
+    });
+    if !cells.iter().any(|&c| c) {
+        return 0;
     }
-    Ok(())
+
+    let mut tiles = 0usize;
+    for ty in (0..h).step_by(TILE) {
+        for tx in (0..w).step_by(TILE) {
+            // The window: the tile and its margin, cut at the frame.
+            let (x0, y0) = (tx.saturating_sub(margin), ty.saturating_sub(margin));
+            let (x1, y1) = ((tx + TILE + margin).min(w), (ty + TILE + margin).min(h));
+            let above = (y0 / margin..y1.div_ceil(margin))
+                .any(|cy| cells[cy * cw + x0 / margin..cy * cw + x1.div_ceil(margin)].iter().any(|&c| c));
+            if !above {
+                continue;
+            }
+            let window = held_window(mosaic, ceiling, x0, y0, x1 - x0, y1 - y0);
+            let part = separate_linear(&window, phase, p);
+            drop(window);
+            let (tw, th) = ((tx + TILE).min(w) - tx, (ty + TILE).min(h) - ty);
+            for (dst, src) in [(&mut sep.c1, &part.c1), (&mut sep.c2, &part.c2)] {
+                for y in 0..th {
+                    let from = &src.row(ty - y0 + y)[tx - x0..tx - x0 + tw];
+                    dst.row_mut(ty + y)[tx..tx + tw].copy_from_slice(from);
+                }
+            }
+            tiles += 1;
+        }
+    }
+    tiles
+}
+
+/// The `w×h` window of `mosaic` at `(x0, y0)`, held to `ceiling`. The
+/// origin is even, so the window has the phase of the frame.
+fn held_window(mosaic: &Mosaic, ceiling: f64, x0: usize, y0: usize, w: usize, h: usize) -> Mosaic {
+    debug_assert!(x0.is_multiple_of(2) && y0.is_multiple_of(2));
+    let full = mosaic.plane.width;
+    let mut plane = Plane::zeros(w, h);
+    plane.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (o, &v) in row.iter_mut().zip(&mosaic.plane.row(y0 + y)[x0..x0 + w]) {
+            *o = v.min(ceiling);
+        }
+    });
+    let mut saturated = vec![0u8; w * h];
+    saturated.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let at = (y0 + y) * full + x0;
+        row.copy_from_slice(&mosaic.saturated[at..at + w]);
+    });
+    Mosaic {
+        plane,
+        phase: mosaic.phase,
+        saturated,
+        colour_ceiling: None,
+        noise: mosaic.noise,
+        wb: mosaic.wb,
+        orientation: mosaic.orientation,
+        camera: mosaic.camera.clone(),
+        xyz_to_cam: mosaic.xyz_to_cam,
+        report: mosaic.report.clone(),
+    }
 }
 
 fn separate_linear(mosaic: &Mosaic, phase: BayerPhase, p: &SeparateParams) -> Separation {
@@ -253,36 +355,10 @@ mod tests {
         }
     }
 
-    /// A neutral field with a burnt-out patch, balanced R 2, G 1, B 1.5:
-    /// inside the patch the mosaic reads (2, 1, 1.5), a false magenta. The
-    /// gate takes that colour out of the mixes, so the three plates are
-    /// equal there and equal to the luminance; the luminance itself, and
-    /// so the native negative, is what the ungated separation gives.
-    #[test]
-    fn burnt_out_green_leaves_the_plates_neutral_and_the_luminance_alone() {
+    /// A 12-bit frame with white at 1000 and black at 0, as-shot balance off.
+    fn raw_frame(w: usize, h: usize, phase: BayerPhase, raw: Vec<u16>) -> crate::decode::RawFrame {
         use crate::decode::{RawData, RawFrame, Rect, SensorKind};
-        use crate::ingest::{ingest, IngestParams, WhiteBalance};
-        use crate::plate::{mix_plate, PlateWeights};
-
-        let (w, h) = (96usize, 96usize);
-        let phase = BayerPhase::RGGB;
-        let patch = |x: usize, y: usize| (36..60).contains(&x) && (36..60).contains(&y);
-        // The field is a neutral 0.3 once balanced; the patch is at white.
-        let raw: Vec<u16> = (0..w * h)
-            .map(|i| {
-                let (x, y) = (i % w, i / w);
-                if patch(x, y) {
-                    1000
-                } else {
-                    match phase.color_at(x, y) {
-                        Color::R => 150,
-                        Color::G => 300,
-                        Color::B => 200,
-                    }
-                }
-            })
-            .collect();
-        let frame = RawFrame {
+        RawFrame {
             make: String::new(),
             model: String::new(),
             clean_make: String::new(),
@@ -300,48 +376,254 @@ mod tests {
             wb_as_shot: None,
             exposure: Default::default(),
             data: RawData::Integer(raw),
-        };
+        }
+    }
+
+    const MODES: [MaskMode; 3] = [MaskMode::Dubois, MaskMode::Off, MaskMode::Adaptive];
+
+    /// A neutral field with a burnt-out patch, balanced R 2, G 1, B 1.5:
+    /// inside the patch the mosaic reads (2, 1, 1.5), a false magenta. Held
+    /// to the ceiling the patch is neutral, so the three plates are equal
+    /// there and equal to the luminance; the luminance itself, and so the
+    /// native negative, is what the separation of the mosaic as it is
+    /// gives. No colour is left around the patch either.
+    #[test]
+    fn a_burnt_out_neutral_has_no_colour_and_the_luminance_is_untouched() {
+        use crate::ingest::{ingest, IngestParams, WhiteBalance};
+        use crate::plate::{mix_plate, PlateWeights};
+
+        let (w, h) = (192usize, 192usize);
+        let phase = BayerPhase::RGGB;
+        let patch = |x: usize, y: usize| (84..108).contains(&x) && (84..108).contains(&y);
+        // The field is a neutral 0.3 once balanced; the patch is at white.
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if patch(x, y) {
+                    1000
+                } else {
+                    match phase.color_at(x, y) {
+                        Color::R => 150,
+                        Color::G => 300,
+                        Color::B => 200,
+                    }
+                }
+            })
+            .collect();
         let wb = [2.0, 1.0, 1.5];
         let p = IngestParams { wb: WhiteBalance::Manual(wb), ..IngestParams::default() };
-        let mosaic = ingest(&frame, &p).unwrap();
-        assert!(mosaic.chroma_gate.is_some());
-        let mut ungated = mosaic.clone();
-        ungated.chroma_gate = None;
+        let mosaic = ingest(&raw_frame(w, h, phase, raw), &p).unwrap();
+        assert!(mosaic.colour_ceiling.is_some());
+        let mut as_it_is = mosaic.clone();
+        as_it_is.colour_ceiling = None;
 
-        for sp in [
-            SeparateParams::default(),
-            SeparateParams { mask: MaskMode::Off, ..Default::default() },
-            SeparateParams { mask: MaskMode::Adaptive, ..Default::default() },
-        ] {
-            let gated = separate(&mosaic, &sp).unwrap();
-            let plain = separate(&ungated, &sp).unwrap();
-            assert_eq!(gated.lum.data, plain.lum.data, "{:?}: the luminance does not see the gate", sp.mask);
+        for mask in MODES {
+            let sp = SeparateParams { mask, ..Default::default() };
+            let held = separate(&mosaic, &sp).unwrap();
+            let plain = separate(&as_it_is, &sp).unwrap();
+            assert_eq!(held.lum.data, plain.lum.data, "{mask:?}: the luminance does not see the ceiling");
             // The mixes see it: the camera's channels straight into the plates.
-            let [r, g, b] = mix_plate(&gated, &PlateWeights::channels());
+            let [r, g, b] = mix_plate(&held, &PlateWeights::channels());
             let [r0, g0, b0] = mix_plate(&plain, &PlateWeights::channels());
-            for y in 40..56 {
-                for x in 40..56 {
-                    let l = gated.lum.at(x, y);
-                    assert!((r.at(x, y) - l).abs() < 1e-9 && (g.at(x, y) - l).abs() < 1e-9, "{:?}", sp.mask);
-                    assert!((b.at(x, y) - l).abs() < 1e-9, "{:?}", sp.mask);
-                    // Without the gate the patch is magenta: red and blue over green.
-                    assert!(
-                        r0.at(x, y) > g0.at(x, y) + 0.5 && b0.at(x, y) > g0.at(x, y) + 0.2,
-                        "{:?}",
-                        sp.mask
-                    );
+            let (mut worst, mut least) = (0.0f64, f64::INFINITY);
+            for y in 88..104 {
+                for x in 88..104 {
+                    let l = held.lum.at(x, y);
+                    for v in [r.at(x, y), g.at(x, y), b.at(x, y)] {
+                        worst = worst.max((v - l).abs());
+                        least = least.min(v);
+                    }
+                    // As it is, the patch is magenta: red and blue over green.
+                    assert!(r0.at(x, y) > g0.at(x, y) + 0.5 && b0.at(x, y) > g0.at(x, y) + 0.2, "{mask:?}");
                 }
+            }
+            // What is left is what the estimator makes of any neutral
+            // corner, a few hundredths four pixels inside it, and every
+            // plate is over the range of the file: white.
+            assert!(worst < 0.05 && least > 1.25, "{mask:?}: {worst} {least}");
+            if mask == MaskMode::Dubois {
+                let l = held.lum.at(96, 96);
+                assert!((r.at(96, 96) - l).abs() < 1e-9 && (b.at(96, 96) - l).abs() < 1e-9);
             }
             // At the centre, the luminance is the sum of the three clips.
             let l = (wb[0] + 2.0 * wb[1] + wb[2]) / 4.0;
-            assert!((gated.lum.at(48, 48) - l).abs() < 0.05, "{:?}: {}", sp.mask, gated.lum.at(48, 48));
-            // Far from the patch the field is neutral and measured either way.
-            for (x, y) in [(8, 8), (8, 88), (88, 8), (88, 88)] {
-                let v = (r.at(x, y), g.at(x, y), b.at(x, y));
-                assert!((v.0 - 0.3).abs() < 1e-4 && (v.1 - 0.3).abs() < 1e-4, "{:?} {v:?}", sp.mask);
-                assert!((v.2 - 0.3).abs() < 1e-4, "{:?} {v:?}", sp.mask);
-                assert_eq!(r.at(x, y), r0.at(x, y));
+            assert!((held.lum.at(96, 96) - l).abs() < 0.05, "{mask:?}: {}", held.lum.at(96, 96));
+            // The patch throws its false colour into the field around it,
+            // as far as the chrominance low-pass reaches; held to the
+            // ceiling it is a neutral step and throws none. The pixel-
+            // adaptive estimate keeps a neutral step neutral; the fixed
+            // low-pass leaks a step's luminance into the colour, the same
+            // on any edge, and far less than the clip did.
+            let fringe = |r: &Plane, g: &Plane, b: &Plane| {
+                let mut worst = 0.0f64;
+                for y in 90..102 {
+                    for x in 108..116 {
+                        worst =
+                            worst.max((r.at(x, y) - g.at(x, y)).abs()).max((b.at(x, y) - g.at(x, y)).abs());
+                    }
+                }
+                worst
+            };
+            let (now, before) = (fringe(&r, &g, &b), fringe(&r0, &g0, &b0));
+            assert!(before > 0.2, "{mask:?}: {before}");
+            match mask {
+                MaskMode::Dubois => assert!(now < 0.005, "{mask:?}: {now}"),
+                _ => assert!(now < 0.4 * before, "{mask:?}: {now} against {before}"),
             }
+            // Far from the patch the field is neutral and measured either way.
+            for (x, y) in [(8, 8), (8, 184), (184, 8), (184, 184)] {
+                let v = (r.at(x, y), g.at(x, y), b.at(x, y));
+                assert!((v.0 - 0.3).abs() < 1e-4 && (v.1 - 0.3).abs() < 1e-4, "{mask:?} {v:?}");
+                assert!((v.2 - 0.3).abs() < 1e-4, "{mask:?} {v:?}");
+                if mask != MaskMode::Adaptive {
+                    assert_eq!(r.at(x, y), r0.at(x, y), "{mask:?}");
+                }
+            }
+        }
+    }
+
+    /// A field where red and green are burnt out and blue is measured, far
+    /// below them: the sky around a low sun. The blue plate keeps its
+    /// distance to the other two, where a gate on burnt-out green made all
+    /// three the luminance and the field a white hole. The three plates
+    /// still add up to the luminance of the monochrome negative.
+    #[test]
+    fn a_measured_channel_keeps_its_colour_beside_burnt_out_ones() {
+        use crate::ingest::{ingest, IngestParams, WhiteBalance};
+        use crate::plate::{mix_plate, PlateWeights};
+
+        let (w, h) = (128usize, 128usize);
+        let phase = BayerPhase::RGGB;
+        // Red and green at white, blue at 200: balanced (2, 1, 0.3).
+        let raw: Vec<u16> =
+            (0..w * h).map(|i| if phase.color_at(i % w, i / w) == Color::B { 200 } else { 1000 }).collect();
+        let p = IngestParams { wb: WhiteBalance::Manual([2.0, 1.0, 1.5]), ..IngestParams::default() };
+        let mosaic = ingest(&raw_frame(w, h, phase, raw), &p).unwrap();
+        let ceiling = mosaic.colour_ceiling.unwrap();
+        for mask in MODES {
+            let sep = separate(&mosaic, &SeparateParams { mask, ..Default::default() }).unwrap();
+            let [r, g, b] = mix_plate(&sep, &PlateWeights::channels());
+            // The luminance is the mosaic's own: (2 + 2·1 + 0.3) / 4.
+            let l = (2.0 + 2.0 + 0.3) / 4.0;
+            // The colour is that of (ceiling, ceiling, 0.3).
+            let lc = (3.0 * ceiling + 0.3) / 4.0;
+            for (x, y) in [(64, 64), (50, 77), (81, 40)] {
+                assert!((sep.lum.at(x, y) - l).abs() < 1e-9, "{mask:?}");
+                assert!((r.at(x, y) - (l + ceiling - lc)).abs() < 1e-9, "{mask:?} {}", r.at(x, y));
+                assert!((g.at(x, y) - (l + ceiling - lc)).abs() < 1e-9, "{mask:?} {}", g.at(x, y));
+                assert!((b.at(x, y) - (l + 0.3 - lc)).abs() < 1e-9, "{mask:?} {}", b.at(x, y));
+                // Red and green are over the file's range, blue far inside it.
+                assert!(r.at(x, y) > 1.0 && g.at(x, y) > 1.0 && b.at(x, y) < 0.6, "{mask:?}");
+                let sum = 0.25 * r.at(x, y) + 0.5 * g.at(x, y) + 0.25 * b.at(x, y);
+                assert!((sum - sep.lum.at(x, y)).abs() < 1e-12, "{mask:?}");
+            }
+        }
+    }
+
+    /// The chrominance is estimated again only on the tiles that hold a
+    /// photosite above the ceiling, each on its own window. On a frame of
+    /// several tiles, with such photosites across a seam, in a corner and
+    /// nowhere in one tile, the result is the chrominance of the whole
+    /// mosaic held to the ceiling: to the bit where every filter is
+    /// finite, closely under the block mask. The luminance is that of the
+    /// mosaic as it is.
+    #[test]
+    fn the_tiles_give_the_chrominance_of_the_held_mosaic() {
+        use crate::ingest::{ingest, IngestParams, WhiteBalance};
+
+        let (w, h) = (2 * TILE + 90, TILE + 150);
+        let phase = BayerPhase::GRBG;
+        // A coloured texture of a few hundred counts, the same on any run.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f64 / (1u64 << 24) as f64
+        };
+        let bright = |x: usize, y: usize| {
+            // Across the seam at x = TILE, in the last corner, and a
+            // speck a few pixels inside the second tile's margin.
+            ((TILE - 20..TILE + 30).contains(&x) && (300..360).contains(&y))
+                || (x >= w - 12 && y >= h - 9)
+                || ((TILE - 40..TILE - 36).contains(&x) && (700..704).contains(&y))
+        };
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let wave = 0.5 + 0.5 * ((x as f64 * 0.045).sin() * (y as f64 * 0.031).cos());
+                let level = match phase.color_at(x, y) {
+                    Color::R => 120.0 + 200.0 * wave,
+                    Color::G => 260.0 + 300.0 * wave,
+                    Color::B => 90.0 + 160.0 * (1.0 - wave),
+                } + 12.0 * noise();
+                if bright(x, y) {
+                    // Red and green at white, blue as the scene has it.
+                    match phase.color_at(x, y) {
+                        Color::B => (2.5 * level) as u16,
+                        _ => 1000,
+                    }
+                } else {
+                    level as u16
+                }
+            })
+            .collect();
+        let p = IngestParams { wb: WhiteBalance::Manual([1.9, 1.0, 1.6]), ..IngestParams::default() };
+        let mosaic = ingest(&raw_frame(w, h, phase, raw), &p).unwrap();
+        let ceiling = mosaic.colour_ceiling.unwrap();
+        assert!(mosaic.report.above_ceiling > 1000);
+        let mut as_it_is = mosaic.clone();
+        as_it_is.colour_ceiling = None;
+        let mut held = as_it_is.clone();
+        held.plane.data.iter_mut().for_each(|v| *v = v.min(ceiling));
+
+        for mask in MODES {
+            let sp = SeparateParams { mask, ..Default::default() };
+            let sep = separate(&mosaic, &sp).unwrap();
+            let plain = separate(&as_it_is, &sp).unwrap();
+            let whole = separate(&held, &sp).unwrap();
+            assert_eq!(sep.lum.data, plain.lum.data, "{mask:?}: luminance");
+            // Of the six tiles, the two at the seam and the one with the
+            // corner hold a bright photosite; the wider margin of the
+            // longer filters reaches the corner from its neighbour too.
+            let tiles = chroma_below(&mosaic, ceiling, phase, &sp, &mut plain.clone());
+            assert_eq!(tiles, if mask == MaskMode::Dubois { 3 } else { 4 }, "{mask:?}");
+            if mask == MaskMode::Adaptive {
+                let worst = |a: &Plane, b: &Plane| {
+                    a.data.iter().zip(&b.data).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max)
+                };
+                let (d1, d2) = (worst(&sep.c1, &whole.c1), worst(&sep.c2, &whole.c2));
+                assert!(d1 < 1e-3 && d2 < 1e-3, "{mask:?}: {d1} {d2}");
+            } else {
+                assert!(sep.c1.data == whole.c1.data, "{mask:?}: C1 is not the held mosaic's");
+                assert!(sep.c2.data == whole.c2.data, "{mask:?}: C2 is not the held mosaic's");
+            }
+            // And it is not the chrominance of the mosaic as it is.
+            assert!(sep.c1.data != plain.c1.data, "{mask:?}");
+        }
+    }
+
+    /// A mosaic with nothing above its ceiling separates as one without a
+    /// ceiling, to the bit: the second estimate does not run.
+    #[test]
+    fn a_mosaic_below_its_ceiling_is_separated_once() {
+        let (w, h) = (160usize, 96usize);
+        let phase = BayerPhase::BGGR;
+        let plane = mosaic_of(phase, w, h, |x, y| {
+            let v = 0.2 + 0.5 * (x as f64 / w as f64);
+            (v, 0.9 * v + 0.1 * (y as f64 / h as f64), 0.4)
+        });
+        let raw: Vec<u16> = plane.data.iter().map(|v| (v * 1000.0) as u16).collect();
+        let p = crate::ingest::IngestParams { wb: crate::ingest::WhiteBalance::None, ..Default::default() };
+        let mosaic = crate::ingest::ingest(&raw_frame(w, h, phase, raw), &p).unwrap();
+        assert_eq!(mosaic.report.above_ceiling, 0);
+        let mut as_it_is = mosaic.clone();
+        as_it_is.colour_ceiling = None;
+        for mask in MODES {
+            let sp = SeparateParams { mask, ..Default::default() };
+            let (a, b) = (separate(&mosaic, &sp).unwrap(), separate(&as_it_is, &sp).unwrap());
+            assert!(a.lum.data == b.lum.data && a.c1.data == b.c1.data && a.c2.data == b.c2.data, "{mask:?}");
+            assert_eq!(chroma_below(&mosaic, mosaic.colour_ceiling.unwrap(), phase, &sp, &mut a.clone()), 0);
         }
     }
 
