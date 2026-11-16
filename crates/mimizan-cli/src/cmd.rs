@@ -12,7 +12,7 @@ use mimizan_core::pipeline::{self, NegativeParams};
 use mimizan_core::plate::{PlateFilters, PlateParams, PlateSpace};
 use mimizan_core::print::{sidecar_path, LAMP_LIMIT};
 use mimizan_core::separate::{MaskMode, SeparateParams};
-use mimizan_core::tiffout::{write_gray16, write_gray8, TiffMeta};
+use mimizan_core::tiffout::{write_gray16, write_gray16_range, write_gray8, TiffMeta};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -270,7 +270,11 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
             pi.space.name()
         );
     }
-    let desc = serde_json::to_string(&neg.info)?;
+    // The DNG's samples are the channels with the balance undone, to the
+    // sensor's white: it has no range. The TIFF's samples are the plane
+    // divided by the range its description states.
+    let range = if a.dng { 1.0 } else { neg.info.range };
+    let desc = serde_json::to_string(&pipeline::NegativeInfo { range, ..neg.info.clone() })?;
     let t = Instant::now();
     if a.dng {
         let pi = neg.info.plate.as_ref().context("the DNG needs the plate")?;
@@ -303,9 +307,10 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
             t.elapsed().as_millis()
         );
     } else {
-        write_gray16(
+        write_gray16_range(
             &a.out,
             &neg.plane,
+            range,
             &TiffMeta { description: &desc, trc: GrayTrc::Linear, orientation: neg.orientation, dpi: None },
         )?;
         let side = sidecar_path(&a.out);

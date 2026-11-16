@@ -10,7 +10,7 @@ use mimizan_core::decode::{Rect, SensorKind};
 use mimizan_core::ingest::{ingest, IngestParams};
 use mimizan_core::metrics::wedge_fit;
 use mimizan_core::mix::WeightSpace;
-use mimizan_core::tiffin::read_gray;
+use mimizan_core::tiffin::read_negative;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -203,7 +203,7 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
             if rects.len() != ref_rects.len() {
                 bail!("{} negative patches but {} reference patches", rects.len(), ref_rects.len());
             }
-            let neg = read_gray(neg_path)?;
+            let neg = read_negative(neg_path)?;
             let mask_path = mimizan_core::print::sidecar_path(neg_path);
             // A sidecar of another size belongs to another negative.
             let sat = mimizan_core::tiffin::read_mask8(&mask_path)
@@ -410,7 +410,7 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
             Ok(())
         }
         CalibrateCmd::Star { negative, center, radius, spokes, camera, cameras, usm_amount, write, json } => {
-            let g = read_gray(negative)?;
+            let g = read_negative(negative)?;
             let rep = star_report(&g.plane, center, radius, *spokes)?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&rep)?);

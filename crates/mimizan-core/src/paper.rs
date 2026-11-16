@@ -16,7 +16,11 @@
 //!   development, N). A scene value `L` (grey card 0.18, clip 1) gives the
 //!   paper the exposure `log₁₀ E = log₁₀2 · (t − γ_n · log₂ L)`, `t` the
 //!   exposure time in stops. A stop of time is therefore worth `1/γ_n` scene
-//!   stops: the negative has compressed the scene.
+//!   stops: the negative has compressed the scene. The line does not end
+//!   at the clip: a value above 1, which a balanced channel reaches before
+//!   its photosite is full and a burnt-out one reads, is a denser negative
+//!   and prints lighter than the clip, towards the paper's white. More
+//!   time brings it back, as a sky is burnt in.
 //! * Each pass exposes one emulsion component. The hard pass (filter 5) is a
 //!   normal CDF in log exposure, `b = Φ((log₁₀E − μ)/σ)`, its width `σ` from
 //!   the ISO range [`ISO_R_HARD`]. The soft pass (filter 00) is the measured
@@ -246,13 +250,14 @@ impl Paper {
 
     /// `D/Dmax` for scene value `l` under absolute times (stops over the
     /// speed-matched time). `l ≤ 0` is a clear negative: all the light the
-    /// lamp has, the paper's black.
+    /// lamp has, the paper's black. A value above the clip is the denser
+    /// negative it is. A value that is no number prints as the clip.
     #[inline]
     fn fraction_at(&self, l: f64, soft: f64, hard: f64) -> f64 {
         if l <= 0.0 {
             return 1.0;
         }
-        let l = l.min(1.0);
+        let l = if l.is_nan() { 1.0 } else { l };
         let a = self.soft.fraction(log_exposure(l, soft));
         let b = self.hard.fraction(log_exposure(l, hard));
         1.0 - (1.0 - a) * (1.0 - b)
@@ -273,7 +278,8 @@ impl Paper {
             } else if l <= 0.0 {
                 1.0
             } else {
-                c.fraction(log_exposure(l.min(1.0), t + time.log2()))
+                let l = if l.is_nan() { 1.0 } else { l };
+                c.fraction(log_exposure(l, t + time.log2()))
             }
         };
         let a = pass(&self.soft, soft, soft_time);
@@ -440,9 +446,9 @@ impl PaperCurve {
     /// Print value of scene value `l` where the soft pass lasted
     /// `soft_time` times its time and the hard pass `hard_time` times its
     /// own: the dodge or the burn at one point (`burn.rs`). Both 1 is
-    /// [`Self::eval`] to the bit. Time, not scene: a clipped highlight
-    /// dodged goes towards paper white, where a placing would hold it at
-    /// the clip.
+    /// [`Self::eval`] to the bit. A highlight above the clip burnt in
+    /// comes down the scale with its gradation: the factor `l^γₙ` on both
+    /// passes prints the scene value `l` where the clip printed.
     #[inline]
     pub fn eval_timed(&self, l: f64, soft_time: f64, hard_time: f64) -> f64 {
         self.paper.encode(self.paper.fraction_timed(l, self.soft, self.hard, soft_time, hard_time))
@@ -557,8 +563,9 @@ pub struct PaperTable {
     soft: Vec<f32>,
     hard: Vec<f32>,
     encode: Vec<f32>,
-    /// `γₙ log₂ l` over the square root of `l` in 65536 steps: the
-    /// shadows a 16-bit code would lump together are told apart.
+    /// `γₙ log₂ l` over the square root of `l` in 65536 steps, up to the
+    /// clip: the shadows a 16-bit code would lump together are told
+    /// apart. Above the clip the logarithm is taken.
     scene: Vec<f32>,
     /// Entries per stop of exposure.
     per_stop: f64,
@@ -621,10 +628,14 @@ impl PaperTable {
                 self.encode_fraction(1.0)
             };
         }
-        // The scene table is over √l; below its first step is below any
-        // paper's toe.
-        let code = (l.min(1.0).sqrt() * (SCENE_TABLE - 1) as f64 + 0.5) as usize;
-        let scene = f64::from(self.scene[code.clamp(1, SCENE_TABLE - 1)]);
+        // The scene table is over √l up to the clip; below its first step
+        // is below any paper's toe. Above the clip, the denser negative.
+        let scene = if l > 1.0 {
+            NEGATIVE_GAMMA * l.log2()
+        } else {
+            let code = (l.min(1.0).sqrt() * (SCENE_TABLE - 1) as f64 + 0.5) as usize;
+            f64::from(self.scene[code.clamp(1, SCENE_TABLE - 1)])
+        };
         let pass = |table: &[f32], log_time: f64| -> f64 {
             if log_time == f64::NEG_INFINITY {
                 0.0
@@ -766,7 +777,8 @@ mod tests {
             let curve = SplitGrade::new(soft, hard).curve();
             let table = PaperTable::new(&curve);
             let mut worst = 0.0f64;
-            for i in 0..=400 {
+            // From sixteen stops under the clip to two stops over it.
+            for i in 0..=450 {
                 let l = if i == 0 { 0.0 } else { 2f64.powf(-16.0 + 16.0 * i as f64 / 400.0) };
                 for (ts, th) in [
                     (1.0, 1.0),
@@ -1044,8 +1056,8 @@ mod tests {
     /// A dodge or a burn is time. Unit times are the plain curve to the
     /// bit; the same factor on both passes is a shift of both times; one
     /// pass alone moves its own end of the scale; no time at all is white,
-    /// even under a clear negative; and a clipped highlight dodged goes
-    /// whiter than the clip, which a placing could not do.
+    /// even under a clear negative; and a highlight above the clip is a
+    /// denser negative, which more time prints where the clip printed.
     #[test]
     fn time_is_local_exposure() {
         let c = SplitGrade::new(0.3, -0.2).curve();
@@ -1079,11 +1091,28 @@ mod tests {
             c.eval_timed(0.0, 0.5, 0.5) < 0.1,
             "a clear negative under half the time is still near black"
         );
-        // A clipped highlight (scene 1, Zone VIII at the base) dodged by a
-        // stop prints whiter than the clip; placed by a stop it stays there.
+        // The clip (scene 1, Zone VIII at the base) dodged by a stop prints
+        // whiter than the clip. So does the scene above the clip: a denser
+        // negative, lighter all the way and never past the paper's white.
         let base = SplitGrade::default().curve();
         assert!(base.eval_timed(1.0, 0.5, 0.5) > base.eval(1.0) + 0.01);
-        assert_eq!(base.eval(2.0), base.eval(1.0));
+        let mut last = base.eval(1.0);
+        for i in 1..=60 {
+            let v = base.eval(1.0 + 0.05 * f64::from(i));
+            assert!(v > last && v < 1.0, "scene {}: {v} after {last}", 1.0 + 0.05 * f64::from(i));
+            last = v;
+        }
+        assert!(base.eval(1.34) > base.eval(1.0) + 0.03, "{} {}", base.eval(1.34), base.eval(1.0));
+        // Burnt in by the negative's own factor it prints where the clip
+        // printed, and a stop of scene is γₙ stops of time, as below it.
+        for &l in &[1.1f64, 1.34, 2.0, 3.5] {
+            let t = l.powf(NEGATIVE_GAMMA);
+            assert!((base.eval_timed(l, t, t) - base.eval(1.0)).abs() < 1e-12, "{l}");
+            assert!((c.eval_timed(l, t, 1.0) - c.eval_timed(1.0, 1.0, t.recip())).abs() < 1e-12, "{l}");
+        }
+        // What is no number prints as the clip.
+        assert_eq!(base.eval(f64::NAN), base.eval(1.0));
+        assert_eq!(base.eval_timed(f64::NAN, 2.0, 0.5), base.eval_timed(1.0, 2.0, 0.5));
         // Monotone in the time factor, down to the faintest time.
         let mut last = 0.0;
         for i in 0..=400 {

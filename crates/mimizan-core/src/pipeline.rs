@@ -91,10 +91,32 @@ pub struct NegativeInfo {
     pub cutoff: f64,
     pub report: IngestReport,
     pub timing: Timing,
+    /// The scene value the file's full scale stands for ([`scene_range`]
+    /// of the plane that is written): a sample `s` of the file is the
+    /// scene value `s · range`. Left out when it is 1, which every file
+    /// without the field means.
+    #[serde(skip_serializing_if = "is_one")]
+    pub range: f64,
     /// Present when the file is a three-colour plate (`plate.rs`): frame
     /// order, frame height, the filter set and its weights.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plate: Option<crate::plate::PlateInfo>,
+}
+
+fn is_one(v: &f64) -> bool {
+    *v == 1.0
+}
+
+/// The range a negative's file needs to hold `plane`: its highest value,
+/// and 1 when nothing in it goes above 1. A balanced channel passes 1,
+/// the level at which green is full, before its own photosite is, and a
+/// burnt-out photosite reads its multiplier; a mix or a plate of them
+/// stands above 1 there. The file keeps that: its samples are the plane
+/// divided by the range (`tiffout::write_gray16_range`). A plane within
+/// 1 is written as it always was.
+pub fn scene_range(plane: &Plane) -> f64 {
+    let top = plane.data.par_iter().copied().filter(|v| v.is_finite()).reduce(|| 1.0, f64::max);
+    top.max(1.0)
 }
 
 /// The developed negative: the linear plane, its sharpening mask, and the
@@ -168,6 +190,7 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
         cutoff: p.separate.cutoff,
         report: mosaic.report.clone(),
         timing: Timing { decode_ms, ingest_ms, separate_ms: 0, mix_ms: 0 },
+        range: 1.0,
         plate: None,
     };
     let orientation = mosaic.orientation;
@@ -234,6 +257,10 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
             (plane, mask8, None)
         }
     };
+    info.range = scene_range(&plane);
+    if info.range > 1.0 {
+        info!("range {:.4}: the negative holds {:.2} stops above 1", info.range, info.range.log2());
+    }
     Ok(Negative { plane, mask8, orientation, info, separation })
 }
 
@@ -407,6 +434,129 @@ mod tests {
         assert_ne!(m1.plane.data, m2.plane.data);
         // Without a camera file the emulsion is the native one.
         assert_eq!(plate_base(None, [2.0, 1.0, 1.5]), Weights::default());
+    }
+
+    /// A negative keeps what stands above 1. A burnt-out neutral under a
+    /// daylight balance reads (k_R + 2 + k_B)/4 in the luminance: the
+    /// description states that as the range, the file's samples are the
+    /// plane divided by it, and read back as a negative they are the plane
+    /// again to half a 16-bit step of that range. Read as plain samples
+    /// the file ends at its full scale. A negative with nothing above 1
+    /// has range 1, says nothing of it and is written as it always was.
+    #[test]
+    fn a_negative_keeps_what_stands_above_one() {
+        use crate::cfa::{BayerPhase, Color};
+        use crate::decode::{RawData, Rect, SensorKind};
+        use crate::icc::GrayTrc;
+        use crate::ingest::WhiteBalance;
+        use crate::tiffin::{described_range, read_gray, read_negative};
+        use crate::tiffout::{write_gray16, write_gray16_range, TiffMeta};
+
+        let (w, h) = (96usize, 96usize);
+        let phase = BayerPhase::RGGB;
+        let frame = |burnt: bool| RawFrame {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 12,
+            kind: SensorKind::Bayer(phase),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            // A neutral grey, and a burnt-out square in it.
+            data: RawData::Integer(
+                (0..w * h)
+                    .map(|i| {
+                        let (x, y) = (i % w, i / w);
+                        if burnt && (30..66).contains(&x) && (30..66).contains(&y) {
+                            return 1000;
+                        }
+                        match phase.color_at(x, y) {
+                            Color::R => 200,
+                            Color::G => 400,
+                            Color::B => 267,
+                        }
+                    })
+                    .collect(),
+            ),
+        };
+        let develop = |burnt: bool| {
+            let mut p = NegativeParams::default();
+            p.ingest.wb = WhiteBalance::Manual([2.0, 1.0, 1.5]);
+            negative_from_frame(&frame(burnt), &p, 0).unwrap()
+        };
+        let dir = std::env::temp_dir().join(format!("mimizan-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = |description: &'static str| TiffMeta {
+            description: Box::leak(description.to_string().into_boxed_str()),
+            trc: GrayTrc::Linear,
+            orientation: 1,
+            dpi: None,
+        };
+
+        let neg = develop(true);
+        let top = neg.plane.data.iter().copied().fold(0.0, f64::max);
+        assert!((neg.plane.at(48, 48) - 1.375).abs() < 1e-9, "{}", neg.plane.at(48, 48));
+        assert_eq!(neg.info.range, top);
+        assert_eq!(neg.info.range, scene_range(&neg.plane));
+        // The highest value is the estimator's overshoot at the square's
+        // hard edge, a little above the square itself.
+        assert!(neg.info.range >= 1.375 && neg.info.range < 1.7, "{}", neg.info.range);
+        let json = serde_json::to_string(&neg.info).unwrap();
+        assert_eq!(described_range(Some(&json)).unwrap(), neg.info.range);
+        let path = dir.join("burnt.tif");
+        write_gray16_range(
+            &path,
+            &neg.plane,
+            neg.info.range,
+            &TiffMeta { description: &json, trc: GrayTrc::Linear, orientation: 1, dpi: None },
+        )
+        .unwrap();
+        let back = read_negative(&path).unwrap();
+        let step = neg.info.range / 65535.0;
+        for (a, b) in back.plane.data.iter().zip(&neg.plane.data) {
+            assert!((a - b.max(0.0)).abs() <= 0.5 * step + 1e-12, "{a} vs {b}");
+        }
+        let plain = read_gray(&path).unwrap();
+        assert_eq!(plain.plane.data.iter().copied().fold(0.0, f64::max), 1.0);
+        assert!((plain.plane.at(48, 48) * neg.info.range - 1.375).abs() <= step);
+
+        // Nothing above 1: no range in the description, the file as before.
+        let calm = develop(false);
+        assert!(calm.plane.data.iter().all(|&v| v <= 1.0));
+        assert_eq!(calm.info.range, 1.0);
+        let json = serde_json::to_string(&calm.info).unwrap();
+        assert!(!json.contains("range"), "{json}");
+        assert_eq!(described_range(Some(&json)).unwrap(), 1.0);
+        let (a, b) = (dir.join("calm-range.tif"), dir.join("calm.tif"));
+        write_gray16_range(&a, &calm.plane, calm.info.range, &meta("{}")).unwrap();
+        write_gray16(&b, &calm.plane, &meta("{}")).unwrap();
+        assert_eq!(std::fs::read(&a).unwrap(), std::fs::read(&b).unwrap());
+        assert_eq!(read_negative(&b).unwrap().plane.data, read_gray(&b).unwrap().plane.data);
+
+        // What a description may say.
+        assert_eq!(described_range(None).unwrap(), 1.0);
+        assert_eq!(described_range(Some("not json")).unwrap(), 1.0);
+        assert_eq!(described_range(Some(r#"{"stage":"negative"}"#)).unwrap(), 1.0);
+        assert_eq!(described_range(Some(r#"{"range":1.25}"#)).unwrap(), 1.25);
+        for bad in [r#"{"range":0.5}"#, r#"{"range":"2"}"#, r#"{"range":null}"#, r#"{"range":-3}"#] {
+            assert!(described_range(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(write_gray16_range(&a, &calm.plane, 0.5, &meta("{}")).is_err());
+        assert!(write_gray16_range(&a, &calm.plane, f64::NAN, &meta("{}")).is_err());
+        // A plane with a value that is no number: the range is of the rest.
+        let odd = Plane::from_vec(3, 1, vec![0.5, f64::NAN, 1.25]);
+        assert_eq!(scene_range(&odd), 1.25);
+        assert_eq!(scene_range(&Plane::from_vec(2, 1, vec![0.2, 0.9])), 1.0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 255 in the sidecar says "burnt out" and nothing else. A mask of 1,

@@ -1,8 +1,10 @@
 //! The paper strip: the one control the paper has, as on the phone.
 //!
 //! The axis is the scene, one zone per stop, from five stops under the
-//! grey card up to the clip, two and a half stops above it, where the
-//! negative ends; the card stands at the mark, two thirds along. Each
+//! grey card up to the clip, two and a half stops above it, where green
+//! is full (a burnt highlight may stand above it in the negative; the
+//! strip is the wedge up to the clip); the card stands at the mark, two
+//! thirds along. Each
 //! slice is the paper's value for that grey under the current pair of
 //! exposures. So the strip is the print of a grey wedge, every slice of
 //! it a grey of its own, and the two exposures only move the greys along

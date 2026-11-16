@@ -135,8 +135,8 @@ impl ToneMap {
     }
 
     /// The scene factor a time factor `t` equals for this tone, when one
-    /// exists: `eval_timed(l, t) == eval(l · k)` for every `l` with
-    /// `l ≤ 1` and `l · k ≤ 1`. Both passes must see the same time. A
+    /// exists: `eval_timed(l, t) == eval(l · k)` for every `l`, above 1
+    /// as below it. Both passes must see the same time. A
     /// stop of time is `1/γ_n` scene stops on paper and one on a look. The
     /// GUI uses it to keep its table; the print evaluates the time.
     pub fn scene_factor(&self, times: Times) -> Option<f64> {
@@ -345,11 +345,18 @@ mod tests {
             let mut none = src.clone();
             render_with(&mut none, 0.3, &map, None, (0, 0));
             assert_eq!(none.data, plain.data);
-            // The scene factor stands in for an even time where the table may be used.
-            let t = Times { soft: 2.0, hard: 2.0, all: 2.0 };
-            let k = map.scene_factor(t).unwrap();
-            for &l in &[0.01, 0.18, 0.4] {
-                assert!((map.eval_timed(l, t) - map.eval(l * k)).abs() < 1e-9, "{} {l}", tone.name());
+            // The scene factor stands in for an even time, a burn or a
+            // dodge, below 1 and above it.
+            for time in [2.0, 0.5] {
+                let t = Times { soft: time, hard: time, all: time };
+                let k = map.scene_factor(t).unwrap();
+                for &l in &[0.01, 0.18, 0.4, 1.0, 1.3, 2.6] {
+                    assert!(
+                        (map.eval_timed(l, t) - map.eval(l * k)).abs() < 1e-9,
+                        "{} {l} at {time}",
+                        tone.name()
+                    );
+                }
             }
             assert!(
                 map.scene_factor(Times { soft: 2.0, hard: 1.0, all: 2.0 }).is_none()

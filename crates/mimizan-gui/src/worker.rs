@@ -616,6 +616,9 @@ fn export_linear(
         let channels = PlateWeights::channels();
         let planes = mix_plate(sep, &channels);
         info.plate = Some(PlateInfo::new(&channels, PlateSpace::default(), sep.lum.height));
+        // The DNG's samples are the channels with the balance undone, to
+        // the sensor's white: no range.
+        info.range = 1.0;
         let desc = serde_json::to_string(&info)?;
         let meta = DngMeta::of(&s.frame, s.wb(), &desc)
             .context("the file carries no colour matrix, so no DNG can name the camera's colour")?;
@@ -627,9 +630,12 @@ fn export_linear(
         let mixed = mixed_plane(s, &weights)?;
         let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
         let mask = s.mask_plane()?;
+        // The range of the plane that is written: another mix than the
+        // development's has another.
+        info.range = mimizan_core::pipeline::scene_range(plane);
         let desc = serde_json::to_string(&info)?;
         status(format!("writing {}", path.display()));
-        write_negative(path, plane, Some(&mask), framing, &desc)?
+        write_negative(path, plane, Some(&mask), framing, info.range, &desc)?
     };
     Ok(Event::Exported {
         path: path.to_path_buf(),

@@ -4411,8 +4411,9 @@ impl App {
                  black/white: pixels at 0 and 65535 in 16 bit",
             );
             ui.radio_value(&mut self.hist_source, HistSource::Negative, "negative").on_hover_text(
-                "The full-resolution linear mix before any placing or curve, drawn on a gamma-2.2 axis. \
-                 black/white: pixels at 0 and 65535 in 16 bit",
+                "The full-resolution linear mix before any placing or curve, drawn on a gamma-2.2 axis, as \
+                 the negative's TIFF holds it: the axis ends at 1, or at the highest value when highlights \
+                 stand above 1. black/white: pixels at 0 and 65535 in 16 bit",
             );
             let raw_tip = if self.session.as_ref().is_some_and(|s| s.is_mono()) {
                 "The sensor as shot, one channel, normalised by its black and white level, on a gamma-2.2 axis. \

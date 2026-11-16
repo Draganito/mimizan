@@ -706,8 +706,8 @@ What follows from it:
   every other mix and each of the three plates has $\hat L$ as its
   luminance.
 - A burnt-out neutral is the constant $c$ in $\bar m$ and has no
-  chrominance: the three plates are $\hat L$ there and go to paper white
-  together.
+  chrominance: the three plates are $\hat L$ there, a neutral, and go
+  towards paper white together.
 - A channel measured below the ceiling keeps its distance to the ones
   that are held: beside burnt-out red and green, blue stays as far below
   them as it was measured below $c$.
@@ -743,17 +743,42 @@ Nothing is reconstructed in either.
 ### 6.1 File
 
 16-bit TIFF, one channel, `PhotometricInterpretation = BlackIsZero`,
-$\mathrm{value} = \mathrm{round}(\mathrm{clamp}(\mathrm{out}, 0, 1)\cdot 65535)$.
+$\mathrm{value} = \mathrm{round}(\mathrm{clamp}(\mathrm{out}/r, 0, 1)\cdot 65535)$,
+with $r$ the *range* of the file: the highest value of the plane, and 1
+when nothing stands above 1.
 Embedded ICC: grey, D50, `kTRC` = gamma 1.0 (linear grey). `ImageDescription`
 holds JSON with camera, phase, balance, weights in both spaces, mask mode,
 rounds, noise parameters, defect count and whether the defects were
-repaired, program version. The RAW
+repaired, program version, and `range` when it is above 1. A reader
+multiplies the samples by the range and has the scene values again; a
+file without one is read as it stands. The RAW
 orientation is carried as the TIFF `Orientation` tag; pixels are not turned
 (source: the raw IFD; if it reports nothing turned, the EXIF orientation).
 A plate (`--plate`) is the same file three frames tall, blue, green, red
 from the top, in sensor orientation, with a `plate` object in the JSON
 (frame order, frame height, filter set, the three weight triples); the
-mask sidecar is one frame for all three.
+mask sidecar is one frame for all three, and so is the range.
+
+**What stands above 1.** The scale is the balance's (§3.5): 1 is the
+level at which green is full. Red and blue are full at $k_R$ and $k_B$
+(§5.5), so where green has stopped and another channel still measures,
+the luminance goes on rising above 1. It ends where all three are full,
+at $(k_R + 2 + k_B)/4$ for the native mix, 1.26 on a file with the
+multipliers 1.56 and 1.47, and a little higher when the file's white
+level lies below the sensor's real clip (1.34 on that file, 0.42 stops
+above 1). The gradation between 1 and that end is measured: it is the
+light of the channels that had not stopped. At the end itself nothing is
+measured any more, and the negative is flat there.
+
+Up to 0.18.15 the file ended at 1: what stood above it was written as 1
+and printed as one tone, the clip's, which no burn could take apart. On
+the 45 MP frame of §5.5 that was the sky around the sun: 13.6 % of the
+print lay within half an 8-bit step of its lightest tone. With the range
+it is 0.3 %, at the base print and with a stop more of both lights; the
+rest of that sky has its gradation (§6.6). A file with nothing
+above 1 has the range 1 and is the file it was, sample for sample. A
+program up to 0.18.15 does not know the range and reads such a file by
+its samples: the picture $\log_2 r$ scene stops darker.
 
 ### 6.2 Mask sidecar
 
@@ -777,7 +802,8 @@ XYZ→camera matrix as `SRATIONAL`, `CalibrationIlluminant1` the EXIF
 light source it was measured under (0 when the file does not say, which
 converters read as D65), `AsShotNeutral` $(1/k_R, 1, 1/k_B)$, and
 `UniqueCameraModel` the make and model, so the converter applies the
-profile it has for that camera. Orientation and crop are applied to the
+profile it has for that camera. The DNG has no range: a sample ends at
+its white level, as a RAW of that camera does. Orientation and crop are applied to the
 pixels (a permutation and a window; nothing is resampled) and the file
 carries orientation 1. `ImageDescription` holds the negative's JSON with
 the plate object. The monochrome counterpart of this export is the
@@ -856,8 +882,10 @@ at an exposure time of $t$ stops,
 $$ \log_{10}E = \log_{10}2\,(t - \gamma_n \log_2 L) . $$
 
 A stop of time is worth $1/\gamma_n$ scene stops: the negative has
-compressed the scene. Values above 1 are taken as 1; $L \le 0$ is a clear
-negative and prints the paper's black.
+compressed the scene. The line does not end at the clip: a value above 1
+(§6.1) is a denser negative and prints lighter than the clip, towards the
+unexposed paper. $L \le 0$ is a clear negative and prints the paper's
+black.
 
 **The hard pass** (filter 5) is a normal CDF in log exposure,
 
@@ -910,7 +938,9 @@ Unexposed paper is 1.
 **The base exposure** is the pair of times that puts the grey card at
 $D = 0.67$ and the clip ($L = 1$) at $D = 0.10$, a textured white, solved
 once from the constants above by two nested bisections (the density rises
-with either time). The two exposures of a print are stops of time from
+with either time). What the negative holds above the clip prints between
+that white and the unexposed paper: $L = 1.34$ at $v = 0.944$, where the
+clip is at $v = 0.900$. The two exposures of a print are stops of time from
 that pair, each within ±3 stops; they are the only global tone
 parameters. A pair is read as a printer reads it: the grade is the hard
 exposure over the soft, the exposure is what both have beyond the pair of
@@ -920,7 +950,8 @@ changing one speed-matched filter for another does; the same stops added
 to both change the exposure alone.
 
 The print evaluates the paper exactly at every pixel; the desktop reads
-it from tables of each pass's exposure, within a thousandth. Beside the
+it from tables of each pass's exposure, within a thousandth, above the
+clip as below it. Beside the
 paper, a look (monotone PCHIP through points in $[0,1]^2$
 after encoding; `neutral` is pure gamma 2.2, `reference` is fitted from a
 grey wedge against a monochrome camera's JPEG) remains for the
@@ -945,7 +976,10 @@ before; a stroke under one light leaves the other pass as printed, which
 is the split-grade burn of the highlights or the shadows alone. Because
 the stroke changes the time and not the scene value, a clipped highlight
 dodged to $T = 0$ goes to paper white, and a look with a single light is
-evaluated at $L/T$.
+evaluated at $L/T$. A highlight above the clip (§6.1) is burnt in like
+any other tone: $T = L^{\gamma_n}$ on both passes prints the scene value
+$L$ where the clip printed, 0.25 stops of time for $L = 1.34$, and what
+lies around it comes down with it, each value keeping its distance.
 
 No edge is a line: the lens is a disc of light above the hand, and its
 shadow has a penumbra, the lit fraction of that disc past a straight
@@ -1236,8 +1270,10 @@ balance gain is largest. Method, file format and limits are in
 - The desktop treats the plate as a re-mix of the resident separation
   (`ViewParams.plate`): the fitted view, the 100 % view and the print box
   carry an RGB buffer next to the grey one and go through the same tone
-  table; the print histogram stays the monochrome mix's, with the three
-  channels as outlines over it. The plate is the desktop's
+  table (the 16-bit codes up to 1, then steps of 1/8192 up to 9, the
+  paper itself beyond); the print histogram stays the monochrome mix's,
+  with the three channels as outlines over it. The negative histogram
+  counts the samples of the negative's file, over its range (§6.1). The plate is the desktop's
   second process, switched in the toolbar: the taking filters and the
   primaries stand in the Enlarger where the mix stands, the lamps are two
   sliders under the paper's exposures, and the strip shows slides. Plate
@@ -1283,12 +1319,22 @@ balance gain is largest. Method, file format and limits are in
   reduction, as a matter of principle; the plate's chroma noise has not
   been measured yet.
 - Above the colour ceiling (§5.5) the plate carries only the colour that
-  is still measured: a burnt-out neutral goes to paper white in all three,
-  and a channel that goes over the ceiling alone is held there and pales
+  is still measured: a burnt-out neutral is a neutral in all three and
+  goes towards paper white, and a channel that goes over the ceiling
+  alone is held there and pales
   towards white with its excess, where a brighter colour would have been
   true. The ceiling stands where the file's white level puts it; a white
   level set below the sensor's real clip lowers it. There is no highlight
   reconstruction.
+- What the negative holds above 1 (§6.1) is the light of the channels
+  that had not stopped, not the scene's: with green full, the luminance
+  there rises a quarter as fast as red or blue does, and where all three
+  are full it is one flat level. A burn brings the sky around the sun
+  down with its gradation, and in the plate without its colour; the sun's
+  disc is there as an outline only if a channel still measured across
+  it. At the hard edge of a burnt-out area the estimate can overshoot
+  the area's level; up to 0.18.15 the clip at 1 hid that, now it may
+  show as a fine lighter rim under a strong burn.
 - The plate has two lamps and nothing else: no saturation, no hue, no
   per-channel curve. The filter transmissions of `wratten` are the same
   approximations as the monochrome weights; the `camera` matrix is the

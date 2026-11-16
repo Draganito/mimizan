@@ -84,8 +84,8 @@ daylight file, where green clips first. What a photosite reads above it counts a
 light and not as colour. The luminance is estimated from the mosaic as it
 is; the chrominance is the estimate of the mosaic held to the ceiling. A
 burnt-out neutral is held to one level in all three channels and has no
-colour: the three plates are the luminance there and go to paper white
-together, like the shoulder of a slide. A channel that is still measured
+colour: the three plates are the luminance there, a neutral, and go
+towards paper white together, like the shoulder of a slide. A channel that is still measured
 below the ceiling keeps its distance to the burnt-out ones, so a sunset
 keeps its yellow until blue burns out too. A channel that goes over the
 ceiling alone is held there and its excess is light in all three plates:
@@ -93,12 +93,20 @@ a burnt-out red stays red and pales towards white with the exposure.
 Nothing is reconstructed, and the luminance, and with it the native
 negative, does not see the ceiling (PAPER §5.5).
 
+That luminance goes on above 1, the level at which green is full, as
+long as red or blue still measures, and the negative keeps it (PAPER
+§6.1). A burn over a burnt-out sky therefore brings it down with its
+gradation in all three plates alike: as a neutral, with colour only
+where a channel was still below the ceiling.
+
 **The file.** One 16-bit linear grey TIFF with the three frames stacked,
 blue at the top, green, red at the bottom, in the sensor orientation; the
 negative's JSON carries a `plate` object with the frame order, the frame
 height, the filter set and its three weight triples. Any viewer shows it
 as what it is, a three-frame plate; the existing print path prints it as
 a contact copy. The mask sidecar is one frame, the same for all three.
+Where a frame stands above 1 the samples of all three are divided by the
+highest value, and the JSON names it as `range` (PAPER §6.1).
 
 **The print.** `print` recognises the `plate` object, splits the frames
 and runs the one pass three times with the same layout, the same crop,

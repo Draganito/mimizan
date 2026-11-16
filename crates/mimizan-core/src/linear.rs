@@ -36,7 +36,7 @@ use crate::print::{orient, sidecar_path, window_plane, MASK_KERNEL};
 use crate::recipe::CropRect;
 use crate::resize::ResampleKernel;
 use crate::straighten::STRAIGHTEN_KERNEL;
-use crate::tiffout::{write_gray16, write_gray8, TiffMeta};
+use crate::tiffout::{write_gray16_range, write_gray8, TiffMeta};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::fs::File;
@@ -198,17 +198,24 @@ fn framed(p: &Plane, f: &Framing, kernel: ResampleKernel) -> Plane {
 /// framed as `framing` says, the JSON in the description, orientation 1;
 /// beside it `<stem>.mask.tif`, the sharpening mask framed the same way,
 /// its straighten with [`MASK_KERNEL`] so a flag stays a flag (`mask` is
-/// `max(M)` with saturated pixels at 1, the sidecar as a plane). Returns
-/// the size written.
+/// `max(M)` with saturated pixels at 1, the sidecar as a plane). `range`
+/// is `pipeline::scene_range` of `plane`, the one `description` states:
+/// the samples are the plane divided by it. Returns the size written.
 pub fn write_negative(
     path: &Path,
     plane: &Plane,
     mask: Option<&Plane>,
     framing: &Framing,
+    range: f64,
     description: &str,
 ) -> Result<Written> {
     let out = framed(plane, framing, STRAIGHTEN_KERNEL);
-    write_gray16(path, &out, &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None })?;
+    write_gray16_range(
+        path,
+        &out,
+        range,
+        &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None },
+    )?;
     if let Some(m) = mask {
         if (m.width, m.height) != (plane.width, plane.height) {
             return Err(Error::Invalid("the mask and the negative differ in size".into()));
@@ -499,7 +506,8 @@ mod tests {
         let path = tmp("neg.tif");
         let crop = Some(CropRect { x: 2, y: 1, w: 3, h: 4 });
         let framing = Framing { crop, ..Framing::upright(8) };
-        let got = write_negative(&path, &plane, Some(&mask), &framing, r#"{"stage":"negative"}"#).unwrap();
+        let got =
+            write_negative(&path, &plane, Some(&mask), &framing, 1.0, r#"{"stage":"negative"}"#).unwrap();
         assert_eq!(got, Written { width: 3, height: 4 });
         let read = crate::tiffin::read_gray(&path).unwrap();
         assert_eq!((read.plane.width, read.plane.height, read.orientation), (3, 4, 1));
@@ -528,7 +536,7 @@ mod tests {
         let framing = Framing { orientation: 6, angle: -4.0, crop };
         let (fw, fh) = crate::straighten::frame_size(h, w, -4.0);
         assert!(fw < h && fh < w, "{fw}x{fh}");
-        let got = write_negative(&path, &plane, Some(&mask), &framing, "{}").unwrap();
+        let got = write_negative(&path, &plane, Some(&mask), &framing, 1.0, "{}").unwrap();
         assert_eq!(got, Written { width: 30, height: 20 });
         let read = crate::tiffin::read_gray(&path).unwrap();
         for v in &read.plane.data {
@@ -539,7 +547,7 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 255));
         // Without a crop the file is the whole frame.
         let whole = Framing { crop: None, ..framing };
-        let got = write_negative(&path, &plane, Some(&mask), &whole, "{}").unwrap();
+        let got = write_negative(&path, &plane, Some(&mask), &whole, 1.0, "{}").unwrap();
         assert_eq!(got, Written { width: fw, height: fh });
     }
 }

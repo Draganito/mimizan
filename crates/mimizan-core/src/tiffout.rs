@@ -52,8 +52,19 @@ pub fn ascii_description(s: &str) -> Cow<'_, str> {
 /// Quantise `clamp(v,0,1)*65535` and write a 16-bit grey TIFF in strips of
 /// 64 rows.
 pub fn write_gray16(path: &Path, plane: &Plane, meta: &TiffMeta<'_>) -> Result<()> {
+    write_gray16_range(path, plane, 1.0, meta)
+}
+
+/// [`write_gray16`] for a negative whose plane goes above 1: a sample is
+/// `v / range`, so the file's full scale stands for the scene value
+/// `range` (`pipeline::scene_range`), and the description has to say so
+/// (`NegativeInfo::range`). A range of 1 is `write_gray16` to the bit.
+pub fn write_gray16_range(path: &Path, plane: &Plane, range: f64, meta: &TiffMeta<'_>) -> Result<()> {
+    if !(range.is_finite() && range >= 1.0) {
+        return Err(crate::Error::Invalid(format!("a negative's range is 1 or more, not {range}")));
+    }
     let data: Vec<u16> =
-        plane.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
+        plane.data.par_iter().map(|&v| ((v / range).clamp(0.0, 1.0) * 65535.0).round() as u16).collect();
     write_gray16_u16(path, plane.width, plane.height, &data, meta)
 }
 

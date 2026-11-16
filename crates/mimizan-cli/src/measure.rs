@@ -12,7 +12,7 @@ use mimizan_core::metrics::{carrier_energy, region_stats, star_mtf, wedge_fit, S
 use mimizan_core::plane::Plane;
 use mimizan_core::separate::SeparateParams;
 use mimizan_core::synth::{self, Scene, SynthParams};
-use mimizan_core::tiffin::read_gray;
+use mimizan_core::tiffin::read_negative;
 use mimizan_core::tiffout::{write_gray16, TiffMeta};
 use std::path::{Path, PathBuf};
 
@@ -361,7 +361,7 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
             Ok(())
         }
         MeasureCmd::Star { tif, center, radius, spokes, json } => {
-            let g = read_gray(tif)?;
+            let g = read_negative(tif)?;
             let rep = star_report(&g.plane, center, radius, *spokes)?;
             if *json {
                 println!("{}", serde_json::to_string_pretty(&rep)?);
@@ -371,7 +371,7 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
             Ok(())
         }
         MeasureCmd::Carrier { tif, rect, noise } => {
-            let g = read_gray(tif)?;
+            let g = read_negative(tif)?;
             let r =
                 rect.as_deref().map(parse_rect).transpose()?.map(|r| on_picture(r, &g.plane)).transpose()?;
             let nm = parse_noise(noise)?.unwrap_or_default();
@@ -388,7 +388,7 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
             Ok(())
         }
         MeasureCmd::Diff { a, b, out, diff_scale, preview_scale } => {
-            let (pa, pb) = (read_gray(a)?, read_gray(b)?);
+            let (pa, pb) = (read_negative(a)?, read_negative(b)?);
             if (pa.plane.width, pa.plane.height) != (pb.plane.width, pb.plane.height) {
                 bail!(
                     "sizes differ: {}x{} vs {}x{}",
@@ -441,7 +441,7 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff"));
             let (mut plane, encode) =
-                if is_tiff { (read_gray(tif)?.plane, !*encoded) } else { (read_gray_image(tif)?, false) };
+                if is_tiff { (read_negative(tif)?.plane, !*encoded) } else { (read_gray_image(tif)?, false) };
             if *gain != 1.0 {
                 plane.data.iter_mut().for_each(|v| *v *= gain);
             }
@@ -450,7 +450,7 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
             Ok(())
         }
         MeasureCmd::Wedge { tif, patches, exposures } => {
-            let g = read_gray(tif)?;
+            let g = read_negative(tif)?;
             let rects: Vec<Rect> = patches
                 .split(';')
                 .map(|p| parse_rect(p).and_then(|r| on_picture(r, &g.plane)))

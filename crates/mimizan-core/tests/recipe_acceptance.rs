@@ -10,7 +10,7 @@ use mimizan_core::plane::Plane;
 use mimizan_core::print::{render, PrintParams, PrintSize};
 use mimizan_core::recipe::{Recipe, Sharpen};
 use mimizan_core::resize::ResampleKernel;
-use mimizan_core::tiffout::{write_gray16, write_gray8, TiffMeta};
+use mimizan_core::tiffout::{write_gray16, write_gray16_range, write_gray8, TiffMeta};
 use mimizan_core::tone::Tone;
 use mimizan_core::zone;
 use std::path::{Path, PathBuf};
@@ -243,4 +243,73 @@ fn description_carries_the_recipe_and_the_old_fields() {
     // The recipe inside the file is the recipe that ran.
     let back: Recipe = serde_json::from_value(v["recipe"].clone()).unwrap();
     assert_eq!(back, p.recipe);
+}
+
+/// A negative whose file states a range prints what stands above 1: on
+/// paper the tones go on rising from the clip towards the paper's white,
+/// where the same negative cut at 1 is one flat tone, and more time makes
+/// that stretch of the scale longer, as a sky burnt in. Below 1 the two
+/// prints agree to the step the coarser file can hold. The file prints
+/// as the plane it was written from.
+#[test]
+fn a_negative_above_one_prints_its_highlights() {
+    use mimizan_core::print::{render_planes, PrintSource};
+    let dir = std::env::temp_dir().join(format!("mimizan-acceptance-{}-range", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (w, h) = (161usize, 8usize);
+    // 0.01 a column from 0.02: column 98 is the clip, the last 1.62.
+    let scene = |x: usize| 0.02 + 0.01 * x as f64;
+    let mut ramp = Plane::zeros(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            ramp.set(x, y, scene(x));
+        }
+    }
+    let range = mimizan_core::pipeline::scene_range(&ramp);
+    assert_eq!(range, scene(w - 1));
+    let description = format!(r#"{{"stage":"negative","range":{range}}}"#);
+    let meta = |description: &str| TiffMeta {
+        description: Box::leak(description.to_string().into_boxed_str()),
+        trc: GrayTrc::Linear,
+        orientation: 1,
+        dpi: None,
+    };
+    let (kept, cut) = (dir.join("kept.tif"), dir.join("cut.tif"));
+    write_gray16_range(&kept, &ramp, range, &meta(&description)).unwrap();
+    write_gray16(&cut, &ramp, &meta(r#"{"stage":"negative"}"#)).unwrap();
+
+    let base = on_paper(0.0, 0.0);
+    let more = on_paper(1.0, 1.0);
+    let row = |v: &[u16]| v[..w].to_vec();
+    let (kept_base, cut_base) = (row(&run(&kept, base.clone())), row(&run(&cut, base.clone())));
+    let (kept_more, cut_more) = (row(&run(&kept, more.clone())), row(&run(&cut, more)));
+    let clip = (0.98f64 / 0.01).round() as usize;
+    assert!((scene(clip) - 1.0).abs() < 1e-12);
+    for x in 0..=clip {
+        // The scaled file is coarser by its range; the paper is steepest
+        // in the shadows, where that is a few codes.
+        assert!((i32::from(kept_base[x]) - i32::from(cut_base[x])).abs() <= 8, "column {x}");
+    }
+    let white = (paper::SplitGrade::default().curve().white() * 65535.0).round() as u16;
+    for x in clip + 1..w {
+        assert_eq!(cut_base[x], cut_base[clip], "cut at 1, column {x}");
+        assert_eq!(cut_more[x], cut_more[clip], "cut at 1 with more time, column {x}");
+        assert!(kept_base[x] > kept_base[x - 1], "column {x}: {} after {}", kept_base[x], kept_base[x - 1]);
+        assert!(kept_more[x] > kept_more[x - 1], "column {x} with more time");
+        assert!(kept_base[x] < white);
+    }
+    let (span_base, span_more) = (kept_base[w - 1] - kept_base[clip], kept_more[w - 1] - kept_more[clip]);
+    assert!(span_base > 2000, "{span_base}");
+    assert!(span_more > span_base + 1000, "{span_more} against {span_base}");
+
+    // The file is the plane: printed from memory, the same sheet to the
+    // step of the file.
+    let p = PrintParams { recipe: base, viewing_distance_mm: Some(400.0), ..Default::default() };
+    let src =
+        PrintSource { plane: &ramp, mask: None, orientation: 1, name: "ramp".into(), description: None };
+    let memory = row(&q16(&render_planes(&src, &p).plane));
+    for x in 0..w {
+        assert!((i32::from(memory[x]) - i32::from(kept_base[x])).abs() <= 8, "column {x}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
 }

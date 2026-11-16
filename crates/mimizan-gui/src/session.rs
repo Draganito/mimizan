@@ -967,7 +967,7 @@ fn display_rgb_with(
         for (i, px) in chunk.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let idx = base + i;
             for c in 0..3 {
-                px[c] = table.show[q16(planes[c].data[idx] * gains[c])];
+                px[c] = table.show_of(planes[c].data[idx] * gains[c]);
             }
         }
     });
@@ -1348,14 +1348,49 @@ fn q16(x: f64) -> usize {
     (x.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize
 }
 
-/// One table of the paper: index `q16(placed linear)`, then the print.
+/// Steps of the tone table per unit of placed linear value above 1.
+const ABOVE_STEPS: usize = 8192;
+/// Where the tone table ends: three stops and a sixth above 1. A value
+/// past it is evaluated, not looked up.
+const TABLE_TOP: f64 = 9.0;
+/// Slots of the tone table: the 16-bit codes up to 1, then the steps above.
+const TABLE_SLOTS: usize = 65536 + (TABLE_TOP as usize - 1) * ABOVE_STEPS;
+
+/// The table's slot for a placed linear value: `q16` up to 1, as before
+/// the negative kept what stands above it, then steps of 1/8192 up to
+/// [`TABLE_TOP`] (the paper is at its toe there: a step is a hundredth of
+/// an 8-bit level at most). `None` past the table's end.
+#[inline]
+fn slot(x: f64) -> Option<usize> {
+    if x > 1.0 {
+        (x <= TABLE_TOP).then(|| 65535 + ((x - 1.0) * ABOVE_STEPS as f64 + 0.5) as usize)
+    } else {
+        Some(q16(x))
+    }
+}
+
+/// The placed linear value a slot of the table stands for.
+#[inline]
+fn slot_value(i: usize) -> f64 {
+    if i <= 65535 {
+        i as f64 / 65535.0
+    } else {
+        1.0 + (i - 65535) as f64 / ABOVE_STEPS as f64
+    }
+}
+
+/// One table of the paper: index [`slot`] of the placed linear value, then
+/// the print.
 ///
-/// The screen and the histogram share it. Building it is 65536 evaluations;
-/// a slider then looks up, it does not solve the paper again per pixel.
-/// `view` is the histogram bin `(eval * 255).round()`. `show` is the 8-bit
-/// face of the 16-bit code the TIFF stores, `q16(eval)`. Quantising the
-/// linear value first is the histogram's contract; the file evaluates the
-/// float and then quantises, so a code can differ by the last bit.
+/// The screen and the histogram share it. Building it is one evaluation
+/// per slot; a slider then looks up, it does not solve the paper again per
+/// pixel. `view` is the histogram bin `(eval * 255).round()`. `show` is the
+/// 8-bit face of the 16-bit code the TIFF stores, `q16(eval)`. Quantising
+/// the linear value first is the histogram's contract; the file evaluates
+/// the float and then quantises, so a code can differ by the last bit.
+/// Above 1 the table goes on as the negative does: a highlight the sensor
+/// read above the level at which green is full prints lighter than the
+/// clip, and the screen shows it so.
 pub(crate) struct ToneTable {
     view: Vec<u8>,
     show: Vec<u8>,
@@ -1381,7 +1416,8 @@ struct Timed<'a> {
 /// What a pixel's times come to, once.
 #[derive(Clone, Copy)]
 enum Solved {
-    /// The table at the value scaled by this: `eval_timed(l, t) == eval(l·k)`.
+    /// The table at the value scaled by this: `eval_timed(l, t) == eval(l·k)`,
+    /// above 1 as below it.
     Factor(f64),
     /// The paper solved from the tables, the times as logarithms.
     Logged { soft: f64, hard: f64 },
@@ -1426,18 +1462,10 @@ impl<'a> Timed<'a> {
     fn faces(&mut self, lp: f64, times: Times) -> (u8, u8, u8) {
         let t = self.table;
         if times.is_unit() {
-            let q = q16(lp);
-            return (t.view[q], t.show[q], t.clip[q]);
+            return t.faces_of(lp);
         }
         match self.solved(times) {
-            Solved::Factor(k) => {
-                let s = lp * k;
-                if lp <= 1.0 && s <= 1.0 {
-                    let q = q16(s);
-                    return (t.view[q], t.show[q], t.clip[q]);
-                }
-                ToneTable::faces(t.tone.eval_timed(lp, times))
-            }
+            Solved::Factor(k) => t.faces_of(lp * k),
             Solved::Logged { soft, hard } => {
                 ToneTable::faces(t.timed.as_ref().unwrap().eval_logged(lp, soft, hard))
             }
@@ -1452,7 +1480,7 @@ impl<'a> Timed<'a> {
     #[inline]
     fn show_fresh(&self, lp: f64, times: Times) -> u8 {
         if times.is_unit() {
-            return self.table.show[q16(lp)];
+            return self.table.show_of(lp);
         }
         self.show_solved(lp, times, self.solve(times))
     }
@@ -1462,13 +1490,7 @@ impl<'a> Timed<'a> {
     fn show_solved(&self, lp: f64, times: Times, solved: Solved) -> u8 {
         let t = self.table;
         match solved {
-            Solved::Factor(k) => {
-                let s = lp * k;
-                if lp <= 1.0 && s <= 1.0 {
-                    return t.show[q16(s)];
-                }
-                ToneTable::faces(t.tone.eval_timed(lp, times)).1
-            }
+            Solved::Factor(k) => t.show_of(lp * k),
             Solved::Logged { soft, hard } => {
                 ToneTable::faces(t.timed.as_ref().unwrap().eval_logged(lp, soft, hard)).1
             }
@@ -1481,13 +1503,10 @@ impl<'a> Timed<'a> {
     fn show(&mut self, lp: f64, times: Times) -> u8 {
         let t = self.table;
         if times.is_unit() {
-            return t.show[q16(lp)];
+            return t.show_of(lp);
         }
         if let Solved::Factor(k) = self.solved(times) {
-            let s = lp * k;
-            if lp <= 1.0 && s <= 1.0 {
-                return t.show[q16(s)];
-            }
+            return t.show_of(lp * k);
         }
         self.faces(lp, times).1
     }
@@ -1518,9 +1537,28 @@ impl ToneTable {
         (view, show, clip)
     }
 
+    /// The shown face of a placed linear value: the table, or past its
+    /// end the tone itself.
+    #[inline]
+    fn show_of(&self, x: f64) -> u8 {
+        match slot(x) {
+            Some(i) => self.show[i],
+            None => Self::faces(self.tone.eval(x)).1,
+        }
+    }
+
+    /// `(view, show, clip)` of a placed linear value.
+    #[inline]
+    fn faces_of(&self, x: f64) -> (u8, u8, u8) {
+        match slot(x) {
+            Some(i) => (self.view[i], self.show[i], self.clip[i]),
+            None => Self::faces(self.tone.eval(x)),
+        }
+    }
+
     fn build(tone: &ToneMap) -> Self {
         let built: Vec<(u8, u8, u8)> =
-            (0..65536u32).into_par_iter().map(|i| Self::faces(tone.eval(f64::from(i) / 65535.0))).collect();
+            (0..TABLE_SLOTS).into_par_iter().map(|i| Self::faces(tone.eval(slot_value(i)))).collect();
         let mut view = Vec::with_capacity(built.len());
         let mut show = Vec::with_capacity(built.len());
         let mut clip = Vec::with_capacity(built.len());
@@ -1562,28 +1600,73 @@ fn neg_lut() -> &'static [u8; 65536] {
     })
 }
 
-/// `q16` of the full-resolution mix, sensor order. Rebuilt when the weights
-/// change, then every exposure is a lookup.
-fn mix_codes(sep: &Separation, w: &Weights) -> Vec<u16> {
+/// The 16-bit codes of the full-resolution mix as the negative's file
+/// holds them, sensor order, and the file's range: `q16(mix / range)`, the
+/// range the highest value of the mix and 1 when nothing stands above 1
+/// (`pipeline::scene_range`), so a code times the range over 65535 is the
+/// scene value. Rebuilt when the weights change, then every exposure is a
+/// lookup.
+fn mix_codes(sep: &Separation, w: &Weights) -> (Vec<u16>, f64) {
     let width = sep.lum.width;
-    let mut out = vec![0u16; width * sep.lum.height];
     if w.is_native() {
-        out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
-            for (o, &v) in row.iter_mut().zip(sep.lum.row(y)) {
-                *o = q16(v) as u16;
-            }
+        return codes_of(width, sep.lum.height, |y| {
+            let l = sep.lum.row(y);
+            move |x| l[x]
         });
-        return out;
     }
     let k1 = w.g - w.r - w.b;
     let k2 = 2.0 * (w.r - w.b);
-    out.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+    codes_of(width, sep.lum.height, |y| {
         let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
-        for x in 0..width {
-            row[x] = q16(l[x] + k1 * c1[x] + k2 * c2[x]) as u16;
-        }
-    });
-    out
+        move |x| l[x] + k1 * c1[x] + k2 * c2[x]
+    })
+}
+
+/// [`mix_codes`] of a plane as it stands: a monochrome negative.
+fn plane_codes(plane: &Plane) -> (Vec<u16>, f64) {
+    codes_of(plane.width, plane.height, |y| {
+        let row = plane.row(y);
+        move |x| row[x]
+    })
+}
+
+/// The codes of `row(y)(x)` and their range. One pass when nothing stands
+/// above 1, which is every file but the ones with burnt highlights; a
+/// second one, by the range, when something does.
+fn codes_of<R: Fn(usize) -> f64>(
+    width: usize,
+    height: usize,
+    row: impl Fn(usize) -> R + Sync,
+) -> (Vec<u16>, f64) {
+    let mut out = vec![0u16; width * height];
+    if width == 0 {
+        return (out, 1.0);
+    }
+    let top = out
+        .par_chunks_mut(width)
+        .enumerate()
+        .map(|(y, codes)| {
+            let at = row(y);
+            let mut top = 1.0f64;
+            for (x, o) in codes.iter_mut().enumerate() {
+                let v = at(x);
+                if v.is_finite() && v > top {
+                    top = v;
+                }
+                *o = q16(v) as u16;
+            }
+            top
+        })
+        .reduce(|| 1.0, f64::max);
+    if top > 1.0 {
+        out.par_chunks_mut(width).enumerate().for_each(|(y, codes)| {
+            let at = row(y);
+            for (x, o) in codes.iter_mut().enumerate() {
+                *o = q16(at(x) / top) as u16;
+            }
+        });
+    }
+    (out, top)
 }
 
 /// 8-bit face of the print without burns, for the tests' expectations.
@@ -1599,7 +1682,7 @@ fn display_bytes_with(plane: &Plane, place: f64, table: &ToneTable, field: Optio
     let global = 2f64.powf(place);
     let placed = |v: f64| if place == 0.0 { v } else { v * global };
     let Some(field) = field else {
-        return plane.data.par_iter().map(|&v| table.show[q16(placed(v))]).collect();
+        return plane.data.par_iter().map(|&v| table.show_of(placed(v))).collect();
     };
     let width = plane.width.max(1);
     let mut out = vec![0u8; plane.data.len()];
@@ -1701,14 +1784,17 @@ impl Histogram {
     /// Histograms of the full-resolution negative in one pass: the linear mix
     /// on a gamma-2.2 axis (the scan, before any placing), and the mix after
     /// `place` stops and the tone `table` (what the TIFF gets). Values are
-    /// quantised to 16 bits first, so the clipping counts are the TIFF's own
-    /// 0 and 65535 pixels. Nothing is downscaled: a resampled copy rings at
+    /// quantised to 16 bits first, as the negative's file holds them (over
+    /// `range`, the highest value of the mix, 1 when nothing stands above
+    /// 1), so the clipping counts are the TIFF's own 0 and 65535 pixels.
+    /// Nothing is downscaled: a resampled copy rings at
     /// edges (false black and white) and averages isolated clipped pixels
     /// away, so its histogram ends are wrong by an order of magnitude.
     #[cfg(test)]
     pub fn of_separation(
         sep: &Separation,
         w: &Weights,
+        range: f64,
         table: &ToneTable,
         place: f64,
         window: Option<HistWindow>,
@@ -1716,7 +1802,7 @@ impl Histogram {
     ) -> (Self, Self) {
         let k1 = w.g - w.r - w.b;
         let k2 = 2.0 * (w.r - w.b);
-        Self::count(sep.lum.width, sep.lum.height, window, table, place, field, |y| {
+        Self::count(sep.lum.width, sep.lum.height, range, window, table, place, field, |y| {
             let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
             move |x| l[x] + k1 * c1[x] + k2 * c2[x]
         })
@@ -1727,24 +1813,27 @@ impl Histogram {
     #[cfg(test)]
     pub fn of_plane(
         plane: &Plane,
+        range: f64,
         table: &ToneTable,
         place: f64,
         window: Option<HistWindow>,
         field: Option<&Field>,
     ) -> (Self, Self) {
-        Self::count(plane.width, plane.height, window, table, place, field, |y| {
+        Self::count(plane.width, plane.height, range, window, table, place, field, |y| {
             let row = plane.row(y);
             move |x| row[x]
         })
     }
 
-    /// The same counts as [`of_separation`] from cached `q16(mix)` codes.
-    /// `place == 0` is exact: the view index is the code. A placing
-    /// dequantises the code before scaling, which can move a bin at the
-    /// boundary. The tests' reference for the tally.
+    /// The same counts as [`of_separation`] from the cached codes of the
+    /// mix and their range ([`mix_codes`]). `place == 0` is exact: the view
+    /// is read at the code. A placing dequantises the code before scaling,
+    /// which can move a bin at the boundary. The tests' reference for the
+    /// tally.
     #[cfg(test)]
     fn of_codes(
         codes: &[u16],
+        range: f64,
         width: usize,
         table: &ToneTable,
         place: f64,
@@ -1752,16 +1841,17 @@ impl Histogram {
         field: Option<&Field>,
     ) -> (Self, Self) {
         let height = codes.len().checked_div(width).unwrap_or(0);
-        Self::count(width, height, window, table, place, field, |y| {
+        Self::count(width, height, range, window, table, place, field, |y| {
             let row = &codes[y * width..(y + 1) * width];
-            move |x| row[x] as f64 / 65535.0
+            move |x| row[x] as f64 / 65535.0 * range
         })
     }
 
     /// The same histograms from a tally of the window's codes: the tone and
-    /// the placing rebin it, one step per code, the view code of a placed
-    /// one being `q16` of the dequantised code (which can differ from the
-    /// float walk by a bin at a boundary). The pixels a `field` of strokes
+    /// the placing rebin it, one step per code, the view of a placed code
+    /// (or of a code under a `range` above 1) being read at the dequantised
+    /// code (which can differ from the float walk by a bin at a boundary).
+    /// The pixels a `field` of strokes
     /// reaches are taken out of the tally and counted at their own times,
     /// from `codes`; the negative's bins do not see the strokes. A large
     /// burned area is sampled on a lattice of `k` pixels, each sample
@@ -1769,9 +1859,11 @@ impl Histogram {
     /// pixels; up to that many it is exact. A sample stands for no more
     /// pixels than the tally still has of its code, so every pixel is
     /// counted once and the bins add up to the total.
+    #[allow(clippy::too_many_arguments)]
     fn of_tally(
         tally: &Tally,
         codes: &[u16],
+        range: f64,
         width: usize,
         window: Option<HistWindow>,
         table: &ToneTable,
@@ -1779,8 +1871,11 @@ impl Histogram {
         field: Option<&Field>,
     ) -> (Self, Self) {
         let lut_neg = neg_lut();
-        let global = 2f64.powf(place);
-        let view_code = |q: usize| if place == 0.0 { q } else { q16(q as f64 / 65535.0 * global) };
+        // A code as the placed scene value: the code itself when the file
+        // has no range and nothing is placed.
+        let plain = place == 0.0 && range == 1.0;
+        let scale = if plain { 1.0 } else { range * 2f64.powf(place) };
+        let placed = |q: u16| if plain { f64::from(q) / 65535.0 } else { f64::from(q) / 65535.0 * scale };
         let mut unit = tally.bins.clone();
         let mut burned = Counts::default();
         if let Some(field) = field {
@@ -1814,8 +1909,7 @@ impl Histogram {
                             continue;
                         }
                         let q = row[x];
-                        let m = q as f64 / 65535.0;
-                        let (bin, clip) = timed.view(if place == 0.0 { m } else { m * global }, times);
+                        let (bin, clip) = timed.view(placed(q), times);
                         taken.push((q, bin, clip));
                     }
                     (!taken.is_empty()).then_some(taken)
@@ -1844,9 +1938,10 @@ impl Histogram {
         all.neg_high = tally.bins[65535] as usize;
         for (q, &n) in unit.iter().enumerate() {
             if n > 0 {
-                let qv = view_code(q);
-                all.view[table.view[qv] as usize] += n;
-                match table.clip[qv] {
+                let (bin, _, clip) =
+                    if plain { (table.view[q], 0, table.clip[q]) } else { table.faces_of(placed(q as u16)) };
+                all.view[bin as usize] += n;
+                match clip {
                     1 => all.view_low += n as usize,
                     2 => all.view_high += n as usize,
                     _ => {}
@@ -1861,15 +1956,18 @@ impl Histogram {
     }
 
     /// The shared walk. `row(y)` gives a sampler of the linear value `m` at
-    /// `x`; the negative code is `q16(m)` and the view code `q16(m · 2^place)`
-    /// on the float (what `tone::place` does to the pixels), or the negative
-    /// code itself when `place == 0`. A `field` of burns over the sensor's
-    /// pixels gives a pixel its own times; the negative's bins do not see
-    /// it. Row-ordered partial counts are merged deterministically.
+    /// `x`; the negative code is the file's, `q16(m / range)`, and the view
+    /// is read at `m · 2^place` on the float (what `tone::place` does to
+    /// the pixels), or at the negative code itself when `place == 0`. A
+    /// `field` of burns over the sensor's pixels gives a pixel its own
+    /// times; the negative's bins do not see it. Row-ordered partial counts
+    /// are merged deterministically.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     fn count<R: Fn(usize) -> f64>(
         width: usize,
         height: usize,
+        range: f64,
         window: Option<HistWindow>,
         table: &ToneTable,
         place: f64,
@@ -1893,14 +1991,21 @@ impl Histogram {
                     }
                     c.total += 1;
                     let m = code_at(x);
-                    let q = q16(m);
+                    let q = if range == 1.0 { q16(m) } else { q16(m / range) };
                     c.neg[lut_neg[q] as usize] += 1;
                     c.neg_low += (q == 0) as usize;
                     c.neg_high += (q == 65535) as usize;
                     let times = line.at(x);
                     let (bin, clip) = if times.is_unit() {
-                        let qv = if place == 0.0 { q } else { q16(m * global) };
-                        (table.view[qv], table.clip[qv])
+                        if place != 0.0 {
+                            let (bin, _, clip) = table.faces_of(m * global);
+                            (bin, clip)
+                        } else if range == 1.0 {
+                            (table.view[q], table.clip[q])
+                        } else {
+                            let (bin, _, clip) = table.faces_of(q as f64 / 65535.0 * range);
+                            (bin, clip)
+                        }
                     } else {
                         timed.view(if place == 0.0 { m } else { m * global }, times)
                     };
@@ -1984,6 +2089,9 @@ pub struct HistCache {
     session: Option<u64>,
     weights: Option<Weights>,
     codes: Vec<u16>,
+    /// What the codes are over: the range of the negative's file, 1 when
+    /// nothing in the mix stands above 1.
+    range: f64,
     width: usize,
     /// The window's codes counted, by crop and angle (the weights through
     /// the codes), and the pixels in it.
@@ -1998,6 +2106,7 @@ impl Default for HistCache {
             session: None,
             weights: None,
             codes: Vec::new(),
+            range: 1.0,
             width: 0,
             tally: None,
             hist_key: None,
@@ -2148,7 +2257,7 @@ impl HistCache {
                 return;
             }
             self.width = s.negative.plane.width;
-            self.codes = s.negative.plane.data.par_iter().map(|&v| q16(v) as u16).collect();
+            (self.codes, self.range) = plane_codes(&s.negative.plane);
             self.session = Some(ptr);
             self.weights = None;
             self.tally = None;
@@ -2159,7 +2268,7 @@ impl HistCache {
             return;
         }
         self.width = sep.lum.width;
-        self.codes = mix_codes(sep, w);
+        (self.codes, self.range) = mix_codes(sep, w);
         self.session = Some(ptr);
         self.weights = Some(*w);
         self.tally = None;
@@ -2192,7 +2301,16 @@ impl HistCache {
             self.hists = if self.codes.is_empty() {
                 (Histogram::empty(), Histogram::empty())
             } else {
-                Histogram::of_tally(tally, &self.codes, self.width, window, table, v.place, field.as_ref())
+                Histogram::of_tally(
+                    tally,
+                    &self.codes,
+                    self.range,
+                    self.width,
+                    window,
+                    table,
+                    v.place,
+                    field.as_ref(),
+                )
             };
             self.hist_key = Some(key);
         }
@@ -2515,7 +2633,9 @@ mod histogram_tests {
     use mimizan_core::cfa::BayerPhase;
 
     /// The one-pass full-resolution histogram must agree with the plain
-    /// per-pixel computation, including the 16-bit clipping counts.
+    /// per-pixel computation, including the 16-bit clipping counts. The
+    /// sweep runs above 1: the codes are the file's, over its range, and
+    /// the paper is read at the scene value the code stands for.
     #[test]
     fn of_separation_matches_direct_computation() {
         let (w, h) = (64usize, 3usize);
@@ -2538,30 +2658,35 @@ mod histogram_tests {
             "/../../look/reference.json"
         )))
         .unwrap();
-        let curve = Tone::Look(look).compile();
-        let (neg, view) = Histogram::of_separation(&sep, &wts, &ToneTable::build(&curve), 0.0, None, None);
-
         let mixed = mix(&sep, &wts);
-        let mut en = [0u32; 256];
-        let mut ev = [0u32; 256];
-        let (mut nl, mut nh, mut vl, mut vh) = (0, 0, 0, 0);
-        for &m in &mixed.data {
-            let q = q16(m);
-            nl += (q == 0) as usize;
-            nh += (q == 65535) as usize;
-            let lin = q as f64 / 65535.0;
-            en[(lin.powf(1.0 / 2.2) * 255.0).round() as usize] += 1;
-            let v = curve.eval(lin);
-            ev[(v * 255.0).round() as usize] += 1;
-            vl += (q16(v) == 0) as usize;
-            vh += (q16(v) == 65535) as usize;
+        let range = mimizan_core::pipeline::scene_range(&mixed);
+        assert!(range > 1.15, "the sweep stands above 1: {range}");
+        for curve in [Tone::Look(look).compile(), Tone::paper().compile()] {
+            let (neg, view) =
+                Histogram::of_separation(&sep, &wts, range, &ToneTable::build(&curve), 0.0, None, None);
+            let mut en = [0u32; 256];
+            let mut ev = [0u32; 256];
+            let (mut nl, mut nh, mut vl, mut vh) = (0, 0, 0, 0);
+            for &m in &mixed.data {
+                let q = q16(m / range);
+                nl += (q == 0) as usize;
+                nh += (q == 65535) as usize;
+                let lin = q as f64 / 65535.0;
+                en[(lin.powf(1.0 / 2.2) * 255.0).round() as usize] += 1;
+                // The scene value of the file's code, at the table's step.
+                let v = curve.eval(slot_value(slot(lin * range).unwrap()));
+                ev[(v * 255.0).round() as usize] += 1;
+                vl += (q16(v) == 0) as usize;
+                vh += (q16(v) == 65535) as usize;
+            }
+            assert_eq!(neg.bins, en);
+            assert_eq!(view.bins, ev);
+            assert_eq!((neg.low, neg.high), (nl, nh));
+            assert_eq!((view.low, view.high), (vl, vh));
+            // Black still clips; the top of the file is its highest pixel.
+            assert!(nl > 1 && nh == 1, "{nl} at black, {nh} at the top");
+            assert_eq!(neg.total, w * h);
         }
-        assert_eq!(neg.bins, en);
-        assert_eq!(view.bins, ev);
-        assert_eq!((neg.low, neg.high), (nl, nh));
-        assert_eq!((view.low, view.high), (vl, vh));
-        assert!(nl > 0 && nh > 0, "sweep must clip at both ends");
-        assert_eq!(neg.total, w * h);
     }
 
     fn sweep(w: usize, h: usize) -> Separation {
@@ -2581,6 +2706,8 @@ mod histogram_tests {
 
     /// The view histogram must equal the histogram of the picture the
     /// export renders: place, then the look or the paper, 16-bit first.
+    /// The placing on the paper lifts the top of the sweep above 1, where
+    /// the paper goes on printing lighter and the table follows it.
     #[test]
     fn of_separation_matches_the_rendered_picture() {
         let sep = sweep(40, 24);
@@ -2588,15 +2715,18 @@ mod histogram_tests {
         for (tone, place) in
             [(Tone::Look(LookFile::neutral()).compile(), -0.4), (Tone::paper().compile(), 0.2)]
         {
-            let (_, view) = Histogram::of_separation(&sep, &wts, &ToneTable::build(&tone), place, None, None);
+            let (_, view) =
+                Histogram::of_separation(&sep, &wts, 1.0, &ToneTable::build(&tone), place, None, None);
             let mut pic = mix(&sep, &wts);
             mimizan_core::tone::place(&mut pic, place);
             let mut ev = [0u32; 256];
             for &l in &pic.data {
-                let lin = q16(l) as f64 / 65535.0;
+                let lin = slot_value(slot(l).unwrap());
                 ev[(tone.eval(lin) * 255.0).round() as usize] += 1;
             }
             assert_eq!(view.bins, ev);
+            let above = pic.data.iter().filter(|&&l| l > 1.0).count();
+            assert_eq!(above > 0, place > 0.0, "{above} values above 1 at place {place}");
         }
     }
 
@@ -2607,14 +2737,16 @@ mod histogram_tests {
         let wts = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let tone = Tone::paper().compile();
         let table = ToneTable::build(&tone);
-        let (n1, v1) = Histogram::of_separation(&sep, &wts, &table, 0.0, None, None);
-        let codes = mix_codes(&sep, &wts);
-        let (n2, v2) = Histogram::of_codes(&codes, sep.lum.width, &table, 0.0, None, None);
+        let (n1, v1) = Histogram::of_separation(&sep, &wts, 1.0, &table, 0.0, None, None);
+        let (codes, range) = mix_codes(&sep, &wts);
+        assert_eq!(range, 1.0);
+        let (n2, v2) = Histogram::of_codes(&codes, range, sep.lum.width, &table, 0.0, None, None);
         assert_eq!(n1, n2);
         assert_eq!(v1, v2);
     }
 
-    /// The byte on screen is the 8-bit face of the 16-bit print code.
+    /// The byte on screen is the 8-bit face of the 16-bit print code, of
+    /// a value above 1 as of one below it.
     #[test]
     fn display_byte_is_the_files_code() {
         let n = 16usize;
@@ -2626,10 +2758,66 @@ mod histogram_tests {
         let table = ToneTable::build(&tone);
         let got = display_bytes(&plane, 0.0, &table);
         for (byte, &v) in got.iter().zip(&plane.data) {
-            let code = q16(tone.eval(q16(v) as f64 / 65535.0));
+            let code = q16(tone.eval(slot_value(slot(v).unwrap())));
             let expect = ((code as f64 / 65535.0) * 255.0).round() as u8;
             assert_eq!(*byte, expect);
         }
+        assert!(got[15] > got[14], "1.05 prints lighter than 0.98: {} and {}", got[15], got[14]);
+    }
+
+    /// The table above 1. Up to 1 a slot is the 16-bit code it always was;
+    /// above, the table follows the paper to within a level of the screen,
+    /// never falling, past its end by the paper itself. A highlight above
+    /// the clip burnt in by `l^γₙ` shows where the clip shows, and a look,
+    /// which has no negative, stays flat above 1.
+    #[test]
+    fn the_table_goes_on_above_one() {
+        use mimizan_core::paper::NEGATIVE_GAMMA;
+        for i in 0..=4000 {
+            let x = -0.1 + 1.1 * i as f64 / 4000.0;
+            assert_eq!(slot(x), Some(q16(x)), "{x}");
+        }
+        assert_eq!((slot(1.0), slot(f64::NAN)), (Some(65535), Some(0)));
+        assert_eq!(slot(TABLE_TOP), Some(TABLE_SLOTS - 1));
+        assert_eq!(slot(TABLE_TOP + 1e-9), None);
+        for i in [0, 1, 40_000, 65_535, 65_536, 70_000, TABLE_SLOTS - 1] {
+            assert_eq!(slot(slot_value(i)), Some(i));
+        }
+        let tone = Tone::Paper(mimizan_core::paper::SplitGrade::new(0.6, -0.4)).compile();
+        let table = ToneTable::build(&tone);
+        assert_eq!(table.show.len(), TABLE_SLOTS);
+        let face = |t: f64| ToneTable::faces(t).1;
+        let mut last = 0u8;
+        for i in 0..=2400 {
+            let x = 0.9 + 11.1 * i as f64 / 2400.0;
+            let shown = table.show_of(x);
+            let d = (i32::from(shown) - i32::from(face(tone.eval(x)))).abs();
+            assert!(d <= 1, "at {x} the table is {d} levels from the paper");
+            assert!(shown >= last, "the table falls at {x}");
+            last = shown;
+            if x > TABLE_TOP {
+                assert_eq!(table.faces_of(x), ToneTable::faces(tone.eval(x)));
+            }
+        }
+        assert!(table.show_of(1.34) > table.show_of(1.0) + 5);
+        // The burn that brings a highlight back to the clip's tone.
+        let mut timed = Timed::new(&table);
+        for l in [1.1f64, 1.34, 2.0, 3.5] {
+            let t = l.powf(NEGATIVE_GAMMA);
+            let both = Times { soft: t, hard: t, all: t };
+            let at_clip = i32::from(table.show_of(1.0));
+            assert!((i32::from(timed.show(l, both)) - at_clip).abs() <= 1, "{l}");
+            assert!((i32::from(timed.show_fresh(l, both)) - at_clip).abs() <= 1, "{l}");
+            assert!((i32::from(timed.faces(l, both).1) - at_clip).abs() <= 1, "{l}");
+            // One light alone is the paper solved at the pixel.
+            let soft = Times { soft: t, hard: 1.0, all: t };
+            let d = i32::from(timed.show(l, soft)) - i32::from(face(tone.eval_timed(l, soft)));
+            assert!(d.abs() <= 1, "{l} under the soft light alone");
+            assert!(timed.show(l, soft) < table.show_of(l), "{l}: more soft light is darker");
+        }
+        let look = ToneTable::build(&Tone::Look(LookFile::neutral()).compile());
+        assert_eq!(look.show_of(1.6), look.show_of(1.0));
+        assert_eq!(look.faces_of(40.0), look.faces_of(1.0));
     }
 
     /// A plane with no colour counts the same as a mix of that plane.
@@ -2651,8 +2839,8 @@ mod histogram_tests {
         let w = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let tone = Tone::paper().compile();
         let table = ToneTable::build(&tone);
-        let (n1, v1) = Histogram::of_separation(&sep, &w, &table, 0.4, None, None);
-        let (n2, v2) = Histogram::of_plane(&lum, &table, 0.4, None, None);
+        let (n1, v1) = Histogram::of_separation(&sep, &w, 1.0, &table, 0.4, None, None);
+        let (n2, v2) = Histogram::of_plane(&lum, 1.0, &table, 0.4, None, None);
         assert_eq!(n1, n2);
         assert_eq!(v1, v2);
     }
@@ -2906,7 +3094,8 @@ mod histogram_tests {
         let sep = sweep(64, 40);
         let wts = Weights { r: 0.3, g: 0.5, b: 0.2 };
         let table = ToneTable::build(&Tone::paper().compile());
-        let codes = mix_codes(&sep, &wts);
+        let (codes, range) = mix_codes(&sep, &wts);
+        assert_eq!(range, 1.0);
         let (w, h) = (sep.lum.width, sep.lum.height);
         let to_frame = Affine { a: 0.98, b: 0.2, c: -0.2, d: 0.98, tx: 3.0, ty: -2.0 };
         let window =
@@ -2920,8 +3109,8 @@ mod histogram_tests {
         let field = Field::new(std::slice::from_ref(&stroke), burn::normalize(w, h)).unwrap();
         for (window, field) in [(None, None), (window, None), (window, Some(&field)), (None, Some(&field))] {
             let tally = Tally::of(&codes, w, window);
-            let (n1, v1) = Histogram::of_separation(&sep, &wts, &table, 0.0, window, field);
-            let (n2, v2) = Histogram::of_tally(&tally, &codes, w, window, &table, 0.0, field);
+            let (n1, v1) = Histogram::of_separation(&sep, &wts, 1.0, &table, 0.0, window, field);
+            let (n2, v2) = Histogram::of_tally(&tally, &codes, 1.0, w, window, &table, 0.0, field);
             assert_eq!(n1, n2);
             assert!(v1.total > 0);
             if field.is_none() {
@@ -2934,8 +3123,8 @@ mod histogram_tests {
         }
         for place in [-0.7, 0.4] {
             let tally = Tally::of(&codes, w, None);
-            let (n1, v1) = Histogram::of_separation(&sep, &wts, &table, place, None, Some(&field));
-            let (n2, v2) = Histogram::of_tally(&tally, &codes, w, None, &table, place, Some(&field));
+            let (n1, v1) = Histogram::of_separation(&sep, &wts, 1.0, &table, place, None, Some(&field));
+            let (n2, v2) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, place, Some(&field));
             assert_eq!(n1, n2);
             assert_eq!(v1.total, v2.total);
             let moved: u32 = v1.bins.iter().zip(&v2.bins).map(|(a, b)| a.abs_diff(*b)).sum();
@@ -2969,8 +3158,8 @@ mod histogram_tests {
         };
         let field = Field::new(std::slice::from_ref(&stroke), burn::normalize(w, h)).unwrap();
         let tally = Tally::of(&codes, w, None);
-        let (plain_neg, plain) = Histogram::of_tally(&tally, &codes, w, None, &table, 0.0, None);
-        let (neg, view) = Histogram::of_tally(&tally, &codes, w, None, &table, 0.0, Some(&field));
+        let (plain_neg, plain) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, 0.0, None);
+        let (neg, view) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, 0.0, Some(&field));
         let sum = |h: &Histogram| h.bins.iter().map(|&n| n as usize).sum::<usize>();
         assert_eq!(neg, plain_neg);
         assert_eq!((sum(&plain), plain.total), (w * h, w * h));
@@ -3402,5 +3591,197 @@ mod histogram_tests {
                 "{quarter_turns} turns, angle {angle}: the strokes reach {touched} of {pixels} pixels"
             );
         }
+    }
+
+    /// What stands above 1 is on the screen as it is in the files. A Bayer
+    /// negative with a burnt-out square, balanced so that the square reads
+    /// well above the level at which green is full. The window's codes are
+    /// the samples of the negative's TIFF, over the same range; the fitted
+    /// print on the screen is the export's picture, at the base print and
+    /// with the square burnt in by a stop; the square is lighter than the
+    /// clip's tone and comes down with the burn; and the print histogram
+    /// counts the tones of that picture, none of them piled at the clip.
+    /// Before, the window held the negative in 16 bits up to 1: the square
+    /// was one flat tone on the screen whatever the file printed.
+    #[test]
+    fn a_highlight_above_one_on_screen_is_the_files_picture() {
+        use mimizan_core::burn::{Light, Tip};
+        use mimizan_core::cfa::Color;
+        use mimizan_core::decode::{RawData, Rect};
+        use mimizan_core::icc::GrayTrc;
+        use mimizan_core::ingest::WhiteBalance;
+        use mimizan_core::pipeline;
+        use mimizan_core::print::{render_planes, PrintSize, PrintSource};
+        use mimizan_core::tiffin::{described_range, read_gray, read_negative};
+        use mimizan_core::tiffout::{write_gray16_range, TiffMeta};
+        let (w, h) = (96usize, 64usize);
+        let phase = BayerPhase::RGGB;
+        let burnt = |x: usize, y: usize| (52..84).contains(&x) && (16..48).contains(&y);
+        // A neutral ramp under the balance (2, 1, 1.5), and the square at
+        // the sensor's white in every colour.
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                if burnt(x, y) {
+                    return 1000;
+                }
+                let grey = 120.0 + 480.0 * (x as f64 / w as f64);
+                let part = match phase.color_at(x, y) {
+                    Color::R => 0.5,
+                    Color::G => 1.0,
+                    Color::B => 2.0 / 3.0,
+                };
+                (grey * part) as u16
+            })
+            .collect();
+        let frame = RawFrame {
+            make: "Test".into(),
+            model: "Bayer".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 14,
+            kind: SensorKind::Bayer(phase),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let mut params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        params.ingest.wb = WhiteBalance::Manual([2.0, 1.0, 1.5]);
+        let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        let preview = preview_planes(&neg).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let session = Session {
+            id: next_session_id(),
+            path: "burnt.dng".into(),
+            frame: Arc::new(frame),
+            negative: neg,
+            camera_file: None,
+            camera_file_path: None,
+            develop: Develop::default(),
+            preview,
+            raw_hist,
+        };
+        let weights = Weights::default();
+        let mixed = mix(session.separation().unwrap(), &weights);
+        let range = pipeline::scene_range(&mixed);
+        assert!((mixed.at(68, 32) - 1.375).abs() < 1e-9, "the square reads {}", mixed.at(68, 32));
+        assert!(range >= 1.375, "{range}");
+        assert_eq!(range, session.negative.info.range);
+
+        // The window's codes are the negative's file.
+        let dir = std::env::temp_dir().join(format!("mimizan-gui-range-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("negative.tif");
+        let description = serde_json::to_string(&session.negative.info).unwrap();
+        let meta = TiffMeta { description: &description, trc: GrayTrc::Linear, orientation: 1, dpi: None };
+        write_gray16_range(&path, &mixed, range, &meta).unwrap();
+        let file = read_gray(&path).unwrap();
+        assert_eq!(described_range(file.description.as_deref()).unwrap(), range);
+        let samples: Vec<u16> = file.plane.data.iter().map(|&v| (v * 65535.0).round() as u16).collect();
+        let mut cache = HistCache::default();
+        assert_eq!(cache.codes_for(&session, &weights), &samples[..]);
+        assert_eq!(cache.range, range);
+        let scene = read_negative(&path).unwrap().plane;
+        std::fs::remove_dir_all(&dir).ok();
+
+        let tone = Tone::paper();
+        let compiled = tone.compile();
+        let table = ToneTable::build(&compiled);
+        let face = |t: f64| ((q16(t) as f64 / 65535.0) * 255.0).round() as i32;
+        let clip = face(compiled.eval(1.0));
+        let burn = Stroke::Hand {
+            tip: Tip { rx: 0.25, ry: 0.35, angle: 0.0, feather: 0.05 },
+            stops: 1.0,
+            light: Light::Both,
+            points: vec![[0.2, 0.0]],
+        };
+        let mut lightest = Vec::new();
+        for burns in [Vec::new(), vec![burn]] {
+            let recipe = Recipe {
+                size: Some(PrintSize::Physical { width_in: 0.6, height_in: 0.4 }),
+                dpi: 300.0,
+                curve: tone.clone(),
+                burns: burns.clone(),
+                ..Recipe::on_paper()
+            };
+            recipe.validate().unwrap();
+            let view = ViewParams {
+                weights,
+                tone: tone.clone(),
+                place: 0.0,
+                rotation: 0,
+                angle: 0.0,
+                crop: None,
+                burns: burns.clone(),
+                burn_live: false,
+                plate: None,
+            };
+            let print = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
+            let lay = layout(w, h, 1, &print);
+            let pixels = lay.image_w * lay.image_h;
+            let rect = DetailRect { x: 0, y: 0, w: lay.image_w, h: lay.image_h };
+            let shown = render_print_detail(&session, &view, &recipe, rect, &table).unwrap();
+            // The export from the window's plane, and the print of the
+            // negative's file: one picture, and the screen shows it.
+            for (name, plane) in [("the window", &mixed), ("the file", &scene)] {
+                let src =
+                    PrintSource { plane, mask: None, orientation: 1, name: "t".into(), description: None };
+                let out = render_planes(&src, &print);
+                let mut off_by_one = 0usize;
+                for y in 0..lay.image_h {
+                    for x in 0..lay.image_w {
+                        let d = i32::from(shown.gray[y * lay.image_w + x])
+                            - face(out.plane.at(lay.picture_x + x, lay.picture_y + y));
+                        assert!(d.abs() <= 1, "{name}, at {x},{y}: the screen is {d} levels off");
+                        off_by_one += (d != 0) as usize;
+                    }
+                }
+                assert!(off_by_one * 100 <= pixels, "{name}: {off_by_one} of {pixels} a level off");
+            }
+            let top = shown.gray.iter().copied().max().unwrap();
+            lightest.push(i32::from(top));
+
+            // The print histogram is that picture's, counted on the sensor.
+            let (neg_hist, print_hist) = cache.histograms(&session, &view, &table);
+            assert_eq!((neg_hist.total, print_hist.total), (w * h, w * h));
+            assert_eq!(neg_hist.high, samples.iter().filter(|&&q| q == 65535).count());
+            assert!(neg_hist.high >= 1 && neg_hist.high < 8, "{} pixels at the file's top", neg_hist.high);
+            let field = hist_field(&session, &view);
+            let mut expect = [0u32; 256];
+            for y in 0..h {
+                let line = FieldRow::new(field.as_ref(), y, 0, w);
+                for x in 0..w {
+                    let v = compiled.eval_timed(mixed.at(x, y), line.at(x));
+                    expect[(v.clamp(0.0, 1.0) * 255.0).round() as usize] += 1;
+                }
+            }
+            let moved: u32 = print_hist.bins.iter().zip(&expect).map(|(a, b)| a.abs_diff(*b)).sum();
+            assert!(moved as usize * 100 <= 2 * w * h, "{moved} of {} pixels in another bin", w * h);
+            assert_eq!(print_hist.high, 0);
+        }
+        // The square is lighter than the clip's tone at the base print, and
+        // a stop of burning brings it down below where it was.
+        let square = (face(compiled.eval(1.375)), clip);
+        assert!(square.0 > square.1 + 8, "1.375 prints as {} and the clip as {}", square.0, square.1);
+        assert!(lightest[0] >= square.0, "the lightest tone on screen is {}", lightest[0]);
+        assert!(lightest[1] < lightest[0] - 20, "burnt in: {} from {}", lightest[1], lightest[0]);
+
+        // The plate's positives go through the same table, each by its lamp.
+        let planes = [mixed.clone(), mixed.clone(), mixed.clone()];
+        let rgb = display_rgb_with(&planes, 0.0, [0.0, 0.25, -0.25], &table, None);
+        for (c, lamp) in [0.0, 0.25, -0.25].into_iter().enumerate() {
+            let grey = display_bytes(&mixed, lamp, &table);
+            assert!(rgb.iter().skip(c).step_by(3).eq(grey.iter()), "channel {c}");
+        }
+        let at = (32 * w + 68) * 3;
+        assert!(rgb[at + 1] > rgb[at] && rgb[at] > rgb[at + 2], "{:?}", &rgb[at..at + 3]);
     }
 }

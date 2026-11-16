@@ -32,7 +32,8 @@ fn open(path: &Path) -> Result<Decoder<BufReader<File>>> {
 /// A grey TIFF as read: pixels, description, and the two tags the print
 /// pass needs.
 pub struct GrayTiff {
-    /// Samples scaled to [0, 1] by the file's bit depth.
+    /// Samples scaled to [0, 1] by the file's bit depth ([`read_gray`]),
+    /// or the scene values they stand for ([`read_negative`]).
     pub plane: Plane,
     /// `ImageDescription`, when present.
     pub description: Option<String>,
@@ -59,6 +60,37 @@ pub fn read_gray(path: &Path) -> Result<GrayTiff> {
         return Err(Error::Invalid("TIFF is not single-channel".into()));
     }
     Ok(GrayTiff { plane: Plane::try_from_vec(w as usize, h as usize, data)?, description, bits, orientation })
+}
+
+/// The scene value a negative's full scale stands for, from its
+/// description: the `range` it states, 1 when it states none (every
+/// negative up to 0.18.15, and every one whose plane stays within 1) or
+/// when there is no description to read. A range that is no number of 1
+/// or more is not ours and is refused.
+pub fn described_range(description: Option<&str>) -> Result<f64> {
+    let Some(v) = description.and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok()) else {
+        return Ok(1.0);
+    };
+    match v.get("range") {
+        None => Ok(1.0),
+        Some(r) => match r.as_f64() {
+            Some(r) if r.is_finite() && r >= 1.0 => Ok(r),
+            _ => Err(Error::Invalid(format!("the negative states a range of {r}; it is 1 or more"))),
+        },
+    }
+}
+
+/// A negative as the print takes it: [`read_gray`] with every sample
+/// multiplied by the range the description states, so the plane holds
+/// scene values, above 1 where the file kept them. A file with no range
+/// reads as `read_gray` to the bit.
+pub fn read_negative(path: &Path) -> Result<GrayTiff> {
+    let mut g = read_gray(path)?;
+    let range = described_range(g.description.as_deref())?;
+    if range != 1.0 {
+        g.plane.data.par_iter_mut().for_each(|v| *v *= range);
+    }
+    Ok(g)
 }
 
 /// 8- or 16-bit three-channel TIFF (a plate print) to `[r, g, b]` in [0,1].

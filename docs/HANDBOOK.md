@@ -103,6 +103,12 @@ Alt shows the strokes; *Clear strokes* at the top takes them away. Escape
 opens the brush again, and a second Escape puts the tool down. Orange
 burns, blue dodges.
 
+A sky that came out too light: burn it in. The negative keeps what the
+sensor still measured above its full green, so the sky comes down with
+its clouds, not as one grey patch. Where the sensor was full in every
+colour, around the sun, there is nothing behind it; that stays one
+tone, and in the plate it stays without colour.
+
 Scroll zooms. A double click switches between the whole picture and 1:1.
 The recipe sits as a small file next to the RAW and comes back when you
 open it again.
@@ -170,6 +176,7 @@ it back, and the strip is white again.
 | Darker or lighter before the shot (Android, Pro iPhone) | Drag the strip under the finder |
 | More contrast | Wheel up over the strip; on the phone, pinch it |
 | Less contrast | Wheel down; on the phone, spread it |
+| A burnt-out sky darker | *Dodge & burn*, a burn over it |
 | Crop | *Crop* → format → *Apply crop* |
 | Straighten a tilted horizon | *Crop* → *Straighten* → draw a line along it → *Apply crop* |
 | Save | *Export* on the computer or on the phone |
