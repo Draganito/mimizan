@@ -111,7 +111,9 @@ open it again.
 two lamps, red and blue, as two bars under the strip, R and B at their
 left edge, zero at the mark in the middle. Click or drag, wheel for a
 twelfth, double click for zero and back. Green is the
-reference. The taking filters are Camera, Wratten or Channels. The
+reference. The taking filters are Camera, Wratten or Channels, three
+palettes: Camera is vivid and deep, Channels calm and natural, Wratten
+the quietest. The
 export is an RGB TIFF or JPEG, sRGB by default; the primaries are in
 *Print*, on the file line.
 
