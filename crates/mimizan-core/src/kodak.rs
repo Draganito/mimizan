@@ -127,7 +127,8 @@ pub fn mosaic_rgb(rgb: &Rgb, phase: BayerPhase, noise: NoiseModel, name: &str) -
 
 // ------------------------------------------------------------ real RAW truth
 
-/// Decode and ingest a RAW (as-shot balance, defects repaired), then bin every
+/// Decode and ingest a RAW (as-shot balance, defects counted and left as
+/// measured, the default of the ingest since 0.15), then bin every
 /// 2x2 CFA cell into one RGB pixel: R and B are the measured sites, G the mean
 /// of the two. No interpolation anywhere, so the half-size picture is a true
 /// RGB reference from real optics and real noise. Clipped sites stay clipped.

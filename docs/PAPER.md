@@ -45,7 +45,7 @@ tone controls and dodging and burning as times under a hand or a card
 default reaches 51.6 dB luminance PSNR against 51.5 dB for the best of
 sixteen demosaicers (DCB, RawTherapee); band-limited at 2× it reaches
 51.8 dB against 49.1 dB; on four Nikon Z f files at the camera's own band
-limit 53.9 dB against 50.7 dB (RCD). The whole method, including every
+limit 54.0 dB against 50.7 dB (RCD). The whole method, including every
 constant, is given here so that it can be re-implemented without access to
 the source.
 
@@ -548,8 +548,10 @@ neutral pictures it costs
 1.2 dB (a neutral oriented edge is never perfectly one-dimensional, and the
 opened ring takes some luminance with it); on the pictures the coloured
 edges outweigh that in every condition of §7.2. $\gamma$ swept 0.3–2:
-lens-like peaks at 0.5, the band-limited and real conditions keep rising to
-0.7 by 0.05–0.1 dB, 1 and 2 lose on lens-like (−0.3, −1.0).
+lens-like peaks at 0.5 and loses at 1 and 2 (−0.3, −1.0); band-limited 2×
+peaks at 0.7 (+0.07 dB); the real files at 1× stay within 0.01 dB between
+0.5 and 0.7, and at the camera's own band limit they keep rising, +0.06 dB
+at 0.7 and +0.16 dB at 2.
 
 ### 4.5 Parameters of the default path
 
@@ -980,7 +982,8 @@ Conditions: **pixel-sharp** (the Kodak pixels as they are, content sharper
 than any lens delivers), **lens-like** (Gaussian σ = 0.75 px before
 mosaicking), **band-limited 2×** (picture upscaled 2× before mosaicking), and
 two **real** conditions from Nikon Z f NEFs: every 2×2 cell binned to one
-RGB pixel, the 3024×2016 result is the truth and is re-mosaicked with the
+RGB pixel (the photosites as ingested, defects counted and not repaired,
+§3.4), the 3024×2016 result is the truth and is re-mosaicked with the
 camera's noise model, at 1× (twice as sharp as the camera saw it) and
 upscaled 2× ("soft", the camera's own band limit).
 
@@ -995,18 +998,19 @@ base-band tensor (the default):
 | Condition | fixed (4.2) | Dubois weight (4.3) | + ring (4.4), no tensor | **+ tensor (4.3–4.4), default** | best of 16 demosaicers |
 |---|---|---|---|---|---|
 | pixel-sharp (24) | 34.60 | 36.45 | 36.55 | **37.29** | LMMSE (RT) 43.09, AMaZE 40.72 |
-| lens-like σ 0.75 (24) | 43.95 | – | 50.21 | **51.59** | DCB (RT) 51.47, RCD 50.59 |
+| lens-like σ 0.75 (24) | 43.95 | 49.41 | 50.21 | **51.59** | DCB (RT) 51.47, RCD 50.59 |
 | band-limited 2× (24) | 44.02 | 49.32 | 50.80 | **51.83** | DCB (RT) 49.13, RCD 48.88 |
-| Z f binned (4) | 37.22 | 40.29 | 40.38 | **41.36** | RCD 42.81, DCB (RT) 42.64 |
-| Z f binned, ×2 (4) | 42.61 | 48.16 | 51.92 | **53.94** | RCD 50.66, DCB (libraw) 50.51 |
+| Z f binned (4) | 37.23 | 40.31 | 40.40 | **41.37** | RCD 42.81, DCB (RT) 42.65 |
+| Z f binned, ×2 (4) | 42.65 | 48.20 | 51.95 | **53.97** | RCD 50.71, DCB (libraw) 50.54 |
 
-Per picture: lens-like, every picture gains from the tensor (0.5 to
+Per picture: lens-like, every picture gains from the tensor (0.3 to
 2.9 dB) and 9 of 24 are at or above the best of the sixteen demosaicers
 (without the tensor: 5), the largest gaps are kodim19, the fence
 (−2.4 dB), and kodim08 (−2.1); at 2× all 24 are above every demosaicer
 (without the tensor: 21), the smallest margin 0.5 dB; on the real files at
-the camera's own band limit all four are above RCD (+2.4, +3.0, +4.3,
-+3.3 dB; without the tensor: three of four). The binned real
+the camera's own band limit all four are above every demosaicer (+2.4,
++2.9, +4.3 and +3.3 dB over the best on each picture, RCD on three and DCB
+of libraw on the fourth; without the tensor: three of four). The binned real
 files at twice the camera's sharpness behave like the pixel-sharp set,
 0.5–1.9 dB behind RCD.
 
@@ -1036,18 +1040,25 @@ chrominance (every error is chrominance the estimate missed).
 |---|---|---|---|---|
 | without the tensor (energy weight, coherence ring) | 50.21 | 50.80 | 57.30 | 61.19 |
 | tensor in $w_H$, $\beta$ 0.5, band 0.30, $\sigma_t$ 2, second differences | 51.40 | 51.43 | 57.33 | 61.13 |
-| — $\beta$ 0.3 / 0.7 / 1.0 / 2.0 | 50.91 / 51.04 / 50.92 / 50.46 | 51.33 / 51.31 / 51.16 / 50.74 | | |
-| — band 0.10 / 0.15 / 0.25 / 0.35 | 50.88 / 51.04 / 51.17 / 51.19 | 51.31 / 51.37 / 51.41 / 51.41 | | |
-| — $\sigma_t$ 1.5 / 3 / 5 / 8 | 51.44 / 50.96 / 50.96 / 50.86 | 51.43 / 51.34 / 51.34 / 51.29 | | |
+| — $\beta$ 0.3 / 0.7 / 1.0 / 2.0 | 51.25 / 51.38 / 51.23 / 50.78 | 51.45 / 51.30 / 51.09 / 50.70 | | |
+| — band 0.10 / 0.15 / 0.25 / 0.35 | 51.01 / 51.20 / 51.36 / 51.44 | 51.28 / 51.38 / 51.43 / 51.43 | | |
+| — $\sigma_t$ 1.5 / 3 / 5 / 8 | 51.44 / 51.33 / 51.20 / 51.07 | 51.43 / 51.41 / 51.36 / 51.31 | | |
 | — first differences; band-pass 0.15–0.30 | 51.19; 51.24 | 51.41; 51.42 | | |
 | **+ clean copy's ring, $\gamma$ 0.5 (default)** | **51.59** | **51.83** | 56.10 | 61.19 |
 | — $\gamma$ 0.3 / 0.7 / 1.0 / 2.0 | 51.58 / 51.52 / 51.27 / 50.63 | 51.71 / 51.90 / 51.88 / 51.73 | | |
 
-Open: in the lens-like column the $\beta$ row and the band row do not join
-the row above them. $\beta$ 0.5 stands at 51.40 between 50.91 (0.3) and
-51.04 (0.7), band 0.30 at 51.40 between 51.17 (0.25) and 51.19 (0.35); the
-2× column joins. The two rows were probably taken from another starting
-point than the row above. They have not been re-measured.
+The $\beta$, band and $\sigma_t$ rows are each one parameter of the row
+above them changed, measured with the code as it is, and they join it:
+on lens-like $\beta$ 0.5 (51.40) stands above 0.3 (51.25) and 0.7 (51.38),
+and the figure falls steadily with a narrower band and a wider window. Three
+neighbours are level with the default or a few hundredths above it: band
+0.35 and $\sigma_t$ 1.5 on lens-like (51.44), $\beta$ 0.3 at 2× (51.45
+against 51.43). The row of first differences and the band-pass is older:
+the code has only second differences on the low-pass now, so it could not
+be measured again, and on which state of the estimator it was taken is not
+recorded: the three rows above it, as they stood here before, lay up to
+0.4 dB from what the code gives now. It is kept for the record and does not
+compare with the row above to that precision.
 
 Rejected, all measured against the same baseline:
 

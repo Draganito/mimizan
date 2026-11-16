@@ -162,7 +162,10 @@ before sampling, the sharpest real lens on a real sensor), and at twice
 the size (`--scale 2`, the picture upsampled 2× before sampling, a 48 MP
 sensor seen from the distance of 12 MP). Mean CPSNR and R/G/B PSNR in dB;
 the leads column counts pictures won, the removed rows among the
-contenders. The rows marked *removed* are the
+contenders. The tables show a selection of the sixteen demosaicers; every
+one of them is in the report. Among all sixteen, without the removed rows,
+the plate is thirteenth of seventeen pixel-sharp, sixth behind a lens and
+first at twice the size. The rows marked *removed* are the
 plate with the nonlinear last-octave step of 0.11–0.14; 0.15 took that
 step out (every pixel is a measured sum again), and the rows stay so the
 decision can be read against the numbers it was made on.
@@ -188,6 +191,7 @@ Behind a lens (σ 0.75 px):
 | LMMSE (RawTherapee) | 46.16 | 44.99 | 49.27 | 45.95 | 8/24 |
 | DCB (RawTherapee) | 46.03 | 46.18 | 51.55 | 44.61 | 3/24 |
 | AMaZE (RawTherapee) | 45.61 | 45.55 | 49.64 | 44.51 | 0/24 |
+| DHT (libraw) | 45.01 | 43.65 | 47.34 | 45.46 | 0/24 |
 | **plate** | 44.98 | 47.16 | 51.83 | 41.92 | 0/24 |
 | AHD (libraw) | 41.90 | 44.58 | 48.43 | 38.74 | 0/24 |
 
@@ -205,14 +209,21 @@ Twice the size (scale 2):
 
 Reading: on the synthetic pixel-sharp pictures the band limit of the
 chrominance costs the plate 6 dB against the best demosaicer; the removed
-step recovered all but 1.1 dB of it, by computing pixels. As soon as the
-picture has passed a lens the plate is level with the best (RCD, LMMSE,
-DCB within 0.5 dB, every other demosaicer behind), and at the sampling of
-a real high-resolution sensor the plate leads by 2 dB. That is why the
-step could go: it paid only where no camera goes. Against the sixteen
+step recovered all but 1.1 dB of it, by computing pixels. Once the
+picture has passed a lens the gap is 1.2 dB: RCD, LMMSE and DCB stand
+within 0.2 dB of one another at the top, AMaZE and DHT are ahead of the
+plate as well (by 0.6 and 0.03 dB), the other eleven are behind it; with
+the removed step the plate stood 0.3 dB above the three. At the sampling of a
+real high-resolution sensor the plate leads by 1.8 dB. The step was worth
+close to 5 dB where no camera goes, 1.5 dB behind the sharpest lens and
+0.3 dB at twice the size: that is what a measured sum at every pixel costs
+the plate in CPSNR. Against the sixteen
 demosaicers alone, without the removed rows, the plate is ahead of every
 one of them on 0 of the 24 pixel-sharp pictures, on 3 behind a lens and on
-22 at twice the size (`bench plate` of 0.18.7, the same means as above).
+22 at twice the size; the other pictures go to LMMSE (23) and DHT (1)
+pixel-sharp, to LMMSE (10), RCD (6) and DCB (5) behind a lens, to RCD and
+LMMSE (one each) at twice the size (`bench plate` of 0.18.14, the same
+means as above).
 The green channel of the plate is its best, 3–5 dB above its red, and
 behind a lens and at twice the size it is above every demosaicer's green,
 by 0.3 and 3.4 dB (on the pixel-sharp pictures LMMSE's green is 5.7 dB
