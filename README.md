@@ -1,5 +1,7 @@
 # Mimizan Lab
 
+> Lift the colour off. Print what remains.
+
 A darkroom for the digital negative, with two processes.
 
 You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process.
@@ -13,12 +15,6 @@ You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the
 The switch between the two is in the toolbar, and the whole darkroom follows it: the strip of film, the Enlarger, the print. A file from a monochrome sensor opens as the measurement; that sensor has no colour filter and no plate.
 
 It is for analog photographers and fine-art printers who decide the print on the paper.
-
-> Lift the colour off. Print what remains.
->
-> Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Nothing is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
->
-> Dragan Bojovic
 
 **Draws finer than any demosaicer.** What your lens puts on the sensor stays in the negative: every tone in the grey is a sum of measured photosites, none is guessed. On real camera files that is 2 to 4 dB closer to the scene than the best of sixteen demosaicers.
 
@@ -43,6 +39,10 @@ It is for analog photographers and fine-art printers who decide the print on the
 **One paper, two darkrooms.** The phone's negative is printed here, by `mimizan print`, through the same paper.
 
 **Your pictures are yours.** No cloud. No AI. No account. Everything happens on your computer. Nothing leaves it.
+
+> Pure monochrome. A new split-grade digital darkroom, authentic for fine-art monochrome. A minimal, honest darkroom. The Bayer file is read as frequencies: luminance below, colour on the carriers. No demosaicing. The pixels stay measured. Nothing is reconstructed, and the character and soul of the lens are left unchanged. Focus on the picture, and on what you want to say with it. Your art.
+>
+> Dragan Bojovic
 
 The name is the beach at Mimizan, where the idea came up watching the surf: separate the waves, and keep the picture underneath. Lab is the darkroom.
 
