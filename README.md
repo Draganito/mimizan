@@ -20,23 +20,25 @@ It is for analog photographers and fine-art printers who decide the print on the
 >
 > Dragan Bojovic
 
-**Not a filter that looks like film. A darkroom.** Presets paint a look over a finished photo. Mimizan Lab develops a real negative on real paper. Nothing is pretended, because nothing has to be.
+**Draws finer than any demosaicer.** What your lens puts on the sensor stays in the negative: every tone in the grey is a sum of measured photosites, none is guessed. On real camera files that is 2 to 4 dB closer to the scene than the best of sixteen demosaicers.
 
 **Never invents a pixel.** Every other converter guesses two of three colours per pixel. Mimizan Lab reads the sensor the way analogue television read its signal: luminance and colour separated, nothing interpolated, nothing made up.
+
+**Not a filter that looks like film. A darkroom.** Presets paint a look over a finished photo. Mimizan Lab develops a real negative on real paper. Nothing is pretended, because nothing has to be.
 
 **A negative, not a file.** Your photo is a real negative in linear light. You develop it, you don't edit it.
 
 **Black and white like film.** Measured variable-contrast paper, soft and hard light mixed like an enlarger. Highlights roll off the way silver does.
 
-**Colour the way it was first photographed.** Three separate colour plates printed together. Saturated, deep, alive. Two lamps are the only colour control.
-
-**One colour look, and it holds.** The colour is the process's own, as a film stock's is. Saturated colours run to white in the highlights and go deeper in the shadows, and the colour lies softer than the drawing. With two lamps and nothing else to set, a series keeps one character. It is a slide, not a colour chart: where a product's colour has to match a sample, the linear DNG goes to your own converter.
+**The zones on a strip of paper.** In the Enlarger lies the scene as a grey wedge, a zone to the stop, from five stops under the grey card to the clip, each slice printed as the paper stands. Drag it and the print is lighter or darker; turn the wheel over it and the grade is harder or softer, from 00 to 5. You see where every zone of the scene falls on the paper.
 
 **Sharp without the halo.** The measured sharpening stops before the edge becomes a line.
 
 **Printed like a sheet.** Centimetres and dpi, a border and a film edge. The file is a print, not a screen picture.
 
-**Draws finer than any demosaicer.** What your lens puts on the sensor stays in the negative: every tone in the grey is a sum of measured photosites, none is guessed. On real camera files that is 2 to 4 dB closer to the scene than the best of sixteen demosaicers.
+**Colour the way it was first photographed.** Three separate colour plates printed together. Saturated, deep, alive. Two lamps are the only colour control.
+
+**One colour look, and it holds.** The colour is the process's own, as a film stock's is. Saturated colours run to white in the highlights and go deeper in the shadows, and the colour lies softer than the drawing. With two lamps and nothing else to set, a series keeps one character. It is a slide, not a colour chart: where a product's colour has to match a sample, the linear DNG goes to your own converter.
 
 **One paper, two darkrooms.** The phone's negative is printed here, by `mimizan print`, through the same paper.
 
