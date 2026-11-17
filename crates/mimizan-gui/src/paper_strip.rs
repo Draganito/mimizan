@@ -23,6 +23,7 @@
 //! back is the same two numbers the two sliders used to set, on the same
 //! grid of twelfths, inside the same `STOP_LIMIT`.
 
+use crate::session::Screen;
 use egui::{pos2, vec2, Color32, CursorIcon, Event, Id, MouseWheelUnit, Rect, Sense, Shape, Stroke, Ui};
 use mimizan_core::paper::{SplitGrade, STOP_LIMIT};
 use mimizan_core::zone;
@@ -40,9 +41,10 @@ const WHEEL_POINTS: f32 = 50.0;
 /// The darkroom's amber: the strip's frame off the base print.
 pub const AMBER: Color32 = Color32::from_rgb(255, 170, 60);
 
-/// Print value shown as the print grey.
-fn grey(v: f64) -> Color32 {
-    Color32::from_gray((v.clamp(0.0, 1.0) * 255.0).round() as u8)
+/// Print value shown as the print grey: the grey the picture beside the
+/// strip shows that value as (`Screen`).
+fn grey(v: f64, screen: Screen) -> Color32 {
+    Color32::from_gray(screen.byte(v))
 }
 
 /// Stops of the scene over the grey card: up to the clip, linear 1.
@@ -72,7 +74,7 @@ fn zone_ticks() -> impl Iterator<Item = f64> {
 /// Draws the strip for `split` and lets the pointer move it. `picture`
 /// names the picture the pair belongs to: what a double click remembers
 /// is kept under it, so it is not handed to the next picture.
-pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32) {
+pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32, screen: Screen) {
     let (rect, response) = ui.allocate_exact_size(vec2(width, STRIP_H), Sense::click_and_drag());
     let painter = ui.painter_at(rect);
     let id = response.id;
@@ -156,7 +158,7 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32)
             let l = linear_at((i as f64 + 0.5) / SAMPLES as f64);
             let slice =
                 Rect::from_min_size(pos2(rect.left() + i as f32 * w, rect.top()), vec2(w + 0.5, STRIP_H));
-            painter.rect_filled(slice, 0.0, grey(curve.eval(l)));
+            painter.rect_filled(slice, 0.0, grey(curve.eval(l), screen));
         }
         // The zones, whole stops from the grey card, as ticks from the top edge.
         let tick = Color32::from_rgba_unmultiplied(128, 128, 128, 150);
@@ -257,7 +259,7 @@ mod tests {
             let _ = ctx.run_ui(input, |ui| {
                 let strip = Rect::from_min_size(pos2(10.0, 8.0), vec2(300.0, STRIP_H));
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-                    paper_strip(ui, Id::new("a.nef"), split, 300.0)
+                    paper_strip(ui, Id::new("a.nef"), split, 300.0, Screen::PRINT)
                 });
             });
         }
@@ -321,7 +323,7 @@ mod tests {
             let _ = ctx.run_ui(input, |ui| {
                 let strip = Rect::from_min_size(pos2(10.0, 8.0), vec2(300.0, STRIP_H));
                 ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-                    paper_strip(ui, Id::new(picture), split, 300.0)
+                    paper_strip(ui, Id::new(picture), split, 300.0, Screen::PRINT)
                 });
             });
         }
@@ -357,6 +359,37 @@ mod tests {
         let greys: Vec<f64> = (0..SAMPLES).map(|i| linear_at((i as f64 + 0.5) / SAMPLES as f64)).collect();
         let flat = greys.windows(2).filter(|w| w[1] <= w[0]).count();
         assert_eq!(flat, 0, "{flat} of {SAMPLES} slices repeat the one before");
+    }
+
+    /// The strip is the paper beside the picture: a slice is the grey the
+    /// picture shows that print value as. Under a plate in sRGB that is
+    /// the file's sample, the sRGB encoding of the light the value stands
+    /// for; under the grey sheet and a plate in the Adobe space the value
+    /// itself, as it was.
+    #[test]
+    fn a_slice_is_the_grey_the_picture_shows() {
+        use crate::session::PlateView;
+        use mimizan_core::kodak::srgb_encode;
+        use mimizan_core::plate::{PlateSpace, PlateWeights};
+        use mimizan_core::tone::Tone;
+        let plate = |space| PlateView { weights: PlateWeights::channels(), space, lamps: [0.0; 3] };
+        let tone = Tone::paper();
+        let curve = SplitGrade::default().curve();
+        let on_srgb = Screen::of(&tone, Some(&plate(PlateSpace::Srgb)));
+        let on_adobe = Screen::of(&tone, Some(&plate(PlateSpace::AdobeRgb)));
+        let (mut last, mut lower) = (0u8, 0usize);
+        for i in 0..SAMPLES {
+            let v = curve.eval(linear_at((i as f64 + 0.5) / SAMPLES as f64));
+            let was = Color32::from_gray((v.clamp(0.0, 1.0) * 255.0).round() as u8);
+            assert_eq!(grey(v, Screen::PRINT), was, "slice {i}");
+            assert_eq!(grey(v, on_adobe), was, "slice {i}");
+            let want = (srgb_encode(v.powf(2.2)) * 255.0).round() as u8;
+            assert_eq!(grey(v, on_srgb), Color32::from_gray(want), "slice {i}");
+            assert!(want >= last, "the strip falls at slice {i}");
+            last = want;
+            lower += (want < was.r()) as usize;
+        }
+        assert!(lower > SAMPLES / 8, "{lower} slices stand lower under the sRGB plate");
     }
 
     #[test]

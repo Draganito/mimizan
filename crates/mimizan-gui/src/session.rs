@@ -10,14 +10,15 @@ use mimizan_core::burn::{self, Field, Stroke, Times};
 use mimizan_core::calib::CameraFile;
 use mimizan_core::cfa::Color;
 use mimizan_core::decode::{RawFrame, SensorKind};
+use mimizan_core::icc::GrayTrc;
 use mimizan_core::mix::{mix, Weights};
 use mimizan_core::paper::{self, PaperTable};
 use mimizan_core::pipeline::{Negative, NegativeParams};
 use mimizan_core::plane::Plane;
 use mimizan_core::plate::{mix_plate, PlateParams, PlateSpace, PlateWeights};
 use mimizan_core::print::{
-    burn_field, layout, loupe_source_rect, orient, rotated, sharpen_window, source_window, window_plane,
-    PrintParams,
+    burn_field, file_sample, layout, loupe_source_rect, orient, rotated, sample_curve, sharpen_window,
+    source_window, window_plane, PrintParams,
 };
 use mimizan_core::recipe::{CropRect, Develop, Recipe};
 use mimizan_core::resize::{
@@ -235,6 +236,52 @@ pub struct PlateView {
     pub lamps: [f64; 3],
 }
 
+/// What the screen shows of a print value: the sample the print's file
+/// holds for it, by the core's own rule (`print::sample_curve`,
+/// `print::file_sample`), so the picture in the window is the picture in
+/// the file. A plate in sRGB is written on the sRGB curve, each value as
+/// the sRGB encoding of the light it stands for, and is shown so: its
+/// deep shadows stand lower than the print's values, the rest all but
+/// where it was. The grey sheet and a plate in the Adobe space hold the
+/// print's own values, and so does the screen. A grey sheet written as
+/// RGB is the grey print in another file and is shown as the grey print.
+///
+/// Only what shows a tone goes through here: the picture, the 1:1 window,
+/// the print box, the sheet's rings, the paper strip. What counts instead
+/// — the histograms, the clip marks — stays on the print's values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Screen(GrayTrc);
+
+impl Screen {
+    /// The print's own values: the grey sheet on paper.
+    #[cfg(test)]
+    pub const PRINT: Self = Self(GrayTrc::Gamma(2.2));
+
+    /// The screen of a print through `tone`: a plate when one is shown,
+    /// the grey sheet otherwise.
+    pub fn of(tone: &Tone, plate: Option<&PlateView>) -> Self {
+        Self(sample_curve(plate.map(|p| p.space), tone.encoding()))
+    }
+
+    /// The screen value of a print value, both in [0, 1].
+    #[inline]
+    pub fn value(self, v: f64) -> f64 {
+        file_sample(v, self.0)
+    }
+
+    /// The screen's byte of a print value.
+    #[inline]
+    pub fn byte(self, v: f64) -> u8 {
+        (self.value(v) * 255.0).round() as u8
+    }
+
+    /// The print's values as they are: nothing is encoded again.
+    #[inline]
+    pub fn is_print(self) -> bool {
+        !matches!(self.0, GrayTrc::Srgb)
+    }
+}
+
 /// Shrinks full-resolution planes to the preview size and turns them
 /// upright. The resize runs on the sensor frame (to the swapped size when
 /// the orientation transposes) and the small result is oriented, so no
@@ -344,6 +391,13 @@ pub struct ViewParams {
 type HistKey = (Weights, Tone, f64, Option<CropRect>, f64, Vec<Stroke>);
 
 impl ViewParams {
+    /// What the screen shows this view's print values as: the plate's
+    /// file when the picture is shown in colour, the grey sheet's when
+    /// it is not (a monochrome sensor has no plate).
+    pub fn screen(&self, s: &Session) -> Screen {
+        Screen::of(&self.tone, self.plate.as_ref().filter(|_| !s.is_mono()))
+    }
+
     fn hist_key(&self) -> HistKey {
         (self.weights, self.tone.clone(), self.place, self.crop, self.angle, self.burns.clone())
     }
@@ -974,6 +1028,44 @@ fn display_rgb_with(
     out
 }
 
+/// The three channels of a plate print counted on the print's values:
+/// the pixels of [`display_rgb_with`], each in the bin the histogram
+/// gives its print value, whatever the screen shows it as.
+fn plate_histograms(
+    planes: &[Plane; 3],
+    place: f64,
+    lamps: [f64; 3],
+    table: &ToneTable,
+    field: Option<&Field>,
+) -> [[u32; 256]; 3] {
+    let n = planes.iter().map(|p| p.data.len()).min().unwrap_or(0);
+    let gains = lamps.map(|l| 2f64.powf(place + l));
+    let width = planes[0].width.max(1);
+    (0..n.div_ceil(width))
+        .into_par_iter()
+        .map(|y| {
+            let mut bins = [[0u32; 256]; 3];
+            let mut timed = Timed::new(table);
+            let line = FieldRow::varying(field, y, 0, width);
+            for idx in y * width..((y + 1) * width).min(n) {
+                let t = line.at(idx - y * width);
+                for c in 0..3 {
+                    bins[c][usize::from(timed.view(planes[c].data[idx] * gains[c], t).0)] += 1;
+                }
+            }
+            bins
+        })
+        .reduce(
+            || [[0u32; 256]; 3],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().flatten().zip(b.iter().flatten()) {
+                    *x += y;
+                }
+                a
+            },
+        )
+}
+
 /// The visible window of a fitted print as the worker shows it, its two
 /// steps in one, for the tests' expectations: the recipe's kernel on the
 /// negative ([`render_print_linear`]), then the same table as the file's
@@ -1266,7 +1358,9 @@ pub fn render_sharpen_loupe(
         }
     };
     let Some(plane) = through(&linear, &params) else { return SharpenLoupe::empty() };
-    let to_u8 = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    // The box shows the file's samples, as the picture beside it does.
+    let screen = Screen::of(&recipe.curve, plate);
+    let to_u8 = |v: f64| screen.byte(v);
     let gray = plane.data.par_iter().map(|&v| to_u8(v)).collect();
     let rgb = match (plate, plates) {
         (Some(p), Some(planes)) => {
@@ -1385,9 +1479,12 @@ fn slot_value(i: usize) -> f64 {
 /// The screen and the histogram share it. Building it is one evaluation
 /// per slot; a slider then looks up, it does not solve the paper again per
 /// pixel. `view` is the histogram bin `(eval * 255).round()`. `show` is the
-/// 8-bit face of the 16-bit code the TIFF stores, `q16(eval)`. Quantising
-/// the linear value first is the histogram's contract; the file evaluates
-/// the float and then quantises, so a code can differ by the last bit.
+/// 8-bit face of the 16-bit code the TIFF stores: `q16(eval)`, and for a
+/// file on the sRGB curve (`screen`) `q16` of the sample the file holds for
+/// it. The bin and the clip flag stay the print value's on every screen.
+/// Quantising the linear value first is the histogram's contract; the
+/// file evaluates the float and then quantises, so a code can differ by
+/// the last bit.
 /// Above 1 the table goes on as the negative does: a highlight the sensor
 /// read above the level at which green is full prints lighter than the
 /// clip, and the screen shows it so.
@@ -1401,6 +1498,8 @@ pub(crate) struct ToneTable {
     tone: ToneMap,
     /// The paper tabulated for those pixels; a look is quick as it is.
     timed: Option<PaperTable>,
+    /// What `show` is of a print value: the file's sample.
+    screen: Screen,
 }
 
 /// A reader of the table for pixels under strokes: the table where it
@@ -1466,10 +1565,8 @@ impl<'a> Timed<'a> {
         }
         match self.solved(times) {
             Solved::Factor(k) => t.faces_of(lp * k),
-            Solved::Logged { soft, hard } => {
-                ToneTable::faces(t.timed.as_ref().unwrap().eval_logged(lp, soft, hard))
-            }
-            Solved::Exact => ToneTable::faces(t.tone.eval_timed(lp, times)),
+            Solved::Logged { soft, hard } => t.faces(t.timed.as_ref().unwrap().eval_logged(lp, soft, hard)),
+            Solved::Exact => t.faces(t.tone.eval_timed(lp, times)),
         }
     }
 
@@ -1491,10 +1588,8 @@ impl<'a> Timed<'a> {
         let t = self.table;
         match solved {
             Solved::Factor(k) => t.show_of(lp * k),
-            Solved::Logged { soft, hard } => {
-                ToneTable::faces(t.timed.as_ref().unwrap().eval_logged(lp, soft, hard)).1
-            }
-            Solved::Exact => ToneTable::faces(t.tone.eval_timed(lp, times)).1,
+            Solved::Logged { soft, hard } => t.faces(t.timed.as_ref().unwrap().eval_logged(lp, soft, hard)).1,
+            Solved::Exact => t.faces(t.tone.eval_timed(lp, times)).1,
         }
     }
 
@@ -1520,13 +1615,15 @@ impl<'a> Timed<'a> {
 }
 
 impl ToneTable {
-    /// The three faces of one print value: the histogram bin, the 8-bit
-    /// face of the 16-bit code, and whether that code is an end.
+    /// The three faces of one print value on `screen`: the histogram
+    /// bin, the 8-bit face of the 16-bit code the file holds for it, and
+    /// whether the print's own code is an end.
     #[inline]
-    fn faces(t: f64) -> (u8, u8, u8) {
+    fn faces_on(t: f64, screen: Screen) -> (u8, u8, u8) {
         let code = q16(t);
         let view = (t.clamp(0.0, 1.0) * 255.0).round() as u8;
-        let show = ((code as f64 / 65535.0) * 255.0).round() as u8;
+        let held = if screen.is_print() { code } else { q16(screen.value(t)) };
+        let show = ((held as f64 / 65535.0) * 255.0).round() as u8;
         let clip = if code == 0 {
             1
         } else if code == 65535 {
@@ -1537,13 +1634,19 @@ impl ToneTable {
         (view, show, clip)
     }
 
+    /// The three faces of one print value on this table's screen.
+    #[inline]
+    fn faces(&self, t: f64) -> (u8, u8, u8) {
+        Self::faces_on(t, self.screen)
+    }
+
     /// The shown face of a placed linear value: the table, or past its
     /// end the tone itself.
     #[inline]
     fn show_of(&self, x: f64) -> u8 {
         match slot(x) {
             Some(i) => self.show[i],
-            None => Self::faces(self.tone.eval(x)).1,
+            None => self.faces(self.tone.eval(x)).1,
         }
     }
 
@@ -1552,13 +1655,22 @@ impl ToneTable {
     fn faces_of(&self, x: f64) -> (u8, u8, u8) {
         match slot(x) {
             Some(i) => (self.view[i], self.show[i], self.clip[i]),
-            None => Self::faces(self.tone.eval(x)),
+            None => self.faces(self.tone.eval(x)),
         }
     }
 
+    /// The table of the grey sheet: the screen shows the print's values.
+    #[cfg(test)]
     fn build(tone: &ToneMap) -> Self {
-        let built: Vec<(u8, u8, u8)> =
-            (0..TABLE_SLOTS).into_par_iter().map(|i| Self::faces(tone.eval(slot_value(i)))).collect();
+        Self::build_on(tone, Screen::PRINT)
+    }
+
+    /// The table of `tone` for a picture shown on `screen`.
+    fn build_on(tone: &ToneMap, screen: Screen) -> Self {
+        let built: Vec<(u8, u8, u8)> = (0..TABLE_SLOTS)
+            .into_par_iter()
+            .map(|i| Self::faces_on(tone.eval(slot_value(i)), screen))
+            .collect();
         let mut view = Vec::with_capacity(built.len());
         let mut show = Vec::with_capacity(built.len());
         let mut clip = Vec::with_capacity(built.len());
@@ -1567,23 +1679,24 @@ impl ToneTable {
             show.push(s);
             clip.push(c);
         }
-        Self { view, show, clip, tone: tone.clone(), timed: tone.table() }
+        Self { view, show, clip, tone: tone.clone(), timed: tone.table(), screen }
     }
 }
 
-/// The paper for `tone`, kept while the exposures stay put. A pan reuses it.
+/// The paper for `tone` on `screen`, kept while the exposures and the
+/// file's curve stay put. A pan reuses it.
 #[derive(Default)]
 pub struct ToneHold {
-    held: Option<(Tone, ToneTable)>,
+    held: Option<(Tone, Screen, ToneTable)>,
 }
 
 impl ToneHold {
-    pub fn get(&mut self, tone: &Tone) -> &ToneTable {
-        let fresh = !matches!(&self.held, Some((t, _)) if t == tone);
+    pub fn get(&mut self, tone: &Tone, screen: Screen) -> &ToneTable {
+        let fresh = !matches!(&self.held, Some((t, on, _)) if t == tone && *on == screen);
         if fresh {
-            self.held = Some((tone.clone(), ToneTable::build(&tone.compile())));
+            self.held = Some((tone.clone(), screen, ToneTable::build_on(&tone.compile(), screen)));
         }
-        &self.held.as_ref().unwrap().1
+        &self.held.as_ref().unwrap().2
     }
 }
 
@@ -2062,8 +2175,9 @@ pub struct PreviewImage {
     pub rgb: Option<Vec<u8>>,
     pub hist_view: Histogram,
     pub hist_negative: Histogram,
-    /// The three channels of the plate as shown, counted on the preview's
-    /// bytes: outlines over the print histogram, which stays the mix's.
+    /// The three channels of the plate, counted on the preview's pixels
+    /// by their print values: outlines over the print histogram, which
+    /// stays the mix's.
     pub hist_rgb: Option<[[u32; 256]; 3]>,
 }
 
@@ -2471,14 +2585,23 @@ pub fn render_preview(
     let mixed = stages.mixed(s, v);
     let (width, height) = (mixed.width, mixed.height);
     let gray = display_bytes_with(mixed, v.place, table, field.as_ref());
-    let rgb = match v.plate.filter(|_| !s.is_mono()) {
+    let (rgb, hist_rgb) = match v.plate.filter(|_| !s.is_mono()) {
         Some(plate) => {
             let planes = stages.plate(s, v, &plate.weights);
-            Some(display_rgb_with(planes, v.place, plate.lamps, table, field.as_ref()))
+            let rgb = display_rgb_with(planes, v.place, plate.lamps, table, field.as_ref());
+            // The outlines stand on the print's values, as the bars under
+            // them do. Where the screen shows the print's values the
+            // bytes are those; where it shows the file's samples the
+            // channels are counted through the table's other face.
+            let hist = if table.screen.is_print() {
+                rgb_histograms(&rgb)
+            } else {
+                plate_histograms(planes, v.place, plate.lamps, table, field.as_ref())
+            };
+            (Some(rgb), Some(hist))
         }
-        None => None,
+        None => (None, None),
     };
-    let hist_rgb = rgb.as_deref().map(rgb_histograms);
     PreviewImage { width, height, rotation: v.rotation, gray, rgb, hist_view, hist_negative, hist_rgb }
 }
 
@@ -2786,7 +2909,7 @@ mod histogram_tests {
         let tone = Tone::Paper(mimizan_core::paper::SplitGrade::new(0.6, -0.4)).compile();
         let table = ToneTable::build(&tone);
         assert_eq!(table.show.len(), TABLE_SLOTS);
-        let face = |t: f64| ToneTable::faces(t).1;
+        let face = |t: f64| ToneTable::faces_on(t, Screen::PRINT).1;
         let mut last = 0u8;
         for i in 0..=2400 {
             let x = 0.9 + 11.1 * i as f64 / 2400.0;
@@ -2796,7 +2919,7 @@ mod histogram_tests {
             assert!(shown >= last, "the table falls at {x}");
             last = shown;
             if x > TABLE_TOP {
-                assert_eq!(table.faces_of(x), ToneTable::faces(tone.eval(x)));
+                assert_eq!(table.faces_of(x), ToneTable::faces_on(tone.eval(x), Screen::PRINT));
             }
         }
         assert!(table.show_of(1.34) > table.show_of(1.0) + 5);
@@ -3783,5 +3906,428 @@ mod histogram_tests {
         }
         let at = (32 * w + 68) * 3;
         assert!(rgb[at + 1] > rgb[at] && rgb[at] > rgb[at + 2], "{:?}", &rgb[at..at + 3]);
+    }
+
+    /// A Bayer session of a coloured ramp, dark at the left: the three
+    /// plates differ, and the left third lies in the print's deep shadows.
+    fn colour_session() -> Session {
+        use mimizan_core::cfa::BayerPhase;
+        use mimizan_core::decode::{RawData, Rect};
+        use mimizan_core::pipeline;
+        let (w, h) = (96usize, 64usize);
+        let raw: Vec<u16> = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                // RGGB: red, the two greens, blue, each with its own share.
+                let share = [[0.9, 0.6], [0.6, 0.35]][y % 2][x % 2];
+                let level = 30.0 + 900.0 * (x as f64 / w as f64).powi(2) + 40.0 * ((y / 6) % 3) as f64;
+                (level * share) as u16
+            })
+            .collect();
+        let frame = RawFrame {
+            make: "Test".into(),
+            model: "Bayer".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 10,
+            kind: SensorKind::Bayer(BayerPhase::RGGB),
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: Some([1.0, 1.0, 1.0]),
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        let preview = preview_planes(&neg).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        Session {
+            id: next_session_id(),
+            path: "colour.nef".into(),
+            frame: Arc::new(frame),
+            negative: neg,
+            camera_file: None,
+            camera_file_path: None,
+            develop: Develop::default(),
+            preview,
+            raw_hist,
+        }
+    }
+
+    /// The screen of a print is the sample its file holds. The grey sheet
+    /// and a plate in the Adobe space hold the print's values, and the
+    /// table is what it was; a plate in sRGB holds the sRGB encoding of
+    /// the light `v^2.2`, and the table shows that, by the table, past its
+    /// end and under a stroke's own times, while the histogram's bin and
+    /// the clip flag stay the print value's.
+    #[test]
+    fn the_screen_shows_the_files_sample_and_the_histogram_counts_the_print() {
+        use mimizan_core::calib::LookEncoding;
+        use mimizan_core::kodak::srgb_encode;
+        use mimizan_core::paper::SplitGrade;
+        let srgb = PlateView { weights: PlateWeights::channels(), space: PlateSpace::Srgb, lamps: [0.0; 3] };
+        let adobe = PlateView { space: PlateSpace::AdobeRgb, ..srgb };
+        let paper = Tone::Paper(SplitGrade::new(0.6, -0.4));
+        // Which screen a print has.
+        assert_eq!(Screen::of(&paper, None), Screen::PRINT);
+        assert!(Screen::PRINT.is_print());
+        assert!(Screen::of(&paper, Some(&adobe)).is_print());
+        let screen = Screen::of(&paper, Some(&srgb));
+        assert!(!screen.is_print());
+        // A look without an encoding is linear in every file.
+        let linear = Tone::Look(LookFile { encoding: LookEncoding::None, ..LookFile::neutral() });
+        assert!(Screen::of(&linear, Some(&srgb)).is_print());
+        // A look on the gamma is written as the paper is.
+        assert_eq!(Screen::of(&Tone::Look(LookFile::neutral()), Some(&srgb)), screen);
+
+        // The value: the print's own, or the sRGB encoding of its light.
+        let in_file = |v: f64| srgb_encode(v.clamp(0.0, 1.0).powf(2.2));
+        for i in 0..=1000 {
+            let v = i as f64 / 1000.0;
+            assert_eq!(Screen::PRINT.value(v), v);
+            assert_eq!(Screen::PRINT.byte(v), (v * 255.0).round() as u8);
+            assert_eq!(Screen::of(&paper, Some(&adobe)).value(v), v);
+            assert!((screen.value(v) - in_file(v)).abs() < 1e-12, "{v}");
+        }
+        // Black and white are the ends on either screen; the deep shadows
+        // stand lower, the upper half all but where it was.
+        assert_eq!((screen.byte(0.0), screen.byte(1.0)), (0, 255));
+        assert_eq!(
+            (screen.byte(13.0 / 255.0), screen.byte(25.0 / 255.0), screen.byte(51.0 / 255.0)),
+            (5, 18, 48)
+        );
+        for b in 102..=255u8 {
+            let d = i32::from(screen.byte(f64::from(b) / 255.0)) - i32::from(b);
+            assert!((0..=2).contains(&d), "{b} is shown {d} away");
+        }
+        assert_eq!((screen.value(-0.5), screen.byte(7.0)), (0.0, 255));
+
+        // The table of the plate in sRGB against the print's.
+        let map = paper.compile();
+        let print = ToneTable::build(&map);
+        let file = ToneTable::build_on(&map, screen);
+        assert_eq!(file.view, print.view, "the histogram's bins are the print's");
+        assert_eq!(file.clip, print.clip, "the clip marks are the print's");
+        assert_eq!(ToneTable::build_on(&map, Screen::of(&paper, Some(&adobe))).show, print.show);
+        let face = |t: f64| ((q16(in_file(t)) as f64 / 65535.0) * 255.0).round() as i32;
+        let (mut last, mut lower) = (0u8, 0usize);
+        for i in 0..=6000 {
+            // Up to the clip closely, then on above it and past the table's end.
+            let x = if i <= 4000 { i as f64 / 4000.0 } else { 1.0 + 11.0 * (i - 4000) as f64 / 2000.0 };
+            let shown = file.show_of(x);
+            let d = (i32::from(shown) - face(map.eval(x))).abs();
+            assert!(d <= 1, "at {x} the screen is {d} levels from the file");
+            assert!(shown >= last, "the screen falls at {x}");
+            last = shown;
+            let was = print.show_of(x);
+            if (8..=60).contains(&was) {
+                assert!(shown < was, "at {x} the file's shadow is not under the print's value");
+                lower += 1;
+            }
+            assert_eq!(file.faces_of(x).0, print.faces_of(x).0, "bin at {x}");
+            assert_eq!(file.faces_of(x).2, print.faces_of(x).2, "clip at {x}");
+        }
+        assert!(lower > 100, "{lower} shadow values looked at");
+
+        // Under a stroke: an even time is the table at another value, one
+        // light alone is the paper solved at the pixel.
+        let even = Times { soft: 2.0, hard: 2.0, all: 2.0 };
+        let soft = Times { soft: 2.5, hard: 1.0, all: 2.5 };
+        let (mut on_file, mut on_print) = (Timed::new(&file), Timed::new(&print));
+        for times in [even, soft] {
+            for l in [0.004, 0.01, 0.03, 0.09, 0.18, 0.5, 1.0, 1.4] {
+                let want = face(map.eval_timed(l, times));
+                assert!((i32::from(on_file.show(l, times)) - want).abs() <= 1, "{l} {times:?}");
+                assert!((i32::from(on_file.show_fresh(l, times)) - want).abs() <= 1, "{l} {times:?}");
+                let solved = on_file.solve(times);
+                assert!(
+                    (i32::from(on_file.show_solved(l, times, solved)) - want).abs() <= 1,
+                    "{l} {times:?}"
+                );
+                assert!((i32::from(on_file.faces(l, times).1) - want).abs() <= 1, "{l} {times:?}");
+                assert_eq!(on_file.view(l, times), on_print.view(l, times), "{l} {times:?}");
+            }
+        }
+        // A look under uneven times is evaluated exactly, and encoded.
+        let look = Tone::Look(LookFile::neutral());
+        let look_map = look.compile();
+        let look_file = ToneTable::build_on(&look_map, Screen::of(&look, Some(&srgb)));
+        let third = Times { soft: 2.0, hard: 1.0, all: 3.0 };
+        let mut timed = Timed::new(&look_file);
+        for l in [0.01, 0.05, 0.3] {
+            let want = face(look_map.eval_timed(l, third));
+            assert!((i32::from(timed.show(l, third)) - want).abs() <= 1, "{l}");
+        }
+
+        // The worker keeps one table: another screen is another table.
+        let mut hold = ToneHold::default();
+        assert_eq!(hold.get(&paper, Screen::PRINT).show, print.show);
+        assert_eq!(hold.get(&paper, screen).show, file.show);
+        assert_ne!(file.show, print.show);
+        assert_eq!(hold.get(&paper, Screen::PRINT).show, print.show);
+    }
+
+    /// The same plate shown in sRGB and in the Adobe space, with the same
+    /// three mixes: the whole picture, the 1:1 window, a coarser grid of
+    /// it, the print's window and the print box are, byte for byte, the
+    /// print's values in the one and the file's samples of those values
+    /// in the other; the histograms are the same in both. With lamps, a
+    /// placing, the paper off its base, and under strokes.
+    #[test]
+    fn a_plate_in_srgb_is_shown_as_its_file_and_counted_as_its_print() {
+        use mimizan_core::burn::{Light, Tip};
+        use mimizan_core::paper::SplitGrade;
+        use mimizan_core::print::PrintSize;
+        let session = colour_session();
+        let strokes = vec![
+            Stroke::Hand {
+                tip: Tip { rx: 0.14, ry: 0.07, angle: 20.0, feather: 0.05 },
+                stops: 1.0,
+                light: Light::Both,
+                points: vec![[-0.35, -0.1], [-0.1, 0.05], [0.2, -0.05]],
+            },
+            Stroke::Card {
+                x: -0.2,
+                y: 0.0,
+                angle: 15.0,
+                travel: 0.1,
+                feather: 0.05,
+                stops: -0.5,
+                light: Light::Soft,
+            },
+        ];
+        let tone = Tone::Paper(SplitGrade::new(0.3, -0.2));
+        let plate = |space| PlateView { weights: PlateWeights::channels(), space, lamps: [0.25, 0.0, -0.5] };
+        let on_file = Screen::of(&tone, Some(&plate(PlateSpace::Srgb)));
+        // The file's sample of a byte of the print, to the level.
+        let mapped = |b: u8| i32::from(on_file.byte(f64::from(b) / 255.0));
+        let mut seen_lower = 0usize;
+        let mut same_picture = |what: &str, print: &[u8], file: &[u8]| {
+            assert_eq!(print.len(), file.len(), "{what}");
+            assert!(!print.is_empty(), "{what}");
+            for (i, (&p, &f)) in print.iter().zip(file).enumerate() {
+                let d = (i32::from(f) - mapped(p)).abs();
+                assert!(
+                    d <= 1,
+                    "{what} byte {i}: the print's {p} is shown as {f}, {d} from the file's sample"
+                );
+                seen_lower += (f < p) as usize;
+            }
+        };
+        for burns in [Vec::new(), strokes] {
+            let view = |space| ViewParams {
+                weights: Weights { r: 0.4, g: 0.4, b: 0.2 },
+                tone: tone.clone(),
+                place: 0.2,
+                rotation: 0,
+                angle: 0.0,
+                crop: None,
+                burns: burns.clone(),
+                burn_live: false,
+                plate: Some(plate(space)),
+            };
+            let (adobe, srgb) = (view(PlateSpace::AdobeRgb), view(PlateSpace::Srgb));
+            assert!(adobe.screen(&session).is_print());
+            assert_eq!(srgb.screen(&session), on_file);
+            let print_table = ToneTable::build_on(&tone.compile(), adobe.screen(&session));
+            let file_table = ToneTable::build_on(&tone.compile(), srgb.screen(&session));
+
+            // The whole picture and its histograms.
+            let fresh = || (HistCache::default(), PreviewStages::default());
+            let (mut c, mut st) = fresh();
+            let a = render_preview(&session, &adobe, &mut c, &mut st, &print_table);
+            let (mut c, mut st) = fresh();
+            let b = render_preview(&session, &srgb, &mut c, &mut st, &file_table);
+            same_picture("preview", a.rgb.as_ref().unwrap(), b.rgb.as_ref().unwrap());
+            same_picture("preview grey", &a.gray, &b.gray);
+            assert_eq!(a.hist_rgb, b.hist_rgb, "the channels are counted on the print's values");
+            assert_eq!(a.hist_rgb.unwrap(), rgb_histograms(a.rgb.as_ref().unwrap()));
+            assert_eq!(a.hist_view, b.hist_view);
+            assert_eq!(a.hist_negative, b.hist_negative);
+            // The three channels differ, or the test says nothing of colour.
+            let px = a.rgb.as_ref().unwrap().as_chunks::<3>().0;
+            assert!(px.iter().filter(|p| p[0] != p[1] && p[1] != p[2]).count() * 2 > px.len());
+
+            // The 1:1 window and a coarser grid of it.
+            for ask in [
+                DetailAsk::pixels(DetailRect { x: 2, y: 3, w: 60, h: 40 }),
+                DetailAsk { x: 0, y: 0, w: 40, h: 28, step: 2 },
+            ] {
+                let a = render_detail(&session, &adobe, ask, &print_table).unwrap();
+                let b = render_detail(&session, &srgb, ask, &file_table).unwrap();
+                same_picture("window", a.rgb.as_ref().unwrap(), b.rgb.as_ref().unwrap());
+                same_picture("window grey", &a.gray, &b.gray);
+            }
+
+            // The print's window and the print box.
+            let recipe = Recipe {
+                size: Some(PrintSize::Physical { width_in: 0.5, height_in: 0.4 }),
+                dpi: 300.0,
+                place: 0.2,
+                curve: tone.clone(),
+                burns: burns.clone(),
+                ..Recipe::on_paper()
+            };
+            recipe.validate().unwrap();
+            let rect = DetailRect { x: 0, y: 0, w: 120, h: 80 };
+            let a = render_print_detail(&session, &adobe, &recipe, rect, &print_table).unwrap();
+            let b = render_print_detail(&session, &srgb, &recipe, rect, &file_table).unwrap();
+            assert!(a.ask.w > 60, "the print is enlarged: {:?}", a.ask);
+            same_picture("print window", a.rgb.as_ref().unwrap(), b.rgb.as_ref().unwrap());
+            let o = session.negative.orientation;
+            let w = Weights { r: 0.4, g: 0.4, b: 0.2 };
+            let a = render_sharpen_loupe(&session, &w, adobe.plate.as_ref(), &recipe, o, 0.2, 0.5, 48);
+            let b = render_sharpen_loupe(&session, &w, srgb.plate.as_ref(), &recipe, o, 0.2, 0.5, 48);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            same_picture("print box", a.rgb.as_ref().unwrap(), b.rgb.as_ref().unwrap());
+            same_picture("print box grey", &a.gray, &b.gray);
+            // Without the plate the box is the grey print, as it was.
+            let grey = render_sharpen_loupe(&session, &w, None, &recipe, o, 0.2, 0.5, 48);
+            assert_eq!(grey.gray, a.gray);
+        }
+        assert!(seen_lower > 1000, "only {seen_lower} bytes stood lower in the file");
+    }
+
+    /// The print's window on the screen is the file the export writes, in
+    /// the plate too: a plate in sRGB and one in the Adobe space, with
+    /// lamps, a placing, the paper off its base and strokes, upright and
+    /// through a turn with a straighten and a crop. The file is written
+    /// (`print::write_as`), in 16 bits and in 8, and read back; every
+    /// pixel of the picture on the screen is compared with the 8-bit face
+    /// of the file's sample, in the three channels.
+    #[test]
+    fn the_plates_window_on_the_screen_is_the_written_file() {
+        use mimizan_core::burn::{Light, Tip};
+        use mimizan_core::paper::SplitGrade;
+        use mimizan_core::plate::PlateInfo;
+        use mimizan_core::print::{render_plate, write_as, FileOptions, PrintSize, PrintSource};
+        use mimizan_core::tiffin::read_rgb16;
+        let session = colour_session();
+        let (w, h) = (session.negative.plane.width, session.negative.plane.height);
+        let sep = session.separation().unwrap();
+        let dir = std::env::temp_dir().join(format!("mimizan-gui-screen-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let burns = vec![
+            Stroke::Hand {
+                tip: Tip { rx: 0.14, ry: 0.07, angle: 20.0, feather: 0.05 },
+                stops: 1.0,
+                light: Light::Both,
+                points: vec![[-0.35, -0.1], [-0.1, 0.05], [0.2, -0.05]],
+            },
+            Stroke::Card {
+                x: -0.2,
+                y: 0.0,
+                angle: 15.0,
+                travel: 0.1,
+                feather: 0.05,
+                stops: -0.5,
+                light: Light::Soft,
+            },
+        ];
+        let weights = Weights { r: 0.4, g: 0.4, b: 0.2 };
+        let framings = [(0u8, 0.0, None), (1u8, 2.0, Some(CropRect { x: 4, y: 4, w: 80, h: 52 }))];
+        let mut shadows = 0usize;
+        for space in [PlateSpace::Srgb, PlateSpace::AdobeRgb] {
+            for (quarter_turns, angle, crop) in framings {
+                let plate = PlateView { weights: PlateWeights::channels(), space, lamps: [0.25, 0.0, -0.5] };
+                let recipe = Recipe {
+                    quarter_turns,
+                    angle,
+                    crop,
+                    size: Some(PrintSize::Physical { width_in: 0.6, height_in: 0.4 }),
+                    dpi: 300.0,
+                    place: 0.2,
+                    curve: Tone::Paper(SplitGrade::new(0.3, -0.2)),
+                    burns: burns.clone(),
+                    ..Recipe::on_paper()
+                };
+                recipe.validate().unwrap();
+                let view = ViewParams {
+                    weights,
+                    tone: recipe.curve.clone(),
+                    place: recipe.place,
+                    rotation: quarter_turns,
+                    angle,
+                    crop,
+                    burns: burns.clone(),
+                    burn_live: false,
+                    plate: Some(plate),
+                };
+                // The file, as the export worker makes and writes it.
+                let planes = mix_plate(sep, &plate.weights);
+                let params =
+                    PrintParams { recipe: recipe.clone(), lamps: plate.lamps, ..PrintParams::default() };
+                let pi = PlateInfo::new(&plate.weights, plate.space, sep.lum.height);
+                let [r, g, b] = &planes;
+                let sources = [r, g, b].map(|plane| PrintSource {
+                    plane,
+                    mask: None,
+                    orientation: session.negative.orientation,
+                    name: "t".into(),
+                    description: None,
+                });
+                let out = render_plate(sources, &pi, &params);
+                // The screen: the whole picture as one window of the recipe
+                // on the turned picture.
+                let (turned, on_turned) = recipe.with_turns_applied(session.negative.orientation, w, h);
+                let lay = layout(
+                    w,
+                    h,
+                    turned,
+                    &PrintParams { recipe: on_turned.clone(), ..PrintParams::default() },
+                );
+                assert!(lay.enlargement > 1.0);
+                assert_eq!((out.plane.width, out.plane.height), (lay.out_w, lay.out_h));
+                let table = ToneTable::build_on(&view.tone.compile(), view.screen(&session));
+                let rect = DetailRect { x: 0, y: 0, w: lay.image_w, h: lay.image_h };
+                let shown = render_print_detail(&session, &view, &on_turned, rect, &table).unwrap();
+                assert_eq!((shown.ask.w, shown.ask.h), (lay.image_w, lay.image_h));
+                let rgb = shown.rgb.as_ref().unwrap();
+                for eight_bit in [false, true] {
+                    let path = dir.join(format!("{space:?}-{quarter_turns}-{eight_bit}.tif"));
+                    write_as(&out, &path, &params, FileOptions { eight_bit, rgb: false }).unwrap();
+                    let file = read_rgb16(&path).unwrap();
+                    let mut off_by_one = 0usize;
+                    for y in 0..lay.image_h {
+                        for x in 0..lay.image_w {
+                            for (c, plane) in file.iter().enumerate() {
+                                let face =
+                                    (plane.at(lay.picture_x + x, lay.picture_y + y) * 255.0).round() as i32;
+                                let on_screen = i32::from(rgb[(y * lay.image_w + x) * 3 + c]);
+                                let d = (on_screen - face).abs();
+                                assert!(
+                                    d <= 1,
+                                    "{space:?}, {quarter_turns} turns, 8 bit {eight_bit}, channel {c} at {x},{y}: \
+                                     the screen is {d} levels from the file"
+                                );
+                                off_by_one += (d == 1) as usize;
+                                shadows += (space == PlateSpace::Srgb && (4..40).contains(&face)) as usize;
+                            }
+                        }
+                    }
+                    // A level off where a rounding falls the other way: the
+                    // table reads the placed value at a 16-bit slot, the
+                    // file evaluates it. This picture stands deep in the
+                    // shadows, where the paper is steepest, so the share is
+                    // above the grey sheet's (measured: 0.14 to 0.18 %, in
+                    // the Adobe space, whose screen is the print's values,
+                    // as in sRGB).
+                    let samples = 3 * lay.image_w * lay.image_h;
+                    assert!(
+                        off_by_one * 250 <= samples,
+                        "{space:?}, {quarter_turns} turns, 8 bit {eight_bit}: {off_by_one} of {samples} a level off"
+                    );
+                }
+            }
+        }
+        // The comparison reached the deep shadows, where the two curves part.
+        assert!(shadows > 2000, "only {shadows} shadow samples compared");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

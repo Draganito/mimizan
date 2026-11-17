@@ -123,7 +123,11 @@ matrix/TRC profile with the D50-adapted colorants. The sRGB file is
 written on the sRGB curve, each value as the sRGB encoding of the light
 it stands for, under the profile `sRGB IEC61966-2.1`; the Adobe RGB
 file keeps the gamma 2.2 under a profile named `compatible with Adobe
-RGB (1998)`. `--lamp R,B` adds stops of exposure to the red and
+RGB (1998)`. The window shows a plate in sRGB in the file's samples
+(`print::file_sample`, the rule the writer uses), so the screen and the
+exported file are one picture down to the deep shadows, where the two
+curves part by up to 3 L*; its histogram and clip marks stay on the
+print's values. `--lamp R,B` adds stops of exposure to the red and
 blue positive, the lamps of the projector; it is the only colour control.
 
 ```bash

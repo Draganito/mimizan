@@ -1298,7 +1298,12 @@ fn file_space(
 
 /// The curve the print's values are encoded with.
 fn look_trc(recipe: &Recipe) -> GrayTrc {
-    match recipe.curve.encoding() {
+    encoding_trc(recipe.curve.encoding())
+}
+
+/// The curve of print values encoded `encoding`.
+fn encoding_trc(encoding: crate::calib::LookEncoding) -> GrayTrc {
+    match encoding {
         crate::calib::LookEncoding::Gamma22 => GrayTrc::Gamma(2.2),
         crate::calib::LookEncoding::None => GrayTrc::Linear,
     }
@@ -1340,6 +1345,27 @@ fn file_value(v: f64, trc: GrayTrc) -> f64 {
         GrayTrc::Srgb => crate::kodak::srgb_encode(v.powf(crate::zone::GAMMA)),
         GrayTrc::Gamma(_) | GrayTrc::Linear => v,
     }
+}
+
+/// The curve the samples of a print's file are on, as [`write`] writes
+/// it: a plate in `space`, or the grey sheet when that is `None`, the
+/// print's values encoded `encoding`. With [`file_sample`] it is what a
+/// screen needs to show the file and not only the print: the window and
+/// the phone read the rule here, so they cannot hold another one. A grey
+/// sheet written as RGB ([`FileOptions::rgb`]) is not asked for here; it
+/// is the grey print in another file.
+pub fn sample_curve(
+    space: Option<crate::plate::PlateSpace>,
+    encoding: crate::calib::LookEncoding,
+) -> GrayTrc {
+    file_trc(space, encoding_trc(encoding))
+}
+
+/// The sample a print value has in a file on `curve`, both in [0, 1]:
+/// the value itself, or on the sRGB curve the sRGB encoding of the light
+/// it stands for. The number [`write_as`] quantises.
+pub fn file_sample(v: f64, curve: GrayTrc) -> f64 {
+    file_value(v, curve)
 }
 
 /// `look_encoding` of the description: the curve of the embedded profile.
@@ -3271,10 +3297,16 @@ mod tests {
         assert_eq!((back.channels, back.bits), (3, 16));
         assert_eq!(back.icc, crate::icc::rgb_profile(PlateSpace::Srgb, GrayTrc::Srgb));
         assert_eq!(back.description["look_encoding"], "srgb");
+        // What a screen is given to show this file: the same number.
+        let gamma = crate::calib::LookEncoding::Gamma22;
+        let on_srgb = sample_curve(Some(PlateSpace::Srgb), gamma);
+        assert_eq!(on_srgb, GrayTrc::Srgb);
         for i in 0..n {
             for (c, plane) in [&out.plane, &sheet.green, &sheet.blue].into_iter().enumerate() {
                 let want = crate::kodak::srgb_encode(light(plane.data[i]));
                 assert!((back.samples[3 * i + c] - want).abs() <= 0.5 / 65535.0 + 1e-12);
+                let code = (file_sample(plane.data[i], on_srgb) * 65535.0).round();
+                assert_eq!(code, (back.samples[3 * i + c] * 65535.0).round(), "sample {i} channel {c}");
             }
         }
 
@@ -3284,6 +3316,25 @@ mod tests {
         write_as(&out, &path, &p, FileOptions { eight_bit: true, rgb: false }).unwrap();
         let back = read_back(&path);
         assert_eq!((back.channels, back.bits), (3, 8));
+        // The Adobe file and the grey sheet hold the print's own values.
+        let on_adobe = sample_curve(Some(PlateSpace::AdobeRgb), gamma);
+        assert_eq!((on_adobe, sample_curve(None, gamma)), (GrayTrc::Gamma(2.2), GrayTrc::Gamma(2.2)));
+        for i in 0..n {
+            for (c, plane) in [&out.plane, &sheet.green, &sheet.blue].into_iter().enumerate() {
+                let code = (file_sample(plane.data[i], on_adobe) * 255.0).round();
+                assert_eq!(code, (back.samples[3 * i + c] * 255.0).round(), "sample {i} channel {c}");
+                assert_eq!(file_sample(plane.data[i], on_adobe), plane.data[i].clamp(0.0, 1.0));
+            }
+        }
+        // A look without an encoding is linear in every file, on the screen too.
+        let none = crate::calib::LookEncoding::None;
+        assert_eq!(sample_curve(Some(PlateSpace::Srgb), none), GrayTrc::Linear);
+        assert_eq!(file_sample(0.25, GrayTrc::Linear), 0.25);
+        // The ends stay the ends, and the curve only moves the shadows much.
+        assert_eq!(file_sample(0.0, on_srgb), 0.0);
+        assert!((file_sample(1.0, on_srgb) - 1.0).abs() < 1e-12);
+        assert_eq!((file_sample(1.0, on_srgb) * 65535.0).round(), 65535.0);
+        assert!(file_sample(0.1, on_srgb) < 0.1 && (file_sample(0.5, on_srgb) - 0.5).abs() < 0.01);
         assert_eq!(back.icc, crate::icc::rgb_profile(PlateSpace::AdobeRgb, GrayTrc::Gamma(2.2)));
         assert_eq!(back.description["look_encoding"], "gamma22");
         let file = FileOptions::default();

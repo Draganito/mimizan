@@ -856,7 +856,8 @@ file keeps the paper's gamma 2.2, which is that space's own curve. The
 sRGB file is written on the sRGB curve, each value $v$ as the sRGB
 encoding of the light $v^{2.2}$ it stands for, under the profile of that
 name: the light is the same, and the file is sRGB to a reader that only
-assumes it. The TIFF has 16 bits a sample, or 8 on request, and a grey
+assumes it. The desktop's window shows a plate in sRGB in those samples,
+by the writer's own rule, and counts $v$ in its histogram. The TIFF has 16 bits a sample, or 8 on request, and a grey
 sheet can be written as RGB with three equal channels, in sRGB by the
 same encoding, for a print service that takes no greyscale file. The file
 still records the one-arc-minute radius

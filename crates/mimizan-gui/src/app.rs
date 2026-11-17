@@ -13,7 +13,7 @@ use crate::filter_strip::{self, filter_ink, filter_short, filter_strip, Field};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::lamp_bar::{lamp_bar, Lamp};
 use crate::paper_strip::paper_strip;
-use crate::session::{DetailAsk, Histogram, PlateView, Session, ViewParams, DETAIL_MARGIN};
+use crate::session::{DetailAsk, Histogram, PlateView, Screen, Session, ViewParams, DETAIL_MARGIN};
 use crate::toolbar::{self, Chip, Icon};
 use crate::unlock::{self, Unlock};
 use crate::worker::{
@@ -1686,6 +1686,13 @@ impl App {
         Some(PlateView { weights: *weights, space: params.space, lamps: self.edit.lamps_rgb() })
     }
 
+    /// What the screen shows the print's values as: the samples of the
+    /// file the print would be written to. The picture comes from the
+    /// worker so; the strip and the sheet's rings are painted here.
+    fn screen(&self) -> Screen {
+        Screen::of(&self.edit.recipe.curve, self.plate_view().as_ref())
+    }
+
     /// The orientation of the picture on the stage: the file's plus the
     /// recipe's 90° turns. The print box, the measurement and the linear
     /// export apply it with `print_recipe`; the print export hands the
@@ -1808,12 +1815,15 @@ impl App {
         let Some(l) = self.print_layout() else { return Rings::default() };
         let scale = tw as f32 / l.image_w.max(1) as f32;
         let tone = self.edit.recipe.curve.compile();
+        // The paper round the picture is the picture's paper: the same
+        // screen value for the same print value.
+        let screen = self.screen();
         Rings {
             black_tex: stage_black_px(l.border_px, l.black_px, l.picture_x, l.picture_y) as f32 * scale,
             frame_x_tex: l.picture_x as f32 * scale,
             frame_y_tex: l.picture_y as f32 * scale,
-            white: (tone.white().clamp(0.0, 1.0) * 255.0).round() as u8,
-            black: (tone.eval(0.0).clamp(0.0, 1.0) * 255.0).round() as u8,
+            white: screen.byte(tone.white()),
+            black: screen.byte(tone.eval(0.0)),
         }
     }
 
@@ -4596,7 +4606,7 @@ impl App {
             return;
         };
         let mut split = split;
-        paper_strip(ui, self.picture_id(), &mut split, width);
+        paper_strip(ui, self.picture_id(), &mut split, width, self.screen());
         if self.edit.recipe.curve.as_paper() != Some(&split) {
             self.edit.recipe.curve = Tone::Paper(split.clone());
         }

@@ -845,7 +845,7 @@ fn paint_preview(
     if view_changed {
         hold.held = None;
     }
-    let table = hold.tones.get(&req.view.tone);
+    let table = hold.tones.get(&req.view.tone, req.view.screen(&req.session));
     // Under a stroke being painted with a sharp window up, the window
     // covers what is seen: the small picture waits for the release (the
     // view differs then, and it is rendered), the window follows the hand.
