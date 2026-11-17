@@ -147,7 +147,9 @@ meanwhile.
    the paper strip. Drag the strip: lighter or darker. Pinch it: harder;
    spread it: softer. A double tap is the base print again, and a
    second one brings the pair back. Behind the strip sit the same
-   *soft* and *hard* as on the computer; the print is the same.
+   *soft* and *hard* as on the computer; the print is the same. In
+   *Color* the two lamps sit under the strip, red left and blue right:
+   drag one, and a double tap is zero and back.
 3. **Export** writes a JPEG, a TIFF, or the linear negative for the
    desktop.
 
