@@ -21,6 +21,11 @@
 //!   [--bank "a,ac,c1,c2,n,l;..."]  further priors for the oracle to choose from
 //!   [--vary "chroma:0.25,4;lens:-0.2,0.2"]  further priors as changes of the (fitted) one
 //!   [--select sigma,sharp,bias]  choose by the local evidence instead of the oracle
+//!   [--curve root|srgb[,linear]]  separate the mosaic under that tone curve and come back;
+//!     with ",linear" the second step runs in linear light after the return
+//!   [--bayer-curved]  as --bayer, the Bayer separation under the same curve
+//!   [--noise a,b,wr,wb]  a camera's noise on the mosaic: variance a·v + b at the sensor, where
+//!     red and blue are 1/wr and 1/wb of the balanced picture; the truth stays clean
 
 use mimizan_core::cfa::BayerPhase;
 use mimizan_core::kodak;
@@ -35,6 +40,30 @@ use std::path::PathBuf;
 fn band(s: &str) -> Band {
     let v: Vec<f64> = s.split(',').map(|x| x.parse().expect("number")).collect();
     Band { along: v[0], across: v[1] }
+}
+
+/// A camera's noise on a balanced mosaic: at the sensor a photosite of
+/// colour `c` holds `v / gain[c]` with variance `a·that + b`.
+fn camera_noise(
+    m: &mut Plane,
+    colour: impl Fn(usize, usize) -> usize,
+    a: f64,
+    b: f64,
+    gain: [f64; 3],
+    seed: u64,
+) {
+    let mut state = seed | 1;
+    let mut uniform = move || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    let w = m.width;
+    for (i, v) in m.data.iter_mut().enumerate() {
+        let g = gain[colour(i % w, i / w)];
+        let sigma = g * (a * (*v / g).max(0.0) + b).sqrt();
+        let normal = (-2.0 * uniform().ln()).sqrt() * (std::f64::consts::TAU * uniform()).cos();
+        *v += sigma * normal;
+    }
 }
 
 fn quantise(p: &mut Plane) {
@@ -166,6 +195,9 @@ fn main() {
     let mut refine: Option<xtrans::Refine> = None;
     let mut dump: Option<PathBuf> = None;
     let mut crops: Vec<(usize, usize, usize)> = Vec::new();
+    let mut curve = String::from("linear");
+    let mut bayer_curved = false;
+    let mut noise: Option<[f64; 4]> = None;
     let mut i = 1;
     while i < args.len() {
         let val = |i: usize| args[i + 1].as_str();
@@ -259,6 +291,11 @@ fn main() {
                 flag = true;
             }
             "--dump" => dump = Some(PathBuf::from(val(i))),
+            "--curve" => curve = val(i).to_string(),
+            "--noise" => {
+                let v: Vec<f64> = val(i).split(',').map(|x| x.parse().unwrap()).collect();
+                noise = Some([v[0], v[1], v[2], v[3]]);
+            }
             "--crop" => {
                 let v: Vec<usize> = val(i).split(',').map(|x| x.parse().unwrap()).collect();
                 crops.push((v[0], v[1], v[2]));
@@ -269,6 +306,11 @@ fn main() {
             }
             "--bayer" => {
                 bayer = true;
+                flag = true;
+            }
+            "--bayer-curved" => {
+                bayer = true;
+                bayer_curved = true;
                 flag = true;
             }
             "--rows" => {
@@ -336,21 +378,56 @@ fn main() {
         let rgb = Rgb { r: crop(&rgb.r), g: crop(&rgb.g), b: crop(&rgb.b) };
         assert!(tile.mirrors(w, h));
         let truth_b = rgb.luminance();
+        let seed =
+            stem.bytes().fold(0x9e37_79b9_7f4a_7c15u64, |h, c| (h ^ c as u64).wrapping_mul(0x100_0000_01b3));
 
+        // The mosaic of a picture under a tone curve is the mosaic under
+        // that curve: separate there, and come back channel by channel.
+        let (kind, second_linear) = match curve.split_once(',') {
+            Some((k, "linear")) => (k, true),
+            Some((k, o)) => panic!("curve {k},{o}"),
+            None => (curve.as_str(), false),
+        };
+        let tone = xtrans::Curve::from_name(kind).unwrap_or_else(|| panic!("curve {kind}"));
+        let (to, back) = (|v: f64| tone.to(v), |v: f64| tone.back(v));
         let mut b = [f64::NAN; 5];
         let mut bayer_rgb: Option<Rgb> = None;
         if bayer {
-            let fb = kodak::mosaic_rgb(&rgb, BayerPhase::RGGB, kodak::quantisation_noise(), &stem);
+            let mut fb = kodak::mosaic_rgb(&rgb, BayerPhase::RGGB, kodak::quantisation_noise(), &stem);
+            if let Some([na, nb, wr, wb]) = noise {
+                let at = |x: usize, y: usize| BayerPhase::RGGB.color_at(x, y) as usize;
+                camera_noise(&mut fb.mosaic.plane, at, na, nb, [wr, 1.0, wb], seed);
+            }
+            let curved = bayer_curved && kind != "linear";
+            if curved {
+                fb.mosaic.plane.data.iter_mut().for_each(|v| *v = to(*v));
+            }
             let sep = separate(&fb.mosaic, &SeparateParams::default()).unwrap();
             let [br, bg, bb] = mix_plate(&sep, &PlateWeights::channels());
-            let out = Rgb { r: br, g: bg, b: bb };
+            let mut out = Rgb { r: br, g: bg, b: bb };
+            let lum = if curved {
+                for pl in [&mut out.r, &mut out.g, &mut out.b] {
+                    pl.data.iter_mut().for_each(|v| *v = back(*v));
+                }
+                out.luminance()
+            } else {
+                sep.lum.clone()
+            };
             let c = cpsnr(&out, &rgb, border);
-            b = [psnr(&sep.lum, &truth_b, border), c[0], c[1], c[2], c[3]];
+            b = [psnr(&lum, &truth_b, border), c[0], c[1], c[2], c[3]];
             bayer_rgb = Some(out);
         }
 
         let mut m = xtrans::mosaic_of(&rgb, &tile);
         quantise(&mut m);
+        if let Some([na, nb, wr, wb]) = noise {
+            let at = |x: usize, y: usize| tile.color_at(x as isize, y as isize) as usize;
+            camera_noise(&mut m, at, na, nb, [wr, 1.0, wb], seed);
+        }
+        let light = m.clone();
+        if kind != "linear" {
+            m.data.iter_mut().for_each(|v| *v = to(*v));
+        }
         if let (Some(stride), Some(start)) = (fit, p.lmmse) {
             let found = xtrans::fit_prior(&m, &tile, &p, start, stride, free);
             if rows {
@@ -438,9 +515,12 @@ fn main() {
         } else {
             xtrans::separate_xtrans(&m, &tile, &p)
         };
-        let xs = match &refine {
-            Some(r) => xtrans::refine(&m, &tile, &xs, r),
-            None => xs,
+        let xs = match (&refine, kind != "linear", second_linear) {
+            (Some(r), true, true) => xtrans::refine(&light, &tile, &xs.mapped(back), r),
+            (Some(r), true, false) => xtrans::refine(&m, &tile, &xs, r).mapped(back),
+            (Some(r), false, _) => xtrans::refine(&m, &tile, &xs, r),
+            (None, true, _) => xs.mapped(back),
+            (None, false, _) => xs,
         };
         let truth_x = Plane::from_vec(
             w,

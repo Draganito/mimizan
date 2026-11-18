@@ -10,6 +10,7 @@
 //!   [--orient n,k[,f..]]  n oriented priors (cos^2k) beside the others, at f times the colour's share (1 and 16)
 //!   [--two]  the second step (colour on one line)
 //!   [--patch x,y,size]  mean of each channel in that window, photosites against separation
+//!   [--curve root|srgb]  separate the mosaic under that tone curve and come back
 //!   [--clip]  the balanced mosaic cut at the level the first channel burns out at, so that burnt areas are white
 //!
 //! Writes the luminance and the colour picture (camera matrix towards
@@ -51,6 +52,7 @@ fn main() {
     let mut given: Option<Prior> = None;
     let mut two = false;
     let mut clip = false;
+    let mut curve = String::from("linear");
     let mut patches: Vec<(usize, usize, usize)> = Vec::new();
     let mut free = [true; 6];
     let mut orient: Option<(usize, f64, Vec<f64>)> = None;
@@ -71,6 +73,10 @@ fn main() {
             "--single" => single = true,
             "--two" => two = true,
             "--clip" => clip = true,
+            "--curve" => {
+                curve = args[i + 1].clone();
+                i += 1;
+            }
             "--patch" => {
                 let v: Vec<usize> = args[i + 1].split(',').map(|x| x.parse().unwrap()).collect();
                 patches.push((v[0], v[1], v[2]));
@@ -242,6 +248,14 @@ fn main() {
         return;
     }
 
+    // The mosaic of a picture under a tone curve is the mosaic under
+    // that curve: separate there, and come back channel by channel.
+    let light = m.clone();
+    let tone = xtrans::Curve::from_name(&curve).unwrap_or_else(|| panic!("curve {curve}"));
+    if tone != xtrans::Curve::Linear {
+        m = tone.mosaic(&m);
+    }
+
     let p = XParams::default();
     let t1 = std::time::Instant::now();
     let prior = given.unwrap_or_else(|| {
@@ -283,6 +297,9 @@ fn main() {
         sep = xtrans::refine(&m, &tile, &sep, &xtrans::Refine::default());
         eprintln!("second step in {:.1} s", t3.elapsed().as_secs_f64());
     }
+    if tone != xtrans::Curve::Linear {
+        sep = sep.mapped(|v| tone.back(v));
+    }
 
     // Mean of each channel in a window: the photosites of each colour
     // against the separation's three channels.
@@ -293,7 +310,7 @@ fn main() {
         for y in py..py + size {
             for x in px..px + size {
                 let c = tile.color_at(x as isize, y as isize) as usize;
-                site[c].0 += m.at(x, y);
+                site[c].0 += light.at(x, y);
                 site[c].1 += 1.0;
                 for (k, pl) in [&out.r, &out.g, &out.b].iter().enumerate() {
                     mean[k] += pl.at(x, y) / (size * size) as f64;

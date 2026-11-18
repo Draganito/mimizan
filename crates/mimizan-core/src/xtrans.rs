@@ -54,6 +54,29 @@
 //!    takes them out. Kept only where the luminance comes out smoother,
 //!    which here (one candidate against the first step, not many against
 //!    each other) is a test that holds.
+//! 6. Under a tone curve ([`Curve`]). A curve applied photosite by
+//!    photosite to the mosaic gives the mosaic of the picture under that
+//!    curve, so the separation can run there and each channel be taken
+//!    back. Under the sRGB curve the photon noise is nearly the same at
+//!    every level, shadows and lights of one frame come closer together
+//!    (one prior has to serve both), and the error is made small where it
+//!    is measured and seen. Linear pictures from a camera gain about 1 dB,
+//!    the Kodak pictures 2 to 5 dB (they were made under such a curve).
+//!    A Bayer mosaic gains as much.
+//! 7. The search for the prior from several starts ([`fit_prior`]). Little
+//!    noise behind no lens explains a noisy mosaic nearly as well as the
+//!    noise does, and the search from one start ended there on some
+//!    frames and on some parts of a frame. The most probable of four ends
+//!    is taken. On a mosaic with heavy noise this prior measures 0.5 dB
+//!    below the less probable one: a prior that denies the noise lets the
+//!    colour take part of it out of the luminance.
+//! 8. One level per window of the search instead of one for all: a frame
+//!    at ISO 3200 then gets hardly any noise and no lens. Taken out.
+//! 9. A noise of its own at red, green and blue photosites, which the
+//!    balance gives them. The evidence is higher and the search finds the
+//!    noise more surely, but the picture is 0.1 to 0.5 dB worse and the
+//!    noisier photosites stand in the luminance as a dotted grain. Taken
+//!    out.
 //!
 //! The filters are applied by FFT on tiles: a tool for finding the
 //! method, not the form a release would have.
@@ -786,7 +809,8 @@ fn evidence(samples: &[Sample], prior: &Prior, stride: usize) -> f64 {
 
 /// The prior under which the mosaic itself is most probable, searched
 /// from `start` (Nelder–Mead over the two exponents, the two chrominance
-/// shares, the noise and the lens). Up to nine windows of the frame are
+/// shares, the noise and the lens) and from three more starts with more
+/// noise, a wider lens and both. Up to nine windows of the frame are
 /// looked at, every `stride`-th set of each.
 pub fn fit_prior(
     m: &Plane,
@@ -851,54 +875,123 @@ pub fn fit_prior(
     };
     let cost = |z: &[f64]| -evidence(&samples, &to_prior(z), stride);
     let steps = [0.6, 0.6, 1.0, 1.0, 2.0, 0.35];
-    let z0: Vec<f64> = dims.iter().map(|i| x0[*i]).collect();
-    let mut simplex: Vec<(Vec<f64>, f64)> = vec![(z0.clone(), cost(&z0))];
-    for (k, i) in dims.iter().enumerate() {
-        let mut z = z0.clone();
-        z[k] += steps[*i];
-        let c = cost(&z);
-        simplex.push((z, c));
-    }
-    for _ in 0..220 {
-        simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
-        if simplex[nd].1 - simplex[0].1 < 2e-6 {
-            break;
-        }
-        let mut centre = vec![0.0; nd];
-        for (z, _) in &simplex[..nd] {
-            for (c, v) in centre.iter_mut().zip(z) {
-                *c += v / nd as f64;
+    let z_start: Vec<f64> = dims.iter().map(|i| x0[*i]).collect();
+    // The search has more than one valley: little noise behind no lens
+    // explains a noisy mosaic nearly as well as the noise does. It is
+    // run from several starts, and the most probable end is taken.
+    let mut ends: Vec<(Vec<f64>, f64)> = Vec::new();
+    for (more_noise, more_lens) in [(0.0, 0.0), (6.0, 0.0), (0.0, 0.5), (6.0, 0.5)] {
+        let mut z0 = z_start.clone();
+        for (v, i) in z0.iter_mut().zip(&dims) {
+            match *i {
+                4 => *v += more_noise,
+                5 => *v += more_lens,
+                _ => {}
             }
         }
-        let worst = simplex[nd].clone();
-        let along = |t: f64| -> (Vec<f64>, f64) {
-            let z: Vec<f64> = centre.iter().zip(&worst.0).map(|(c, v)| c + t * (v - c)).collect();
+        let mut simplex: Vec<(Vec<f64>, f64)> = vec![(z0.clone(), cost(&z0))];
+        for (k, i) in dims.iter().enumerate() {
+            let mut z = z0.clone();
+            z[k] += steps[*i];
             let c = cost(&z);
-            (z, c)
-        };
-        let reflected = along(-1.0);
-        if reflected.1 < simplex[0].1 {
-            let expanded = along(-2.0);
-            simplex[nd] = if expanded.1 < reflected.1 { expanded } else { reflected };
-        } else if nd > 1 && reflected.1 < simplex[nd - 1].1 {
-            simplex[nd] = reflected;
-        } else {
-            let contracted = along(if reflected.1 < worst.1 { -0.5 } else { 0.5 });
-            if contracted.1 < worst.1.min(reflected.1) {
-                simplex[nd] = contracted;
+            simplex.push((z, c));
+        }
+        for _ in 0..220 {
+            simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
+            if simplex[nd].1 - simplex[0].1 < 2e-6 {
+                break;
+            }
+            let mut centre = vec![0.0; nd];
+            for (z, _) in &simplex[..nd] {
+                for (c, v) in centre.iter_mut().zip(z) {
+                    *c += v / nd as f64;
+                }
+            }
+            let worst = simplex[nd].clone();
+            let along = |t: f64| -> (Vec<f64>, f64) {
+                let z: Vec<f64> = centre.iter().zip(&worst.0).map(|(c, v)| c + t * (v - c)).collect();
+                let c = cost(&z);
+                (z, c)
+            };
+            let reflected = along(-1.0);
+            if reflected.1 < simplex[0].1 {
+                let expanded = along(-2.0);
+                simplex[nd] = if expanded.1 < reflected.1 { expanded } else { reflected };
+            } else if nd > 1 && reflected.1 < simplex[nd - 1].1 {
+                simplex[nd] = reflected;
             } else {
-                let best = simplex[0].0.clone();
-                for v in simplex.iter_mut().skip(1) {
-                    for (x, b) in v.0.iter_mut().zip(&best) {
-                        *x = b + 0.5 * (*x - b);
+                let contracted = along(if reflected.1 < worst.1 { -0.5 } else { 0.5 });
+                if contracted.1 < worst.1.min(reflected.1) {
+                    simplex[nd] = contracted;
+                } else {
+                    let best = simplex[0].0.clone();
+                    for v in simplex.iter_mut().skip(1) {
+                        for (x, b) in v.0.iter_mut().zip(&best) {
+                            *x = b + 0.5 * (*x - b);
+                        }
+                        v.1 = cost(&v.0);
                     }
-                    v.1 = cost(&v.0);
                 }
             }
         }
+        simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
+        ends.push(simplex.swap_remove(0));
     }
-    simplex.sort_by(|a, b| a.1.total_cmp(&b.1));
-    to_prior(&simplex[0].0)
+    ends.sort_by(|a, b| a.1.total_cmp(&b.1));
+    to_prior(&ends[0].0)
+}
+
+/// A tone curve to separate under: applied to every photosite of the
+/// mosaic it gives the mosaic of the picture under that curve, and the
+/// separation's channels are taken back one by one
+/// ([`XSeparation::mapped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Curve {
+    /// None: the mosaic as it is.
+    Linear,
+    /// The square root, odd about zero: photon noise the same at every
+    /// level, but endlessly steep at black.
+    Root,
+    /// The sRGB curve, its straight foot continued below zero and its
+    /// power above one.
+    Srgb,
+}
+
+impl Curve {
+    /// `linear`, `root` or `srgb`.
+    pub fn from_name(name: &str) -> Option<Curve> {
+        match name {
+            "linear" => Some(Curve::Linear),
+            "root" => Some(Curve::Root),
+            "srgb" => Some(Curve::Srgb),
+            _ => None,
+        }
+    }
+
+    /// From light to the curve.
+    pub fn to(self, v: f64) -> f64 {
+        match self {
+            Curve::Linear => v,
+            Curve::Root => v.signum() * v.abs().sqrt(),
+            Curve::Srgb if v <= 0.003_130_8 => 12.92 * v,
+            Curve::Srgb => 1.055 * v.powf(1.0 / 2.4) - 0.055,
+        }
+    }
+
+    /// From the curve back to light.
+    pub fn back(self, v: f64) -> f64 {
+        match self {
+            Curve::Linear => v,
+            Curve::Root => v.signum() * v * v,
+            Curve::Srgb if v <= 0.04045 => v / 12.92,
+            Curve::Srgb => ((v + 0.055) / 1.055).powf(2.4),
+        }
+    }
+
+    /// The mosaic under the curve.
+    pub fn mosaic(self, m: &Plane) -> Plane {
+        Plane::from_vec(m.width, m.height, m.data.iter().map(|v| self.to(*v)).collect())
+    }
 }
 
 /// Luminance and the two chrominances of an X-Trans mosaic.
@@ -915,6 +1008,24 @@ pub struct XSeparation {
 }
 
 impl XSeparation {
+    /// The same picture with each of its three channels passed through
+    /// `f`: back from a tone curve the mosaic was separated under.
+    pub fn mapped(&self, f: impl Fn(f64) -> f64 + Sync) -> XSeparation {
+        let rgb = self.rgb();
+        let (w, h, g) = (self.lum.width, self.lum.height, self.g);
+        let n = self.lum.data.len();
+        let px: Vec<[f64; 3]> =
+            (0..n).into_par_iter().map(|i| [f(rgb.r.data[i]), f(rgb.g.data[i]), f(rgb.b.data[i])]).collect();
+        let plane =
+            |of: &(dyn Fn(&[f64; 3]) -> f64 + Sync)| Plane::from_vec(w, h, px.par_iter().map(of).collect());
+        XSeparation {
+            lum: plane(&|c| g * c[1] + (1.0 - g) * (c[0] + c[2]) / 2.0),
+            c1: plane(&|c| c[1] - (c[0] + c[2]) / 2.0),
+            c2: plane(&|c| (c[0] - c[2]) / 2.0),
+            g,
+        }
+    }
+
     /// The three channels: the luminance plus the band-limited colour.
     pub fn rgb(&self) -> Rgb {
         let n = self.lum.data.len();
@@ -1574,6 +1685,66 @@ mod tests {
             fit_prior(&m, &t, &XParams::default(), Prior { lens: 0.3, ..Prior::default() }, 1, [true; 6]);
         assert!((found.lens - lens).abs() < 0.15, "{found:?}");
         assert!(found.chroma[0] < 0.2 && found.chroma[1] < 0.2, "{found:?}");
+    }
+
+    /// The same under heavy noise: lens and noise are both found.
+    #[test]
+    fn the_prior_is_found_under_noise() {
+        let (w, h) = (304, 211);
+        let mut rng = crate::synth::Rng::new(7);
+        let mut rgb = Rgb::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = 0.5 + 0.1 * rng.gaussian();
+                rgb.set(x, y, l + 0.02 * rng.gaussian(), l, l + 0.02 * rng.gaussian());
+            }
+        }
+        let lens = 1.0;
+        let blur = |p: &Plane| crate::usm::gaussian_blur(p, lens);
+        let rgb = Rgb { r: blur(&rgb.r), g: blur(&rgb.g), b: blur(&rgb.b) };
+        let t = fuji().shifted(2, 2);
+        let mut m = mosaic_of(&rgb, &t);
+        m.data.iter_mut().for_each(|v| *v += 0.01 * rng.gaussian());
+        let found =
+            fit_prior(&m, &t, &XParams::default(), Prior { lens: 0.3, ..Prior::default() }, 1, [true; 6]);
+        eprintln!("{found:?}");
+        assert!((found.lens - lens).abs() < 0.2, "{found:?}");
+        assert!(found.noise > 1e-3, "{found:?}");
+    }
+
+    /// A curve and its way back are each other's inverse, below zero and
+    /// above one as well, and a separation taken back through a curve is
+    /// the picture taken back channel by channel.
+    #[test]
+    fn a_curve_comes_back() {
+        for curve in [Curve::Linear, Curve::Root, Curve::Srgb] {
+            for v in [-0.2, -0.001, 0.0, 0.001, 0.003, 0.004, 0.18, 1.0, 1.9] {
+                let back = curve.back(curve.to(v));
+                assert!((back - v).abs() < 1e-12, "{curve:?} {v} {back}");
+            }
+            assert!(curve.to(0.2) > curve.to(0.1) && curve.to(-0.1) < 0.0);
+        }
+        let (w, h) = (22, 19);
+        let mut rgb = Rgb::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                rgb.set(x, y, 0.1 + 0.03 * x as f64, 0.2 + 0.02 * y as f64, 0.5 - 0.01 * x as f64);
+            }
+        }
+        let g = 5.0 / 9.0;
+        let plane = |of: &dyn Fn(usize) -> f64| Plane::from_vec(w, h, (0..w * h).map(of).collect());
+        let s = XSeparation {
+            lum: plane(&|i| g * rgb.g.data[i] + (1.0 - g) * (rgb.r.data[i] + rgb.b.data[i]) / 2.0),
+            c1: plane(&|i| rgb.g.data[i] - (rgb.r.data[i] + rgb.b.data[i]) / 2.0),
+            c2: plane(&|i| (rgb.r.data[i] - rgb.b.data[i]) / 2.0),
+            g,
+        };
+        let out = s.mapped(|v| Curve::Srgb.back(v)).rgb();
+        for i in 0..w * h {
+            for (a, b) in [(&out.r, &rgb.r), (&out.g, &rgb.g), (&out.b, &rgb.b)] {
+                assert!((a.data[i] - Curve::Srgb.back(b.data[i])).abs() < 1e-12);
+            }
+        }
     }
 
     /// Several priors weighed per pixel, differing only in the colour's
