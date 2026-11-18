@@ -3696,6 +3696,13 @@ impl App {
                 "The sensor has no colour filter: this file is the measurement, and it prints monochrome.",
                 "No plate from a monochrome sensor.",
             )
+        } else if self.session.as_ref().is_some_and(|s| s.is_channels()) {
+            (
+                "The monochrome negative: the luminance of the file's three channels, printed split-grade (P \
+                 switches)",
+                "The three-colour plate: the file's channels mixed through three taking filters, printed \
+                 through the same paper into one colour file, Prokudin-Gorsky's way (P switches)",
+            )
         } else {
             (
                 "The monochrome negative: the luminance separated from the mosaic, printed split-grade (P switches)",
@@ -4072,7 +4079,7 @@ impl App {
         let Some(s) = self.session.clone() else {
             ui.label("Open a RAW file or drop it here.");
             ui.add_space(8.0);
-            ui.label(RichText::new("Bayer sensors: Nikon Z f (NEF) and other rawler-supported cameras, in either process, the monochrome negative or the three-colour plate. Monochrome sensors (DNG without CFA) pass through without separation.").weak());
+            ui.label(RichText::new("Bayer sensors: Nikon Z f (NEF) and other rawler-supported cameras, in either process, the monochrome negative or the three-colour plate. Monochrome sensors (DNG without CFA) pass through without separation, and so does a linear DNG, which has its three channels already.").weak());
             return;
         };
         let n = &s.negative;
@@ -4107,7 +4114,20 @@ impl App {
             val(ui, format!("{} x {} @ {} bit", n.plane.width, n.plane.height, info.camera.bits));
             ui.end_row();
             ui.label("pattern");
-            val(ui, info.phase.clone().map(|p| format!("Bayer {p}")).unwrap_or_else(|| "monochrome".into()));
+            val(
+                ui,
+                match &info.phase {
+                    Some(p) => format!("Bayer {p}"),
+                    None if s.is_channels() => "three channels (linear DNG)".into(),
+                    None => "monochrome".into(),
+                },
+            )
+            .on_hover_text(if s.is_channels() {
+                "The file holds red, green and blue at every pixel: whatever wrote it made them. \
+                 Nothing is separated here."
+            } else {
+                ""
+            });
             ui.end_row();
             ui.label("orientation");
             val(
@@ -4166,6 +4186,9 @@ impl App {
             if s.is_mono() {
                 ui.label("colour");
                 val(ui, "none: the sensor has no colour filter");
+            } else if s.is_channels() {
+                ui.label("colour");
+                val(ui, "the file's three channels, not separated");
             } else {
                 ui.label("mask");
                 val(ui, format!("{:?}, {} round(s)", info.mask, info.rounds));
@@ -4174,7 +4197,7 @@ impl App {
             ui.label("timing");
             val(
                 ui,
-                if s.is_mono() {
+                if s.is_mono() || s.is_channels() {
                     format!("decode {} · ingest {} ms", info.timing.decode_ms, info.timing.ingest_ms)
                 } else {
                     format!(
@@ -4214,7 +4237,14 @@ impl App {
                 return;
             }
             ui.label(RichText::new("Changes here recompute the picture.").weak());
-            ui.label(RichText::new("Separation, no demosaic.").weak());
+            ui.label(
+                RichText::new(if s.is_channels() {
+                    "The file's three channels: nothing to separate, the mask does not apply."
+                } else {
+                    "Separation, no demosaic."
+                })
+                .weak(),
+            );
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("white balance")
                     .selected_text(match self.wb_choice {
@@ -4255,14 +4285,16 @@ impl App {
                 });
                 self.wb_manual[1] = 1.0;
             }
-            egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
-                ui,
-                |ui| {
-                    ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
-                    ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
-                    ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
-                },
-            );
+            if !s.is_channels() {
+                egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
+                    ui,
+                    |ui| {
+                        ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
+                        ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
+                        ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
+                    },
+                );
+            }
             let differs = self.develop_params() != s.develop;
             if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
                 // Sent at the start of the next frame, when this panel's
@@ -4428,6 +4460,9 @@ impl App {
             let raw_tip = if self.session.as_ref().is_some_and(|s| s.is_mono()) {
                 "The sensor as shot, one channel, normalised by its black and white level, on a gamma-2.2 axis. \
                  The percentage is pixels at the white level."
+            } else if self.session.as_ref().is_some_and(|s| s.is_channels()) {
+                "The file's three channels (R, G, B) as it holds them, each normalised by its black and \
+                 white level, on a gamma-2.2 axis. The percentages are pixels at the white level."
             } else {
                 "The four sensor channels as shot (R, G1, G2, B by tile position), each normalised by its \
                  black and white level, on a gamma-2.2 axis. The percentages are pixels at the white level."

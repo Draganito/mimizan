@@ -234,8 +234,11 @@ method and the subject of §4.3–4.4.
 
 Input: Bayer RAW with a 2×2 pattern (RGGB, BGGR, GRBG, GBRG), integer
 (≤ 16 bit) or float, and monochrome DNGs (`LinearRaw` / `BlackIsZero` with
-one component, for which $L = m$ and nothing below applies). Excluded with an
-error, no fallback: X-Trans, full-resolution Quad-Bayer, Foveon, Nikon
+one component, for which $L = m$ and nothing below applies). A linear DNG
+with three components (`LinearRaw`) is read as its three channels: $L$, $C_1$
+and $C_2$ are those of the model above, computed from the channels, and
+nothing is separated; what the channels are worth was decided by whatever
+wrote the file. Excluded with an error, no fallback: X-Trans, full-resolution Quad-Bayer, Foveon, Nikon
 High-Efficiency NEF, files without a usable CFA description.
 
 ---

@@ -19,7 +19,8 @@ fn channel_colour(c: Color, second_green: bool) -> Color32 {
 
 /// Four CFA channels as outlines on one gamma-2.2 axis, each normalised to
 /// its own peak (excluding the end bins) so the shapes compare; the
-/// clipping fraction per channel is printed beside the legend.
+/// clipping fraction per channel is printed beside the legend. A
+/// three-channel file has three, and one green.
 pub fn raw_histogram_widget(ui: &mut Ui, h: &RawHistogram, size: egui::Vec2, log_scale: bool) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -44,8 +45,9 @@ pub fn raw_histogram_widget(ui: &mut Ui, h: &RawHistogram, size: egui::Vec2, log
         );
         return;
     }
+    let shown = if h.channels { 3 } else { 4 };
     let mut seen_green = false;
-    for t in 0..4 {
+    for t in 0..shown {
         let colour = channel_colour(h.colors[t], h.colors[t] == Color::G && seen_green);
         seen_green |= h.colors[t] == Color::G;
         draw_channel(&painter, rect, &h.bins[t], log_scale, colour);
@@ -54,10 +56,11 @@ pub fn raw_histogram_widget(ui: &mut Ui, h: &RawHistogram, size: egui::Vec2, log
     let font = egui::FontId::proportional(10.5);
     let mut y = rect.top() + 3.0;
     seen_green = false;
-    for t in 0..4 {
+    for t in 0..shown {
         let colour = channel_colour(h.colors[t], h.colors[t] == Color::G && seen_green);
         let name = match h.colors[t] {
             Color::R => "R",
+            Color::G if h.channels => "G",
             Color::G if seen_green => "G2",
             Color::G => "G1",
             Color::B => "B",

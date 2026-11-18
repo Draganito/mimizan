@@ -1,5 +1,6 @@
-//! Small pictures of RAW files for a folder browser: the mosaic binned to
-//! the balanced channels, then mixed once to the grey of the development's
+//! Small pictures of RAW files for a folder browser: the mosaic (or the
+//! three channels of a file that has them) binned to the balanced
+//! channels, then mixed once to the grey of the development's
 //! weights and once to the colour of the plate's taking filters. No
 //! separation is needed, the binning removes the chrominance carrier. The
 //! camera's embedded JPEG was measured as the alternative and rejected:
@@ -44,8 +45,9 @@ pub fn browser_plate(frame: &RawFrame) -> PlateWeights {
 /// is at most `long_edge`. Each bin averages its samples per colour after
 /// black and white levels and applies `wb` (G = 1); the grey is the mix
 /// with `weights` (balanced space), the colour the three rows of `plate`.
-/// A monochrome sensor averages everything and is grey in both. Values
-/// above 1 are clipped, like the negative's saturated pixels.
+/// A monochrome sensor averages everything and is grey in both; a
+/// three-channel file averages each of its channels. Values above 1 are
+/// clipped, like the negative's saturated pixels.
 ///
 /// A bin with a photosite above the colour ceiling
 /// (`ingest::colour_ceiling`) is mixed as the developed picture is: its
@@ -85,29 +87,42 @@ pub fn binned(
                 let mut above = false;
                 let y0 = c.y + oy * f;
                 let x0 = c.x + ox * f;
+                let mut take = |ch: usize, raw: f64, black: f64, white: f64| {
+                    let v = ((raw - black) / (white - black).max(1.0)).max(0.0);
+                    sum[ch] += v;
+                    held[ch] += (wb[ch] * v).min(ceiling);
+                    above |= wb[ch] * v > ceiling;
+                    n[ch] += 1;
+                };
                 for y in y0..(y0 + f).min(c.y + c.h) {
                     for x in x0..(x0 + f).min(c.x + c.w) {
-                        let black = frame.black_at(x, y);
-                        let white = frame.white_at(x, y);
-                        let raw = frame.data.get(y * frame.width + x);
-                        let v = ((raw - black) / (white - black).max(1.0)).max(0.0);
+                        if frame.kind == SensorKind::Rgb {
+                            let raw = frame.rgb_at(x, y);
+                            for (ch, &v) in raw.iter().enumerate() {
+                                let (black, white) = frame.channel_levels(ch);
+                                take(ch, v, black, white);
+                            }
+                            continue;
+                        }
                         let ch = match frame.kind {
                             SensorKind::Bayer(ph) => match ph.color_at(x, y) {
                                 Color::R => 0,
                                 Color::G => 1,
                                 Color::B => 2,
                             },
-                            SensorKind::Mono => 1,
+                            SensorKind::Mono | SensorKind::Rgb => 1,
                         };
-                        sum[ch] += v;
-                        held[ch] += (wb[ch] * v).min(ceiling);
-                        above |= wb[ch] * v > ceiling;
-                        n[ch] += 1;
+                        take(
+                            ch,
+                            frame.data.get(y * frame.width + x),
+                            frame.black_at(x, y),
+                            frame.white_at(x, y),
+                        );
                     }
                 }
                 let mean = |i: usize| if n[i] > 0 { wb[i] * sum[i] / n[i] as f64 } else { 0.0 };
                 match frame.kind {
-                    SensorKind::Bayer(_) if above => {
+                    SensorKind::Bayer(_) | SensorKind::Rgb if above => {
                         // The luminance of the readings, the colour of the
                         // readings held to the ceiling.
                         let h = |i: usize| if n[i] > 0 { held[i] / n[i] as f64 } else { 0.0 };
@@ -117,7 +132,7 @@ pub fn binned(
                         gg[ox] = l + h(1) - lh;
                         bb[ox] = l + h(2) - lh;
                     }
-                    SensorKind::Bayer(_) => {
+                    SensorKind::Bayer(_) | SensorKind::Rgb => {
                         rr[ox] = mean(0);
                         gg[ox] = mean(1);
                         bb[ox] = mean(2);
@@ -271,6 +286,49 @@ mod tests {
             assert!((px[0] as i32 - enc(r)).abs() <= 1 && (px[1] as i32 - enc(g)).abs() <= 1, "{px:?}");
             assert!((px[2] as i32 - enc(b)).abs() <= 1, "{px:?}");
         }
+    }
+
+    /// A three-channel frame bins each of its channels: the same picture
+    /// as the mosaic of those colours, below the ceiling and above it.
+    #[test]
+    fn three_channels_bin_like_the_mosaic_of_them() {
+        let wb = [2.0, 1.0, 1.5];
+        let colour = |x: usize, y: usize| -> [u16; 3] {
+            match (x < 16, y < 16) {
+                (true, true) => [1500, 3000, 1500],
+                (false, true) => [600, 900, 2400],
+                (true, false) => [4195, 4195, 4195],
+                (false, false) => [2200, 4195, 2200],
+            }
+        };
+        let mosaic = frame(
+            32,
+            32,
+            |x, y| {
+                let [r, g, b] = colour(x, y);
+                match BayerPhase::RGGB.color_at(x, y) {
+                    Color::R => r,
+                    Color::G => g,
+                    Color::B => b,
+                }
+            },
+            1,
+        );
+        let mut channels = mosaic.clone();
+        channels.kind = SensorKind::Rgb;
+        channels.data = RawData::Integer((0..32 * 32).flat_map(|i| colour(i % 32, i / 32)).collect());
+        for weights in [Weights::default(), Weights { r: 0.6, g: 0.3, b: 0.1 }] {
+            let a = binned_gray(&mosaic, weights, wb, 8);
+            let b = binned_gray(&channels, weights, wb, 8);
+            assert_eq!((a.width, a.height), (b.width, b.height));
+            let near = |a: &[u8], b: &[u8]| a.iter().zip(b).all(|(a, b)| (*a as i32 - *b as i32).abs() <= 1);
+            assert!(near(&a.gray, &b.gray), "{:?} vs {:?}", &a.gray[..8], &b.gray[..8]);
+            assert!(near(&a.rgb, &b.rgb), "{:?} vs {:?}", &a.rgb[..12], &b.rgb[..12]);
+        }
+        // And it is a colour picture: the blue quarter is blue.
+        let t = binned_gray(&channels, Weights::default(), wb, 8);
+        let px = &t.rgb[3 * 7..3 * 8];
+        assert!(px[2] > px[0] + 40 && px[2] > px[1] + 40, "{px:?}");
     }
 
     #[test]

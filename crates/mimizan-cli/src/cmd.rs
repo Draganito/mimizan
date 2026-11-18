@@ -540,6 +540,7 @@ pub fn info(raw: &Path, as_json: bool) -> Result<()> {
     let kind = match frame.kind {
         SensorKind::Bayer(p) => format!("Bayer {p}"),
         SensorKind::Mono => "Mono (no CFA)".to_string(),
+        SensorKind::Rgb => "none: three channels a pixel (linear DNG)".to_string(),
     };
     let v = json!({
         "file": raw.display().to_string(),
@@ -578,7 +579,11 @@ pub fn info(raw: &Path, as_json: bool) -> Result<()> {
             frame.bits
         );
         println!("{:<14} {}", "pattern", kind);
-        println!("{:<14} {:?} (tile (0,0),(1,0),(0,1),(1,1))", "black", frame.black_tile);
+        if frame.kind == SensorKind::Rgb {
+            println!("{:<14} {:?} (R,G,B)", "black", &frame.black_tile[..3]);
+        } else {
+            println!("{:<14} {:?} (tile (0,0),(1,0),(0,1),(1,1))", "black", frame.black_tile);
+        }
         println!("{:<14} {:?} (R,G,B)", "white", frame.white_rgb);
         println!(
             "{:<14} x={} y={} w={} h={}",

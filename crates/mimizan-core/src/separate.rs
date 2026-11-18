@@ -1,4 +1,9 @@
 //! Luminance / chrominance separation of a Bayer mosaic.
+//!
+//! A file that already has its three channels (a linear DNG) is not
+//! separated: [`from_channels`] writes them as the same luminance and
+//! chrominances, so that everything after this module reads one kind of
+//! picture.
 
 use crate::cfa::BayerPhase;
 use crate::filter::{convolve_cols_signed, convolve_rows_mod, convolve_rows_mod_into, LowpassSpec};
@@ -79,8 +84,47 @@ pub struct Separation {
     pub mask_max: Plane,
     /// Refinement rounds that ran.
     pub rounds: usize,
-    /// Bayer phase of the mosaic the separation was made from.
+    /// Bayer phase of the mosaic the separation was made from. Of a
+    /// picture that had no mosaic ([`from_channels`]) it is `RGGB` and
+    /// says nothing; no stage after the separation reads it.
     pub phase: BayerPhase,
+}
+
+/// The separation of a picture that already has its three balanced
+/// channels: `L = (R + 2G + B)/4`, `C1 = (2G − R − B)/4`,
+/// `C2 = (R − B)/4`, the model a mosaic is taken apart by, read forwards.
+/// Nothing is estimated and nothing filtered: a mix with weights
+/// `(1, 0, 0)` gives `R` back, to the rounding of the sum.
+///
+/// The rule of [`separate`] above the colour ceiling holds here too: the
+/// luminance is that of the channels as they are, the chrominances are
+/// those of the channels held to `ceiling`, so a burnt-out neutral has no
+/// colour. Without a ceiling the channels are taken as they are.
+///
+/// `mask_max` is one sample, [`FIXED_MASK_VALUE`]: there is no carrier
+/// whose band could be weighed, and sharpening is allowed as far as it is
+/// around a fixed separation. `rounds` is 0.
+pub fn from_channels(rgb: [Plane; 3], ceiling: Option<f64>) -> Separation {
+    let [mut r, mut g, mut b] = rgb;
+    let w = r.width.max(1);
+    let top = ceiling.unwrap_or(f64::INFINITY);
+    r.data.par_chunks_mut(w).zip(g.data.par_chunks_mut(w)).zip(b.data.par_chunks_mut(w)).for_each(
+        |((rr, gg), bb)| {
+            for ((r, g), b) in rr.iter_mut().zip(gg.iter_mut()).zip(bb.iter_mut()) {
+                let lum = 0.25 * (*r + 2.0 * *g + *b);
+                let (hr, hg, hb) = (r.min(top), g.min(top), b.min(top));
+                (*r, *g, *b) = (lum, 0.25 * (2.0 * hg - hr - hb), 0.25 * (hr - hb));
+            }
+        },
+    );
+    Separation {
+        lum: r,
+        c1: g,
+        c2: b,
+        mask_max: Plane::from_vec(1, 1, vec![FIXED_MASK_VALUE]),
+        rounds: 0,
+        phase: BayerPhase::RGGB,
+    }
 }
 
 /// The Nyquist carrier `(−1)^x`: +1 on even, −1 on odd indices.
@@ -380,6 +424,56 @@ mod tests {
     }
 
     const MODES: [MaskMode; 3] = [MaskMode::Dubois, MaskMode::Off, MaskMode::Adaptive];
+
+    /// Three channels written as a separation mix back to themselves: the
+    /// weights of one channel give that channel, the native weights the
+    /// luminance. Nothing is weighed, so the mask is one fixed sample.
+    #[test]
+    fn from_channels_mixes_back_to_the_channels() {
+        use crate::mix::{mix, Weights};
+        let (w, h) = (7usize, 5usize);
+        let plane = |f: &dyn Fn(usize) -> f64| Plane::from_vec(w, h, (0..w * h).map(f).collect());
+        let r = plane(&|i| 0.9 * (i as f64 / 35.0));
+        let g = plane(&|i| 0.2 + 0.5 * ((i * 7 % 35) as f64 / 35.0));
+        let b = plane(&|i| 0.7 - 0.6 * ((i * 11 % 35) as f64 / 35.0));
+        let sep = from_channels([r.clone(), g.clone(), b.clone()], None);
+        assert_eq!((sep.lum.width, sep.lum.height), (w, h));
+        assert_eq!((sep.mask_max.width, sep.mask_max.height), (1, 1));
+        assert_eq!(sep.mask_max.data, vec![FIXED_MASK_VALUE]);
+        assert_eq!(sep.rounds, 0);
+        let one = |r: f64, g: f64, b: f64| mix(&sep, &Weights { r, g, b });
+        for (got, want) in [(one(1.0, 0.0, 0.0), &r), (one(0.0, 1.0, 0.0), &g), (one(0.0, 0.0, 1.0), &b)] {
+            for (a, b) in got.data.iter().zip(&want.data) {
+                assert!((a - b).abs() < 1e-15, "{a} vs {b}");
+            }
+        }
+        for (i, l) in mix(&sep, &Weights::default()).data.iter().enumerate() {
+            let want = 0.25 * (r.data[i] + 2.0 * g.data[i] + b.data[i]);
+            assert!((l - want).abs() < 1e-15, "{l} vs {want}");
+        }
+    }
+
+    /// Above the colour ceiling the luminance is the channels' as they
+    /// are and the colour that of the channels held to it: a burnt-out
+    /// neutral, which reads (2, 1, 1.5) under its balance, has none, and
+    /// a red above the ceiling keeps the distance to what is measured.
+    #[test]
+    fn from_channels_holds_the_colour_to_the_ceiling() {
+        let px = |r: f64, g: f64, b: f64| {
+            let p = |v: f64| Plane::from_vec(1, 1, vec![v]);
+            let s = from_channels([p(r), p(g), p(b)], Some(0.98));
+            (s.lum.data[0], s.c1.data[0], s.c2.data[0])
+        };
+        assert_eq!(px(2.0, 1.0, 1.5), (1.375, 0.0, 0.0));
+        let (lum, c1, c2) = px(1.2, 0.5, 0.3);
+        assert!((lum - 0.625).abs() < 1e-15);
+        assert!((c1 - 0.25 * (1.0 - 0.98 - 0.3)).abs() < 1e-15, "{c1}");
+        assert!((c2 - 0.25 * (0.98 - 0.3)).abs() < 1e-15, "{c2}");
+        // Below the ceiling nothing is held.
+        let (lum, c1, c2) = px(0.4, 0.5, 0.3);
+        assert!((lum - 0.425).abs() < 1e-15);
+        assert!((c1 - 0.075).abs() < 1e-15 && (c2 - 0.025).abs() < 1e-15, "{c1} {c2}");
+    }
 
     /// A neutral field with a burnt-out patch, balanced R 2, G 1, B 1.5:
     /// inside the patch the mosaic reads (2, 1, 1.5), a false magenta. Held

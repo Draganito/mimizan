@@ -379,10 +379,10 @@ fn develop_frame(
     develop: Develop,
     status: &dyn Fn(String),
 ) -> Result<Session> {
-    status(if matches!(frame.kind, mimizan_core::decode::SensorKind::Mono) {
-        "reading the sensor".into()
-    } else {
-        "separating".into()
+    status(match frame.kind {
+        SensorKind::Mono => "reading the sensor".into(),
+        SensorKind::Rgb => "reading the channels".into(),
+        SensorKind::Bayer(_) => "separating".into(),
     });
     let params = negative_params(&develop, camera_file.clone());
     let negative: Negative = pipeline::negative_from_frame(&frame, &params, decode_ms)?;

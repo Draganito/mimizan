@@ -86,8 +86,8 @@ pub fn next_session_id() -> u64 {
 /// Histogram of the four sensor channels (one per 2x2 tile position) over
 /// the active area, normalised by black and white level and binned on a
 /// gamma-2.2 axis like the negative histogram. A monochrome sensor is one
-/// channel in `bins[0]`. Nothing but the frame goes in, so it is computed
-/// once per file.
+/// channel in `bins[0]`, a three-channel file R, G, B in `bins[0..3]`.
+/// Nothing but the frame goes in, so it is computed once per file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawHistogram {
     /// Tile positions (0,0), (1,0), (0,1), (1,1), as `RawFrame::black_tile`.
@@ -98,11 +98,20 @@ pub struct RawHistogram {
     pub total: [usize; 4],
     /// One measured channel, no colour filter.
     pub mono: bool,
+    /// Three channels a pixel and no tile: R, G, B, the fourth entry empty.
+    pub channels: bool,
 }
 
 impl RawHistogram {
     fn empty() -> Self {
-        Self { bins: [[0; 256]; 4], colors: [Color::G; 4], clipped: [0; 4], total: [0; 4], mono: false }
+        Self {
+            bins: [[0; 256]; 4],
+            colors: [Color::G; 4],
+            clipped: [0; 4],
+            total: [0; 4],
+            mono: false,
+            channels: false,
+        }
     }
 
     /// Count the active area of the frame.
@@ -123,15 +132,24 @@ impl RawHistogram {
                 let mut total = [0usize; 4];
                 let mono = matches!(frame.kind, SensorKind::Mono);
                 let base = y * frame.width;
-                for x in x0..x1 {
-                    let t = if mono { 0 } else { (y & 1) * 2 + (x & 1) };
-                    let black = frame.black_at(x, y);
-                    let white = frame.white_at(x, y);
-                    let v = (frame.data.get(base + x) - black) / (white - black).max(1.0);
+                let mut count = |t: usize, raw: f64, black: f64, white: f64| {
+                    let v = (raw - black) / (white - black).max(1.0);
                     let q = (v.clamp(0.0, 1.0) * 65535.0).round() as usize;
                     bins[t][lut[q] as usize] += 1;
                     clipped[t] += (v >= 1.0) as usize;
                     total[t] += 1;
+                };
+                for x in x0..x1 {
+                    if frame.kind == SensorKind::Rgb {
+                        let raw = frame.rgb_at(x, y);
+                        for (c, &v) in raw.iter().enumerate() {
+                            let (black, white) = frame.channel_levels(c);
+                            count(c, v, black, white);
+                        }
+                        continue;
+                    }
+                    let t = if mono { 0 } else { (y & 1) * 2 + (x & 1) };
+                    count(t, frame.data.get(base + x), frame.black_at(x, y), frame.white_at(x, y));
                 }
                 (bins, clipped, total)
             })
@@ -154,6 +172,10 @@ impl RawHistogram {
                 }
             }
             SensorKind::Mono => out.mono = true,
+            SensorKind::Rgb => {
+                out.colors = [Color::R, Color::G, Color::B, Color::G];
+                out.channels = true;
+            }
         }
         out
     }
@@ -172,6 +194,12 @@ impl Session {
     /// A monochrome sensor: one measured plane, no separation.
     pub fn is_mono(&self) -> bool {
         self.negative.separation.is_none()
+    }
+
+    /// A file that came with its three channels (a linear DNG): there was
+    /// no mosaic to separate. In every other respect a colour file.
+    pub fn is_channels(&self) -> bool {
+        self.frame.kind == SensorKind::Rgb
     }
 
     /// None on a monochrome negative: `is_mono` is this, asked the other
@@ -3078,6 +3106,91 @@ mod histogram_tests {
         )
         .unwrap();
         assert_eq!(d.gray, display_bytes(&mimizan_core::print::orient(&expected, 6), 0.0, &table));
+    }
+
+    /// A linear DNG opens as a colour file without a mosaic: the window
+    /// has a separation to mix, the weights of one channel show that
+    /// channel, and the raw histogram counts three channels a pixel.
+    #[test]
+    fn a_three_channel_file_is_a_colour_file() {
+        use mimizan_core::decode::{RawData, Rect, SensorKind};
+        use mimizan_core::pipeline::{self, NegativeParams};
+        use std::sync::Arc;
+        let (w, h) = (8usize, 6usize);
+        let px = |i: usize| -> [u16; 3] {
+            if i == 9 {
+                [200, 1000, 300]
+            } else {
+                [100 + 20 * (i % w) as u16, 400, 700 - 50 * (i / w) as u16]
+            }
+        };
+        let raw: Vec<u16> = (0..w * h).flat_map(px).collect();
+        let frame = RawFrame {
+            make: "Fujifilm".into(),
+            model: "X-Pro3".into(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 16,
+            kind: SensorKind::Rgb,
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: Some([1.0, 1.0, 1.0]),
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        assert!(neg.separation.is_some());
+        assert_eq!(neg.info.phase, None);
+        let preview = preview_planes(&neg).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let session = Session {
+            id: next_session_id(),
+            path: "fuji.dng".into(),
+            frame: Arc::new(frame),
+            negative: neg,
+            camera_file: None,
+            camera_file_path: None,
+            develop: Develop::default(),
+            preview,
+            raw_hist,
+        };
+        assert!(session.is_channels() && !session.is_mono());
+        let hist = &session.raw_hist;
+        assert!(hist.channels && !hist.mono);
+        assert_eq!(hist.colors[..3], [Color::R, Color::G, Color::B]);
+        assert_eq!(hist.total, [w * h, w * h, w * h, 0]);
+        assert_eq!(hist.clipped, [0, 1, 0, 0], "one green at white");
+
+        let tone = Tone::paper().compile();
+        let table = ToneTable::build(&tone);
+        let red = Weights { r: 1.0, g: 0.0, b: 0.0 };
+        let view = ViewParams {
+            weights: red,
+            tone: Tone::paper(),
+            place: 0.0,
+            rotation: 0,
+            angle: 0.0,
+            crop: None,
+            burns: Vec::new(),
+            burn_live: false,
+            plate: None,
+        };
+        let detail =
+            render_detail(&session, &view, DetailAsk::pixels(DetailRect { x: 0, y: 0, w, h }), &table)
+                .unwrap();
+        let mut channel = Plane::from_vec(w, h, (0..w * h).map(|i| px(i)[0] as f64 / 1000.0).collect());
+        // The burnt-out green is held to the ceiling in the colour and
+        // not in the luminance: half of what it stands above (1 − 0.98)
+        // shows in red.
+        channel.data[9] += 0.01;
+        assert_eq!(detail.gray, display_bytes(&channel, 0.0, &table));
     }
 
     /// A burn in the view: the 1:1 tile gives the ellipse's pixels their

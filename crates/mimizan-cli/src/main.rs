@@ -124,8 +124,9 @@ enum Cmd {
         /// channels of the separation with the white balance undone, three
         /// samples a pixel (LinearRaw), the camera's colour matrix and
         /// as-shot neutral in the tags. A RAW converter opens it as a RAW of
-        /// the camera and skips its own demosaicing. Bayer sensors only; the
-        /// recipe's 90° turns, straighten and crop are applied; no mask sidecar.
+        /// the camera and skips its own demosaicing. Not from a monochrome
+        /// sensor; the recipe's 90° turns, straighten and crop are applied; no
+        /// mask sidecar.
         #[arg(long)]
         dng: bool,
     },

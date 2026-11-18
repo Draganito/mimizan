@@ -5,7 +5,7 @@ use crate::decode::RawFrame;
 #[cfg(feature = "decode-rawler")]
 use crate::decode::RawlerDecoder;
 use crate::error::Result;
-use crate::ingest::{ingest, IngestParams, IngestReport, Mosaic, NoiseModel};
+use crate::ingest::{ingest, ingest_rgb, Channels, IngestParams, IngestReport, Mosaic, NoiseModel};
 use crate::mix::{mix, mix_into, ColorFilter, WeightSpace, Weights};
 use crate::plane::Plane;
 use crate::separate::{separate, MaskMode, SeparateParams};
@@ -140,6 +140,11 @@ pub fn decode(path: &Path) -> Result<RawFrame> {
 
 /// Develop a decoded frame: ingest, separate (Bayer only), mix. `decode_ms`
 /// is recorded in the timing.
+///
+/// A three-channel frame (a linear DNG) is not separated: its channels
+/// are the separation ([`crate::separate::from_channels`]), and the mix,
+/// the plate and everything after them are those of a Bayer file. The
+/// separation's settings do nothing there.
 pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128) -> Result<Negative> {
     if let (Some(cam), crate::decode::SensorKind::Bayer(ph)) = (&p.camera_file, frame.kind) {
         if cam.phase() != ph {
@@ -152,6 +157,10 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     p.weights.validate()?;
 
     let t = Instant::now();
+    if frame.kind == crate::decode::SensorKind::Rgb {
+        let channels = ingest_rgb(frame, &p.ingest)?;
+        return negative_from_channels(channels, p, decode_ms, t.elapsed().as_millis());
+    }
     let mosaic = ingest(frame, &p.ingest)?;
     let ingest_ms = t.elapsed().as_millis();
     info!("ingest {} ms: {}", ingest_ms, serde_json::to_string(&mosaic.report)?);
@@ -264,6 +273,75 @@ pub fn negative_from_frame(frame: &RawFrame, p: &NegativeParams, decode_ms: u128
     Ok(Negative { plane, mask8, orientation, info, separation })
 }
 
+/// [`negative_from_frame`] for a file that has its three channels: the
+/// weights and the plate as there, the channels in place of a separation.
+fn negative_from_channels(
+    channels: Channels,
+    p: &NegativeParams,
+    decode_ms: u128,
+    ingest_ms: u128,
+) -> Result<Negative> {
+    info!("ingest {} ms: {}", ingest_ms, serde_json::to_string(&channels.report)?);
+    let weights = p.weights.to_balanced(p.weights_space, channels.wb);
+    weights.validate()?;
+    let weights = weights.filtered(p.filter);
+    if p.filter != ColorFilter::None {
+        weights.validate().map_err(|e| {
+            crate::Error::Invalid(format!(
+                "filter {} passes none of the weighted channels: {e}",
+                p.filter.name()
+            ))
+        })?;
+    }
+    let mut info = NegativeInfo {
+        mimizan: env!("CARGO_PKG_VERSION"),
+        stage: "negative",
+        camera: channels.camera.clone(),
+        phase: None,
+        noise: channels.noise,
+        wb: channels.wb,
+        weights,
+        filter: p.filter,
+        weights_raw: weights.balanced_to_raw(channels.wb),
+        mask: p.separate.mask,
+        rounds: 0,
+        cutoff: p.separate.cutoff,
+        report: channels.report.clone(),
+        timing: Timing { decode_ms, ingest_ms, separate_ms: 0, mix_ms: 0 },
+        range: 1.0,
+        plate: None,
+    };
+    let plate_weights = match &p.plate {
+        Some(pp) => {
+            let base = plate_base(p.camera_file.as_ref(), channels.wb);
+            Some((crate::plate::PlateWeights::resolve(pp, base, channels.xyz_to_cam.as_ref())?, pp.space))
+        }
+        None => None,
+    };
+    let Channels { rgb, saturated, colour_ceiling, orientation, .. } = channels;
+    // No carriers to weigh: sharpening allowed except at saturation, as
+    // on a monochrome sensor.
+    let allowed = (crate::separate::FIXED_MASK_VALUE * 255.0).round() as u8;
+    let mask8 = saturated.iter().map(|&s| if s != 0 { 255 } else { allowed }).collect();
+    drop(saturated);
+    let t = Instant::now();
+    let sep = crate::separate::from_channels(rgb, colour_ceiling);
+    let (plane, separation) = if let Some((w, space)) = plate_weights {
+        info.plate = Some(crate::plate::PlateInfo::new(&w, space, sep.lum.height));
+        (crate::plate::mix_plate_stacked(&sep, &w)?, p.keep_separation.then_some(sep))
+    } else if p.keep_separation {
+        (mix(&sep, &weights), Some(sep))
+    } else {
+        (mix_into(sep, &weights), None)
+    };
+    info.timing.mix_ms = t.elapsed().as_millis();
+    info.range = scene_range(&plane);
+    if info.range > 1.0 {
+        info!("range {:.4}: the negative holds {:.2} stops above 1", info.range, info.range.log2());
+    }
+    Ok(Negative { plane, mask8, orientation, info, separation })
+}
+
 /// The panchromatic emulsion behind the plate's Wratten glass, on the
 /// balanced channels: the camera file's calibrated response when there is
 /// one, else the native 0.25 / 0.50 / 0.25. A fact of the file, not a
@@ -298,7 +376,10 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
 /// the colour ceiling, runs in windows of a megapixel beside five held
 /// planes and stays under that peak on any frame above 3 MP. Mono: the
 /// normalised plane beside the measured one, over the frame and the
-/// saturation map.
+/// saturation map. Three channels: a plate at its widest, the three planes
+/// (which became the separation in place), the plate's three and the
+/// frame being mixed, over the frame's three samples a pixel and the
+/// saturation map; nothing is estimated, and one negative needs less.
 /// A guide for refusing a file the machine cannot hold, measured to about
 /// a tenth; what it does not see is the allocator and whatever else the
 /// process has open.
@@ -322,8 +403,9 @@ fn develop_memory_for(w: usize, h: usize, kind: crate::decode::SensorKind, sampl
     let (planes, maps) = match kind {
         crate::decode::SensorKind::Bayer(_) => (9, 1),
         crate::decode::SensorKind::Mono => (2, 1),
+        crate::decode::SensorKind::Rgb => (7, 1),
     };
-    px * (planes * 8 + sample + maps)
+    px * (planes * 8 + kind.samples() as u64 * sample + maps)
 }
 
 #[cfg(test)]
@@ -339,6 +421,12 @@ mod tests {
         assert!((1.8e9..2.0e9).contains(&(bayer as f64)), "{bayer}");
         let mono = develop_memory(6048, 4032, crate::decode::SensorKind::Mono);
         assert!(mono * 3 < bayer, "{mono} vs {bayer}");
+        // Three channels, 26 MP as a plate: measured 63 bytes a pixel,
+        // seven planes, six bytes of frame and the map. Nothing is
+        // estimated, so it stays under the Bayer figure.
+        let channels = develop_memory(6048, 4032, crate::decode::SensorKind::Rgb);
+        assert_eq!(channels, 6048 * 4032 * 63);
+        assert!(mono < channels && channels < bayer, "{mono} {channels} {bayer}");
         // A float file holds two more bytes a sample; an integer one is
         // the figure above.
         let (w, h) = (6048usize, 4032usize);
@@ -434,6 +522,103 @@ mod tests {
         assert_ne!(m1.plane.data, m2.plane.data);
         // Without a camera file the emulsion is the native one.
         assert_eq!(plate_base(None, [2.0, 1.0, 1.5]), Weights::default());
+    }
+
+    /// A three-channel frame develops without a separation: the negative
+    /// is the mix of its balanced channels, the plate is those channels,
+    /// and the mask allows sharpening everywhere but at saturation. A
+    /// burnt-out pixel has the luminance of its reading and no colour.
+    #[test]
+    fn three_channels_develop_as_they_are() {
+        use crate::decode::{RawData, Rect, SensorKind};
+        use crate::ingest::WhiteBalance;
+        use crate::plate::{PlateFilters, PlateParams, PlateSpace};
+
+        let (w, h) = (24usize, 16usize);
+        let burnt = (12usize, 8usize);
+        let px = |x: usize, y: usize| -> [u16; 3] {
+            if (x, y) == burnt {
+                [1000, 1000, 1000]
+            } else {
+                [100 + 10 * x as u16, 300 + 20 * y as u16, 400 - 5 * (x + y) as u16]
+            }
+        };
+        let raw: Vec<u16> = (0..w * h).flat_map(|i| px(i % w, i / w)).collect();
+        let frame = RawFrame {
+            make: String::new(),
+            model: String::new(),
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 16,
+            kind: SensorKind::Rgb,
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: None,
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let wb = [2.0, 1.0, 1.5];
+        let develop = |weights: Weights, plate: Option<PlateParams>, keep: bool| {
+            let mut p = NegativeParams::default();
+            p.ingest.wb = WhiteBalance::Manual(wb);
+            p.ingest.sat_dilate = 0;
+            p.weights = weights;
+            p.plate = plate;
+            p.keep_separation = keep;
+            negative_from_frame(&frame, &p, 0).unwrap()
+        };
+        let balanced = |x: usize, y: usize| {
+            let [r, g, b] = px(x, y);
+            [wb[0] * r as f64 / 1000.0, g as f64 / 1000.0, wb[2] * b as f64 / 1000.0]
+        };
+        let here = |x: usize, y: usize| (x, y) != burnt;
+
+        let n = develop(Weights::default(), None, false);
+        assert_eq!((n.plane.width, n.plane.height), (w, h));
+        assert_eq!((n.info.phase.as_deref(), n.info.rounds, n.info.timing.separate_ms), (None, 0, 0));
+        assert!(n.separation.is_none());
+        let allowed = (crate::separate::FIXED_MASK_VALUE * 255.0).round() as u8;
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b] = balanced(x, y);
+                let want = 0.25 * (r + 2.0 * g + b);
+                assert!((n.plane.at(x, y) - want).abs() < 1e-12, "{x},{y}");
+                assert_eq!(n.mask8[y * w + x], if here(x, y) { allowed } else { 255 });
+            }
+        }
+        // The burnt-out pixel reads (2 + 2 + 1.5)/4, above 1, and the
+        // negative says so.
+        assert!((n.info.range - 1.375).abs() < 1e-12, "{}", n.info.range);
+
+        // One channel's weights are that channel, below the ceiling.
+        let red = develop(Weights { r: 1.0, g: 0.0, b: 0.0 }, None, true);
+        assert!(red.separation.is_some());
+        for y in 0..h {
+            for x in (0..w).filter(|&x| here(x, y)) {
+                assert!((red.plane.at(x, y) - balanced(x, y)[0]).abs() < 1e-12, "{x},{y}");
+            }
+        }
+        // The plate of the bare channels is the three of them, stacked
+        // blue, green, red; the burnt-out pixel is neutral in it.
+        let channels = Some(PlateParams { filters: PlateFilters::Channels, space: PlateSpace::Srgb });
+        let plate = develop(Weights::default(), channels, false);
+        assert_eq!((plate.plane.width, plate.plane.height), (w, 3 * h));
+        assert_eq!(plate.info.plate.as_ref().map(|p| p.frame_height), Some(h));
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b] = if here(x, y) { balanced(x, y) } else { [1.375; 3] };
+                for (i, want) in [b, g, r].into_iter().enumerate() {
+                    assert!((plate.plane.at(x, i * h + y) - want).abs() < 1e-12, "{x},{y} frame {i}");
+                }
+            }
+        }
+        assert_eq!(plate.mask8, n.mask8);
     }
 
     /// A negative keeps what stands above 1. A burnt-out neutral under a

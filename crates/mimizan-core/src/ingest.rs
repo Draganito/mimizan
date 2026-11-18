@@ -1,5 +1,7 @@
 //! Normalisation, saturation mask, defect repair, channel balance: the raw
-//! frame becomes a mosaic the separation can read.
+//! frame becomes a mosaic the separation can read, or, where the file
+//! already has three channels a pixel, the balanced channels themselves
+//! ([`ingest_rgb`]).
 
 use crate::cfa::{BayerPhase, Color};
 use crate::decode::{RawFrame, Rect, SensorKind};
@@ -101,7 +103,8 @@ pub struct CameraInfo {
 #[derive(Clone, Debug, Serialize)]
 pub struct IngestReport {
     pub crop: Rect,
-    /// Photosites at or above the saturation level.
+    /// Photosites at or above the saturation level. Of a three-channel
+    /// file: the pixels with a channel there.
     pub saturated_raw: usize,
     /// Photosites inside the dilated saturation mask.
     pub saturated_dilated: usize,
@@ -111,7 +114,8 @@ pub struct IngestReport {
     #[serde(default)]
     pub colour_ceiling: Option<f64>,
     /// Photosites that read above that level, burnt out or not. 0 on a
-    /// monochrome sensor.
+    /// monochrome sensor. Of a three-channel file, as `saturated_raw`:
+    /// the pixels with a channel above it.
     #[serde(default)]
     pub above_ceiling: usize,
     /// Photosites the defect rule flags: more than `defect_sigma` sigma
@@ -284,12 +288,14 @@ pub struct CardReading {
     /// Mean of the unsaturated R, G and B photosites, normalised between
     /// black and white (1.0 = white level).
     pub mean: [f64; 3],
-    /// Photosites that went into the means.
+    /// Photosites that went into the means; of a three-channel file,
+    /// samples: three for each pixel counted.
     pub counted: usize,
     /// Photosites of the window at or above the saturation threshold; they
-    /// are left out of the means.
+    /// are left out of the means. Of a three-channel file, the pixels with
+    /// a channel there.
     pub clipped: usize,
-    /// Photosites in the window.
+    /// Photosites in the window; of a three-channel file, its pixels.
     pub total: usize,
     /// The window as measured, in frame coordinates.
     pub window: Rect,
@@ -298,7 +304,9 @@ pub struct CardReading {
 /// Balance from a grey card: `mean_G / mean_c` over the unsaturated
 /// photosites of a window of the frame, the same rule as `gray_world` on
 /// the card alone. `centre` is in frame coordinates; the window is
-/// `2·half` wide and high and is pulled inside the frame's crop. A
+/// `2·half` wide and high and is pulled inside the frame's crop. Of a
+/// three-channel file the window's pixels are read, and `counted`,
+/// `clipped` and `total` count samples and pixels as said there. A
 /// monochrome sensor, a crop outside the frame, a white level not above
 /// black, an empty window, a window with no usable photosite of a colour,
 /// or a card at black is an error, as in [`ingest`]: never a panic or an
@@ -309,10 +317,11 @@ pub fn card_balance(
     centre: (usize, usize),
     half: usize,
 ) -> crate::Result<CardReading> {
-    let SensorKind::Bayer(phase) = frame.kind else {
-        return Err(crate::Error::Invalid("a grey card needs a Bayer sensor".into()));
+    let crop = match frame.kind {
+        SensorKind::Bayer(_) => even_crop(frame.crop),
+        SensorKind::Rgb => frame.crop,
+        SensorKind::Mono => return Err(crate::Error::Invalid("a grey card needs a colour sensor".into())),
     };
-    let crop = even_crop(frame.crop);
     check_crop(frame, crop)?;
     check_levels(frame)?;
     if crop.w < 2 || crop.h < 2 {
@@ -326,19 +335,40 @@ pub fn card_balance(
     let mut clipped = 0usize;
     for y in y0..y0 + side {
         for x in x0..x0 + side {
-            let raw = frame.data.get(y * frame.width + x);
-            let white = frame.white_at(x, y);
-            if !(raw.is_finite() && white.is_finite()) {
-                return Err(crate::Error::Invalid("a sensor sample is not a number".into()));
+            match frame.kind {
+                SensorKind::Bayer(phase) => {
+                    let raw = frame.data.get(y * frame.width + x);
+                    let white = frame.white_at(x, y);
+                    if !(raw.is_finite() && white.is_finite()) {
+                        return Err(crate::Error::Invalid("a sensor sample is not a number".into()));
+                    }
+                    if raw >= white * (1.0 - p.sat_margin) {
+                        clipped += 1;
+                        continue;
+                    }
+                    let black = frame.black_at(x, y);
+                    let c = phase.color_at(x, y) as usize;
+                    sum[c] += (raw - black) / (white - black);
+                    cnt[c] += 1;
+                }
+                // A pixel with a channel at the clip is left out whole:
+                // its other two channels would balance against nothing.
+                _ => {
+                    let raw = frame.rgb_at(x, y);
+                    if !raw.iter().all(|v| v.is_finite()) {
+                        return Err(crate::Error::Invalid("a sensor sample is not a number".into()));
+                    }
+                    if (0..3).any(|c| raw[c] >= frame.white_rgb[c] * (1.0 - p.sat_margin)) {
+                        clipped += 1;
+                        continue;
+                    }
+                    for c in 0..3 {
+                        let (black, white) = frame.channel_levels(c);
+                        sum[c] += (raw[c] - black) / (white - black);
+                        cnt[c] += 1;
+                    }
+                }
             }
-            if raw >= white * (1.0 - p.sat_margin) {
-                clipped += 1;
-                continue;
-            }
-            let black = frame.black_at(x, y);
-            let c = phase.color_at(x, y) as usize;
-            sum[c] += (raw - black) / (white - black);
-            cnt[c] += 1;
         }
     }
     if cnt.contains(&0) {
@@ -393,7 +423,7 @@ fn check_crop(frame: &RawFrame, crop: Rect) -> crate::Result<()> {
         && h > 0
         && crop.x.checked_add(w).is_some_and(|x1| x1 <= frame.width)
         && crop.y.checked_add(h).is_some_and(|y1| y1 <= frame.height)
-        && frame.data.len() == frame.width * frame.height;
+        && frame.holds_its_samples();
     if !fits {
         return Err(crate::Error::Invalid(format!(
             "crop {}x{} at {},{} does not fit a {}x{} frame",
@@ -426,17 +456,21 @@ fn check_levels(frame: &RawFrame) -> crate::Result<()> {
 pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
     // A Bayer crop with an odd origin would move the phase. A monochrome
     // sensor has no phase, so every pixel of the file's crop stays.
-    let crop = match frame.kind {
-        SensorKind::Bayer(_) => even_crop(frame.crop),
-        SensorKind::Mono => frame.crop,
+    let (crop, phase) = match frame.kind {
+        SensorKind::Bayer(ph) => {
+            let crop = even_crop(frame.crop);
+            (crop, Some(ph.shifted(crop.x, crop.y)))
+        }
+        SensorKind::Mono => (frame.crop, None),
+        SensorKind::Rgb => {
+            return Err(crate::Error::Invalid(
+                "the file has three channels a pixel: there is no mosaic".into(),
+            ));
+        }
     };
     let (w, h) = (crop.w, crop.h);
     check_crop(frame, crop)?;
     check_levels(frame)?;
-    let phase = match frame.kind {
-        SensorKind::Bayer(ph) => Some(ph.shifted(crop.x, crop.y)),
-        SensorKind::Mono => None,
-    };
 
     // Normalise, flag raw saturation, and check for a non-finite sample in
     // one pass. A NaN would fail the sort in the defect median.
@@ -537,18 +571,206 @@ pub fn ingest(frame: &RawFrame, p: &IngestParams) -> crate::Result<Mosaic> {
 /// saturation rule in the units of the balanced mosaic. With green at
 /// multiplier one and red and blue above it, that is green's, a little
 /// under 1; under a balance that puts red or blue below green it is
-/// theirs. `None` on a monochrome sensor, and where the levels give no
-/// positive finite figure.
+/// theirs. Of a three-channel file the lowest over its three channels.
+/// `None` on a monochrome sensor, and where the levels give no positive
+/// finite figure.
 pub fn colour_ceiling(frame: &RawFrame, wb: [f64; 3], sat_margin: f64) -> Option<f64> {
-    let SensorKind::Bayer(phase) = frame.kind else { return None };
-    let level = [(0, 0), (1, 0), (0, 1), (1, 1)]
-        .into_iter()
-        .map(|(x, y)| {
-            let (black, white) = (frame.black_at(x, y), frame.white_at(x, y));
-            wb[phase.color_at(x, y) as usize] * (white * (1.0 - sat_margin) - black) / (white - black)
-        })
-        .fold(f64::INFINITY, f64::min);
+    let of =
+        |c: usize, black: f64, white: f64| wb[c] * (white * (1.0 - sat_margin) - black) / (white - black);
+    let level = match frame.kind {
+        SensorKind::Bayer(phase) => [(0, 0), (1, 0), (0, 1), (1, 1)]
+            .into_iter()
+            .map(|(x, y)| of(phase.color_at(x, y) as usize, frame.black_at(x, y), frame.white_at(x, y)))
+            .fold(f64::INFINITY, f64::min),
+        SensorKind::Rgb => (0..3)
+            .map(|c| {
+                let (black, white) = frame.channel_levels(c);
+                of(c, black, white)
+            })
+            .fold(f64::INFINITY, f64::min),
+        SensorKind::Mono => return None,
+    };
     (level.is_finite() && level > 0.0).then_some(level)
+}
+
+/// The file's three channels, cropped, normalised and balanced, with
+/// everything the stages after the separation need: what [`Mosaic`] is to
+/// a mosaic. There is no mosaic here and nothing to separate; the
+/// channels are the picture ([`crate::separate::from_channels`]).
+#[derive(Clone, Debug)]
+pub struct Channels {
+    /// R, G, B, each multiplied by its `wb`.
+    pub rgb: [Plane; 3],
+    /// 1 where a channel of the pixel is saturated (after dilation), else
+    /// 0. Same size as each plane.
+    pub saturated: Vec<u8>,
+    /// As [`Mosaic::colour_ceiling`]: the balanced level at which the
+    /// first channel counts as burnt out.
+    pub colour_ceiling: Option<f64>,
+    /// Noise model in raw normalised units, as given; nothing here reads it.
+    pub noise: NoiseModel,
+    /// Multipliers R,G,B applied to `rgb` (G = 1).
+    pub wb: [f64; 3],
+    pub orientation: u16,
+    pub camera: CameraInfo,
+    pub xyz_to_cam: Option<[[f64; 3]; 3]>,
+    pub report: IngestReport,
+}
+
+/// [`ingest`] for a three-channel frame ([`SensorKind::Rgb`]): crop,
+/// normalise each channel to `[0, 1]` between its black and white, mask
+/// the pixels with a saturated channel, and balance. No defect is looked
+/// for: a photosite's neighbours are not in the file, the report counts
+/// none and `repair_defects` does nothing. Gray world is the mean of each
+/// channel over the unsaturated pixels. A frame of another kind, a crop
+/// outside the frame or a white level not above black is an error.
+pub fn ingest_rgb(frame: &RawFrame, p: &IngestParams) -> crate::Result<Channels> {
+    if frame.kind != SensorKind::Rgb {
+        return Err(crate::Error::Invalid("the file is a mosaic, not three channels a pixel".into()));
+    }
+    let crop = frame.crop;
+    let (w, h) = (crop.w, crop.h);
+    check_crop(frame, crop)?;
+    check_levels(frame)?;
+    let levels = [frame.channel_levels(0), frame.channel_levels(1), frame.channel_levels(2)];
+
+    let mut planes = [vec![0.0f64; w * h], vec![0.0f64; w * h], vec![0.0f64; w * h]];
+    let mut sat_raw = vec![0u8; w * h];
+    let [pr, pg, pb] = &mut planes;
+    // Per row: saturated pixels, a non-finite sample, lowest and highest.
+    let rows: Vec<(usize, bool, f64, f64)> = pr
+        .par_chunks_mut(w)
+        .zip(pg.par_chunks_mut(w))
+        .zip(pb.par_chunks_mut(w))
+        .zip(sat_raw.par_chunks_mut(w))
+        .enumerate()
+        .map(|(yy, (((rr, gg), bb), srow))| {
+            let y = crop.y + yy;
+            let (mut count, mut finite) = (0usize, true);
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for xx in 0..w {
+                let raw = frame.rgb_at(crop.x + xx, y);
+                let mut burnt = false;
+                for (c, out) in [&mut rr[xx], &mut gg[xx], &mut bb[xx]].into_iter().enumerate() {
+                    let (black, white) = levels[c];
+                    let v = (raw[c] - black) / (white - black);
+                    finite &= v.is_finite();
+                    burnt |= raw[c] >= white * (1.0 - p.sat_margin);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                    *out = v;
+                }
+                if burnt {
+                    srow[xx] = 1;
+                    count += 1;
+                }
+            }
+            (count, finite, lo, hi)
+        })
+        .collect();
+    if !rows.iter().all(|r| r.1) {
+        return Err(crate::Error::Invalid("a sensor sample is not a number".into()));
+    }
+    let sat_raw_count: usize = rows.iter().map(|r| r.0).sum();
+    let min_norm = rows.iter().map(|r| r.2).fold(f64::INFINITY, f64::min);
+    let max_norm = rows.iter().map(|r| r.3).fold(f64::NEG_INFINITY, f64::max);
+
+    let (saturated, sat_dilated_count) = dilate_counted(&sat_raw, w, h, p.sat_dilate);
+    drop(sat_raw);
+    let [r, g, b] = planes;
+    let mut rgb = [Plane::from_vec(w, h, r), Plane::from_vec(w, h, g), Plane::from_vec(w, h, b)];
+    let (wb, wb_source) = match p.wb {
+        WhiteBalance::None => ([1.0; 3], "none".to_string()),
+        WhiteBalance::AsShot => match frame.wb_as_shot {
+            Some(c) => (normalise_wb(c), "as-shot".to_string()),
+            None => (gray_world_rgb(&rgb, &saturated), "gray-world (no as-shot)".to_string()),
+        },
+        WhiteBalance::GrayWorld => (gray_world_rgb(&rgb, &saturated), "gray-world".to_string()),
+        WhiteBalance::Manual(c) => (normalise_wb(c), "manual".to_string()),
+    };
+    for (plane, k) in rgb.iter_mut().zip(wb) {
+        if k != 1.0 {
+            plane.data.par_iter_mut().for_each(|v| *v *= k);
+        }
+    }
+    let ceiling = colour_ceiling(frame, wb, p.sat_margin);
+    let above_ceiling = ceiling.map_or(0, |c| {
+        let [r, g, b] = &rgb;
+        r.data
+            .par_iter()
+            .zip(g.data.par_iter())
+            .zip(b.data.par_iter())
+            .filter(|((r, g), b)| **r > c || **g > c || **b > c)
+            .count()
+    });
+
+    Ok(Channels {
+        rgb,
+        saturated,
+        colour_ceiling: ceiling,
+        noise: p.noise,
+        wb,
+        orientation: frame.orientation,
+        camera: CameraInfo {
+            make: frame.make.clone(),
+            model: frame.model.clone(),
+            clean_make: frame.clean_make.clone(),
+            clean_model: frame.clean_model.clone(),
+            bits: frame.bits,
+            exposure: frame.exposure.clone(),
+        },
+        xyz_to_cam: frame.xyz_to_cam,
+        report: IngestReport {
+            crop,
+            saturated_raw: sat_raw_count,
+            saturated_dilated: sat_dilated_count,
+            colour_ceiling: ceiling,
+            above_ceiling,
+            defects: 0,
+            defects_repaired: false,
+            defect_hot_rows: Vec::new(),
+            min_norm,
+            max_norm,
+            wb,
+            wb_source,
+        },
+    })
+}
+
+/// [`gray_world`] of three channels: `mean_G / mean_c` over the pixels
+/// that are not saturated.
+pub fn gray_world_rgb(rgb: &[Plane; 3], saturated: &[u8]) -> [f64; 3] {
+    let w = rgb[0].width.max(1);
+    // Per-row partial sums in parallel, combined in row order: the result
+    // does not depend on how rayon splits the work.
+    let rows: Vec<([f64; 3], usize)> = saturated
+        .par_chunks(w)
+        .enumerate()
+        .map(|(y, srow)| {
+            let lines = [rgb[0].row(y), rgb[1].row(y), rgb[2].row(y)];
+            let (mut s, mut n) = ([0.0f64; 3], 0usize);
+            for (x, _) in srow.iter().enumerate().filter(|(_, s)| **s == 0) {
+                for c in 0..3 {
+                    s[c] += lines[c][x];
+                }
+                n += 1;
+            }
+            (s, n)
+        })
+        .collect();
+    let (mut sum, mut cnt) = ([0.0f64; 3], 0usize);
+    for (s, n) in rows {
+        for c in 0..3 {
+            sum[c] += s[c];
+        }
+        cnt += n;
+    }
+    let mean = |c: usize| if cnt > 0 { sum[c] / cnt as f64 } else { 0.0 };
+    let (r, g, b) = (mean(0), mean(1), mean(2));
+    if r <= 0.0 || g <= 0.0 || b <= 0.0 {
+        return [1.0; 3];
+    }
+    [g / r, 1.0, g / b]
 }
 
 /// Chebyshev dilation of a 0/1 mask by `r` pixels (separable max filter).
@@ -857,6 +1079,109 @@ mod tests {
         let m = ingest(&frame(w, h, SensorKind::Mono, 1000.0, full, raw), &IngestParams::default()).unwrap();
         assert_eq!(m.colour_ceiling, None);
         assert_eq!(m.report.above_ceiling, 0);
+    }
+
+    /// A three-channel frame of `w×h` from one `[R, G, B]` a pixel.
+    fn rgb_frame(w: usize, h: usize, px: impl Fn(usize, usize) -> [u16; 3]) -> RawFrame {
+        let raw = (0..w * h).flat_map(|i| px(i % w, i / w)).collect();
+        frame(w, h, SensorKind::Rgb, 1000.0, Rect { x: 0, y: 0, w, h }, raw)
+    }
+
+    /// The three channels of a linear DNG come in as they are: each
+    /// between its own black and white, balanced, a pixel saturated when
+    /// one of its channels is. The crop is the file's, odd origin or not.
+    #[test]
+    fn ingest_rgb_reads_the_three_channels() {
+        let (w, h) = (12usize, 10usize);
+        let mut f = rgb_frame(w, h, |x, y| if (x, y) == (5, 4) { [300, 990, 250] } else { [300, 500, 250] });
+        f.black_tile = [100.0, 0.0, 50.0, 0.0];
+        f.white_rgb = [900.0, 1000.0, 450.0];
+        f.crop = Rect { x: 1, y: 1, w: 10, h: 8 };
+        f.orientation = 6;
+        let p = IngestParams {
+            wb: WhiteBalance::Manual([2.0, 1.0, 1.5]),
+            sat_dilate: 1,
+            ..IngestParams::default()
+        };
+        let c = ingest_rgb(&f, &p).unwrap();
+        assert_eq!(c.report.crop, f.crop);
+        assert_eq!((c.rgb[0].width, c.rgb[0].height), (10, 8));
+        assert_eq!((c.wb, c.orientation), ([2.0, 1.0, 1.5], 6));
+        // (300 − 100)/800 · 2, 500/1000, (250 − 50)/400 · 1.5.
+        let at = |c: &Channels, x: usize, y: usize| [c.rgb[0].at(x, y), c.rgb[1].at(x, y), c.rgb[2].at(x, y)];
+        assert_eq!(at(&c, 0, 0), [0.5, 0.5, 0.75]);
+        assert_eq!(at(&c, 4, 3), [0.5, 0.99, 0.75], "the frame's (5, 4)");
+        // One pixel with a channel at white, grown by one in each direction.
+        assert_eq!((c.report.saturated_raw, c.report.saturated_dilated), (1, 9));
+        assert_eq!(c.saturated.len(), 10 * 8);
+        assert_eq!(c.saturated[3 * 10 + 4], 1);
+        assert_eq!(c.saturated.iter().map(|&s| s as usize).sum::<usize>(), 9);
+        // Green burns out first: 1 · 980/1000. One pixel reads above it.
+        assert!((c.colour_ceiling.unwrap() - 0.98).abs() < 1e-12);
+        assert_eq!(c.report.above_ceiling, 1);
+        assert_eq!((c.report.min_norm, c.report.max_norm), (0.25, 0.99));
+        assert_eq!((c.report.defects, c.report.defects_repaired), (0, false));
+
+        // Gray world: mean green over mean red and blue, the saturated
+        // pixels left out; it is the as-shot balance of a file without one.
+        for wb in [WhiteBalance::GrayWorld, WhiteBalance::AsShot] {
+            let c = ingest_rgb(&f, &IngestParams { wb, ..p }).unwrap();
+            assert!((c.wb[0] - 2.0).abs() < 1e-12 && c.wb[1] == 1.0 && (c.wb[2] - 1.0).abs() < 1e-12);
+            assert!(at(&c, 0, 0).iter().all(|v| (v - 0.5).abs() < 1e-12), "{:?}", at(&c, 0, 0));
+        }
+        f.wb_as_shot = Some([3.0, 1.5, 1.5]);
+        let c = ingest_rgb(&f, &IngestParams { wb: WhiteBalance::AsShot, ..p }).unwrap();
+        assert_eq!((c.wb, c.report.wb_source.as_str()), ([2.0, 1.0, 1.0], "as-shot"));
+        let c = ingest_rgb(&f, &IngestParams { wb: WhiteBalance::None, ..p }).unwrap();
+        assert_eq!(at(&c, 0, 0), [0.25, 0.5, 0.5]);
+    }
+
+    /// Each of the two readers takes its own kind of frame; a frame that
+    /// is short of its three samples a pixel, a crop outside it, a white
+    /// level at black or a sample that is no number are errors.
+    #[test]
+    fn ingest_rgb_refuses_what_it_cannot_read() {
+        let (w, h) = (6usize, 4usize);
+        let p = IngestParams::default();
+        let good = rgb_frame(w, h, |_, _| [300, 500, 250]);
+        assert!(ingest_rgb(&good, &p).is_ok());
+        let err = ingest(&good, &p).unwrap_err();
+        assert!(err.to_string().contains("no mosaic"), "{err}");
+        let full = Rect { x: 0, y: 0, w, h };
+        let bayer = frame(w, h, SensorKind::Bayer(BayerPhase::RGGB), 1000.0, full, vec![0; w * h]);
+        assert!(ingest_rgb(&bayer, &p).unwrap_err().to_string().contains("mosaic"));
+        // One sample a pixel under a three-channel kind.
+        let short = frame(w, h, SensorKind::Rgb, 1000.0, full, vec![0; w * h]);
+        assert!(ingest_rgb(&short, &p).unwrap_err().to_string().contains("does not fit"));
+        let mut outside = good.clone();
+        outside.crop = Rect { x: 2, y: 0, w, h };
+        assert!(ingest_rgb(&outside, &p).unwrap_err().to_string().contains("does not fit"));
+        let mut flat = good.clone();
+        flat.white_rgb[2] = 0.0;
+        assert!(ingest_rgb(&flat, &p).unwrap_err().to_string().contains("white level"));
+        let mut nan = good.clone();
+        let mut data = vec![0.5f32; 3 * w * h];
+        data[7] = f32::NAN;
+        nan.data = crate::decode::RawData::Float(data);
+        assert!(ingest_rgb(&nan, &p).unwrap_err().to_string().contains("not a number"));
+    }
+
+    /// A grey card on a three-channel frame: every pixel of the window
+    /// reads all three channels, and a pixel with a channel at white is
+    /// left out whole.
+    #[test]
+    fn card_balance_reads_three_channels() {
+        let (w, h) = (40usize, 40usize);
+        let f = rgb_frame(w, h, |x, y| if (x, y) == (20, 21) { [250, 1000, 125] } else { [250, 500, 125] });
+        let r = card_balance(&f, &IngestParams::default(), (20, 20), 8).unwrap();
+        assert_eq!(r.window, Rect { x: 12, y: 12, w: 16, h: 16 });
+        assert_eq!((r.total, r.clipped, r.counted), (256, 1, 3 * 255));
+        assert!(
+            (r.wb[0] - 2.0).abs() < 1e-12 && r.wb[1] == 1.0 && (r.wb[2] - 4.0).abs() < 1e-12,
+            "{:?}",
+            r.wb
+        );
+        assert!((r.mean[1] - 0.5).abs() < 1e-12);
     }
 
     #[test]

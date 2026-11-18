@@ -1,6 +1,11 @@
 //! The raw frame the pipeline starts from, and RAW files decoded into it.
 //! The only file backend is `rawler` (feature `decode-rawler`); callers
 //! may also fill a `RawFrame` directly.
+//!
+//! A frame is a mosaic, one sample per photosite, or a linear DNG's three
+//! channels per pixel ([`SensorKind::Rgb`]): a picture another program
+//! has already taken from its mosaic, which is mixed and printed here and
+//! not separated again.
 
 use crate::cfa::BayerPhase;
 #[cfg(feature = "decode-rawler")]
@@ -25,9 +30,27 @@ pub enum SensorKind {
     Bayer(BayerPhase),
     /// No colour filter: every photosite is the measurement.
     Mono,
+    /// No mosaic: three samples per pixel, R, G, B in the camera's own
+    /// colours, as a linear DNG holds them. How they came out of the
+    /// camera's mosaic is the writing program's affair and cannot be read
+    /// from the file.
+    Rgb,
 }
 
-/// The sensor samples as the file stores them, row-major, one per photosite.
+impl SensorKind {
+    /// Samples the frame holds for each pixel: 3 for [`SensorKind::Rgb`],
+    /// 1 for a mosaic.
+    pub fn samples(self) -> usize {
+        match self {
+            SensorKind::Bayer(_) | SensorKind::Mono => 1,
+            SensorKind::Rgb => 3,
+        }
+    }
+}
+
+/// The sensor samples as the file stores them, row-major: one per
+/// photosite, or R, G, B one after the other for each pixel of a
+/// three-channel frame.
 #[derive(Clone, Debug)]
 pub enum RawData {
     Integer(Vec<u16>),
@@ -114,6 +137,7 @@ pub struct RawFrame {
     pub bits: usize,
     pub kind: SensorKind,
     /// Black level per 2x2 tile position, row-major: (0,0),(1,0),(0,1),(1,1).
+    /// Of a three-channel frame: the black level of R, G, B, and G's again.
     pub black_tile: [f64; 4],
     /// White level per colour: R, G, B (index by `Color`), G used twice.
     pub white_rgb: [f64; 3],
@@ -163,11 +187,18 @@ impl RawlerDecoder {
         let decoder = rawler::get_decoder(&source).map_err(|e| Error::Decode(e.to_string()))?;
         let params = rawler::decoders::RawDecodeParams::default();
         let img = decoder.raw_image(&source, &params, false).map_err(|e| Error::Decode(e.to_string()))?;
-        // Before the metadata is asked for: a file that is no mosaic is
-        // refused here whatever its metadata is. rawler 0.8 has none for a
-        // Sigma X3F (three components per pixel) and panics when asked.
-        if img.cpp != 1 {
-            return Err(Error::Unsupported(format!("{} components per pixel; expected a mosaic", img.cpp)));
+        // Before the metadata is asked for: a file that is neither a
+        // mosaic nor a linear DNG is refused here whatever its metadata
+        // is. rawler 0.8 has none for a Sigma X3F (three components per
+        // pixel) and panics when asked.
+        let linear_dng = img.cpp == 3
+            && img.photometric == P::LinearRaw
+            && decoder.format_hint() == rawler::decoders::FormatHint::DNG;
+        if img.cpp != 1 && !linear_dng {
+            return Err(Error::Unsupported(format!(
+                "{} components per pixel; expected a mosaic or a linear DNG",
+                img.cpp
+            )));
         }
         // Metadata is informational; a file without usable EXIF still decodes.
         let (exposure, exif_orientation) = match decoder.raw_metadata(&source, &params) {
@@ -187,13 +218,18 @@ impl RawlerDecoder {
                 }
                 SensorKind::Bayer(BayerPhase::from_name(&cfg.cfa.name)?)
             }
+            P::LinearRaw if linear_dng => SensorKind::Rgb,
             P::LinearRaw | P::BlackIsZero => SensorKind::Mono,
         };
 
         let bl = &img.blacklevel;
         let black_tile: [f64; 4] = if bl.levels.len() == 1 {
             [f64::from(bl.levels[0].as_f32()); 4]
-        } else if bl.width == 2 && bl.height == 2 && bl.cpp == 1 && bl.levels.len() == 4 {
+        } else if linear_dng && bl.width == 1 && bl.height == 1 && bl.cpp == 3 && bl.levels.len() == 3 {
+            // One level per channel: R, G, B.
+            let level = |c: usize| f64::from(bl.levels[c].as_f32());
+            [level(0), level(1), level(2), level(1)]
+        } else if !linear_dng && bl.width == 2 && bl.height == 2 && bl.cpp == 1 && bl.levels.len() == 4 {
             [
                 f64::from(bl.levels[0].as_f32()),
                 f64::from(bl.levels[1].as_f32()),
@@ -304,7 +340,7 @@ impl RawlerDecoder {
             rawler::RawImageData::Integer(v) => RawData::Integer(v),
             rawler::RawImageData::Float(v) => RawData::Float(v),
         };
-        if data.len() != img.width * img.height {
+        if data.len() != img.width * img.height * kind.samples() {
             return Err(Error::Decode(format!(
                 "data length {} does not match {}x{}",
                 data.len(),
@@ -313,11 +349,14 @@ impl RawlerDecoder {
             )));
         }
 
+        // A TIFF string may be padded to a word boundary (the DNG this
+        // crate writes is): the name is what stands before the padding.
+        let name = |s: String| s.trim().to_string();
         Ok(RawFrame {
-            make: img.make,
-            model: img.model,
-            clean_make: img.clean_make,
-            clean_model: img.clean_model,
+            make: name(img.make),
+            model: name(img.model),
+            clean_make: name(img.clean_make),
+            clean_model: name(img.clean_model),
             width: img.width,
             height: img.height,
             bits: img.bps,
@@ -336,13 +375,13 @@ impl RawlerDecoder {
 }
 
 impl RawFrame {
-    /// Black level at absolute sensor position.
+    /// Black level at absolute sensor position, of a mosaic.
     #[inline]
     pub fn black_at(&self, x: usize, y: usize) -> f64 {
         self.black_tile[(y & 1) * 2 + (x & 1)]
     }
 
-    /// White level at absolute sensor position.
+    /// White level at absolute sensor position, of a mosaic.
     #[inline]
     pub fn white_at(&self, x: usize, y: usize) -> f64 {
         match self.kind {
@@ -351,8 +390,32 @@ impl RawFrame {
                 crate::cfa::Color::G => self.white_rgb[1],
                 crate::cfa::Color::B => self.white_rgb[2],
             },
-            SensorKind::Mono => self.white_rgb[1],
+            SensorKind::Mono | SensorKind::Rgb => self.white_rgb[1],
         }
+    }
+
+    /// Black and white level of channel `c` (0 R, 1 G, 2 B) of a
+    /// three-channel frame.
+    #[inline]
+    pub fn channel_levels(&self, c: usize) -> (f64, f64) {
+        (self.black_tile[c], self.white_rgb[c])
+    }
+
+    /// The three samples of pixel (x, y) of a three-channel frame, as
+    /// stored.
+    #[inline]
+    pub fn rgb_at(&self, x: usize, y: usize) -> [f64; 3] {
+        let i = 3 * (y * self.width + x);
+        [self.data.get(i), self.data.get(i + 1), self.data.get(i + 2)]
+    }
+
+    /// The frame holds a sample for every photosite, or three for every
+    /// pixel of a three-channel frame.
+    pub fn holds_its_samples(&self) -> bool {
+        self.width
+            .checked_mul(self.height)
+            .and_then(|n| n.checked_mul(self.kind.samples()))
+            .is_some_and(|n| n == self.data.len())
     }
 
     /// Effective bit depth from the white level (container depth may be 16).
@@ -369,7 +432,9 @@ impl RawFrame {
     pub fn raw_range(&self) -> (f64, f64) {
         use rayon::prelude::*;
         let c = self.crop;
-        if c.x + c.w > self.width || c.y + c.h > self.height || self.data.len() < self.width * self.height {
+        let n = self.kind.samples();
+        if c.x + c.w > self.width || c.y + c.h > self.height || self.data.len() < n * self.width * self.height
+        {
             return (f64::INFINITY, f64::NEG_INFINITY);
         }
         (c.y..c.y + c.h)
@@ -377,8 +442,8 @@ impl RawFrame {
             .map(|y| {
                 let mut lo = f64::INFINITY;
                 let mut hi = f64::NEG_INFINITY;
-                for x in c.x..c.x + c.w {
-                    let v = self.data.get(y * self.width + x);
+                for i in n * (y * self.width + c.x)..n * (y * self.width + c.x + c.w) {
+                    let v = self.data.get(i);
                     lo = lo.min(v);
                     hi = hi.max(v);
                 }

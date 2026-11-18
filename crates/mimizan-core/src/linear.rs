@@ -456,6 +456,89 @@ mod tests {
         }
     }
 
+    /// The DNG this module writes is a file the decoder reads: three
+    /// channels a pixel and no mosaic, with the levels, the balance and
+    /// the matrix that were written, and a name without its padding. It
+    /// develops without a separation, and the plate of its channels is the
+    /// one that was written, to the file's 16 bits.
+    #[cfg(feature = "decode-rawler")]
+    #[test]
+    fn the_dng_comes_back_as_three_channels() {
+        use crate::decode::{RawlerDecoder, SensorKind};
+        use crate::ingest::WhiteBalance;
+        use crate::pipeline::{negative_from_frame, NegativeParams};
+        use crate::plate::{PlateFilters, PlateParams, PlateSpace};
+
+        let (w, h) = (48usize, 32usize);
+        let wb = [2.0, 1.0, 1.5];
+        // Three different pictures, each below the ceiling of its channel.
+        let plane = |f: &dyn Fn(usize, usize) -> f64| {
+            let mut p = Plane::zeros(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    p.set(x, y, f(x, y));
+                }
+            }
+            p
+        };
+        let r = plane(&|x, y| 0.05 + 0.8 * (x + y) as f64 / (w + h) as f64);
+        let g = plane(&|x, _| 0.1 + 0.7 * x as f64 / w as f64);
+        let b = plane(&|_, y| 0.9 - 0.8 * y as f64 / h as f64);
+        let m = [[0.7, 0.2, 0.1], [-0.3, 1.1, 0.2], [0.05, -0.1, 0.9]];
+        let meta = DngMeta {
+            make: "Mimizan",
+            model: "Test",
+            xyz_to_cam: m,
+            illuminant: Some(21),
+            wb,
+            description: "{}",
+        };
+        let path = tmp("back.dng");
+        write_dng(&path, [&r, &g, &b], &Framing::upright(1), &meta).unwrap();
+
+        let frame = RawlerDecoder.decode(&path).unwrap();
+        assert_eq!(frame.kind, SensorKind::Rgb);
+        assert_eq!((frame.width, frame.height, frame.orientation), (w, h, 1));
+        assert_eq!(frame.data.len(), 3 * w * h);
+        assert_eq!((frame.black_tile, frame.white_rgb), ([0.0; 4], [65535.0; 3]));
+        // "Test" was written with a space behind it.
+        assert_eq!((frame.make.as_str(), frame.model.as_str()), ("Mimizan", "Test"));
+        let shot = frame.wb_as_shot.expect("the neutral is the balance");
+        for (a, b) in shot.iter().zip(wb) {
+            assert!((a / shot[1] - b).abs() < 1e-4, "{shot:?}");
+        }
+        let got = frame.xyz_to_cam.expect("the matrix");
+        for (a, b) in got.iter().flatten().zip(m.iter().flatten()) {
+            assert!((a - b).abs() < 1e-4, "{got:?}");
+        }
+        for (i, plane) in [&r, &g, &b].into_iter().enumerate() {
+            for (x, y) in [(0, 0), (17, 5), (w - 1, h - 1)] {
+                let want = (plane.at(x, y) / wb[i] * 65535.0).round();
+                assert_eq!(frame.rgb_at(x, y)[i], want, "channel {i} at {x},{y}");
+            }
+        }
+
+        let params = NegativeParams {
+            plate: Some(PlateParams { filters: PlateFilters::Channels, space: PlateSpace::Srgb }),
+            ..NegativeParams::default()
+        };
+        assert_eq!(params.ingest.wb, WhiteBalance::AsShot);
+        let n = negative_from_frame(&frame, &params, 0).unwrap();
+        assert_eq!(n.info.phase, None);
+        assert_eq!((n.plane.width, n.plane.height), (w, 3 * h));
+        // Half a 16-bit step of the unbalanced sample, times the balance,
+        // and the rationals of the neutral.
+        for (i, plane) in [&b, &g, &r].into_iter().enumerate() {
+            for y in 0..h {
+                for x in 0..w {
+                    let (got, want) = (n.plane.at(x, i * h + y), plane.at(x, y));
+                    assert!((got - want).abs() < 2.0 / 65535.0, "frame {i} at {x},{y}: {got} vs {want}");
+                }
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     /// No matrix, no DNG; a bad multiplier is refused; mismatched planes
     /// are refused.
     #[test]
