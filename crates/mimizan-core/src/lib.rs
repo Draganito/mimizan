@@ -39,6 +39,7 @@ pub mod tiffin;
 pub mod tiffout;
 pub mod tone;
 pub mod usm;
+pub mod xtrans;
 pub mod zone;
 
 pub use error::{Error, Result};
