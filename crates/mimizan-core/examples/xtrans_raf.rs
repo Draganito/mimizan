@@ -10,6 +10,7 @@
 //!   [--orient n,k[,f..]]  n oriented priors (cos^2k) beside the others, at f times the colour's share (1 and 16)
 //!   [--two]  the second step (colour on one line)
 //!   [--patch x,y,size]  mean of each channel in that window, photosites against separation
+//!   [--clip]  the balanced mosaic cut at the level the first channel burns out at, so that burnt areas are white
 //!
 //! Writes the luminance and the colour picture (camera matrix towards
 //! sRGB) as 8-bit PNGs, both scaled so that the 99.9th percentile of the
@@ -49,6 +50,7 @@ fn main() {
     let mut zoom = 1usize;
     let mut given: Option<Prior> = None;
     let mut two = false;
+    let mut clip = false;
     let mut patches: Vec<(usize, usize, usize)> = Vec::new();
     let mut free = [true; 6];
     let mut orient: Option<(usize, f64, Vec<f64>)> = None;
@@ -68,6 +70,7 @@ fn main() {
             }
             "--single" => single = true,
             "--two" => two = true,
+            "--clip" => clip = true,
             "--patch" => {
                 let v: Vec<usize> = args[i + 1].split(',').map(|x| x.parse().unwrap()).collect();
                 patches.push((v[0], v[1], v[2]));
@@ -171,6 +174,10 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
     let mut m = Plane::zeros(w, h);
+    // A photosite at white measures nothing but "at least this much".
+    // Cut at the lowest of the three balanced ceilings, a burnt area is
+    // flat and white instead of the balance's colour.
+    let ceiling = if clip { wb.iter().copied().fold(f64::INFINITY, f64::min) } else { f64::INFINITY };
     let mut sums = [(0.0, 0.0); 3];
     let mut clipped = 0usize;
     for y in 0..h {
@@ -181,7 +188,7 @@ fn main() {
             clipped += (raw >= white - 1.0) as usize;
             sums[c as usize].0 += v;
             sums[c as usize].1 += 1.0;
-            m.set(x, y, v * wb[c as usize]);
+            m.set(x, y, (v * wb[c as usize]).min(ceiling));
         }
     }
     let mean = |c: Color| sums[c as usize].0 / sums[c as usize].1;
