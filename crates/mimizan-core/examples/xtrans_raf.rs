@@ -301,6 +301,10 @@ fn main() {
         sep = sep.mapped(|v| tone.back(v));
     }
 
+    // Sums over the frame, to tell whether two builds give the same picture.
+    let sum = |pl: &Plane| pl.data.iter().map(|v| v.abs()).sum::<f64>();
+    eprintln!("sums: lum {:.9e} c1 {:.9e} c2 {:.9e}", sum(&sep.lum), sum(&sep.c1), sum(&sep.c2));
+
     // Mean of each channel in a window: the photosites of each colour
     // against the separation's three channels.
     for &(px, py, size) in &patches {

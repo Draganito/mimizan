@@ -77,12 +77,22 @@
 //!    noise more surely, but the picture is 0.1 to 0.5 dB worse and the
 //!    noisier photosites stand in the luminance as a dotted grain. Taken
 //!    out.
+//! 10. The same arithmetic in less time, 170 s to 36 s on 26 million
+//!     photosites. A set's system depends on the prior and the tile's
+//!     size and not on the picture: it is factored once per prior
+//!     ([`Ready`]) and not once per tile, and once for all the windows of
+//!     the search. Half the sets are solved, the other half holds the
+//!     conjugates. Four tiles go through a set side by side, and the two
+//!     chrominances come back in one transform. The picture is the same
+//!     but for a prior with a direction at half the sampling rate, which
+//!     had told `+½` from `−½` ([`Prior::bin_power`]): one step of 255 at
+//!     one value in ten thousand.
 //!
 //! The filters are applied by FFT on tiles: a tool for finding the
 //! method, not the form a release would have.
 
 use crate::cfa::Color;
-use crate::filter::{gaussian_kernel, lowpass, reflect};
+use crate::filter::{convolve_cols_signed_into, convolve_rows_mod_into, gaussian_kernel, lowpass, reflect};
 use crate::plane::Plane;
 use crate::synth::Rgb;
 use rayon::prelude::*;
@@ -330,6 +340,22 @@ impl Prior {
     }
 }
 
+impl Prior {
+    /// The powers at bin `(u, v)` of a `tw × th` transform. A bin at half
+    /// the sampling rate stands for `+½` and `−½` alike, which an oriented
+    /// prior tells apart: it gets the mean of the two, so that the bin and
+    /// its mirror agree and the estimate is a real picture.
+    fn bin_power(&self, u: usize, v: usize, tw: usize, th: usize) -> (f64, f64) {
+        let (fu, fv) = (bin_freq(u, tw), bin_freq(v, th));
+        let p = self.power(fu, fv);
+        if self.oriented.is_none() || (2 * u != tw && 2 * v != th) {
+            return p;
+        }
+        let q = if 2 * u == tw { self.power(-fu, fv) } else { self.power(fu, -fv) };
+        (0.5 * (p.0 + q.0), 0.5 * (p.1 + q.1))
+    }
+}
+
 impl Default for XParams {
     fn default() -> Self {
         Self {
@@ -422,24 +448,34 @@ impl Fft2 {
     }
 
     /// In place; the inverse is scaled by `1/(w·h)`.
+    ///
+    /// The columns go through a small buffer, [`Fft2::COLUMNS`] at a
+    /// time: to turn the whole picture and turn it back costs more than
+    /// the transforms between, since a tile is larger than the cache and
+    /// every tile of a batch is at it at once.
     fn run(&self, buf: &mut [C64], inverse: bool) {
         let (w, h) = (self.w, self.h);
         let (fx, fy) = if inverse { (&self.iw, &self.ih) } else { (&self.fw, &self.fh) };
         fx.process(buf);
-        let mut t = vec![C64::new(0.0, 0.0); w * h];
-        for y in 0..h {
-            for x in 0..w {
-                t[x * h + y] = buf[y * w + x];
+        let scale = if inverse { 1.0 / (w * h) as f64 } else { 1.0 };
+        let mut cols = vec![C64::new(0.0, 0.0); Self::COLUMNS * h];
+        for x0 in (0..w).step_by(Self::COLUMNS) {
+            let n = Self::COLUMNS.min(w - x0);
+            for (y, row) in buf.chunks(w).enumerate() {
+                for (j, v) in row[x0..x0 + n].iter().enumerate() {
+                    cols[j * h + y] = *v;
+                }
             }
-        }
-        fy.process(&mut t);
-        let s = if inverse { 1.0 / (w * h) as f64 } else { 1.0 };
-        for y in 0..h {
-            for x in 0..w {
-                buf[y * w + x] = t[x * h + y] * s;
+            fy.process(&mut cols[..n * h]);
+            for (y, row) in buf.chunks_mut(w).enumerate() {
+                for (j, v) in row[x0..x0 + n].iter_mut().enumerate() {
+                    *v = cols[j * h + y] * scale;
+                }
             }
         }
     }
+
+    const COLUMNS: usize = 16;
 }
 
 /// The copies of the `tw × th` window of `m` at `(ox, oy)`; pixels outside
@@ -534,7 +570,28 @@ pub fn combine(copies: &[Copy], kind: u8, p: &XParams) -> Plane {
 
 /// Solve `G·y = b` for a Hermitian positive definite `G` (36×36, row-major)
 /// by Cholesky; `g` and `b` are overwritten, `b` with `y`.
+#[cfg(test)]
 fn solve_hermitian(g: &mut [C64], b: &mut [C64], n: usize) {
+    cholesky(g, n);
+    for i in 0..n {
+        let mut v = b[i];
+        for k in 0..i {
+            v -= g[i * n + k] * b[k];
+        }
+        b[i] = v / g[i * n + i].re;
+    }
+    for i in (0..n).rev() {
+        let mut v = b[i];
+        for k in i + 1..n {
+            v -= g[k * n + i].conj() * b[k];
+        }
+        b[i] = v / g[i * n + i].re;
+    }
+}
+
+/// The Cholesky factor of a Hermitian positive definite `G` (`n × n`,
+/// row-major) in its lower triangle, in place.
+fn cholesky(g: &mut [C64], n: usize) {
     for j in 0..n {
         let mut d = g[j * n + j].re;
         for k in 0..j {
@@ -549,20 +606,6 @@ fn solve_hermitian(g: &mut [C64], b: &mut [C64], n: usize) {
             }
             g[i * n + j] = v / d;
         }
-    }
-    for i in 0..n {
-        let mut v = b[i];
-        for k in 0..i {
-            v -= g[i * n + k] * b[k];
-        }
-        b[i] = v / g[i * n + i].re;
-    }
-    for i in (0..n).rev() {
-        let mut v = b[i];
-        for k in i + 1..n {
-            v -= g[k * n + i].conj() * b[k];
-        }
-        b[i] = v / g[i * n + i].re;
     }
 }
 
@@ -608,12 +651,21 @@ fn bin_freq(i: usize, n: usize) -> f64 {
     }
 }
 
-/// The 36 tied bins of the set at `(u0, v0)`: the mosaic's spectrum there
-/// in `y`, its covariance under `prior` in `g`, the chrominance powers in
-/// the return.
-#[allow(clippy::too_many_arguments)]
-fn set_system(
-    spec: &[C64],
+/// The mosaic's spectrum at the 36 tied bins of the set at `(u0, v0)`.
+fn set_spectrum(spec: &[C64], tw: usize, th: usize, u0: usize, v0: usize, y: &mut [C64; 36]) {
+    let (qw, qh) = (tw / 6, th / 6);
+    for b in 0..6 {
+        let row = &spec[(v0 + b * qh) * tw..];
+        for a in 0..6 {
+            y[b * 6 + a] = row[u0 + a * qw];
+        }
+    }
+}
+
+/// The covariance of the mosaic's spectrum at the 36 tied bins of the set
+/// at `(u0, v0)` under `prior`, in `g`; the chrominance powers in the
+/// return. It depends on the prior and the tile's size, not on the picture.
+fn set_matrix(
     tw: usize,
     th: usize,
     nz: &CarrierLists,
@@ -621,7 +673,6 @@ fn set_system(
     u0: usize,
     v0: usize,
     g: &mut [C64],
-    y: &mut [C64; 36],
 ) -> [[f64; 36]; 2] {
     let (qw, qh) = (tw / 6, th / 6);
     let mut sl = [0.0; 36];
@@ -630,8 +681,7 @@ fn set_system(
         for a in 0..6 {
             let i = b * 6 + a;
             let (u, v) = (u0 + a * qw, v0 + b * qh);
-            y[i] = spec[v * tw + u];
-            let (l, c) = prior.power(bin_freq(u, tw), bin_freq(v, th));
+            let (l, c) = prior.bin_power(u, v, tw, th);
             sl[i] = l;
             sc[0][i] = c * prior.chroma[0];
             sc[1][i] = c * prior.chroma[1];
@@ -658,94 +708,292 @@ fn set_system(
     sc
 }
 
-/// What one prior gives on a tile.
-struct TileEstimate {
-    c1: Plane,
-    c2: Plane,
-    /// `m·(G⁻¹m)` per pixel: how improbable the mosaic is there under
-    /// the prior, before the prior's level is set.
-    energy: Plane,
-    /// `log det G` per pixel of the tile.
-    logdet: f64,
-}
+/// Entries of the lower triangle of a 36×36 matrix.
+const PACKED: usize = 36 * 37 / 2;
 
-/// The least-squares demultiplexer on one tile.
-fn tile_lmmse(
-    m: &Plane,
-    tile: &XTile,
-    prior: &Prior,
-    ox: isize,
-    oy: isize,
+/// A prior made ready for every tile of one size and one place in the
+/// colour tile: the covariance of each set does not depend on the
+/// picture, so it is factored once and not once per tile.
+///
+/// Half the sets are held, the rows `0..=qh/2` of them. The mosaic and
+/// what is estimated from it are real pictures, so a set's bins at the
+/// frequencies `−f` hold the conjugates of what its bins at `f` hold, and
+/// those are the bins of the set in row `qh − v0`.
+struct Ready {
     tw: usize,
     th: usize,
-) -> TileEstimate {
-    let pat = tile.shifted(ox, oy).pattern();
-    let fft = Fft2::new(tw, th);
-    let n = tw * th;
-    let spec = spectrum(m, &fft, ox, oy);
-    let nz = carrier_lists(&pat);
+    nz: CarrierLists,
+    /// Per set held, the lower triangle of the Cholesky factor of its
+    /// covariance, row by row.
+    factors: Vec<C64>,
+    /// Per set held, the powers of `C1` and of `C2` at its 36 bins.
+    powers: Vec<[[f64; 36]; 2]>,
+    /// `log det G` per pixel of the tile.
+    logdet: f64,
+    /// Per chrominance and bin of a set, what it is the sum of: the bins
+    /// its carriers bring it from, each with its coefficient.
+    from: [Vec<(usize, C64)>; 2],
+    fft: Fft2,
+}
+
+impl Ready {
+    /// `tile` is the colour tile at the window's origin.
+    fn new(prior: &Prior, tile: &XTile, tw: usize, th: usize) -> Ready {
+        let sets = (tw / 6) * (th / 6 / 2 + 1);
+        let nz = carrier_lists(&tile.pattern());
+        let from = [0, 1].map(|kind| {
+            let mut v = Vec::new();
+            for b in 0..6 {
+                for a in 0..6 {
+                    v.extend(nz[kind].iter().map(|&(k, l, ak)| (((b + l) % 6) * 6 + (a + k) % 6, ak)));
+                }
+            }
+            v
+        });
+        let mut ready = Ready {
+            tw,
+            th,
+            nz,
+            from,
+            factors: vec![C64::new(0.0, 0.0); sets * PACKED],
+            powers: vec![[[0.0; 36]; 2]; sets],
+            logdet: 0.0,
+            fft: Fft2::new(tw, th),
+        };
+        ready.set(prior);
+        ready
+    }
+
+    /// The same for another prior, in the room the last one had.
+    fn set(&mut self, prior: &Prior) {
+        let (tw, th) = (self.tw, self.th);
+        let (qw, qh) = (tw / 6, th / 6);
+        let nz = &self.nz;
+        let logdet: f64 = self
+            .factors
+            .par_chunks_mut(qw * PACKED)
+            .zip(self.powers.par_chunks_mut(qw))
+            .enumerate()
+            .map(|(v0, (frow, prow))| {
+                let mut g = vec![C64::new(0.0, 0.0); 36 * 36];
+                let mut logdet = 0.0;
+                for u0 in 0..qw {
+                    prow[u0] = set_matrix(tw, th, nz, prior, u0, v0, &mut g);
+                    cholesky(&mut g, 36);
+                    let packed = &mut frow[u0 * PACKED..(u0 + 1) * PACKED];
+                    let mut at = 0;
+                    for i in 0..36 {
+                        packed[at..at + i + 1].copy_from_slice(&g[i * 36..i * 36 + i + 1]);
+                        logdet += 2.0 * g[i * 36 + i].re.ln();
+                        at += i + 1;
+                    }
+                }
+                // The row stands for its mirror as well, unless it is
+                // its own.
+                if mirrored(v0, qh).is_some() {
+                    2.0 * logdet
+                } else {
+                    logdet
+                }
+            })
+            .sum();
+        self.logdet = logdet / (tw * th) as f64;
+    }
+}
+
+/// The row of sets that holds the conjugates of row `v0`, of `qh` rows:
+/// none for the two rows that hold their own.
+fn mirrored(v0: usize, qh: usize) -> Option<usize> {
+    (v0 != 0 && 2 * v0 != qh).then(|| qh - v0)
+}
+
+/// Tiles that are worked on together: each set's factor is read once for
+/// all of them, and they are transformed side by side.
+const AT_ONCE: usize = 8;
+
+/// Tiles that go through a set's system side by side, each in its own
+/// lane. A sum of products cannot be reordered, so one tile alone waits
+/// for every addition before the next; four tiles wait together.
+const LANES: usize = 4;
+
+/// The room [`AT_ONCE`] tiles are worked on in, kept from one batch and
+/// one prior to the next: a tile takes some 36 MB of it, and to ask the
+/// system for that every time costs as much as the arithmetic.
+struct Work {
+    /// Buffers per tile: one, or two with the energy.
+    per: usize,
+    /// Per tile the estimate `Ĉ1 + i·Ĉ2` (both are real pictures, so one
+    /// transform back gives both) and, with the energy, `G⁻¹m` in the real
+    /// part of a second.
+    bufs: Vec<Vec<C64>>,
+}
+
+impl Work {
+    fn new(tiles: usize, energy: bool, tw: usize, th: usize) -> Work {
+        let per = if energy { 2 } else { 1 };
+        let bufs = (0..tiles.min(AT_ONCE) * per).map(|_| vec![C64::new(0.0, 0.0); tw * th]).collect();
+        Work { per, bufs }
+    }
+
+    /// `Ĉ1` in the real and `Ĉ2` in the imaginary part, on tile `t` of
+    /// the last batch.
+    fn chroma(&self, t: usize) -> &[C64] {
+        &self.bufs[t * self.per]
+    }
+
+    /// `m·(G⁻¹m)` on tile `t` of the last batch, whose window of `m` is at
+    /// `(ox, oy)`: how improbable the mosaic is at each pixel under the
+    /// prior, before the prior's level is set. Into `out`, `tw` wide.
+    fn energy(&self, t: usize, m: &Plane, (ox, oy): (isize, isize), tw: usize, out: &mut [f64]) {
+        assert!(self.per == 2, "no energy was asked for");
+        let z = &self.bufs[t * self.per + 1];
+        for (y, (orow, zrow)) in out.chunks_mut(tw).zip(z.chunks(tw)).enumerate() {
+            let row = m.row(reflect(oy + y as isize, m.height));
+            for (x, (o, v)) in orow.iter_mut().zip(zrow).enumerate() {
+                *o = v.re * row[reflect(ox + x as isize, m.width)];
+            }
+        }
+    }
+}
+
+/// The spectra of the windows of `m` at `at`.
+fn spectra(m: &Plane, fft: &Fft2, at: &[(isize, isize)]) -> Vec<Vec<C64>> {
+    at.par_iter().map(|&(ox, oy)| spectrum(m, fft, ox, oy)).collect()
+}
+
+/// The least-squares demultiplexer on no more than [`AT_ONCE`] windows
+/// of the mosaic, whose spectra are `specs`. The estimates are left in
+/// `work`.
+fn tiles_lmmse(r: &Ready, specs: &[Vec<C64>], work: &mut Work) {
+    let (tw, th) = (r.tw, r.th);
     let (qw, qh) = (tw / 6, th / 6);
-    // Per row of sets: the two chrominance spectra and G⁻¹m at the set's
-    // 36 bins, and the row's log det.
-    let rows: Vec<(Vec<[C64; 3]>, f64)> = (0..qh)
-        .into_par_iter()
+    let per = work.per;
+    let used = specs.len() * per;
+    assert!(used <= work.bufs.len(), "tiles_lmmse: {} tiles", specs.len());
+    // A row of sets fills six rows of bins in every buffer: `sixes[v0]`
+    // holds them, buffer by buffer.
+    let mut sixes: Vec<Vec<&mut [C64]>> = (0..qh).map(|_| Vec::new()).collect();
+    for buf in work.bufs[..used].iter_mut() {
+        for (y, row) in buf.chunks_mut(tw).enumerate() {
+            sixes[y % qh].push(row);
+        }
+    }
+    // A row of sets fills its mirror's rows of bins as well.
+    type Rows<'a> = Vec<&'a mut [C64]>;
+    let mut sixes: Vec<Option<Rows>> = sixes.into_iter().map(Some).collect();
+    let halves: Vec<(Rows, Option<Rows>)> = (0..qh / 2 + 1)
         .map(|v0| {
-            let mut out = vec![[C64::new(0.0, 0.0); 3]; qw * 36];
-            let mut g = vec![C64::new(0.0, 0.0); 36 * 36];
-            let mut logdet = 0.0;
-            for u0 in 0..qw {
-                let mut y = [C64::new(0.0, 0.0); 36];
-                let sc = set_system(&spec, tw, th, &nz, prior, u0, v0, &mut g, &mut y);
-                solve_hermitian(&mut g, &mut y, 36);
-                logdet += (0..36).map(|i| 2.0 * g[i * 36 + i].re.ln()).sum::<f64>();
-                for (kind, list) in nz.iter().enumerate() {
+            let own = sixes[v0].take().expect("each row once");
+            (own, mirrored(v0, qh).map(|v| sixes[v].take().expect("each row once")))
+        })
+        .collect();
+    halves.into_par_iter().enumerate().for_each(|(v0, (mut six, mut mirror))| {
+        for u0 in 0..qw {
+            let set = v0 * qw + u0;
+            let l = &r.factors[set * PACKED..(set + 1) * PACKED];
+            let sc = &r.powers[set];
+            for (group, (specs, out)) in specs.chunks(LANES).zip(six.chunks_mut(6 * per * LANES)).enumerate()
+            {
+                // The set's 36 bins, real and imaginary parts, a tile to
+                // a lane.
+                let (mut yr, mut yi) = ([[0.0; LANES]; 36], [[0.0; LANES]; 36]);
+                for (t, spec) in specs.iter().enumerate() {
                     for b in 0..6 {
+                        let row = &spec[(v0 + b * qh) * tw..];
                         for a in 0..6 {
-                            let mut c = C64::new(0.0, 0.0);
-                            for &(k, l, ak) in list {
-                                c += ak.conj() * y[((b + l) % 6) * 6 + (a + k) % 6];
-                            }
-                            out[u0 * 36 + b * 6 + a][kind] = c * sc[kind][b * 6 + a];
+                            let v = row[u0 + a * qw];
+                            (yr[b * 6 + a][t], yi[b * 6 + a][t]) = (v.re, v.im);
                         }
                     }
                 }
-                for (i, v) in y.iter().enumerate() {
-                    out[u0 * 36 + i][2] = *v;
+                // L·z = y, row by row.
+                let mut at = 0;
+                for i in 0..36 {
+                    let row = &l[at..at + i + 1];
+                    let (mut vr, mut vi) = (yr[i], yi[i]);
+                    for (k, c) in row[..i].iter().enumerate() {
+                        let (br, bi) = (&yr[k], &yi[k]);
+                        for t in 0..LANES {
+                            vr[t] -= c.re * br[t] - c.im * bi[t];
+                            vi[t] -= c.re * bi[t] + c.im * br[t];
+                        }
+                    }
+                    let d = row[i].re;
+                    for t in 0..LANES {
+                        (yr[i][t], yi[i][t]) = (vr[t] / d, vi[t] / d);
+                    }
+                    at += i + 1;
                 }
-            }
-            (out, logdet)
-        })
-        .collect();
-    let mut planes = Vec::new();
-    for kind in 0..3 {
-        let mut z = vec![C64::new(0.0, 0.0); n];
-        for (v0, (row, _)) in rows.iter().enumerate() {
-            for u0 in 0..qw {
+                // Lᴴ·x = z, from the last unknown up.
+                for i in (0..36).rev() {
+                    at -= i + 1;
+                    let row = &l[at..at + i + 1];
+                    let d = row[i].re;
+                    let (mut xr, mut xi) = (yr[i], yi[i]);
+                    for t in 0..LANES {
+                        (xr[t], xi[t]) = (xr[t] / d, xi[t] / d);
+                    }
+                    (yr[i], yi[i]) = (xr, xi);
+                    for (k, c) in row[..i].iter().enumerate() {
+                        let (br, bi) = (&mut yr[k], &mut yi[k]);
+                        for t in 0..LANES {
+                            br[t] -= c.re * xr[t] + c.im * xi[t];
+                            bi[t] -= c.re * xi[t] - c.im * xr[t];
+                        }
+                    }
+                }
+                // The chrominances: each bin from the bins its carriers
+                // bring it from.
                 for b in 0..6 {
                     for a in 0..6 {
-                        z[(v0 + b * qh) * tw + u0 + a * qw] = row[u0 * 36 + b * 6 + a][kind];
+                        let bin = b * 6 + a;
+                        let mut c = [[[0.0; LANES]; 2]; 2];
+                        for (kind, from) in r.from.iter().enumerate() {
+                            let n = from.len() / 36;
+                            let [cr, ci] = &mut c[kind];
+                            for &(i, ak) in &from[bin * n..(bin + 1) * n] {
+                                let (br, bi) = (&yr[i], &yi[i]);
+                                for t in 0..LANES {
+                                    cr[t] += ak.re * br[t] + ak.im * bi[t];
+                                    ci[t] += ak.re * bi[t] - ak.im * br[t];
+                                }
+                            }
+                            let s = sc[kind][bin];
+                            for t in 0..LANES {
+                                (cr[t], ci[t]) = (cr[t] * s, ci[t] * s);
+                            }
+                        }
+                        let x = u0 + a * qw;
+                        for (t, out) in out.chunks_mut(6 * per).enumerate() {
+                            out[b][x] = C64::new(c[0][0][t] - c[1][1][t], c[0][1][t] + c[1][0][t]);
+                            if per == 2 {
+                                out[6 + b][x] = C64::new(yr[bin][t], yi[bin][t]);
+                            }
+                        }
+                        // At `−f` the conjugates: of `Ĉ1` and of `Ĉ2`
+                        // each, not of the two packed.
+                        if let Some(mirror) = &mut mirror {
+                            let x = (tw - x) % tw;
+                            let out = &mut mirror[group * 6 * per * LANES..];
+                            for (t, out) in out.chunks_mut(6 * per).take(specs.len()).enumerate() {
+                                out[5 - b][x] = C64::new(c[0][0][t] + c[1][1][t], c[1][0][t] - c[0][1][t]);
+                                if per == 2 {
+                                    out[6 + 5 - b][x] = C64::new(yr[bin][t], -yi[bin][t]);
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        fft.run(&mut z, true);
-        planes.push(Plane::from_vec(tw, th, z.iter().map(|c| c.re).collect()));
-    }
-    let mut energy = planes.pop().expect("three planes");
-    for y in 0..th {
-        let row = m.row(reflect(oy + y as isize, m.height));
-        for (x, v) in energy.row_mut(y).iter_mut().enumerate() {
-            *v *= row[reflect(ox + x as isize, m.width)];
-        }
-    }
-    let c2 = planes.pop().expect("three planes");
-    let c1 = planes.pop().expect("three planes");
-    TileEstimate { c1, c2, energy, logdet: rows.iter().map(|r| r.1).sum::<f64>() / n as f64 }
+    });
+    work.bufs[..used].par_iter_mut().for_each(|z| r.fft.run(z, true));
 }
 
-/// One window of the frame for [`fit_prior`]: its spectrum and carriers.
-struct Sample {
-    spec: Vec<C64>,
+/// The windows of the frame [`fit_prior`] looks at: their spectra, and the
+/// carriers, which are the same in all of them.
+struct Samples {
+    specs: Vec<Vec<C64>>,
     tw: usize,
     th: usize,
     nz: CarrierLists,
@@ -754,56 +1002,53 @@ struct Sample {
 /// How probable the samples are under `prior` (Whittle's likelihood of
 /// the mosaic's spectrum, the overall level left free): larger is better.
 /// Every `stride`-th set in each direction is counted.
-fn evidence(samples: &[Sample], prior: &Prior, stride: usize) -> f64 {
-    let mut total = (0.0, 0.0, 0.0);
-    for s in samples {
-        let (qw, qh) = (s.tw / 6, s.th / 6);
-        let part = (0..qh)
-            .into_par_iter()
-            .step_by(stride)
-            .map(|v0| {
-                let mut g = vec![C64::new(0.0, 0.0); 36 * 36];
-                let (mut q, mut d, mut n) = (0.0, 0.0, 0.0);
-                for u0 in (0..qw).step_by(stride) {
-                    if u0 == 0 && v0 == 0 {
-                        continue;
-                    }
+///
+/// A set's covariance is the same in every window, so it is built and
+/// factored once for all of them. And a row of sets and its mirror hold
+/// conjugate spectra under conjugate covariances (see [`Ready`]), which
+/// count the same: where the stride takes both, one is counted twice.
+fn evidence(samples: &Samples, prior: &Prior, stride: usize) -> f64 {
+    let (tw, th) = (samples.tw, samples.th);
+    let (qw, qh) = (tw / 6, th / 6);
+    let both = qw.is_multiple_of(stride) && qh.is_multiple_of(stride);
+    let rows: Vec<(usize, f64)> = (0..qh)
+        .step_by(stride)
+        .filter_map(|v0| match mirrored(v0, qh) {
+            Some(v) if both => (v0 < v).then_some((v0, 2.0)),
+            _ => Some((v0, 1.0)),
+        })
+        .collect();
+    let (q, d, n) = rows
+        .par_iter()
+        .map(|&(v0, times)| {
+            let mut g = vec![C64::new(0.0, 0.0); 36 * 36];
+            let (mut q, mut d, mut n) = (0.0, 0.0, 0.0);
+            for u0 in (0..qw).step_by(stride) {
+                if u0 == 0 && v0 == 0 {
+                    continue;
+                }
+                set_matrix(tw, th, &samples.nz, prior, u0, v0, &mut g);
+                cholesky(&mut g, 36);
+                let logdet: f64 = (0..36).map(|i| 2.0 * g[i * 36 + i].re.ln()).sum();
+                // |L⁻¹y|² in each window.
+                for spec in &samples.specs {
                     let mut y = [C64::new(0.0, 0.0); 36];
-                    set_system(&s.spec, s.tw, s.th, &s.nz, prior, u0, v0, &mut g, &mut y);
-                    // Cholesky in place; then |L⁻¹y|² and log det.
-                    let nn = 36;
-                    for j in 0..nn {
-                        let mut dd = g[j * nn + j].re;
-                        for k in 0..j {
-                            dd -= g[j * nn + k].norm_sqr();
-                        }
-                        let dd = dd.max(1e-300).sqrt();
-                        g[j * nn + j] = C64::new(dd, 0.0);
-                        for i in j + 1..nn {
-                            let mut v = g[i * nn + j];
-                            for k in 0..j {
-                                v -= g[i * nn + k] * g[j * nn + k].conj();
-                            }
-                            g[i * nn + j] = v / dd;
-                        }
-                        d += 2.0 * dd.ln();
-                    }
-                    for i in 0..nn {
+                    set_spectrum(spec, tw, th, u0, v0, &mut y);
+                    for i in 0..36 {
                         let mut v = y[i];
                         for k in 0..i {
-                            v -= g[i * nn + k] * y[k];
+                            v -= g[i * 36 + k] * y[k];
                         }
-                        y[i] = v / g[i * nn + i].re;
+                        y[i] = v / g[i * 36 + i].re;
                         q += y[i].norm_sqr();
                     }
-                    n += nn as f64;
                 }
-                (q, d, n)
-            })
-            .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-        total = (total.0 + part.0, total.1 + part.1, total.2 + part.2);
-    }
-    let (q, d, n) = total;
+                d += logdet * samples.specs.len() as f64;
+                n += (36 * samples.specs.len()) as f64;
+            }
+            (times * q, times * d, times * n)
+        })
+        .reduce(|| (0.0, 0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
     -(n * (q / n).ln() + d) / n
 }
 
@@ -831,20 +1076,17 @@ pub fn fit_prior(
             k => vec![all[0], all[k / 2], all[k - 1]],
         }
     };
-    let fft = Fft2::new(tw, th);
-    let samples: Vec<Sample> = pick(h, sy)
+    assert!(sx % 6 == 0 && sy % 6 == 0, "the tiles' step must be a multiple of 6");
+    let at: Vec<(isize, isize)> = pick(h, sy)
         .into_iter()
-        .flat_map(|y0| pick(w, sx).into_iter().map(move |x0| (x0, y0)))
-        .map(|(x0, y0)| {
-            let (ox, oy) = (x0 as isize - mg, y0 as isize - mg);
-            Sample {
-                spec: spectrum(m, &fft, ox, oy),
-                tw,
-                th,
-                nz: carrier_lists(&tile.shifted(ox, oy).pattern()),
-            }
-        })
+        .flat_map(|y0| pick(w, sx).into_iter().map(move |x0| (x0 as isize - mg, y0 as isize - mg)))
         .collect();
+    let samples = Samples {
+        specs: spectra(m, &Fft2::new(tw, th), &at),
+        tw,
+        th,
+        nz: carrier_lists(&tile.shifted(-mg, -mg).pattern()),
+    };
     let x0 = [
         start.alpha,
         start.alpha_c,
@@ -1119,25 +1361,47 @@ pub fn chroma(m: &Plane, tile: &XTile, p: &XParams) -> (Plane, Plane) {
     let mg = p.margin;
     let origins: Vec<(usize, usize)> =
         (0..h).step_by(sy).flat_map(|y| (0..w).step_by(sx).map(move |x| (x, y))).collect();
-    let parts: Vec<(usize, usize, Plane, Plane)> = origins
-        .par_iter()
-        .map(|&(x0, y0)| {
-            let (ox, oy) = (x0 as isize - mg as isize, y0 as isize - mg as isize);
-            if let Some(prior) = &p.lmmse {
-                let t = tile_lmmse(m, tile, prior, ox, oy, tw, th);
-                return (x0, y0, t.c1, t.c2);
-            }
-            let copies = tile_copies(m, tile, p, ox, oy, tw, th);
-            (x0, y0, combine(&copies, 1, p), combine(&copies, 2, p))
-        })
-        .collect();
+    assert!(sx % 6 == 0 && sy % 6 == 0, "the tiles' step must be a multiple of 6");
     let mut c1 = Plane::zeros(w, h);
     let mut c2 = Plane::zeros(w, h);
-    for (x0, y0, t1, t2) in &parts {
-        let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
-        for y in 0..ny {
-            c1.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t1.row(y + mg)[mg..mg + nx]);
-            c2.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t2.row(y + mg)[mg..mg + nx]);
+    let window = |&(x0, y0): &(usize, usize)| (x0 as isize - mg as isize, y0 as isize - mg as isize);
+    if let Some(prior) = &p.lmmse {
+        let ready = Ready::new(prior, &tile.shifted(-(mg as isize), -(mg as isize)), tw, th);
+        let mut work = Work::new(origins.len(), false, tw, th);
+        for some in origins.chunks(AT_ONCE) {
+            let at: Vec<(isize, isize)> = some.iter().map(window).collect();
+            tiles_lmmse(&ready, &spectra(m, &ready.fft, &at), &mut work);
+            for (t, &(x0, y0)) in some.iter().enumerate() {
+                let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
+                let z = work.chroma(t);
+                for y in 0..ny {
+                    let from = &z[(y + mg) * tw + mg..][..nx];
+                    for ((o1, o2), v) in
+                        c1.row_mut(y0 + y)[x0..].iter_mut().zip(&mut c2.row_mut(y0 + y)[x0..]).zip(from)
+                    {
+                        (*o1, *o2) = (v.re, v.im);
+                    }
+                }
+            }
+        }
+    } else {
+        let mut place = |x0: usize, y0: usize, t1: &Plane, t2: &Plane| {
+            let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
+            for y in 0..ny {
+                c1.row_mut(y0 + y)[x0..x0 + nx].copy_from_slice(&t1.row(y + mg)[mg..mg + nx]);
+                c2.row_mut(y0 + y)[x0..x0 + nx].copy_from_slice(&t2.row(y + mg)[mg..mg + nx]);
+            }
+        };
+        let parts: Vec<(Plane, Plane)> = origins
+            .par_iter()
+            .map(|o| {
+                let (ox, oy) = window(o);
+                let copies = tile_copies(m, tile, p, ox, oy, tw, th);
+                (combine(&copies, 1, p), combine(&copies, 2, p))
+            })
+            .collect();
+        for (&(x0, y0), (t1, t2)) in origins.iter().zip(&parts) {
+            place(x0, y0, t1, t2);
         }
     }
     (c1, c2)
@@ -1163,30 +1427,33 @@ pub fn hypothesis(m: &Plane, tile: &XTile, p: &XParams) -> Hypothesis {
     let mg = p.margin;
     let origins: Vec<(usize, usize)> =
         (0..h).step_by(sy).flat_map(|y| (0..w).step_by(sx).map(move |x| (x, y))).collect();
-    let parts: Vec<(usize, usize, TileEstimate)> = origins
-        .par_iter()
-        .map(|&(x0, y0)| {
-            (
-                x0,
-                y0,
-                tile_lmmse(m, tile, &prior, x0 as isize - mg as isize, y0 as isize - mg as isize, tw, th),
-            )
-        })
-        .collect();
+    assert!(sx % 6 == 0 && sy % 6 == 0, "the tiles' step must be a multiple of 6");
+    let ready = Ready::new(&prior, &tile.shifted(-(mg as isize), -(mg as isize)), tw, th);
     let mut out = Hypothesis {
         c1: Plane::zeros(w, h),
         c2: Plane::zeros(w, h),
         energy: Plane::zeros(w, h),
-        logdet: 0.0,
+        logdet: ready.logdet,
     };
-    for (x0, y0, t) in &parts {
-        let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
-        for y in 0..ny {
-            out.c1.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t.c1.row(y + mg)[mg..mg + nx]);
-            out.c2.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t.c2.row(y + mg)[mg..mg + nx]);
-            out.energy.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t.energy.row(y + mg)[mg..mg + nx]);
+    let mut work = Work::new(origins.len(), true, tw, th);
+    let mut e = vec![0.0; tw * th];
+    for some in origins.chunks(AT_ONCE) {
+        let at: Vec<(isize, isize)> =
+            some.iter().map(|&(x0, y0)| (x0 as isize - mg as isize, y0 as isize - mg as isize)).collect();
+        tiles_lmmse(&ready, &spectra(m, &ready.fft, &at), &mut work);
+        for (t, &(x0, y0)) in some.iter().enumerate() {
+            let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
+            let z = work.chroma(t);
+            work.energy(t, m, at[t], tw, &mut e);
+            for y in 0..ny {
+                let from = (y + mg) * tw + mg;
+                for x in 0..nx {
+                    out.c1.row_mut(y0 + y)[x0 + x] = z[from + x].re;
+                    out.c2.row_mut(y0 + y)[x0 + x] = z[from + x].im;
+                    out.energy.row_mut(y0 + y)[x0 + x] = e[from + x];
+                }
+            }
         }
-        out.logdet = t.logdet;
     }
     out
 }
@@ -1250,70 +1517,111 @@ pub fn select(hyps: &[Hypothesis], sel: &Selection) -> (Plane, Plane) {
 }
 
 /// The separation under several priors at once, chosen between per pixel
-/// by the local evidence, tile by tile (one tile's hypotheses in memory
-/// at a time). One prior alone is [`separate_xtrans`] with it.
+/// by the local evidence. One prior alone is [`separate_xtrans`] with it.
+///
+/// Prior by prior: each is factored once ([`Ready`]) and then applied to
+/// every tile, and what the priors before it left is held per pixel as
+/// running sums. In memory at a time: every tile's spectrum, the sums,
+/// one prior's factors, and the estimates of [`AT_ONCE`] tiles.
 pub fn separate_bank(m: &Plane, tile: &XTile, p: &XParams, priors: &[Prior], sel: &Selection) -> XSeparation {
+    if let [only] = priors {
+        return separate_xtrans(m, tile, &XParams { lmmse: Some(*only), ..*p });
+    }
     let (w, h) = (m.width, m.height);
     let (sx, sy) = (p.tile.min(up6(w)), p.tile.min(up6(h)));
     let (tw, th) = (up6(sx + 2 * p.margin), up6(sy + 2 * p.margin));
     let mg = p.margin;
+    assert!(sx % 6 == 0 && sy % 6 == 0, "the tiles' step must be a multiple of 6");
+    let at_window = tile.shifted(-(mg as isize), -(mg as isize));
     let origins: Vec<(usize, usize)> =
         (0..h).step_by(sy).flat_map(|y| (0..w).step_by(sx).map(move |x| (x, y))).collect();
     let g = gaussian_kernel(sel.sigma);
-    let mut c1 = Plane::zeros(w, h);
-    let mut c2 = Plane::zeros(w, h);
-    // Memory: one tile's estimate under one prior at a time, beside the
-    // tile's running sums, and no more than four tiles at once (each
-    // estimate is spread over the threads within itself).
-    for group in origins.chunks(4) {
-        let parts: Vec<(usize, usize, Plane, Plane)> = group
-            .par_iter()
-            .map(|&(x0, y0)| {
-                let (ox, oy) = (x0 as isize - mg as isize, y0 as isize - mg as isize);
-                if priors.len() == 1 {
-                    let t = tile_lmmse(m, tile, &priors[0], ox, oy, tw, th);
-                    return (x0, y0, t.c1, t.c2);
-                }
-                // The weights `exp(−½·sharp·(score − best))` as the priors
-                // come: the sums are held against the best score so far
-                // and scaled down when a better one arrives.
-                let n = tw * th;
-                let (mut a1, mut a2) = (vec![0.0; n], vec![0.0; n]);
-                let (mut total, mut best) = (vec![0.0; n], vec![f64::INFINITY; n]);
-                for (k, q) in priors.iter().enumerate() {
-                    let t = tile_lmmse(m, tile, q, ox, oy, tw, th);
-                    let mut score = lowpass(&t.energy, &g);
-                    let head = if k == 0 { sel.bias } else { 0.0 };
-                    score.data.iter_mut().for_each(|v| *v = v.max(1e-30).ln() + t.logdet - head);
-                    for i in 0..n {
-                        let s = score.data[i];
-                        if s < best[i] {
-                            let down = if best[i].is_finite() {
-                                (-0.5 * sel.sharp * (best[i] - s)).exp()
+    // Per tile, over the part of it that is kept: the weights
+    // `exp(−½·sharp·(score − best))` as the priors come. The sums are held
+    // against the best score so far and scaled down when a better one
+    // arrives.
+    struct Running {
+        nx: usize,
+        ny: usize,
+        a1: Vec<f64>,
+        a2: Vec<f64>,
+        total: Vec<f64>,
+        best: Vec<f64>,
+    }
+    let mut running: Vec<Running> = origins
+        .iter()
+        .map(|&(x0, y0)| {
+            let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
+            let zeros = || vec![0.0; nx * ny];
+            Running { nx, ny, a1: zeros(), a2: zeros(), total: zeros(), best: vec![f64::INFINITY; nx * ny] }
+        })
+        .collect();
+    let at: Vec<(isize, isize)> =
+        origins.iter().map(|&(x0, y0)| (x0 as isize - mg as isize, y0 as isize - mg as isize)).collect();
+    let mut ready = Ready::new(&priors[0], &at_window, tw, th);
+    let specs = spectra(m, &ready.fft, &at);
+    let mut work = Work::new(origins.len(), true, tw, th);
+    // Per tile of a batch: the energy, and the two passes of its low-pass.
+    let mut planes: Vec<[Plane; 3]> =
+        (0..origins.len().min(AT_ONCE)).map(|_| std::array::from_fn(|_| Plane::zeros(tw, th))).collect();
+    for (k, q) in priors.iter().enumerate() {
+        if k > 0 {
+            ready.set(q);
+        }
+        let head = if k == 0 { sel.bias } else { 0.0 };
+        for (some, (at, specs)) in
+            running.chunks_mut(AT_ONCE).zip(at.chunks(AT_ONCE).zip(specs.chunks(AT_ONCE)))
+        {
+            tiles_lmmse(&ready, specs, &mut work);
+            let (work, logdet) = (&work, ready.logdet);
+            some.par_iter_mut().zip(planes.par_iter_mut()).enumerate().for_each(|(t, (run, planes))| {
+                let [energy, rows, score] = planes;
+                work.energy(t, m, at[t], tw, &mut energy.data);
+                convolve_rows_mod_into(energy, &g, |_, _| 1.0, rows);
+                convolve_cols_signed_into(rows, &g, |_| 1.0, score);
+                let z = work.chroma(t);
+                for y in 0..run.ny {
+                    let (s_row, z_row) = (score.row(y + mg), &z[(y + mg) * tw..][..tw]);
+                    for x in 0..run.nx {
+                        let i = y * run.nx + x;
+                        let s = s_row[x + mg].max(1e-30).ln() + logdet - head;
+                        if s < run.best[i] {
+                            let down = if run.best[i].is_finite() {
+                                (-0.5 * sel.sharp * (run.best[i] - s)).exp()
                             } else {
                                 0.0
                             };
-                            a1[i] *= down;
-                            a2[i] *= down;
-                            total[i] *= down;
-                            best[i] = s;
+                            run.a1[i] *= down;
+                            run.a2[i] *= down;
+                            run.total[i] *= down;
+                            run.best[i] = s;
                         }
-                        let wt = (-0.5 * sel.sharp * (s - best[i])).exp();
-                        a1[i] += wt * t.c1.data[i];
-                        a2[i] += wt * t.c2.data[i];
-                        total[i] += wt;
+                        // Below one part in 10¹⁸ of the best the sums
+                        // do not move.
+                        let behind = 0.5 * sel.sharp * (s - run.best[i]);
+                        if behind > 42.0 {
+                            continue;
+                        }
+                        let wt = (-behind).exp();
+                        run.a1[i] += wt * z_row[x + mg].re;
+                        run.a2[i] += wt * z_row[x + mg].im;
+                        run.total[i] += wt;
                     }
                 }
-                let out =
-                    |a: Vec<f64>| Plane::from_vec(tw, th, a.iter().zip(&total).map(|(v, t)| v / t).collect());
-                (x0, y0, out(a1), out(a2))
-            })
-            .collect();
-        for (x0, y0, t1, t2) in &parts {
-            let (nx, ny) = (sx.min(w - x0), sy.min(h - y0));
-            for y in 0..ny {
-                c1.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t1.row(y + mg)[mg..mg + nx]);
-                c2.row_mut(y0 + y)[*x0..x0 + nx].copy_from_slice(&t2.row(y + mg)[mg..mg + nx]);
+            });
+        }
+    }
+    let mut c1 = Plane::zeros(w, h);
+    let mut c2 = Plane::zeros(w, h);
+    for (run, &(x0, y0)) in running.iter().zip(&origins) {
+        for y in 0..run.ny {
+            let at = y * run.nx..(y + 1) * run.nx;
+            let total = &run.total[at.clone()];
+            for (plane, sums) in [(&mut c1, &run.a1), (&mut c2, &run.a2)] {
+                let out = &mut plane.row_mut(y0 + y)[x0..x0 + run.nx];
+                for ((o, v), t) in out.iter_mut().zip(&sums[at.clone()]).zip(total) {
+                    *o = v / t;
+                }
             }
         }
     }
@@ -1710,6 +2018,183 @@ mod tests {
         eprintln!("{found:?}");
         assert!((found.lens - lens).abs() < 0.2, "{found:?}");
         assert!(found.noise > 1e-3, "{found:?}");
+    }
+
+    /// What one prior gives on a tile.
+    struct TileEstimate {
+        c1: Plane,
+        c2: Plane,
+        /// `m·(G⁻¹m)` per pixel: how improbable the mosaic is there under
+        /// the prior, before the prior's level is set.
+        energy: Plane,
+        /// `log det G` per pixel of the tile.
+        logdet: f64,
+    }
+
+    /// The demultiplexer of one tile as it is written down: every set's
+    /// system built and solved on the spot, the three spectra taken back
+    /// one by one.
+    fn tile_direct(
+        m: &Plane,
+        tile: &XTile,
+        prior: &Prior,
+        ox: isize,
+        oy: isize,
+        tw: usize,
+        th: usize,
+    ) -> TileEstimate {
+        let fft = Fft2::new(tw, th);
+        let spec = spectrum(m, &fft, ox, oy);
+        let nz = carrier_lists(&tile.shifted(ox, oy).pattern());
+        let (qw, qh) = (tw / 6, th / 6);
+        let zero = C64::new(0.0, 0.0);
+        let mut z = vec![vec![zero; tw * th]; 3];
+        let mut g = vec![zero; 36 * 36];
+        let mut logdet = 0.0;
+        for v0 in 0..qh {
+            for u0 in 0..qw {
+                let mut y = [zero; 36];
+                set_spectrum(&spec, tw, th, u0, v0, &mut y);
+                let sc = set_matrix(tw, th, &nz, prior, u0, v0, &mut g);
+                solve_hermitian(&mut g, &mut y, 36);
+                logdet += (0..36).map(|i| 2.0 * g[i * 36 + i].re.ln()).sum::<f64>();
+                for b in 0..6 {
+                    for a in 0..6 {
+                        let at = (v0 + b * qh) * tw + u0 + a * qw;
+                        for (kind, list) in nz.iter().enumerate() {
+                            let mut c = zero;
+                            for &(k, l, ak) in list {
+                                c += ak.conj() * y[((b + l) % 6) * 6 + (a + k) % 6];
+                            }
+                            z[kind][at] = c * sc[kind][b * 6 + a];
+                        }
+                        z[2][at] = y[b * 6 + a];
+                    }
+                }
+            }
+        }
+        let mut planes = z.into_iter().map(|mut z| {
+            fft.run(&mut z, true);
+            Plane::from_vec(tw, th, z.iter().map(|c| c.re).collect())
+        });
+        let (c1, c2, mut energy) = (planes.next().unwrap(), planes.next().unwrap(), planes.next().unwrap());
+        for y in 0..th {
+            for x in 0..tw {
+                let v = m.row(reflect(oy + y as isize, m.height))[reflect(ox + x as isize, m.width)];
+                energy.row_mut(y)[x] *= v;
+            }
+        }
+        TileEstimate { c1, c2, energy, logdet: logdet / (tw * th) as f64 }
+    }
+
+    /// A mosaic of noise with some colour in it, and its tile.
+    fn noisy_mosaic(w: usize, h: usize, seed: u64) -> (Plane, XTile) {
+        let mut rng = crate::synth::Rng::new(seed);
+        let mut rgb = Rgb::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let l = 0.4 + 0.1 * rng.gaussian();
+                rgb.set(x, y, l + 0.05 * rng.gaussian(), l, l + 0.05 * rng.gaussian());
+            }
+        }
+        let t = fuji().shifted(1, 4);
+        (mosaic_of(&rgb, &t), t)
+    }
+
+    /// A prior factored once and applied to six tiles gives on each what
+    /// building and solving every set's system on the spot gives: for a
+    /// plain and an oriented prior in the room of the one before, at
+    /// origins that are not the tile's, on windows that are not square,
+    /// with an even and an odd number of sets each way.
+    #[test]
+    fn a_ready_prior_gives_the_direct_estimate() {
+        let (m, t) = noisy_mosaic(150, 110, 11);
+        let plain = Prior { noise: 1e-2, lens: 0.5, ..Prior::default() };
+        let far = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        let most = |a: &[f64]| a.iter().map(|v| v.abs()).fold(0.0, f64::max);
+        let (re, im) = (
+            |z: &[C64]| z.iter().map(|c| c.re).collect::<Vec<_>>(),
+            |z: &[C64]| z.iter().map(|c| c.im).collect::<Vec<_>>(),
+        );
+        for (tw, th) in [(96, 72), (90, 66)] {
+            let (ox, oy) = (18isize, -12isize);
+            let at: Vec<(isize, isize)> = (0..6).map(|i| (ox + 30 * (i % 3), oy + 18 * i)).collect();
+            let mut ready = Ready::new(&Prior::default(), &t.shifted(ox, oy), tw, th);
+            let specs = spectra(&m, &ready.fft, &at);
+            let mut work = Work::new(at.len(), true, tw, th);
+            let mut bare = Work::new(at.len(), false, tw, th);
+            for prior in [plain, Prior { oriented: Some((0.7, 8.0)), ..plain }] {
+                ready.set(&prior);
+                tiles_lmmse(&ready, &specs, &mut work);
+                tiles_lmmse(&ready, &specs, &mut bare);
+                for (i, &(ox, oy)) in at.iter().enumerate() {
+                    let direct = tile_direct(&m, &t, &prior, ox, oy, tw, th);
+                    assert!(most(&direct.c1.data) > 1e-3 && most(&direct.c2.data) > 1e-3);
+                    let (c1, c2) = (re(work.chroma(i)), im(work.chroma(i)));
+                    assert!(far(&direct.c1.data, &c1) < 1e-10, "c1 {}", far(&direct.c1.data, &c1));
+                    assert!(far(&direct.c2.data, &c2) < 1e-10, "c2 {}", far(&direct.c2.data, &c2));
+                    let mut e = vec![0.0; tw * th];
+                    work.energy(i, &m, (ox, oy), tw, &mut e);
+                    let scale = most(&direct.energy.data);
+                    assert!(
+                        far(&direct.energy.data, &e) < 1e-10 * scale,
+                        "energy {}",
+                        far(&direct.energy.data, &e)
+                    );
+                    assert!(
+                        (direct.logdet - ready.logdet).abs() < 1e-10,
+                        "{} {}",
+                        direct.logdet,
+                        ready.logdet
+                    );
+                    assert_eq!(bare.chroma(i), work.chroma(i));
+                }
+            }
+        }
+    }
+
+    /// The evidence counts what counting every set of every window on its
+    /// own gives: where the stride takes a row's mirror too, and where it
+    /// does not.
+    #[test]
+    fn the_evidence_is_the_sum_over_every_set() {
+        let (m, t) = noisy_mosaic(150, 110, 5);
+        let (tw, th) = (96, 72);
+        let at = [(18isize, -12isize), (48, 6), (-6, 30)];
+        let samples = Samples {
+            specs: spectra(&m, &Fft2::new(tw, th), &at),
+            tw,
+            th,
+            nz: carrier_lists(&t.shifted(18, -12).pattern()),
+        };
+        let plain = Prior { noise: 1e-2, lens: 0.5, ..Prior::default() };
+        for prior in [plain, Prior { oriented: Some((0.7, 8.0)), ..plain }] {
+            for stride in [1, 2, 4, 5] {
+                let (mut q, mut d, mut n) = (0.0, 0.0, 0.0);
+                let mut g = vec![C64::new(0.0, 0.0); 36 * 36];
+                for spec in &samples.specs {
+                    for v0 in (0..th / 6).step_by(stride) {
+                        for u0 in (0..tw / 6).step_by(stride) {
+                            if u0 == 0 && v0 == 0 {
+                                continue;
+                            }
+                            let mut y = [C64::new(0.0, 0.0); 36];
+                            set_spectrum(spec, tw, th, u0, v0, &mut y);
+                            let x = y;
+                            set_matrix(tw, th, &samples.nz, &prior, u0, v0, &mut g);
+                            solve_hermitian(&mut g, &mut y, 36);
+                            // y·G⁻¹y, and log det G from the factor left in `g`.
+                            q += x.iter().zip(&y).map(|(a, b)| (a.conj() * b).re).sum::<f64>();
+                            d += (0..36).map(|i| 2.0 * g[i * 36 + i].re.ln()).sum::<f64>();
+                            n += 36.0;
+                        }
+                    }
+                }
+                let direct = -(n * (q / n).ln() + d) / n;
+                let found = evidence(&samples, &prior, stride);
+                assert!((direct - found).abs() < 1e-10, "stride {stride}: {direct} {found}");
+            }
+        }
     }
 
     /// A curve and its way back are each other's inverse, below zero and
