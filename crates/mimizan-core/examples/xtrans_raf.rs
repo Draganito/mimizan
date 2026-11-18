@@ -9,6 +9,7 @@
 //!   [--gain v]  the scale of the pictures, instead of the 99.9th percentile's
 //!   [--orient n,k[,f..]]  n oriented priors (cos^2k) beside the others, at f times the colour's share (1 and 16)
 //!   [--two]  the second step (colour on one line)
+//!   [--patch x,y,size]  mean of each channel in that window, photosites against separation
 //!
 //! Writes the luminance and the colour picture (camera matrix towards
 //! sRGB) as 8-bit PNGs, both scaled so that the 99.9th percentile of the
@@ -48,6 +49,7 @@ fn main() {
     let mut zoom = 1usize;
     let mut given: Option<Prior> = None;
     let mut two = false;
+    let mut patches: Vec<(usize, usize, usize)> = Vec::new();
     let mut free = [true; 6];
     let mut orient: Option<(usize, f64, Vec<f64>)> = None;
     let mut region: Option<(usize, usize, usize, usize)> = None;
@@ -66,6 +68,11 @@ fn main() {
             }
             "--single" => single = true,
             "--two" => two = true,
+            "--patch" => {
+                let v: Vec<usize> = args[i + 1].split(',').map(|x| x.parse().unwrap()).collect();
+                patches.push((v[0], v[1], v[2]));
+                i += 1;
+            }
             "--free" => {
                 for (f, c) in free.iter_mut().zip(args[i + 1].chars()) {
                     *f = c == '1';
@@ -270,6 +277,32 @@ fn main() {
         eprintln!("second step in {:.1} s", t3.elapsed().as_secs_f64());
     }
 
+    // Mean of each channel in a window: the photosites of each colour
+    // against the separation's three channels.
+    for &(px, py, size) in &patches {
+        let out = sep.rgb();
+        let mut site = [(0.0, 0.0); 3];
+        let mut mean = [0.0; 3];
+        for y in py..py + size {
+            for x in px..px + size {
+                let c = tile.color_at(x as isize, y as isize) as usize;
+                site[c].0 += m.at(x, y);
+                site[c].1 += 1.0;
+                for (k, pl) in [&out.r, &out.g, &out.b].iter().enumerate() {
+                    mean[k] += pl.at(x, y) / (size * size) as f64;
+                }
+            }
+        }
+        eprintln!(
+            "patch {px},{py}: photosites R {:.5} G {:.5} B {:.5} | separation R {:.5} G {:.5} B {:.5}",
+            site[0].0 / site[0].1,
+            site[1].0 / site[1].1,
+            site[2].0 / site[2].1,
+            mean[0],
+            mean[1],
+            mean[2]
+        );
+    }
     let mut sorted: Vec<f64> = sep.lum.data.iter().step_by(97).copied().collect();
     sorted.sort_by(f64::total_cmp);
     let gain = gain_given.unwrap_or(1.0 / sorted[(sorted.len() as f64 * 0.999) as usize]);

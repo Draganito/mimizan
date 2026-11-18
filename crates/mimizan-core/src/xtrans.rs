@@ -261,7 +261,8 @@ pub struct Prior {
     pub lens: f64,
     /// A luminance (and chrominance) that varies along one direction
     /// only: the angle of that direction (radians, 0 = along x) and the
-    /// exponent of `cos²` that holds the spectrum to it.
+    /// exponent of `cos²` that holds the spectrum to it. The slow part of
+    /// the picture, below 0.03 c/px, is left as it is without a direction.
     pub oriented: Option<(f64, f64)>,
 }
 
@@ -279,6 +280,9 @@ impl Default for Prior {
     }
 }
 
+/// Frequency (c/px) from which an oriented prior holds its direction.
+const ORIENTED_FROM: f64 = 0.03;
+
 impl Prior {
     /// Luminance power and the common factor of the chrominance powers.
     fn power(&self, fu: f64, fv: f64) -> (f64, f64) {
@@ -288,7 +292,14 @@ impl Prior {
         let dir = match self.oriented {
             Some((theta, k)) if r2 > 0.0 => {
                 let c = (fu * theta.cos() + fv * theta.sin()) / r2.sqrt();
-                (c * c).powf(k).max(1e-3)
+                let d = (c * c).powf(k).max(1e-3);
+                // The direction holds for the detail only. Below
+                // `ORIENTED_FROM` the spectrum is the plain one: the level
+                // of a flat area has no direction, and a prior that denies
+                // the slow colour across its angle moves that level (red
+                // +4.8 %, blue -3.9 % in a noisy dark patch at ISO 3200).
+                let detail = r2 / (r2 + ORIENTED_FROM * ORIENTED_FROM);
+                detail * d + (1.0 - detail)
             }
             _ => 1.0,
         };
@@ -1651,6 +1662,76 @@ mod tests {
         let (before, after) = two_colours([0.02, 0.02, 0.02], [0.7, 0.03, 0.03]);
         eprintln!("black/red {before:.5} {after:.5}");
         assert!(after < 1.05 * before, "{before} {after}");
+    }
+
+    /// A dark flat field between brighter ones, under noise, keeps its
+    /// level under a bank with oriented priors: the mean of each channel
+    /// in its middle is the mean of that colour's photosites there.
+    #[test]
+    fn a_noisy_flat_field_keeps_its_level_under_oriented_priors() {
+        let (w, h) = (216, 180);
+        let field = [0.0318, 0.0329, 0.0337];
+        let around = [[0.42, 0.30, 0.12], [0.10, 0.22, 0.40], [0.30, 0.34, 0.10], [0.36, 0.12, 0.20]];
+        let inside = |x: usize, y: usize| (60..150).contains(&x) && (48..132).contains(&y);
+        let mut rgb = Rgb::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let c = if inside(x, y) {
+                    field
+                } else {
+                    around[usize::from(x >= 105) + 2 * usize::from(y >= 90)]
+                };
+                rgb.set(x, y, c[0], c[1], c[2]);
+            }
+        }
+        let t = fuji().shifted(2, 2);
+        let mut m = mosaic_of(&rgb, &t);
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for v in m.data.iter_mut() {
+            // Sum of four uniform numbers: near enough to a Gaussian.
+            let mut n = 0.0;
+            for _ in 0..4 {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                n += (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+            }
+            *v += 0.006 * n / (4.0f64 / 12.0).sqrt();
+        }
+        let base = Prior {
+            alpha: 3.21,
+            alpha_c: 1.94,
+            chroma: [0.1037, 0.0737],
+            noise: 5.3e-2,
+            lens: 0.52,
+            ..Prior::default()
+        };
+        let mut priors = vec![base];
+        for i in 0..8 {
+            priors.push(Prior {
+                chroma: [base.chroma[0] * 4.0, base.chroma[1] * 4.0],
+                oriented: Some((PI * i as f64 / 8.0, 8.0)),
+                ..base
+            });
+        }
+        let s = separate_bank(&m, &t, &XParams::default(), &priors, &Selection::default());
+        let out = s.rgb();
+        let (mut sites, mut count, mut got) = ([0.0f64; 3], [0.0f64; 3], [0.0f64; 3]);
+        for y in 66..114 {
+            for x in 78..132 {
+                let c = t.color_at(x as isize, y as isize) as usize;
+                sites[c] += m.data[y * w + x];
+                count[c] += 1.0;
+                for (k, plane) in [&out.r, &out.g, &out.b].into_iter().enumerate() {
+                    got[k] += plane.at(x, y);
+                }
+            }
+        }
+        let total = count.iter().sum::<f64>();
+        for k in 0..3 {
+            let (want, have) = (sites[k] / count[k], got[k] / total);
+            // Measured within 0.3 %. With the direction held down to the
+            // slowest frequencies: red -59 %, green +18 %, blue +13 %.
+            assert!((have / want - 1.0).abs() < 0.01, "channel {k}: {have} against {want}");
+        }
     }
 
     /// The second step leaves a picture without colour alone.
