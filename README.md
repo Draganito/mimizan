@@ -4,7 +4,7 @@
 
 A darkroom for the digital negative, with two processes.
 
-You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process.
+You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process. That is true of a Bayer file. An X-Trans file comes in as the linear DNG [mimizan-lab-xtrans](https://github.com/Draganito/mimizan-lab-xtrans) writes, and that file is a demosaic: three colour values a pixel, worked out from the readings around it.
 
 **The first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson, Süsstrunk and Hérault 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
 
@@ -86,7 +86,7 @@ The print is a sheet of Ilford Multigrade, taken from its datasheet. Soft is gra
 
 On the Kodak set, brought to the band limit of a photograph, the linear negative is 51.8 dB. The best of the sixteen demosaicers we ran, DCB in RawTherapee, is 49.1 dB; RCD is 48.9 dB. All twenty-four pictures are above every one of them: VNG, PPG, AHD, DCB, DHT and AAHD in libraw, and fast, VNG4, AHD, EAHD, HPHD, DCB, LMMSE, IGV, AMaZE and RCD in RawTherapee. On four Nikon Z f files at the sharpness the camera recorded, the mean is 54.0 dB against 50.7 dB for RCD, and all four are above it by 2.4 to 4.3 dB. Where a lens-like picture still reaches the sensor, the mean is 51.6 dB and DCB is 51.5 dB; nine of the twenty-four lead every demosaicer. On detail sharper than any lens delivers, LMMSE in RawTherapee leads, 43.1 dB to 37.3 dB. On the four Z f files made twice as sharp as the camera saw them, RCD leads by 0.5 to 1.9 dB. Those last two conditions are where the removed nonlinear step used to help, and they are conditions no camera produces. The means, and how many pictures lead, are in the paper.
 
-It opens a Bayer RAW, a file from a sensor with no colour filter, and a linear DNG. A linear DNG has its three channels already: it is taken as it is, nothing is separated, and its colour is the work of whatever wrote it; the darkroom after that is the same. Not a RAW converter: no noise reduction, no lens correction, no saturation, no hue. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported as RAW; an X-Trans file comes in as the linear DNG [mimizan-lab-xtrans](https://github.com/Draganito/mimizan-lab-xtrans) writes.
+It opens a Bayer RAW, a file from a sensor with no colour filter, and a linear DNG. A linear DNG has its three channels already: it is taken as it is, nothing is separated, and its colour is the work of whatever wrote it; the darkroom after that is the same. Not a RAW converter: no noise reduction, no lens correction, no saturation, no hue. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported as RAW; an X-Trans file comes in as the linear DNG [mimizan-lab-xtrans](https://github.com/Draganito/mimizan-lab-xtrans) writes, which is a demosaic and not the measured negative a Bayer file gives.
 
 ## The plate
 
