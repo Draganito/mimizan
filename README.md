@@ -6,6 +6,8 @@ A darkroom for the digital negative, with two processes.
 
 You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process. That is true of a Bayer file. A Fuji X-Trans RAF opens in the same window. The first time, it is written out as a linear DNG beside the RAF, highlights kept, and that file is a demosaic: three colour values a pixel, worked out from the readings around it. The plate then takes those three channels as it takes any linear DNG. The figures for that demosaic are [below](#fuji-x-trans).
 
+> **On the 24 Kodak pictures, sampled with the X-Trans tile and compared with the original, this program leads RawTherapee's Markesteijn on every picture.**
+
 **The first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson, Süsstrunk and Hérault 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
 
 **Monochrome.** The negative is printed the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one. A measured Ilford Multigrade, no hidden curve.
