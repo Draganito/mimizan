@@ -71,6 +71,11 @@ pub struct Meta {
     pub exposure: Exposure,
     pub width: usize,
     pub height: usize,
+    /// The tile is the camera's JPEG, and opening this file writes the
+    /// DNG. The memory estimate is that writing. An older cache leaves it
+    /// off; the worker still measures the writing itself.
+    #[serde(default)]
+    pub xtrans: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -566,9 +571,10 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
             let meta = Meta {
                 make: head.make,
                 model: head.model,
-                exposure: mimizan_core::decode::Exposure::default(),
+                exposure: head.exposure,
                 width: head.width,
                 height: head.height,
+                xtrans: true,
             };
             if let Some(d) = cache {
                 cache_store(d, &key, &thumb, &meta);
@@ -594,6 +600,7 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
         exposure: frame.exposure.clone(),
         width: frame.crop.w,
         height: frame.crop.h,
+        xtrans: false,
     };
     if let Some(d) = cache {
         cache_store(d, &key, &thumb, &meta);

@@ -164,7 +164,7 @@ pub struct RawFrame {
 pub struct RawlerDecoder;
 
 #[cfg(feature = "decode-rawler")]
-pub(crate) fn exposure_from(md: &rawler::decoders::RawMetadata) -> Exposure {
+pub fn exposure_from(md: &rawler::decoders::RawMetadata) -> Exposure {
     let e = &md.exif;
     let rat = |r: &Option<rawler::formats::tiff::Rational>| {
         r.as_ref().filter(|r| r.d != 0).map(|r| f64::from(r.n) / f64::from(r.d))

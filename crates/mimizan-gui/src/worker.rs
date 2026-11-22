@@ -352,18 +352,47 @@ fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(Strin
             return open(&dng, develop, cameras_dir, status);
         }
         crate::fuji::Place::Needs(head) => {
+            // The conversion is the wide part, and it is not the DNG's
+            // development. Refusing here leaves the RAF unwritten; the
+            // window lets the open picture go and sends the job again.
+            let need = crate::fuji::convert_memory(head.width, head.height);
+            let available = available_memory();
+            if !memory_fits(need, available) {
+                let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                return Err(anyhow::Error::new(Refused(format!(
+                    "{name} not converted: {}x{} would hold about {} while the DNG is written, {} is free",
+                    head.width,
+                    head.height,
+                    pr::memory_text(need),
+                    pr::memory_text(available)
+                ))));
+            }
+            // convert will not replace a file that is there. An empty one
+            // is not a DNG; leaving it would block this RAF. A file that
+            // holds something, written since the head was read, stays.
+            if head.dng.is_file() && !crate::fuji::dng_is_ready(&head.dng) {
+                let _ = std::fs::remove_file(&head.dng);
+            }
             status("reading the X-Trans file".into());
             let written =
                 mimizan_lab_xtrans::file::convert(path, &head.dng, &crate::fuji::plate_options(), &|event| {
                     status(crate::fuji::words(&event));
                 });
-            if let Err(e) = written {
-                if !head.dng.is_file() {
-                    return Err(anyhow::Error::msg(e));
+            let report = match written {
+                Ok(report) => Some(report),
+                Err(e) => {
+                    // A finished DNG landed between the check and the
+                    // write. It is the file, as a later open would find it.
+                    if !crate::fuji::dng_is_ready(&head.dng) {
+                        return Err(anyhow::Error::msg(e));
+                    }
+                    None
                 }
-            }
+            };
             status(format!("opening {}", head.dng.display()));
-            return open(&head.dng, develop, cameras_dir, status);
+            let mut session = open(&head.dng, develop, cameras_dir, status)?;
+            session.xtrans_note = report.map(|r| crate::fuji::written_note(&r));
+            return Ok(session);
         }
         crate::fuji::Place::NotXtrans => {}
     }
@@ -424,6 +453,7 @@ fn develop_frame(
         develop,
         preview,
         raw_hist,
+        xtrans_note: None,
     })
 }
 
@@ -1142,6 +1172,7 @@ mod tests {
             develop: Develop::default(),
             preview,
             raw_hist,
+            xtrans_note: None,
         }
     }
 

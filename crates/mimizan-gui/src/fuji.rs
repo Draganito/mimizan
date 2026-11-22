@@ -7,9 +7,10 @@
 //! Bayer RAF is not this and is left to the ordinary path. A later open
 //! reads the DNG and does not look at the RAF again.
 
+use mimizan_core::decode::Exposure;
 use mimizan_core::thumb::Thumb;
 use mimizan_lab_xtrans::convert::frame_of;
-use mimizan_lab_xtrans::file::{self, Event, Options};
+use mimizan_lab_xtrans::file::{self, Event, Options, Report};
 use rawler::decoders::RawDecodeParams;
 use rawler::rawsource::RawSource;
 use std::io::Cursor;
@@ -32,6 +33,40 @@ pub struct Head {
     pub height: usize,
     pub make: String,
     pub model: String,
+    /// Exposure from the RAF's head. The strip shows it while the tile is
+    /// still the camera's JPEG.
+    pub exposure: Exposure,
+}
+
+/// Bytes one photosite of the developed frame holds at the peak of the
+/// conversion. Measured on the pinned program: 7.2 to 7.8 GB for 26
+/// million photosites, 12 GB for 40 million.
+const BYTES_PER_PHOTOSITE: u64 = 300;
+
+/// Memory the conversion of a `width`×`height` frame holds, bytes. The
+/// darkroom's Bayer figure is about a quarter of this, and the DNG's own
+/// development, afterwards, is smaller still. The two do not overlap:
+/// the conversion is finished before the DNG is opened.
+pub fn convert_memory(width: usize, height: usize) -> u64 {
+    (width as u64).saturating_mul(height as u64).saturating_mul(BYTES_PER_PHOTOSITE)
+}
+
+/// One line for the log after the DNG has been written.
+pub fn written_note(r: &Report) -> String {
+    format!(
+        "DNG written in {:.0} s, prior f^{:.2} and f^{:.2}, {:.3}% burnt out and kept",
+        r.total,
+        r.prior.alpha,
+        r.prior.alpha_c,
+        100.0 * r.burnt_share()
+    )
+}
+
+/// A DNG that is there and holds something. An empty file is not one:
+/// `convert` will not write over a file that exists, and an empty one
+/// would otherwise block the RAF for good.
+pub fn dng_is_ready(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
 }
 
 /// The DNG the plate is printed from: the highlights stay in the file.
@@ -73,15 +108,20 @@ pub fn place(path: &Path) -> Place {
         return Place::NotXtrans;
     };
     let dng = file::beside(path);
-    if dng.is_file() {
+    if dng_is_ready(&dng) {
         return Place::Ready(dng);
     }
+    let exposure = decoder
+        .raw_metadata(&source, &RawDecodeParams::default())
+        .map(|md| mimizan_core::decode::exposure_from(&md))
+        .unwrap_or_default();
     Place::Needs(Head {
         dng,
         width: frame.width,
         height: frame.height,
         make: img.clean_make,
         model: img.clean_model,
+        exposure,
     })
 }
 
@@ -171,6 +211,52 @@ mod tests {
         std::fs::write(&path, &raf).unwrap();
         assert_eq!(embedded_jpeg(&path).unwrap(), b"JPEG");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_conversion_holds_more_than_a_bayer_development() {
+        let px = 26_000_000usize;
+        let side = (px as f64).sqrt() as usize;
+        let writing = convert_memory(side, px / side);
+        let bayer = mimizan_core::pipeline::develop_memory(
+            side,
+            px / side,
+            mimizan_core::decode::SensorKind::Bayer(mimizan_core::cfa::BayerPhase::RGGB),
+        );
+        assert!(writing > bayer * 3, "{writing} vs {bayer}");
+        assert_eq!(convert_memory(0, 100), 0);
+    }
+
+    #[test]
+    fn an_empty_file_is_not_a_dng() {
+        let dir = std::env::temp_dir().join(format!("mimizan-fuji-dng-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let empty = dir.join("empty.dng");
+        let held = dir.join("held.dng");
+        std::fs::write(&empty, b"").unwrap();
+        std::fs::write(&held, b"x").unwrap();
+        assert!(!dng_is_ready(&empty));
+        assert!(dng_is_ready(&held));
+        assert!(!dng_is_ready(&dir.join("missing.dng")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_note_names_the_prior_and_the_burnt_share() {
+        let note = written_note(&Report {
+            make: String::new(),
+            model: String::new(),
+            photosites: (10, 10),
+            pixels: (10, 10),
+            prior: mimizan_lab_xtrans::xtrans::Prior { alpha: 1.25, alpha_c: 2.5, ..Default::default() },
+            balance_from_file: true,
+            burnt: 5,
+            below: 0,
+            sums: [0.0; 3],
+            seconds: [0.0; 3],
+            total: 43.2,
+        });
+        assert_eq!(note, "DNG written in 43 s, prior f^1.25 and f^2.50, 5.000% burnt out and kept");
     }
 
     #[test]

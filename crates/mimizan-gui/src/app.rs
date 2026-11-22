@@ -672,8 +672,18 @@ fn sidecar_of(raw: &Path) -> Option<PathBuf> {
 /// size when the strip has read it, else the current session's own, the
 /// next file being most often from the same camera. Nothing to go by
 /// without either.
-fn opening_memory(target: Option<(usize, usize)>, current: Option<u64>) -> Option<u64> {
-    target.map(|(w, h)| develop_memory_of_size(w, h)).or(current)
+fn opening_memory(target: Option<(usize, usize, bool)>, current: Option<u64>) -> Option<u64> {
+    target
+        .map(
+            |(w, h, xtrans)| {
+                if xtrans {
+                    crate::fuji::convert_memory(w, h)
+                } else {
+                    develop_memory_of_size(w, h)
+                }
+            },
+        )
+        .or(current)
 }
 
 /// The print box has a newer exposure than the picture on screen.
@@ -2771,13 +2781,14 @@ impl App {
             }
         }
         self.current_path = Some(path.clone());
-        // The size the strip read for this file, when it has.
+        // The size the strip read for this file, when it has. An X-Trans
+        // tile is the conversion, not a Bayer development.
         let target = self
             .folder
             .as_ref()
             .and_then(|f| f.entries.iter().find(|e| e.path == path))
             .and_then(|e| e.meta.as_ref())
-            .map(|m| (m.width, m.height));
+            .map(|m| (m.width, m.height, m.xtrans));
         let current = self.session.as_ref().map(|s| develop_memory(&s.frame));
         if let Some(need) = opening_memory(target, current) {
             self.make_room(need);
@@ -3192,6 +3203,9 @@ impl App {
                     let t = &s.negative.info.timing;
                     let name =
                         s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    if let Some(note) = &s.xtrans_note {
+                        self.log(format!("{name}: {note}"));
+                    }
                     self.log(if s.is_mono() {
                         format!(
                             "{name}: decode {} ms, ingest {} ms, {}x{}",
@@ -8073,8 +8087,12 @@ mod crop_drag_tests {
         // 24 MP picture on the stage. Without the strip's size the session's
         // own stands in; without either there is nothing to go by.
         let small = develop_memory_of_size(6048, 4032);
-        let big = opening_memory(Some((9504, 6336)), Some(small)).unwrap();
+        let big = opening_memory(Some((9504, 6336, false)), Some(small)).unwrap();
         assert!(big > small * 2, "{big} vs {small}");
+        // An X-Trans file of the same pixels is the conversion, which
+        // holds about four times a Bayer development.
+        let writing = opening_memory(Some((6048, 4032, true)), Some(small)).unwrap();
+        assert!(writing > small * 3, "{writing} vs {small}");
         assert_eq!(opening_memory(None, Some(small)), Some(small));
         assert_eq!(opening_memory(None, None), None);
     }
