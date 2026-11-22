@@ -3164,6 +3164,15 @@ impl App {
             match ev {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
+                    let opened = s.path.clone();
+                    if self.current_path.as_deref() != Some(opened.as_path()) {
+                        if let Some(asked) = self.current_path.clone() {
+                            if let Some(folder) = self.folder.as_mut() {
+                                folder.show_instead(&asked, &opened, self.sort);
+                            }
+                        }
+                        self.current_path = Some(opened);
+                    }
                     let released = self.released.take();
                     let fresh = opened_is_fresh(
                         self.session.as_ref().map(|old| old.path.as_path()),
@@ -3312,16 +3321,21 @@ impl App {
             if r.generation != f.generation {
                 continue;
             }
-            if let Some(e) = f.entries.iter_mut().find(|e| e.path == r.path) {
-                match r.result {
-                    Ok((thumb, meta)) => {
+            match r.result {
+                Ok(browser::ThumbReady::Covered) => {
+                    f.entries.retain(|e| e.path != r.path);
+                }
+                Ok(browser::ThumbReady::Picture(thumb, meta)) => {
+                    if let Some(e) = f.entries.iter_mut().find(|e| e.path == r.path) {
                         tracing::debug!("thumbnail {} in {} ms", e.name, r.ms);
                         e.thumb = Some(thumb);
-                        e.meta = Some(meta);
+                        e.meta = Some(*meta);
                         e.state = ThumbState::Ready;
                         e.texture = None;
                     }
-                    Err(msg) => {
+                }
+                Err(msg) => {
+                    if let Some(e) = f.entries.iter_mut().find(|e| e.path == r.path) {
                         tracing::warn!("thumbnail {}: {msg}", e.name);
                         e.state = ThumbState::Failed;
                     }

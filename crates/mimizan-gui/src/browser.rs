@@ -6,7 +6,9 @@
 //!
 //! Every thumbnail is the mosaic binned to grey with the file's balance
 //! and the camera file's weights (`mimizan_core::thumb`), cached on disk
-//! as an 8-bit PNG keyed by path, size and modification time.
+//! as an 8-bit PNG keyed by path, size and modification time. An X-Trans
+//! RAF that has no DNG beside it is the camera's JPEG instead
+//! (`fuji`); once that DNG is there the RAF leaves the strip.
 
 use mimizan_core::calib::CameraFile;
 use mimizan_core::decode::Exposure;
@@ -96,6 +98,27 @@ pub struct Entry {
     pub let_go: u32,
 }
 
+impl Entry {
+    /// A file the strip has not pictured yet.
+    fn pending(path: &Path) -> Option<Self> {
+        let md = std::fs::metadata(path).ok()?;
+        if !md.is_file() {
+            return None;
+        }
+        Some(Self {
+            name: path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+            size: md.len(),
+            modified: md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            path: path.to_path_buf(),
+            thumb: None,
+            meta: None,
+            state: ThumbState::Pending,
+            texture: None,
+            let_go: 0,
+        })
+    }
+}
+
 /// One folder's listing: its RAW files in the chosen order and its
 /// visible subfolders.
 pub struct Folder {
@@ -171,6 +194,22 @@ impl Folder {
     /// Position of the file in the current order.
     pub fn index_of(&self, path: &Path) -> Option<usize> {
         self.entries.iter().position(|e| e.path == path)
+    }
+
+    /// `asked` was an X-Trans RAF and `opened` is the DNG beside it. The
+    /// RAF leaves the strip. The DNG stays, or is added when the listing
+    /// did not have it yet.
+    pub fn show_instead(&mut self, asked: &Path, opened: &Path, sort: Sort) {
+        if self.index_of(asked).is_none() {
+            return;
+        }
+        self.entries.retain(|e| e.path != asked);
+        if self.index_of(opened).is_none() {
+            if let Some(entry) = Entry::pending(opened) {
+                self.entries.push(entry);
+                self.resort(sort);
+            }
+        }
     }
 }
 
@@ -388,11 +427,19 @@ impl Made {
     }
 }
 
+/// A thumbnail the strip can show, or the news that this RAF is the DNG
+/// beside it.
+pub enum ThumbReady {
+    Picture(Thumb, Box<Meta>),
+    /// Drop this RAF. The DNG beside it is the file.
+    Covered,
+}
+
 /// One finished thumbnail (or the reason it failed).
 pub struct ThumbResult {
     pub generation: u64,
     pub path: PathBuf,
-    pub result: Result<(Thumb, Meta), String>,
+    pub result: Result<ThumbReady, String>,
     pub ms: u128,
 }
 
@@ -504,11 +551,35 @@ fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob
     (tx, rx)
 }
 
-/// Cache hit, or decode and bin the file and cache the result.
-fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Result<(Thumb, Meta), String> {
+/// Cache hit, or decode and bin the file and cache the result. An
+/// X-Trans RAF is the camera's JPEG until its DNG is written, and then
+/// it is not a tile of its own.
+fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Result<ThumbReady, String> {
+    match crate::fuji::place(&job.path) {
+        crate::fuji::Place::Ready(_) => return Ok(ThumbReady::Covered),
+        crate::fuji::Place::Needs(head) => {
+            let key = cache_key(&job.path, job.size, job.modified);
+            if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
+                return Ok(ThumbReady::Picture(hit.0, Box::new(hit.1)));
+            }
+            let thumb = crate::fuji::camera_jpeg(&job.path, THUMB_LONG_EDGE)?;
+            let meta = Meta {
+                make: head.make,
+                model: head.model,
+                exposure: mimizan_core::decode::Exposure::default(),
+                width: head.width,
+                height: head.height,
+            };
+            if let Some(d) = cache {
+                cache_store(d, &key, &thumb, &meta);
+            }
+            return Ok(ThumbReady::Picture(thumb, Box::new(meta)));
+        }
+        crate::fuji::Place::NotXtrans => {}
+    }
     let key = cache_key(&job.path, job.size, job.modified);
     if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
-        return Ok(hit);
+        return Ok(ThumbReady::Picture(hit.0, Box::new(hit.1)));
     }
     let frame = pipeline::decode(&job.path).map_err(|e| e.to_string())?;
     let wb = frame.wb_as_shot.unwrap_or([1.0; 3]);
@@ -527,7 +598,7 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
     if let Some(d) = cache {
         cache_store(d, &key, &thumb, &meta);
     }
-    Ok((thumb, meta))
+    Ok(ThumbReady::Picture(thumb, Box::new(meta)))
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +750,38 @@ impl Persisted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn named(name: &str) -> Entry {
+        Entry {
+            path: PathBuf::from("/photos").join(name),
+            name: name.to_owned(),
+            size: 1,
+            modified: SystemTime::UNIX_EPOCH,
+            thumb: None,
+            meta: None,
+            state: ThumbState::Pending,
+            texture: None,
+            let_go: 0,
+        }
+    }
+
+    #[test]
+    fn an_xtrans_raf_gives_way_to_the_dng_beside_it() {
+        let mut folder = Folder {
+            path: PathBuf::from("/photos"),
+            entries: vec![named("DSCF1110.RAF"), named("DSCF1110.dng"), named("DSCF1111.RAF")],
+            generation: 1,
+            subdirs: Vec::new(),
+        };
+        let raf = PathBuf::from("/photos/DSCF1110.RAF");
+        let dng = PathBuf::from("/photos/DSCF1110.dng");
+        folder.show_instead(&raf, &dng, Sort::Name);
+        let names: Vec<&str> = folder.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["DSCF1110.dng", "DSCF1111.RAF"]);
+        // A file the strip does not list is left alone.
+        folder.show_instead(Path::new("/photos/other.RAF"), Path::new("/photos/other.dng"), Sort::Name);
+        assert_eq!(folder.entries.len(), 2);
+    }
 
     #[test]
     fn natural_order_counts_digits() {

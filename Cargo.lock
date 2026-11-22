@@ -1947,7 +1947,9 @@ dependencies = [
  "image",
  "mimalloc",
  "mimizan-core",
+ "mimizan-lab-xtrans",
  "mimizan-mac",
+ "rawler",
  "rayon",
  "serde",
  "serde_json",
@@ -1956,6 +1958,19 @@ dependencies = [
  "tracing-subscriber",
  "winit",
  "winresource",
+]
+
+[[package]]
+name = "mimizan-lab-xtrans"
+version = "0.4.6"
+source = "git+https://github.com/Draganito/mimizan-lab-xtrans?rev=be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0#be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0"
+dependencies = [
+ "clap",
+ "image",
+ "rawler",
+ "rayon",
+ "rustfft",
+ "tiff 0.11.3",
 ]
 
 [[package]]

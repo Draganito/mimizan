@@ -4,7 +4,7 @@
 
 A darkroom for the digital negative, with two processes.
 
-You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process. That is true of a Bayer file. An X-Trans file comes in as the linear DNG [mimizan-lab-xtrans](https://github.com/Draganito/mimizan-lab-xtrans) writes, and that file is a demosaic: three colour values a pixel, worked out from the readings around it.
+You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process. That is true of a Bayer file. A Fuji X-Trans RAF opens in the same window. The first time, it is written out as a linear DNG beside the RAF, highlights kept, and that file is a demosaic: three colour values a pixel, worked out from the readings around it. The plate then takes those three channels as it takes any linear DNG. The figures for that demosaic are [below](#fuji-x-trans).
 
 **The first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson, Süsstrunk and Hérault 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
 
@@ -86,7 +86,7 @@ The print is a sheet of Ilford Multigrade, taken from its datasheet. Soft is gra
 
 On the Kodak set, brought to the band limit of a photograph, the linear negative is 51.8 dB. The best of the sixteen demosaicers we ran, DCB in RawTherapee, is 49.1 dB; RCD is 48.9 dB. All twenty-four pictures are above every one of them: VNG, PPG, AHD, DCB, DHT and AAHD in libraw, and fast, VNG4, AHD, EAHD, HPHD, DCB, LMMSE, IGV, AMaZE and RCD in RawTherapee. On four Nikon Z f files at the sharpness the camera recorded, the mean is 54.0 dB against 50.7 dB for RCD, and all four are above it by 2.4 to 4.3 dB. Where a lens-like picture still reaches the sensor, the mean is 51.6 dB and DCB is 51.5 dB; nine of the twenty-four lead every demosaicer. On detail sharper than any lens delivers, LMMSE in RawTherapee leads, 43.1 dB to 37.3 dB. On the four Z f files made twice as sharp as the camera saw them, RCD leads by 0.5 to 1.9 dB. Those last two conditions are where the removed nonlinear step used to help, and they are conditions no camera produces. The means, and how many pictures lead, are in the paper.
 
-It opens a Bayer RAW, a file from a sensor with no colour filter, and a linear DNG. A linear DNG has its three channels already: it is taken as it is, nothing is separated, and its colour is the work of whatever wrote it; the darkroom after that is the same. Not a RAW converter: no noise reduction, no lens correction, no saturation, no hue. X-Trans, Quad-Bayer, Foveon and Nikon HE/HE* are not supported as RAW; an X-Trans file comes in as the linear DNG [mimizan-lab-xtrans](https://github.com/Draganito/mimizan-lab-xtrans) writes, which is a demosaic and not the measured negative a Bayer file gives.
+It opens a Bayer RAW, a file from a sensor with no colour filter, a linear DNG, and a Fuji X-Trans RAF. A linear DNG has its three channels already: it is taken as it is, nothing is separated, and its colour is the work of whatever wrote it; the darkroom after that is the same. The X-Trans RAF is written once to that kind of DNG and opened as the DNG. Not a RAW converter: no noise reduction, no lens correction, no saturation, no hue. Quad-Bayer, Foveon and Nikon HE/HE* are not supported.
 
 ## The plate
 
@@ -114,9 +114,67 @@ Measured on the Kodak set against sixteen demosaicers of libraw and RawTherapee,
 
 In the window the plate is the second process: *Plate* in the toolbar, next to *Monochrome*, or the key P. The picture turns to colour at once, fitted, at 1:1 and in the print box; it is a re-mix of the separation, not a re-development. The Enlarger shows the taking filters where the monochrome mix stood, and the two lamps under the paper strip; the primaries are in Print, with the file. The strip shows the folder as slides. The Print panel says what it will write, a 16-bit RGB TIFF with the profile. The recipe saved next to the RAW remembers the process, the filters and the lamps, so the file opens again in colour. On the command line it is `--plate` on `negative` and `--lamp R,B` on `print`, or `--recipe` with the desktop's file on both. [docs/PLATE.md](docs/PLATE.md) has the method, the file format and the measurements; the paper has it in §7.5.
 
+## Fuji X-Trans
+
+A RAF from an X-Trans sensor opens in the window. While no DNG sits beside it, the strip shows the camera's embedded JPEG. Opening the file writes that DNG once, next to the RAF, with the highlights left as recorded, and the RAF leaves the strip. Every later open reads the DNG and does not look at the RAF again. A Bayer RAF, including one from Fuji, stays on the ordinary path. The writing is the slow part: about three quarters of a minute for 26 megapixels, where RawTherapee's 3-pass takes about five seconds. After that the darkroom is as fast as for any linear DNG.
+
+The DNG is a demosaic, and it is not what the two processes do with a Bayer file. There, every pixel is a sum of photosites the sensor measured and nothing is estimated. Here, one reading per photosite goes in and three colour values per pixel come out, worked out from the readings around it. Brightness and colour are read off the frequencies where the X-Trans pattern carries them. The plate then prints those three channels as it prints any other linear DNG: nothing is separated a second time.
+
+It leads Markesteijn, the 3-pass in RawTherapee 5.11 and the family around it, on all 24 pictures of the Kodak set, in each of the three conditions below. Adobe, Iridient and Capture One demosaic X-Trans in their own way, and none of them was in this measurement.
+
+On one test chart from an X-Pro3, at ISO 160 and at ISO 3200, both pictures were printed by Mimizan Lab 0.19.0 and measured on the 8-bit prints, in steps of 255. The figures are ISO 160 / ISO 3200. It is as sharp as the 3-pass, with about a third of its false colour and half its colour noise, and it keeps the colour of fine detail, which the suppression takes out. Lines 2 to 2.8 pixels apart are not as calm as RawTherapee's yet; the blank paper beside them measures 0.56.
+
+| | 3-pass | 3-pass, false colour suppression 3 | Mimizan Lab |
+|---|---|---|---|
+| Edge contrast in the Siemens star | 34.0 / 36.5 | 33.5 / 35.7 | 33.3 / 35.8 |
+| False colour in small white print on black | 20.5 / 30.3 | 6.1 / 11.7 | 6.3 / 9.8 |
+| Colour noise in a dark, flat area | 4.0 / 20.3 | 1.7 / 8.5 | 2.4 / 10.0 |
+| Colour contrast in fine coloured rings | 70.7 / 73.6 | 53.8 / 54.8 | 74.7 / 76.8 |
+| Unrest along lines 2 to 2.8 px apart, ISO 160 | 0.60 | not measured | 0.88 |
+
+### On the Kodak set
+
+The 24 pictures of the Kodak set, linearised, sampled through the X-Trans tile and quantised to 16 bit. The same mosaic goes to this demosaic and to RawTherapee 5.11. The balance is 1, 1, 1, because the picture is already the colour. The separation runs under the sRGB curve and comes back to linear light, as a camera file does. Nothing in these pictures is treated as burnt out. CPSNR, and the PSNR of red, green and blue, in dB on sRGB-encoded values; 16 px of the edge are left out. The last column is how many of the 24 pictures a method leads. A smooth picture, measured the same way, stays above 59 dB for every method, so the path has no tone curve and no offset left in it. On one picture, shifting RawTherapee by a pixel drops it from 31.5 dB to 22.9 dB; the unshifted place is the one that was measured.
+
+Three conditions, the same ones the plate uses. Pixel-sharp is the Kodak pixels as they stand, sharper than a lens delivers. Behind a lens is a Gaussian of σ 0.75 px before the sampling, the sharpest real lens on a real sensor. Twice the size is the picture enlarged 2× with Lanczos-3 before the sampling, a 48 MP sensor seen from the distance of 12 MP.
+
+The same-colour average is the floor, computed here: a photosite of a colour is kept, and a missing colour is the inverse-distance mean of that colour within four pixels. It is not a method anyone ships. The bench that measured the tables is not part of the packages.
+
+Pixel-sharp:
+
+| Method | CPSNR | R | G | B | leads |
+|---|---|---|---|---|---|
+| Mimizan Lab | 39.81 | 39.19 | 42.30 | 38.82 | 24/24 |
+| 3-pass | 34.17 | 33.58 | 36.60 | 33.52 | 0/24 |
+| 1-pass (medium) | 33.78 | 33.20 | 36.05 | 33.18 | 0/24 |
+| 3-pass, false colour suppression 3 | 32.28 | 34.09 | 35.77 | 29.74 | 0/24 |
+| same-colour average | 27.81 | 27.14 | 29.55 | 27.18 | 0/24 |
+
+Behind a lens (σ 0.75 px):
+
+| Method | CPSNR | R | G | B | leads |
+|---|---|---|---|---|---|
+| Mimizan Lab | 50.97 | 49.92 | 54.48 | 50.05 | 24/24 |
+| 3-pass | 42.93 | 42.44 | 47.45 | 42.17 | 0/24 |
+| 1-pass (medium) | 42.76 | 42.30 | 47.09 | 42.05 | 0/24 |
+| 3-pass, false colour suppression 3 | 36.81 | 40.39 | 43.62 | 33.46 | 0/24 |
+| same-colour average | 32.88 | 32.09 | 34.44 | 32.49 | 0/24 |
+
+Twice the size:
+
+| Method | CPSNR | R | G | B | leads |
+|---|---|---|---|---|---|
+| Mimizan Lab | 48.89 | 48.46 | 52.52 | 47.35 | 24/24 |
+| 3-pass | 43.05 | 42.73 | 47.98 | 41.87 | 0/24 |
+| 1-pass (medium) | 43.04 | 42.78 | 47.78 | 41.87 | 0/24 |
+| 3-pass, false colour suppression 3 | 37.40 | 40.40 | 44.02 | 34.16 | 0/24 |
+| same-colour average | 31.84 | 31.38 | 33.50 | 31.03 | 0/24 |
+
+Ahead of Markesteijn on all 24 pictures in each condition: by 5.6 dB pixel-sharp, by 8.0 dB behind a lens, by 5.8 dB at twice the size. The 1-pass sits 0.2 to 0.4 dB under the 3-pass. False colour suppression 3 lowers the figure, and the blue most of all, because it takes out colour the original picture has. Green is this demosaic's best channel. These pictures have no lens of their own: every difference from the original is the demosaic's.
+
 ## A session
 
-Drop a RAW file or a folder on the window, or open one. The folder lies along the bottom as a strip of film: negatives in the monochrome process, slides in the plate, either one inverted on request. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. Tab hides the three panels; 1, 2 and 3 show or hide the one that carries that number in the toolbar.
+Drop a RAW file or a folder on the window, or open one. The folder lies along the bottom as a strip of film: negatives in the monochrome process, slides in the plate, either one inverted on request. An X-Trans RAF with no DNG beside it shows the camera's JPEG there until the file has been opened once. It closes when you click the picture and release, or drag the crosshair and release; B brings it back, and the arrow keys still change the file. Tab hides the three panels; 1, 2 and 3 show or hide the one that carries that number in the toolbar.
 
 *Monochrome* and *Plate* in the toolbar, or P, are the process. The choice is the darkroom's: the strip, the Enlarger and the print follow it, and the next file opens in it. A file with a recipe beside it opens in the process the recipe was saved in. Scroll zooms the print about the pointer; a double click switches between fitted and 1:1. Undo is Ctrl+Z, redo is Ctrl+Shift+Z or Ctrl+Y. *Reset all* puts every control back to its default, the crop and the strokes with them, and leaves the negative where it is; undo brings them back.
 

@@ -16,6 +16,7 @@ mod brush;
 mod cpu;
 mod edit;
 mod filter_strip;
+mod fuji;
 mod histogram;
 mod lamp_bar;
 mod paper_strip;

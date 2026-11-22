@@ -344,6 +344,29 @@ fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame) -> Result<(
 }
 
 fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
+    // An X-Trans RAF is opened as the DNG beside it. The first time, that
+    // DNG is written here, highlights kept; after that only the DNG is read.
+    match crate::fuji::place(path) {
+        crate::fuji::Place::Ready(dng) => {
+            status(format!("opening {}", dng.display()));
+            return open(&dng, develop, cameras_dir, status);
+        }
+        crate::fuji::Place::Needs(head) => {
+            status("reading the X-Trans file".into());
+            let written =
+                mimizan_lab_xtrans::file::convert(path, &head.dng, &crate::fuji::plate_options(), &|event| {
+                    status(crate::fuji::words(&event));
+                });
+            if let Err(e) = written {
+                if !head.dng.is_file() {
+                    return Err(anyhow::Error::msg(e));
+                }
+            }
+            status(format!("opening {}", head.dng.display()));
+            return open(&head.dng, develop, cameras_dir, status);
+        }
+        crate::fuji::Place::NotXtrans => {}
+    }
     status(format!("decoding {}", path.display()));
     let t = Instant::now();
     let frame = pipeline::decode(path).with_context(|| format!("decoding {}", path.display()))?;

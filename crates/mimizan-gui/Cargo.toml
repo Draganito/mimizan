@@ -21,6 +21,9 @@ store = ["mimizan-mac/store"]
 
 [dependencies]
 mimizan-core = { path = "../mimizan-core" }
+# The X-Trans conversion. The desktop writes its DNG and then opens that
+# file on the ordinary linear path. Pinned to the measured program.
+mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,6 +34,7 @@ egui = "0.36"
 egui-file-dialog = "0.15"
 rayon.workspace = true
 image.workspace = true
+rawler.workspace = true
 # Core load in the negative panel. CPU only: no process list, no extra thread pool.
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 
