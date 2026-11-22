@@ -2,7 +2,7 @@
 
 **The Mimizan algorithm — a complete description**
 
-Dragan Bojovic, November 2026. Version of record for Mimizan 0.19.0
+Dragan Bojovic, November 2026. Version of record for Mimizan 0.20.0
 (`github.com/Draganito/mimizan`, GPL-3.0-or-later). Where this text and the
 code disagree, the code and its tests are right and this text has a bug.
 
