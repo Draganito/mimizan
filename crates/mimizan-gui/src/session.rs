@@ -362,7 +362,6 @@ pub fn preview_planes(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         mask_max: Plane::zeros(1, 1),
         rounds: sep.rounds,
         phase: sep.phase,
-        colour_ceiling: sep.colour_ceiling,
     };
     Ok(PreviewPlanes { sep: sep_small, scale: sh.scale() })
 }
@@ -380,7 +379,6 @@ fn preview_measured(neg: &Negative) -> mimizan_core::Result<PreviewPlanes> {
         mask_max: Plane::zeros(1, 1),
         rounds: 0,
         phase: mimizan_core::cfa::BayerPhase::RGGB,
-        colour_ceiling: None,
     };
     Ok(PreviewPlanes { sep, scale: sh.scale() })
 }
@@ -990,7 +988,6 @@ fn crop_separation(sep: &Separation, src: DetailRect) -> Option<Separation> {
         mask_max: Plane::zeros(1, 1),
         rounds: sep.rounds,
         phase: sep.phase,
-        colour_ceiling: sep.colour_ceiling,
     })
 }
 
@@ -2555,7 +2552,6 @@ impl PreviewStages {
                 mask_max: Plane::zeros(1, 1),
                 rounds: pp.sep.rounds,
                 phase: pp.sep.phase,
-                colour_ceiling: pp.sep.colour_ceiling,
             };
             self.shown = Some((key, Shown { sep, small, window }));
             self.mixed = None;
@@ -2706,7 +2702,6 @@ mod tests {
             mask_max: Plane::zeros(1, 1),
             rounds: 1,
             phase: mimizan_core::cfa::BayerPhase::RGGB,
-            colour_ceiling: None,
         };
         let wts = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let mixed = mix(&sep, &wts);
@@ -2809,15 +2804,8 @@ mod histogram_tests {
             *a = 0.02 * ((i % 7) as f64 - 3.0);
             *b = 0.01 * ((i % 5) as f64 - 2.0);
         }
-        let sep = Separation {
-            lum,
-            c1,
-            c2,
-            mask_max: Plane::zeros(1, 1),
-            rounds: 1,
-            phase: BayerPhase::RGGB,
-            colour_ceiling: None,
-        };
+        let sep =
+            Separation { lum, c1, c2, mask_max: Plane::zeros(1, 1), rounds: 1, phase: BayerPhase::RGGB };
         let wts = Weights { r: 0.3, g: 0.5, b: 0.2 };
         let look = LookFile::load(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -2867,7 +2855,6 @@ mod histogram_tests {
             mask_max: Plane::zeros(1, 1),
             rounds: 1,
             phase: BayerPhase::RGGB,
-            colour_ceiling: None,
         }
     }
 
@@ -3002,7 +2989,6 @@ mod histogram_tests {
             mask_max: Plane::zeros(5, 4),
             rounds: 0,
             phase: BayerPhase::RGGB,
-            colour_ceiling: None,
         };
         let w = Weights { r: 0.2, g: 0.5, b: 0.3 };
         let tone = Tone::paper().compile();
