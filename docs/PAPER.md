@@ -945,13 +945,14 @@ once from the constants above by two nested bisections (the density rises
 with either time). What the negative holds above the clip prints between
 that white and the unexposed paper: $L = 1.34$ at $v = 0.944$, where the
 clip is at $v = 0.900$. The two exposures of a print are stops of time from
-that pair, each within ±3 stops; they are the only global tone
-parameters. A pair is read as a printer reads it: the grade is the hard
+that pair. A pair is read as a printer reads it: the grade is the hard
 exposure over the soft, the exposure is what both have beyond the pair of
-that grade which prints the grey card at $D = 0.67$. The grade is changed
-in twelfths of a stop with that mid-grey held (`SplitGrade::graded`), as
-changing one speed-matched filter for another does; the same stops added
-to both change the exposure alone.
+that grade which prints the grey card at $D = 0.67$. The exposure stays
+within ±3 stops of that speed-matched pair. The grade is changed in
+twelfths of a stop with that mid-grey held (`SplitGrade::graded`), from
+00 to 5 at every such exposure, as changing one speed-matched filter for
+another does; one filter's time may then stand beyond ±3 stops. The same
+stops added to both change the exposure alone.
 
 The print evaluates the paper exactly at every pixel; the desktop reads
 it from tables of each pass's exposure, within a thousandth, above the

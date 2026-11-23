@@ -66,7 +66,10 @@ pub const CLIP_DENSITY: f64 = 0.10;
 /// The ISO range is measured between these fractions of Dmax.
 const R_LOW: f64 = 0.04 / DMAX;
 const R_HIGH: f64 = 0.9;
-/// Exposure times stay within this many stops of the base exposure.
+/// The exposure stays within this many stops of the speed-matched time of
+/// its grade. One filter's time may stand further out: the grade still
+/// runs from 00 to 5, and the clock still has these stops either way, as
+/// under the enlarger.
 pub const STOP_LIMIT: f64 = 3.0;
 /// Name of the one paper this version knows.
 pub const PAPER_NAME: &str = "multigrade";
@@ -331,11 +334,10 @@ impl SplitGrade {
         if self.paper != PAPER_NAME {
             return Err(crate::Error::Invalid(format!("paper '{}' unknown (only {PAPER_NAME})", self.paper)));
         }
+        let reach = time_reach();
         for (v, what) in [(self.soft, "soft"), (self.hard, "hard")] {
-            if !v.is_finite() || v.abs() > STOP_LIMIT {
-                return Err(crate::Error::Invalid(format!(
-                    "{what} exposure {v} not within ±{STOP_LIMIT} stops"
-                )));
+            if !v.is_finite() || v.abs() > reach {
+                return Err(crate::Error::Invalid(format!("{what} exposure {v} not within ±{reach} stops")));
             }
         }
         Ok(())
@@ -360,39 +362,100 @@ impl SplitGrade {
     /// is the grey card. Adding the same stops to both exposures is the
     /// other half and changes only the exposure.
     ///
-    /// The grade stops at [`grade_ends`], and before an exposure would
-    /// leave ±[`STOP_LIMIT`]. A pair past an end stays there on a step
-    /// outwards and comes back on one inwards. Both exposures land on
-    /// twelfths, and the same steps back give the same pair again.
+    /// The grade stops at [`grade_ends`]. It does not stop because the
+    /// print is light or dark: the exposure is held, and one filter's time
+    /// may pass ±[`STOP_LIMIT`] by as much as the grade and the speed match
+    /// need. A pair past an end stays there on a step outwards and comes
+    /// back on one inwards. Both exposures land on twelfths, and the same
+    /// steps back give the same pair again.
     pub fn graded(&self, notches: i32) -> Self {
-        let limit = (STOP_LIMIT * 12.0).round() as i32;
-        let twelfths =
-            |v: f64| if v.is_finite() { ((v * 12.0).round() as i32).clamp(-limit, limit) } else { 0 };
+        let span = (2.0 * STOP_LIMIT * 12.0).round() as i32;
         let (soft, hard) = (twelfths(self.soft), twelfths(self.hard));
         // Twenty-fourths from here on: the grade's half and the mean are
         // whole in them, and of one parity when the pair is on twelfths.
-        let grade = hard - soft;
+        let grade = (hard - soft).clamp(-span, span);
         let exposure = soft + hard - matched_mean(grade);
         let (soft_end, hard_end) = grade_ends();
         let to = grade.saturating_add(notches).clamp(soft_end.min(grade), hard_end.max(grade));
-        let pair = |g: i32| {
-            let mean = exposure + matched_mean(g);
-            (mean - g, mean + g)
-        };
-        let fits = |g: i32| {
-            let (s, h) = pair(g);
-            s.abs() <= 2 * limit && h.abs() <= 2 * limit
-        };
-        // The furthest grade on the way that both exposures can reach; the
-        // pair as it stands always does.
-        let step = if to >= grade { 1 } else { -1 };
-        let mut g = to;
-        while g != grade && !fits(g) {
-            g -= step;
+        let mean = exposure + matched_mean(to);
+        Self {
+            soft: f64::from(mean - to) / 24.0,
+            hard: f64::from(mean + to) / 24.0,
+            paper: self.paper.clone(),
         }
-        let (s, h) = pair(g);
-        Self { soft: f64::from(s) / 24.0, hard: f64::from(h) / 24.0, paper: self.paper.clone() }
     }
+
+    /// `delta` stops more time on both filters, snapped to a twelfth. The
+    /// exposure, what both have beyond the speed-matched pair of this
+    /// grade, stops at ±[`STOP_LIMIT`]. The gap stays, so at grade 5 the
+    /// soft time may stand beyond −[`STOP_LIMIT`]: three stops less light
+    /// is still there, as the clock is still there after the filter is in.
+    pub fn shifted(&self, delta: f64) -> Self {
+        let span = (2.0 * STOP_LIMIT * 12.0).round() as i32;
+        let (soft_t, hard_t) = (twelfths(finite_or_zero(self.soft)), twelfths(finite_or_zero(self.hard)));
+        let grade = (hard_t - soft_t).clamp(-span, span);
+        // The same exposure `graded` holds, in twenty-fourths of a stop.
+        // A twelfth on both filters is two of them.
+        let exposure = soft_t + hard_t - matched_mean(grade);
+        let limit = (STOP_LIMIT * 24.0).round() as i32;
+        let requested = if delta.is_finite() { (delta * 12.0).round() as i32 * 2 } else { 0 };
+        let mut lo = -limit - exposure;
+        let mut hi = limit - exposure;
+        if lo % 2 != 0 {
+            lo += 1;
+        }
+        if hi % 2 != 0 {
+            hi -= 1;
+        }
+        let steps = if lo > hi { 0 } else { requested.clamp(lo, hi) };
+        let d = f64::from(steps) / 24.0;
+        Self {
+            soft: finite_or_zero(self.soft) + d,
+            hard: finite_or_zero(self.hard) + d,
+            paper: self.paper.clone(),
+        }
+    }
+}
+
+/// Twelfths of a stop, or zero when `v` is not a number. Far outside any
+/// print the value is held, so a broken file cannot overflow the arithmetic.
+fn twelfths(v: f64) -> i32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    let t = (v * 12.0).round();
+    if t > 1000.0 {
+        1000
+    } else if t < -1000.0 {
+        -1000
+    } else {
+        t as i32
+    }
+}
+
+fn finite_or_zero(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
+/// The furthest one filter's time stands from the base exposure, in stops,
+/// when the grade runs its whole way and the exposure its whole ±[`STOP_LIMIT`].
+pub fn time_reach() -> f64 {
+    static REACH: LazyLock<f64> = LazyLock::new(|| {
+        let mut worst = STOP_LIMIT;
+        for exposure in [-STOP_LIMIT, 0.0, STOP_LIMIT] {
+            let start = SplitGrade::new(exposure, exposure);
+            for notches in [-100, 100] {
+                let g = start.graded(notches);
+                worst = worst.max(g.soft.abs()).max(g.hard.abs());
+            }
+        }
+        (worst * 12.0).ceil() / 12.0
+    });
+    *REACH
 }
 
 /// The mean of the two exposures, in twenty-fourths of a stop from the
@@ -857,33 +920,31 @@ mod tests {
         }
     }
 
-    /// From the base print the wheel has the whole paper: grade 00 at one
-    /// end and grade 5 at the other. A lighter print has less of the soft
-    /// end, since the hard light cannot go under its limit.
+    /// From any exposure the wheel has the whole paper: grade 00 at one
+    /// end and grade 5 at the other. The filter and the clock are separate,
+    /// so a print three stops light still reaches grade 5, and the soft
+    /// time stands beyond −[`STOP_LIMIT`] to keep the mid-grey there.
     #[test]
     fn the_grades_within_reach() {
         let name = |g: &SplitGrade| grade_label(g.curve().grade());
         let base = SplitGrade::default();
         assert_eq!((name(&base.graded(-100)).as_str(), name(&base.graded(100)).as_str()), ("00", "5"));
-        for exposure in [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0] {
+        for exposure in [-STOP_LIMIT, -2.0, -1.0, 0.0, 1.0, 2.0, STOP_LIMIT] {
             let start = SplitGrade::new(exposure, exposure);
             let (soft, hard) = (start.graded(-100), start.graded(100));
-            assert!(soft.validate().is_ok() && hard.validate().is_ok());
-            // From the base print and darker, the whole paper.
-            if exposure >= 0.0 {
-                assert_eq!((name(&soft).as_str(), name(&hard).as_str()), ("00", "5"), "{exposure}");
-            }
+            assert!(soft.validate().is_ok() && hard.validate().is_ok(), "{exposure}");
+            assert_eq!((name(&soft).as_str(), name(&hard).as_str()), ("00", "5"), "{exposure}");
         }
-        // A stop lighter: grade 0 at the soft end, the hard light at its limit.
-        let lighter = SplitGrade::new(-1.0, -1.0);
-        assert_eq!(lighter.graded(-100).hard, -STOP_LIMIT);
-        assert_eq!((name(&lighter.graded(-100)).as_str(), name(&lighter.graded(100)).as_str()), ("0", "5"));
-        // Two stops lighter: grade ½ to 4½.
-        let lightest = SplitGrade::new(-2.0, -2.0);
-        assert_eq!(
-            (name(&lightest.graded(-100)).as_str(), name(&lightest.graded(100)).as_str()),
-            ("½", "4½")
-        );
+        // Three stops light, grade 5: the soft filter is shorter than the
+        // exposure's own limit, and the clock will not go shorter still.
+        let light = SplitGrade::new(-STOP_LIMIT, -STOP_LIMIT);
+        let at_five = light.graded(100);
+        assert!(at_five.soft < -STOP_LIMIT, "soft {}", at_five.soft);
+        assert_eq!(at_five.shifted(-1.0), at_five);
+        // Grade and exposure commute: filter 5, then three stops less, is
+        // the same pair as three stops less and then filter 5.
+        assert_eq!(pair(&base.graded(100).shifted(-STOP_LIMIT)), pair(&at_five));
+        assert_eq!(pair(&base.shifted(-STOP_LIMIT).graded(100)), pair(&at_five));
         // Past an end the steps change nothing more.
         assert_eq!(pair(&base.graded(100)), pair(&base.graded(24)));
         assert_eq!(pair(&base.graded(-100)), pair(&base.graded(-60)));
@@ -909,8 +970,9 @@ mod tests {
                 for notches in [-30, -7, -1, 1, 5, 30] {
                     let there = start.graded(notches);
                     let (ts, th) = pair(&there);
+                    let reach = (time_reach() * 24.0).round() as i32;
                     assert!(ts % 2 == 0 && th % 2 == 0, "{s} {h} {notches}: off the twelfths");
-                    assert!(ts.abs() <= 2 * limit && th.abs() <= 2 * limit, "{s} {h} {notches}");
+                    assert!(ts.abs() <= reach && th.abs() <= reach, "{s} {h} {notches}");
                     let moved = (th - ts) / 2 - (h - s);
                     // Never past the way asked for, never the other way.
                     assert!(moved * notches.signum() >= 0 && moved.abs() <= notches.abs());
@@ -1141,7 +1203,7 @@ mod tests {
         assert_eq!(back, s);
         let minimal: SplitGrade = serde_json::from_str(r#"{"paper":"multigrade"}"#).unwrap();
         assert_eq!(minimal, SplitGrade::default());
-        assert!(SplitGrade::new(3.5, 0.0).validate().is_err());
+        assert!(SplitGrade::new(time_reach() + 1.0 / 12.0, 0.0).validate().is_err());
         assert!(SplitGrade { paper: "fb".into(), ..SplitGrade::default() }.validate().is_err());
         assert!(tone(0.0, 0.0, 0.18) > tone(0.0, 0.0, 0.17));
     }

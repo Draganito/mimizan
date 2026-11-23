@@ -20,8 +20,10 @@
 //! stands for is in the recipe file.
 //!
 //! Nothing here touches the paper's arithmetic: the pair the strip hands
-//! back is the same two numbers the two sliders used to set, on the same
-//! grid of twelfths, inside the same `STOP_LIMIT`.
+//! back is the same two numbers, on the same grid of twelfths. The drag
+//! moves the exposure, within ±[`STOP_LIMIT`] of the speed-matched time of
+//! the grade; one filter's time may stand further out, so grade 5 still
+//! has its three stops of light.
 
 use crate::session::Screen;
 use egui::{pos2, vec2, Color32, CursorIcon, Event, Id, MouseWheelUnit, Rect, Sense, Shape, Stroke, Ui};
@@ -105,7 +107,7 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32,
             (origin, ui.input(|i| i.pointer.press_origin()), response.interact_pointer_pos())
         {
             let delta = -f64::from(pos.x - press.x) / f64::from(rect.width().max(1.0)) * DRAG_STOPS;
-            let (s, h) = shift_grade(s0, h0, delta, STOP_LIMIT);
+            let (s, h) = shift_grade(s0, h0, delta);
             split.soft = s;
             split.hard = h;
         }
@@ -183,33 +185,22 @@ pub fn paper_strip(ui: &mut Ui, picture: Id, split: &mut SplitGrade, width: f32,
     }
 }
 
-// The drag's arithmetic, the same on the phone (`GradeMath` on Android,
-// `Prefs` on iOS). The wheel's is the core's, `SplitGrade::graded`; the
-// phone's spread of two fingers takes the same step.
+// The drag and the wheel are the core's: `SplitGrade::shifted` and
+// `SplitGrade::graded`. The phone (`GradeMath` on Android, `Prefs` on
+// iOS) takes the same two steps.
 
-fn finite_or_zero(v: f64) -> f64 {
-    if v.is_finite() {
-        v
-    } else {
-        0.0
-    }
-}
-
-/// Add `delta` stops to both exposures, snapped to a twelfth, and stop at
-/// `limit` so the gap stays.
-pub fn shift_grade(soft: f64, hard: f64, delta: f64, limit: f64) -> (f64, f64) {
-    let lo = -limit - soft.min(hard);
-    let hi = limit - soft.max(hard);
-    // Not `clamp`: a pair from a file may stand outside the limit, lo above hi.
-    let d = ((finite_or_zero(delta) * 12.0).round() / 12.0).max(lo).min(hi);
-    (soft + d, hard + d)
+/// Add `delta` stops to both exposures, snapped to a twelfth. The exposure
+/// stops at ±[`STOP_LIMIT`] of this grade's speed-matched time; the gap
+/// stays. The same step as [`SplitGrade::shifted`](mimizan_core::paper::SplitGrade::shifted).
+pub fn shift_grade(soft: f64, hard: f64, delta: f64) -> (f64, f64) {
+    let pair = SplitGrade::new(soft, hard).shifted(delta);
+    (pair.soft, pair.hard)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const LIMIT: f64 = 3.0;
     const EPS: f64 = 1e-9;
 
     fn close(a: f64, b: f64) -> bool {
@@ -218,27 +209,34 @@ mod tests {
 
     #[test]
     fn shift_grade_moves_both_and_keeps_the_gap() {
-        let (s, h) = shift_grade(0.5, -0.25, 1.0, LIMIT);
+        let (s, h) = shift_grade(0.5, -0.25, 1.0);
         assert!(close(s, 1.5) && close(h, 0.75));
     }
 
     #[test]
-    fn shift_grade_stops_at_the_limit_so_the_gap_stays() {
-        let (s, h) = shift_grade(1.0, 2.0, 2.5, LIMIT);
-        assert!(close(s, 2.0) && close(h, 3.0));
-        let (s, h) = shift_grade(-1.0, 1.0, -5.0, LIMIT);
-        assert!(close(s, -3.0) && close(h, -1.0));
-        let (s, h) = shift_grade(-3.0, 3.0, 1.0, LIMIT);
-        assert!(close(s, -3.0) && close(h, 3.0));
+    fn shift_grade_stops_at_the_exposure_and_keeps_the_gap() {
+        // Already open by two stops. Three stops less time is still there,
+        // so the soft filter passes −3 and the gap does not close.
+        let (s, h) = shift_grade(-1.0, 1.0, -5.0);
+        assert!(close(h - s, 2.0));
+        assert!(s < -STOP_LIMIT, "{s}");
+        let (s2, h2) = shift_grade(s, h, -1.0);
+        assert!(close(s2, s) && close(h2, h));
+        // The other way, from a pair whose harder filter is already long.
+        let (s, h) = shift_grade(1.0, 2.0, 5.0);
+        assert!(close(h - s, 1.0));
+        assert!(h > STOP_LIMIT, "{h}");
+        let (s2, h2) = shift_grade(s, h, 1.0);
+        assert!(close(s2, s) && close(h2, h));
     }
 
     #[test]
     fn shift_grade_snaps_the_delta_not_the_pair() {
-        let (s, h) = shift_grade(0.0, 0.0, 0.3, LIMIT);
+        let (s, h) = shift_grade(0.0, 0.0, 0.3);
         assert!(close(s, 4.0 / 12.0) && close(h, 4.0 / 12.0));
-        assert!(close(shift_grade(0.0, 0.0, f64::NAN, LIMIT).0, 0.0));
+        assert!(close(shift_grade(0.0, 0.0, f64::NAN).0, 0.0));
         // A pair off the grid keeps its offset: the delta is what snaps.
-        let (s, h) = shift_grade(0.1, 0.1, 1.0, LIMIT);
+        let (s, h) = shift_grade(0.1, 0.1, 1.0);
         assert!(close(s, 1.1) && close(h, 1.1));
     }
 
