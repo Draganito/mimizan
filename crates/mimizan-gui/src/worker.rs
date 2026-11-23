@@ -241,7 +241,7 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
             }),
             Err(e) => Err(e),
         },
-        Job::Redevelop { source, develop } => match check_memory(&source.path, &source.frame) {
+        Job::Redevelop { source, develop } => match check_memory(&source.path, &source.frame, &status) {
             Ok(()) => redevelop(source, develop, &status).map(|s| Event::Opened(Arc::new(s))),
             Err(e) => Ok(Event::Refused {
                 job: Box::new(Job::Redevelop { source, develop }),
@@ -281,9 +281,50 @@ impl Redevelop {
 
 /// Free memory as the system reports it; 0 when it cannot say.
 pub fn available_memory() -> u64 {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    sys.available_memory()
+    Room::read().free
+}
+
+/// macOS makes its swap as it is needed, and Windows enlarges its page
+/// file unless someone gave it a size: how much of it is free now says
+/// nothing about how much a program will be given. Linux has a swap of a
+/// size, and refuses what is beyond it. The same rule as the X-Trans
+/// converter, and here it is how a file is opened, not a switch.
+pub const SWAP_GROWS: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
+/// Free memory, and the swap that holds the rest of a file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Room {
+    pub free: u64,
+    pub swap: u64,
+}
+
+impl Room {
+    pub fn read() -> Self {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let swap = if SWAP_GROWS { u64::MAX } else { sys.free_swap() };
+        Self { free: sys.available_memory(), swap }
+    }
+
+    /// Whether a file that holds `need` bytes may be begun. It fits in the
+    /// free memory with the headroom, or the swap holds the rest. Both
+    /// figures at 0 means nothing was measured, and the file is begun.
+    /// On macOS and Windows the page file grows, so `swap` is every byte.
+    pub fn holds(self, need: u64) -> bool {
+        if self.free == 0 && self.swap == 0 {
+            return true;
+        }
+        if self.free != 0 && memory_fits(need, self.free) {
+            return true;
+        }
+        need <= self.free.saturating_add(self.swap)
+    }
+
+    /// The measured peak stands above the free memory, and the swap is
+    /// what lets the file start.
+    pub fn on_swap(self, need: u64) -> bool {
+        self.holds(need) && self.free != 0 && need > self.free
+    }
 }
 
 /// Bytes the development of this frame holds at its peak.
@@ -298,10 +339,11 @@ pub fn develop_memory_of_size(width: usize, height: usize) -> u64 {
     pipeline::develop_memory(width, height, SensorKind::Bayer(BayerPhase::RGGB))
 }
 
-/// How much of the free memory a development may take: a third is kept
-/// over, for the allocator and whatever else the process has open. The
-/// same figure decides when the UI lets the current picture go and when
-/// the worker refuses to start.
+/// How much of the free memory a development may take before the open
+/// picture is let go: a third is kept over, for the allocator and
+/// whatever else the process has open. The worker then starts the file
+/// when the free memory or the swap holds the measured peak
+/// ([`Room::holds`]).
 pub const MEMORY_HEADROOM: f64 = 1.3;
 
 /// Whether `need` bytes fit in `available` with [`MEMORY_HEADROOM`] to
@@ -323,24 +365,34 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-/// Refuse a development the machine cannot hold. Past the free memory it
-/// ends in the OOM killer or a frozen machine, not in an error, and the
-/// panic catcher sees nothing of it. The UI lets the picture it holds go
-/// and sends the job again; the message states the figures, and the UI
+/// Refuse a development the machine cannot hold, free memory and swap
+/// together. Past both it ends in the OOM killer, not in an error, and
+/// the panic catcher sees nothing of it. The UI lets the picture it holds
+/// go and sends the job again; the message states the figures, and the UI
 /// adds what to do when that was not enough.
-fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame) -> Result<()> {
-    let (need, available) = (develop_memory(frame), available_memory());
-    if memory_fits(need, available) {
+fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame, status: &dyn Fn(String)) -> Result<()> {
+    let (need, room) = (develop_memory(frame), Room::read());
+    if room.on_swap(need) {
+        status("the swap holds the rest".into());
+    }
+    if room.holds(need) {
         return Ok(());
     }
     let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-    Err(anyhow::Error::new(Refused(format!(
-        "{name} not developed: {}x{} would hold about {} while separating, {} is free",
-        frame.width,
-        frame.height,
-        pr::memory_text(need),
-        pr::memory_text(available)
-    ))))
+    Err(anyhow::Error::new(refused(&name, "developed", frame.width, frame.height, "separating", need, room)))
+}
+
+/// The log line when a file is past the free memory and the swap.
+fn refused(name: &str, what: &str, w: usize, h: usize, while_: &str, need: u64, room: Room) -> Refused {
+    let tail = if room.swap == 0 {
+        format!(", {} is free and there is no swap", pr::memory_text(room.free))
+    } else {
+        format!(", {} is free and {} of swap", pr::memory_text(room.free), pr::memory_text(room.swap))
+    };
+    Refused(format!(
+        "{name} not {what}: {w}x{h} would hold about {} while {while_}{tail}",
+        pr::memory_text(need)
+    ))
 }
 
 fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
@@ -356,16 +408,21 @@ fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(Strin
             // development. Refusing here leaves the RAF unwritten; the
             // window lets the open picture go and sends the job again.
             let need = crate::fuji::convert_memory(head.width, head.height);
-            let available = available_memory();
-            if !memory_fits(need, available) {
+            let room = Room::read();
+            if !room.holds(need) {
                 let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-                return Err(anyhow::Error::new(Refused(format!(
-                    "{name} not converted: {}x{} would hold about {} while the DNG is written, {} is free",
+                return Err(anyhow::Error::new(refused(
+                    &name,
+                    "converted",
                     head.width,
                     head.height,
-                    pr::memory_text(need),
-                    pr::memory_text(available)
-                ))));
+                    "the DNG is written",
+                    need,
+                    room,
+                )));
+            }
+            if room.on_swap(need) {
+                status("the swap holds the rest".into());
             }
             // convert will not replace a file that is there. An empty one
             // is not a DNG; leaving it would block this RAF. A file that
@@ -400,7 +457,7 @@ fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(Strin
     let t = Instant::now();
     let frame = pipeline::decode(path).with_context(|| format!("decoding {}", path.display()))?;
     let decode_ms = t.elapsed().as_millis();
-    check_memory(path, &frame)?;
+    check_memory(path, &frame, status)?;
     let frame = Arc::new(frame);
 
     // The camera file only supplies suggested weights and the USM amount;
@@ -1122,6 +1179,28 @@ mod tests {
     use mimizan_core::decode::{RawData, RawFrame, Rect, SensorKind};
     use mimizan_core::pipeline::NegativeParams;
     use mimizan_core::plate::{PlateSpace, PlateWeights};
+
+    /// The bridge file: 7.2 GB to write the DNG, 6.2 GB free. The free
+    /// memory refuses it; the swap holds it, and the file is begun. With
+    /// no swap it is refused. A page file that grows holds any file.
+    #[test]
+    fn a_file_starts_when_the_swap_holds_the_rest() {
+        let need = 7_200_000_000;
+        let short = Room { free: 6_200_000_000, swap: 14_000_000_000 };
+        assert!(!memory_fits(need, short.free));
+        assert!(short.holds(need) && short.on_swap(need));
+        let none = Room { free: 6_200_000_000, swap: 0 };
+        assert!(!none.holds(need));
+        let grows = Room { free: 3_000_000_000, swap: u64::MAX };
+        assert!(grows.holds(need) && grows.on_swap(need));
+        assert!(Room { free: 0, swap: 0 }.holds(need));
+        let easy = Room { free: 20_000_000_000, swap: 0 };
+        assert!(easy.holds(need) && !easy.on_swap(need));
+        // Inside the free memory, outside the headroom: begun, and not
+        // called a swap, because the peak itself fits.
+        let close = Room { free: 6_000_000_000, swap: 0 };
+        assert!(close.holds(5_000_000_000) && !close.on_swap(5_000_000_000));
+    }
 
     /// A wider border refits the print: the held window's samples no longer
     /// sit on the picture's grid, and must not be pieced into the new one.

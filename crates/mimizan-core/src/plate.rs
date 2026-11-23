@@ -24,6 +24,14 @@
 //!   which is how the Library of Congress composites the plates: each
 //!   frame straight into one channel.
 //!
+//! Over the half-stop under the file's colour ceiling the colour runs out
+//! into the light, following the channel that reaches the ceiling first.
+//! A channel that is still below that half-stop is a measurement and the
+//! colour stays. A plate the weights drive below no light is brought back
+//! to none, and the other two give up the same share, so the hue stays
+//! and the light stays. Light above white is kept: the paper can still
+//! burn it in. The monochrome mix does not do this.
+//!
 //! The plate file is one 16-bit grey TIFF with the three frames stacked,
 //! blue on top, green, red at the bottom, the order of the originals. The
 //! print stage copies the three frames through the same paper with the
@@ -34,6 +42,7 @@ use crate::error::{Error, Result};
 use crate::mix::{mix, ColorFilter, Weights};
 use crate::plane::Plane;
 use crate::separate::Separation;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// How the three plates are derived from the balanced channels.
@@ -265,11 +274,129 @@ impl PlateWeights {
     }
 }
 
+/// The half-stop under the colour ceiling. Across it the plate's colour
+/// runs out into the light, following the channel that reaches the
+/// ceiling first. A channel still below this half-stop is a measurement
+/// beside others that have burnt out, and the colour stays.
+pub const HIGHLIGHT_FADE_STOPS: f64 = 0.5;
+
+/// How much of one channel's own colour remains at `level`. One from
+/// `ceiling` down over [`HIGHLIGHT_FADE_STOPS`], and one wherever the
+/// channel is still below that. No ceiling, or a level that is not a
+/// number, keeps the colour.
+pub fn chroma_keep(level: f64, ceiling: f64) -> f64 {
+    if !(ceiling.is_finite() && ceiling > 0.0) || !level.is_finite() || level <= 0.0 {
+        return 1.0;
+    }
+    if level >= ceiling {
+        return 0.0;
+    }
+    let lo = ceiling * (-HIGHLIGHT_FADE_STOPS).exp2();
+    if level <= lo {
+        return 1.0;
+    }
+    let t = (level / lo).log2() / HIGHLIGHT_FADE_STOPS;
+    let t = t.clamp(0.0, 1.0);
+    let s = t * t * (3.0 - 2.0 * t);
+    1.0 - s
+}
+
+/// How much of the three channels' colour remains. `channels` are the
+/// balanced channels the mix sees, which stand above the ceiling by the
+/// light a burnt-out one still added. That light is taken back off before
+/// the shoulder is read, so a channel held at the ceiling is at the
+/// ceiling and one measured far below it is far below it.
+///
+/// The channel that reaches the ceiling first sets the pace, and the
+/// colour is gone when it gets there. While the lowest channel is still
+/// at or below the floor of the shoulder it is a measurement, and the
+/// colour stays; the two meet without a step.
+pub fn highlight_keep(channels: [f64; 3], ceiling: f64) -> f64 {
+    let brightest = channels[0].max(channels[1]).max(channels[2]);
+    let excess = (brightest - ceiling).max(0.0);
+    let held = [channels[0] - excess, channels[1] - excess, channels[2] - excess];
+    let first = held[0].max(held[1]).max(held[2]);
+    let open = held[0].min(held[1]).min(held[2]);
+    let keep_first = chroma_keep(first, ceiling);
+    let keep_open = chroma_keep(open, ceiling);
+    let protect = keep_open.powi(4);
+    keep_first + (1.0 - keep_first) * protect
+}
+
+/// One pixel of the three plates. The colour runs out toward `lum` over
+/// the half-stop under `ceiling`, at the pace of the channel that reaches
+/// it first. A channel the separation still holds below that half-stop
+/// keeps the colour. A plate below no light is brought back to none, and
+/// the other two give up the same share of their distance to `lum`, so
+/// the hue stays and the light stays. A plate above the white is light
+/// the paper can still burn in, and is left there.
+pub(crate) fn settle_pixel(p: &mut [f64; 3], lum: f64, c1: f64, c2: f64, ceiling: Option<f64>) {
+    if let Some(ceiling) = ceiling {
+        let channels = [lum - c1 + 2.0 * c2, lum + c1, lum - c1 - 2.0 * c2];
+        let s = highlight_keep(channels, ceiling);
+        if s < 1.0 {
+            for v in p.iter_mut() {
+                *v = lum + s * (*v - lum);
+            }
+        }
+    }
+    if lum.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+        if p.iter().any(|&v| v < 0.0) {
+            p.fill(lum.min(0.0));
+        }
+        return;
+    }
+    let mut t = 1.0f64;
+    for &v in p.iter() {
+        if v < 0.0 {
+            t = t.min(lum / (lum - v));
+        }
+    }
+    if t < 1.0 {
+        for v in p.iter_mut() {
+            *v = lum + t * (*v - lum);
+        }
+    }
+}
+
+fn settle_row(
+    r: &mut [f64],
+    g: &mut [f64],
+    b: &mut [f64],
+    chroma: (&[f64], &[f64], &[f64]),
+    ceiling: Option<f64>,
+) {
+    let (lum, c1, c2) = chroma;
+    for i in 0..r.len() {
+        let mut p = [r[i], g[i], b[i]];
+        settle_pixel(&mut p, lum[i], c1[i], c2[i], ceiling);
+        r[i] = p[0];
+        g[i] = p[1];
+        b[i] = p[2];
+    }
+}
+
 /// The three plates, by output channel R, G, B, each the full-resolution
-/// `L̂` plus its band-limited chrominance.
+/// `L̂` plus its band-limited chrominance. Where the file has a colour
+/// ceiling the colour runs out into the light over the half-stop under
+/// it, and a
+/// plate the weights drive below no light is brought back to none.
 pub fn mix_plate(sep: &Separation, w: &PlateWeights) -> [Plane; 3] {
     let [r, g, b] = w.weights();
-    [mix(sep, &r), mix(sep, &g), mix(sep, &b)]
+    let mut planes = [mix(sep, &r), mix(sep, &g), mix(sep, &b)];
+    let ceiling = sep.colour_ceiling;
+    let width = sep.lum.width.max(1);
+    let (r, rest) = planes.split_at_mut(1);
+    let (g, b) = rest.split_at_mut(1);
+    r[0].data
+        .par_chunks_mut(width)
+        .zip(g[0].data.par_chunks_mut(width))
+        .zip(b[0].data.par_chunks_mut(width))
+        .zip(sep.lum.data.par_chunks(width))
+        .zip(sep.c1.data.par_chunks(width))
+        .zip(sep.c2.data.par_chunks(width))
+        .for_each(|(((((rr, gg), bb), lum), c1), c2)| settle_row(rr, gg, bb, (lum, c1, c2), ceiling));
+    planes
 }
 
 /// Frame order on the plate, top to bottom.
@@ -324,6 +451,18 @@ pub fn mix_plate_stacked(sep: &Separation, w: &PlateWeights) -> Result<Plane> {
         let frame = mix(sep, &weights);
         data.extend_from_slice(&frame.data);
     }
+    let frame = width * h;
+    let chunk = width.max(1);
+    let ceiling = sep.colour_ceiling;
+    let (blue, rest) = data.split_at_mut(frame);
+    let (green, red) = rest.split_at_mut(frame);
+    red.par_chunks_mut(chunk)
+        .zip(green.par_chunks_mut(chunk))
+        .zip(blue.par_chunks_mut(chunk))
+        .zip(sep.lum.data.par_chunks(chunk))
+        .zip(sep.c1.data.par_chunks(chunk))
+        .zip(sep.c2.data.par_chunks(chunk))
+        .for_each(|(((((rr, gg), bb), lum), c1), c2)| settle_row(rr, gg, bb, (lum, c1, c2), ceiling));
     Plane::try_from_vec(width, 3 * h, data)
 }
 
@@ -391,6 +530,7 @@ mod tests {
             mask_max: one(0.5),
             rounds: 1,
             phase: crate::cfa::BayerPhase::RGGB,
+            colour_ceiling: None,
         }
     }
 
@@ -425,6 +565,102 @@ mod tests {
                     && (b.at(1, 1) - 0.4).abs() < 1e-9
             );
         }
+    }
+
+    #[test]
+    fn chroma_keep_is_one_below_the_half_stop_and_none_at_the_ceiling() {
+        let ceiling = 0.98;
+        let lo = ceiling * (-HIGHLIGHT_FADE_STOPS).exp2();
+        assert_eq!(chroma_keep(lo, ceiling), 1.0);
+        assert_eq!(chroma_keep(lo * 0.5, ceiling), 1.0);
+        assert_eq!(chroma_keep(ceiling, ceiling), 0.0);
+        assert_eq!(chroma_keep(ceiling * 1.2, ceiling), 0.0);
+        let mid = ceiling * (-0.5 * HIGHLIGHT_FADE_STOPS).exp2();
+        // Smoothstep is a half at the middle of the half-stop.
+        assert!((chroma_keep(mid, ceiling) - 0.5).abs() < 1e-12);
+        assert_eq!(chroma_keep(0.5, f64::INFINITY), 1.0);
+        // All three at the ceiling: only light. The first channel sets
+        // the pace, so a lowest channel still inside the shoulder leaves
+        // less colour when the first has already arrived.
+        let gone = highlight_keep([ceiling, ceiling, ceiling], ceiling);
+        assert_eq!(gone, 0.0);
+        let open = ceiling * (-0.25 * HIGHLIGHT_FADE_STOPS).exp2();
+        let paced = highlight_keep([ceiling, open, open], ceiling);
+        let together = highlight_keep([open, open, open], ceiling);
+        assert!(paced < together && together < 1.0, "{paced} {together}");
+        // A channel below the shoulder is a measurement: the colour stays.
+        assert_eq!(highlight_keep([ceiling * 1.2, ceiling * 1.2, lo * 0.5], ceiling), 1.0);
+    }
+
+    #[test]
+    fn a_negative_plate_is_lifted_to_no_light_and_the_luminance_stays() {
+        // A midtone the matrix drives below no light on red. No ceiling,
+        // so the fade does not enter: only the lift.
+        let (r, g, b) = (0.2, 0.8, 0.1);
+        let mut sep = flat_sep(r, g, b);
+        sep.colour_ceiling = None;
+        let rows = [[1.8, -0.5, -0.3], [0.0, 1.0, 0.0], [-0.8, 0.5, 1.3]];
+        let w = PlateWeights { filters: PlateFilters::Camera, rows };
+        let raw = 1.8 * r - 0.5 * g - 0.3 * b;
+        assert!(raw < 0.0, "{raw}");
+        let [pr, pg, pb] = mix_plate(&sep, &w);
+        let lum = sep.lum.at(0, 0);
+        assert!(pr.at(0, 0).abs() < 1e-12, "{}", pr.at(0, 0));
+        assert!(pg.at(0, 0) > 0.0 && pb.at(0, 0) > 0.0);
+        assert!(pg.at(0, 0) < g && pb.at(0, 0) > b);
+        let sum = 0.25 * pr.at(0, 0) + 0.5 * pg.at(0, 0) + 0.25 * pb.at(0, 0);
+        assert!((sum - lum).abs() < 1e-12);
+        // Above one is headroom, and a fully positive plate is left as mixed.
+        let sep = flat_sep(0.4, 0.5, 0.2);
+        let [pr, pg, pb] = mix_plate(&sep, &PlateWeights::channels());
+        assert!((pr.at(1, 1) - 0.4).abs() < 1e-12);
+        assert!((pg.at(1, 1) - 0.5).abs() < 1e-12);
+        assert!((pb.at(1, 1) - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_half_stop_lets_the_colour_out_and_a_measured_channel_keeps_its() {
+        // A fully clipped reading reconstructs as one value above the
+        // ceiling: the held channels are equal, and only the light remains.
+        let (r, g, b) = (1.2, 1.2, 1.2);
+        let mut sep = flat_sep(r, g, b);
+        sep.colour_ceiling = Some(1.0);
+        let [pr, pg, pb] = mix_plate(&sep, &PlateWeights::channels());
+        let lum = sep.lum.at(0, 0);
+        assert!((pr.at(0, 0) - lum).abs() < 1e-12);
+        assert!((pg.at(0, 0) - lum).abs() < 1e-12);
+        assert!((pb.at(0, 0) - lum).abs() < 1e-12);
+        assert!(lum > 1.0, "the light above white is kept: {lum}");
+        // The same excess sits on a blue the sensor still measured, so
+        // the reconstructed blue is near the ceiling while the held blue
+        // is far below the shoulder. The colour stays.
+        let (r, g, b) = (1.495, 1.495, 0.815);
+        let mut sep = flat_sep(r, g, b);
+        sep.colour_ceiling = Some(0.98);
+        let [pr, pg, pb] = mix_plate(&sep, &PlateWeights::channels());
+        assert!((pr.at(1, 1) - r).abs() < 1e-12 && (pg.at(1, 1) - g).abs() < 1e-12);
+        assert!((pb.at(1, 1) - b).abs() < 1e-12);
+        // All three inside the half-stop: the colour is part way out,
+        // at the pace of the highest channel.
+        let (r, g, b) = (0.95, 0.90, 0.92);
+        let mut sep = flat_sep(r, g, b);
+        sep.colour_ceiling = Some(1.0);
+        let [pr, pg, pb] = mix_plate(&sep, &PlateWeights::channels());
+        let lum = sep.lum.at(0, 0);
+        let s = highlight_keep([r, g, b], 1.0);
+        assert!(s > 0.0 && s < 1.0, "{s}");
+        assert!((pr.at(0, 0) - (lum + s * (r - lum))).abs() < 1e-12);
+        assert!((pg.at(0, 0) - (lum + s * (g - lum))).abs() < 1e-12);
+        assert!((pb.at(0, 0) - (lum + s * (b - lum))).abs() < 1e-12);
+        // Blue measured half a stop and more under a burnt red and green.
+        let (r, g, b) = (1.2, 1.2, 0.5);
+        let mut sep = flat_sep(r, g, b);
+        sep.colour_ceiling = Some(1.0);
+        let [pr, pg, pb] = mix_plate(&sep, &PlateWeights::channels());
+        assert!((pr.at(1, 0) - r).abs() < 1e-12 && (pg.at(1, 0) - g).abs() < 1e-12);
+        assert!((pb.at(1, 0) - b).abs() < 1e-12);
+        let stacked = mix_plate_stacked(&sep, &PlateWeights::channels()).unwrap();
+        assert_eq!(stacked.data, stack(&[pr, pg, pb]).unwrap().data);
     }
 
     #[test]

@@ -494,7 +494,7 @@ pub fn separate_adaptive(
         }
     }
 
-    Separation { lum, c1, c2, mask_max, rounds, phase }
+    Separation { lum, c1, c2, mask_max, rounds, phase, colour_ceiling: None }
 }
 
 #[cfg(test)]

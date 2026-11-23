@@ -88,6 +88,14 @@ pub struct Separation {
     /// picture that had no mosaic ([`from_channels`]) it is `RGGB` and
     /// says nothing; no stage after the separation reads it.
     pub phase: BayerPhase,
+    /// The balanced level at which the first channel burns out, when the
+    /// file has one. The plate lets its colour out over the half-stop
+    /// under it ([`crate::plate::HIGHLIGHT_FADE_STOPS`]), at the pace of
+    /// the channel that reaches it first.
+    /// `None` on a monochrome separation and on a picture with no ceiling:
+    /// the plate keeps its colour to the end. The monochrome mix does not
+    /// read it.
+    pub colour_ceiling: Option<f64>,
 }
 
 /// The separation of a picture that already has its three balanced
@@ -124,6 +132,7 @@ pub fn from_channels(rgb: [Plane; 3], ceiling: Option<f64>) -> Separation {
         mask_max: Plane::from_vec(1, 1, vec![FIXED_MASK_VALUE]),
         rounds: 0,
         phase: BayerPhase::RGGB,
+        colour_ceiling: ceiling.filter(|c| c.is_finite() && *c > 0.0),
     }
 }
 
@@ -187,7 +196,7 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
     drop(c2b);
     let lum = luminance(m, phase, &c1, &c2a);
     let mask_max = Plane::from_vec(m.width, m.height, vec![FIXED_MASK_VALUE; m.width * m.height]);
-    Separation { lum, c1, c2: c2a, mask_max, rounds: 1, phase }
+    Separation { lum, c1, c2: c2a, mask_max, rounds: 1, phase, colour_ceiling: None }
 }
 
 /// Separate a Bayer mosaic in the mode `p.mask` names. Every output pixel
@@ -206,6 +215,7 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
 pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
     let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
     let mut sep = separate_linear(mosaic, phase, p);
+    sep.colour_ceiling = mosaic.colour_ceiling.filter(|c| c.is_finite() && *c > 0.0);
     if let Some(ceiling) = mosaic.colour_ceiling {
         let t = std::time::Instant::now();
         let tiles = chroma_below(mosaic, ceiling, phase, p, &mut sep);

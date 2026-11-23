@@ -12,6 +12,7 @@ use crate::decode::{RawFrame, SensorKind};
 use crate::ingest::{colour_ceiling, SAT_MARGIN};
 use crate::mix::Weights;
 use crate::plane::Plane;
+use crate::plate::settle_pixel;
 use crate::plate::{PlateSpace, PlateWeights};
 use crate::print::orient;
 use rayon::prelude::*;
@@ -52,7 +53,10 @@ pub fn browser_plate(frame: &RawFrame) -> PlateWeights {
 /// A bin with a photosite above the colour ceiling
 /// (`ingest::colour_ceiling`) is mixed as the developed picture is: its
 /// luminance from the readings as they are, its colour from the readings
-/// held to the ceiling.
+/// held to the ceiling. The plate then lets that colour run out into the
+/// light over the half-stop under the ceiling, at the pace of the channel
+/// that reaches it first, and brings a plate below no light back to none.
+/// The grey is the mix of the channels as they stand.
 pub fn binned(
     frame: &RawFrame,
     weights: Weights,
@@ -158,6 +162,7 @@ pub fn binned(
     let n = width * height;
     let mono = matches!(frame.kind, SensorKind::Mono);
     let w = [weights.r, weights.g, weights.b];
+    let keep = (ceiling.is_finite() && ceiling > 0.0).then_some(ceiling);
     let mut gray = vec![0u8; n];
     let mut rgb = vec![0u8; 3 * n];
     gray.par_iter_mut().zip(rgb.par_chunks_mut(3)).enumerate().for_each(|(i, (gy, px))| {
@@ -169,8 +174,14 @@ pub fn binned(
             return;
         }
         *gy = encode((0..3).map(|k| w[k] * c[k]).sum::<f64>());
-        for (out, row) in px.iter_mut().zip(plate.rows.iter()) {
-            *out = encode((0..3).map(|k| row[k] * c[k]).sum::<f64>());
+        let mut p = [0.0; 3];
+        for (out, row) in p.iter_mut().zip(plate.rows.iter()) {
+            *out = (0..3).map(|k| row[k] * c[k]).sum();
+        }
+        let lum = 0.25 * c[0] + 0.5 * c[1] + 0.25 * c[2];
+        settle_pixel(&mut p, lum, c[1] - lum, 0.25 * (c[0] - c[2]), keep);
+        for (out, v) in px.iter_mut().zip(p) {
+            *out = encode(v);
         }
     });
     Thumb { width, height, gray, rgb }
@@ -253,7 +264,8 @@ mod tests {
     /// magenta no scene had. Held to the ceiling it is neutral, and the
     /// bin is grey in the plate: the luminance (k_R + 2 + k_B)/4, clipped
     /// to white at the encoding. Where green and red are over the ceiling
-    /// and blue is measured below it, blue keeps its distance.
+    /// and blue is measured inside the half-stop, so the colour runs part
+    /// way out and blue stays the low plate.
     #[test]
     fn above_the_ceiling_a_bin_keeps_only_the_colour_that_is_measured() {
         let wb = [2.0, 1.0, 1.5];
@@ -270,13 +282,53 @@ mod tests {
         let f = frame(32, 32, |x, y| if (x + y) % 2 == 1 { 4195 } else { 2200 }, 1);
         let t = binned_gray(&f, Weights::default(), wb, 8);
         let (l, lh): (f64, f64) = ((1.0256 + 2.0 + 0.7692) / 4.0, (3.0 * 0.9795 + 0.7692) / 4.0);
-        let blue = ((l + 0.7692 - lh).powf(1.0 / 2.2) * 255.0).round() as i32;
+        // Red is just over the ceiling and blue is inside the half-stop,
+        // so the colour runs part way out. Blue stays the low plate.
+        let (sr, sg, sb) = (l + 0.9795 - lh, l + 0.9795 - lh, l + 0.7692 - lh);
+        let ceiling = colour_ceiling(&f, wb, SAT_MARGIN).unwrap();
+        let s = crate::plate::highlight_keep([sr, sg, sb], ceiling);
+        assert!(s > 0.0 && s < 1.0, "{s}");
+        let enc = |v: f64| (v.powf(1.0 / 2.2) * 255.0).round() as i32;
+        let fade = |v: f64| l + s * (v - l);
+        let blue = enc(fade(sb));
         for px in t.rgb.as_chunks::<3>().0 {
-            assert_eq!((px[0], px[1]), (255, 255), "{px:?}");
-            assert!((px[2] as i32 - blue).abs() <= 1 && px[2] < 235, "{px:?} vs {blue}");
+            assert!((px[0] as i32 - enc(fade(sr))).abs() <= 1, "{px:?}");
+            assert!((px[1] as i32 - enc(fade(sg))).abs() <= 1, "{px:?}");
+            assert!((px[2] as i32 - blue).abs() <= 1 && px[2] < px[0], "{px:?} vs {blue}");
         }
         let grey = (l.powf(1.0 / 2.2) * 255.0).round() as i32;
         assert!(t.gray.iter().all(|&v| (v as i32 - grey).abs() <= 1), "{:?} vs {grey}", &t.gray[..4]);
+        // All three channels inside the half-stop: the plate lets the
+        // colour part way out, and the grey is the channels as mixed.
+        let raw = |v: f64| (100.0 + v).round() as u16;
+        let f = frame(
+            32,
+            32,
+            |x, y| {
+                raw(match (x % 2, y % 2) {
+                    (0, 0) => 3800.0,
+                    (1, 1) => 3700.0,
+                    _ => 3600.0,
+                })
+            },
+            1,
+        );
+        let t = binned_gray(&f, Weights::default(), [1.0; 3], 8);
+        let bal = |counts: f64| counts / 4095.0;
+        let (r, g, b) = (bal(3800.0), bal(3600.0), bal(3700.0));
+        let ceiling = colour_ceiling(&f, [1.0; 3], SAT_MARGIN).unwrap();
+        let lum = 0.25 * r + 0.5 * g + 0.25 * b;
+        let s = crate::plate::highlight_keep([r, g, b], ceiling);
+        assert!(s > 0.0 && s < 1.0, "{s} under {ceiling}");
+        let enc = |v: f64| (v.powf(1.0 / 2.2) * 255.0).round() as i32;
+        let faded = |v: f64| lum + s * (v - lum);
+        for px in t.rgb.as_chunks::<3>().0 {
+            assert!((px[0] as i32 - enc(faded(r))).abs() <= 1, "{px:?}");
+            assert!((px[1] as i32 - enc(faded(g))).abs() <= 1, "{px:?}");
+            assert!((px[2] as i32 - enc(faded(b))).abs() <= 1, "{px:?}");
+        }
+        let grey = enc(0.25 * r + 0.5 * g + 0.25 * b);
+        assert!(t.gray.iter().all(|&v| (v as i32 - grey).abs() <= 1));
         // A bin with nothing above the ceiling is mixed from its means.
         let f = frame(32, 32, |x, y| if (x + y) % 2 == 1 { 3000 } else { 1500 }, 1);
         let t = binned_gray(&f, Weights::default(), wb, 8);
