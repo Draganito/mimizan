@@ -48,9 +48,10 @@ jobs:
       - name: No redistributable, and no console on the window
         shell: pwsh
         run: |
-          cargo build --release -p mimizan-cli -p mimizan-gui
+          cargo build --release -p mimizan-cli -p mimizan-gui -p mimizan-compare
           pwsh -File dist/check_windows_exe.ps1 -Path target/release/mimizan.exe -Kind console
           pwsh -File dist/check_windows_exe.ps1 -Path target/release/mimizan-gui.exe -Kind gui
+          pwsh -File dist/check_windows_exe.ps1 -Path target/release/mimizan-compare.exe -Kind gui
 
   macos:
     # Hosted macOS runners are Apple silicon. The job refuses an Intel machine.
@@ -75,7 +76,8 @@ jobs:
         run: cargo build --release -p mimizan-gui
       - name: No libraries beyond macOS, and no purchase in the download
         run: |
-          bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui
+          cargo build --release -p mimizan-compare
+          bash dist/check_macos_links.sh target/release/mimizan target/release/mimizan-gui target/release/mimizan-compare
           if grep -q 'StoreKit\.framework' <<<"$(otool -L target/release/mimizan-gui)"; then
             echo "ERROR: the window built without the store feature links StoreKit"
             exit 1

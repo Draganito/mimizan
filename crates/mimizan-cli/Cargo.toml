@@ -47,11 +47,12 @@ TIFF with a mask sidecar; the negative is printed through a split-grade
 paper model, the plate through the same paper into an RGB file with its
 profile. A checkbox in the window writes a Bayer file out instead as a
 linear DNG, by the least-squares demosaic, and opens it the way a Fuji
-X-Trans file is opened. Includes the mimizan CLI and the mimizan-gui
-desktop app."""
+X-Trans file is opened. Includes the mimizan CLI, the mimizan-gui
+desktop app and mimizan-compare."""
 assets = [
     ["target/release/mimizan", "usr/bin/", "755"],
     ["target/release/mimizan-gui", "usr/bin/", "755"],
+    ["target/release/mimizan-compare", "usr/bin/", "755"],
     ["../../cameras/*.json", "usr/share/mimizan/cameras/", "644"],
     ["../../look/*.json", "usr/share/mimizan/look/", "644"],
     ["../../dist/mimizan-gui.desktop", "usr/share/applications/", "644"],

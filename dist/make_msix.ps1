@@ -6,7 +6,8 @@
 # The upload file is what Partner Center takes. The Store signs it again.
 # The certificate made here only lets this machine install the package for the check.
 # mimizan.exe sits next to the window. It is not its own app: an individual
-# Store account cannot submit an app without a window.
+# Store account cannot submit an app without a window. mimizan-compare
+# stays in the download zip and is not copied into this package.
 #
 # Usage:  pwsh -STA -File dist/make_msix.ps1 [-SkipBuild]
 
@@ -133,6 +134,11 @@ $PackageFullName = $null
 
 try {
     Copy-Item -LiteralPath $Cli, $Gui -Destination $Layout
+    # The loupe is in the download zip. A Store package is the window and
+    # the command beside it, and nothing else.
+    if (Test-Path -LiteralPath (Join-Path $Layout "mimizan-compare.exe")) {
+        throw "ERROR: the Store package must not carry mimizan-compare"
+    }
     Copy-Item -LiteralPath (Join-Path $ProjectDir "cameras") -Destination $Layout -Recurse
     Copy-Item -LiteralPath (Join-Path $ProjectDir "look") -Destination $Layout -Recurse
     # The libraries of others the programs link, and the license text one

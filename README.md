@@ -288,16 +288,16 @@ Debian and Ubuntu: [mimizan_0.20.9-1_amd64.deb](https://github.com/Draganito/mim
 sudo apt install ./mimizan_0.20.9-1_amd64.deb
 ```
 
-That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
+That installs the darkroom window, `mimizan-gui`, the `mimizan` command, and `mimizan-compare`.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.20.9-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.9/mimizan-0.20.9-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
+Windows, 64-bit Intel and AMD: [mimizan-0.20.9-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.9/mimizan-0.20.9-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. `mimizan-compare.exe` is the loupe in the same folder. Leave `cameras` and `look` next to the programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed. That package has no loupe.
 
-Apple silicon: [mimizan-0.20.9-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.9/mimizan-0.20.9-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open. A signed and sandboxed build of the window, without the command, is uploaded to App Store Connect for TestFlight; it is not on the Mac App Store yet. That build alone has a purchase: the JPEG at full size is free there, and the TIFF and the negative for another program are one purchase, made once and shared with the iPhone. This download, Linux and Windows have no purchase and lock nothing.
+Apple silicon: [mimizan-0.20.9-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.9/mimizan-0.20.9-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`, and `mimizan-compare` sits next to the app. The programs use the frameworks that come with macOS. The first launch is a right-click and Open. A signed and sandboxed build of the window, without the command and without the loupe, is uploaded to App Store Connect for TestFlight; it is not on the Mac App Store yet. That build alone has a purchase: the JPEG at full size is free there, and the TIFF and the negative for another program are one purchase, made once and shared with the iPhone. This download, Linux and Windows have no purchase and lock nothing.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 
 ```bash
-xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
+xattr -cr "Mimizan Lab.app" mimizan-compare && codesign --force --deep -s - "Mimizan Lab.app" && codesign --force -s - mimizan-compare
 ```
 
 From source (a recent stable Rust, a C compiler for the small allocator mimalloc, and on Linux and macOS a working OpenGL for the window; Windows uses DirectX 12, which comes with the system):

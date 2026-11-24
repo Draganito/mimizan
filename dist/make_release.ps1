@@ -2,9 +2,9 @@
 #
 # Result (always under dist/, not committed):
 #   dist/mimizan-<version>-x86_64-windows.zip
-#     mimizan.exe, mimizan-gui.exe, cameras/, look/, README, manual, license
+#     mimizan.exe, mimizan-gui.exe, mimizan-compare.exe, cameras/, look/, README, license
 #   dist/mimizan-<version>-x64.msixupload
-#     the Store package (make_msix.ps1)
+#     the Store package (make_msix.ps1), which does not carry the loupe
 # The programs carry the Visual C++ runtime. mimizan-gui.exe opens no console.
 #
 # Usage:  dist/make_release.ps1 [-SkipBuild]
@@ -19,19 +19,20 @@ $ProjectDir = Split-Path -Parent $PSScriptRoot
 $TargetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $ProjectDir "target" }
 $Cli = Join-Path $TargetDir "dist\mimizan.exe"
 $Gui = Join-Path $TargetDir "dist\mimizan-gui.exe"
+$Compare = Join-Path $TargetDir "dist\mimizan-compare.exe"
 
 if (-not $SkipBuild) {
     Write-Host "==> cargo build --profile dist"
     Push-Location $ProjectDir
     try {
-        cargo build --profile dist -p mimizan-cli -p mimizan-gui
+        cargo build --profile dist -p mimizan-cli -p mimizan-gui -p mimizan-compare
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     } finally {
         Pop-Location
     }
 }
 
-foreach ($binary in @($Cli, $Gui)) {
+foreach ($binary in @($Cli, $Gui, $Compare)) {
     if (-not (Test-Path -LiteralPath $binary)) {
         throw "ERROR: $binary missing"
     }
@@ -39,6 +40,7 @@ foreach ($binary in @($Cli, $Gui)) {
 }
 & "$PSScriptRoot\check_windows_exe.ps1" -Path $Cli -Kind console
 & "$PSScriptRoot\check_windows_exe.ps1" -Path $Gui -Kind gui
+& "$PSScriptRoot\check_windows_exe.ps1" -Path $Compare -Kind gui
 
 $versionLine = (& $Cli --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -56,7 +58,7 @@ $Name = "mimizan-$Version-x86_64-windows"
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("mimizan-" + [guid]::NewGuid().ToString("n"))
 $Root = Join-Path $Stage $Name
 New-Item -ItemType Directory -Path $Root -Force | Out-Null
-Copy-Item -LiteralPath $Cli, $Gui -Destination $Root
+Copy-Item -LiteralPath $Cli, $Gui, $Compare -Destination $Root
 Copy-Item -LiteralPath (Join-Path $ProjectDir "cameras") -Destination $Root -Recurse
 Copy-Item -LiteralPath (Join-Path $ProjectDir "look") -Destination $Root -Recurse
 foreach ($doc in @("README.md", "LICENSE")) {

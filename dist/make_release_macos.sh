@@ -8,6 +8,8 @@
 #
 # The two programs link only the frameworks that ship with macOS.
 # cameras/ and look/ sit in Contents/Resources. MacOS holds the two programs.
+# mimizan-compare is built with them and packed beside the app. The Store
+# package is the window alone, so the --store build does not compile it.
 #
 # Usage:  dist/make_release_macos.sh [--skip-build] [--store]
 #
@@ -24,6 +26,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 CLI="$TARGET_DIR/dist/mimizan"
 GUI="$TARGET_DIR/dist/mimizan-gui"
+COMPARE="$TARGET_DIR/dist/mimizan-compare"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
     echo "ERROR: this archive is the Apple silicon build (uname -m is $(uname -m))"
@@ -47,15 +50,19 @@ if [[ "$BUILD" == 1 ]]; then
             cargo build --profile dist -p mimizan-cli -p mimizan-gui --features mimizan-gui/store)
     else
         echo "==> cargo build --profile dist"
-        (cd "$PROJECT_DIR" && cargo build --profile dist -p mimizan-cli -p mimizan-gui)
+        (cd "$PROJECT_DIR" && cargo build --profile dist -p mimizan-cli -p mimizan-gui -p mimizan-compare)
     fi
 fi
-for b in "$CLI" "$GUI"; do
+bins=("$CLI" "$GUI")
+if [[ "$STORE" == 0 ]]; then
+    bins+=("$COMPARE")
+fi
+for b in "${bins[@]}"; do
     [[ -x "$b" ]] || { echo "ERROR: $b missing"; exit 1; }
     echo "==> binary: $b ($(du -h "$b" | cut -f1))"
 done
 
-"$PROJECT_DIR/dist/check_macos_links.sh" "$CLI" "$GUI"
+"$PROJECT_DIR/dist/check_macos_links.sh" "${bins[@]}"
 
 # The purchase is in the Mac App Store window and in no other. StoreKit
 # among the window's frameworks is the sign of it.
@@ -86,6 +93,7 @@ trap 'rm -rf "$STAGE"' EXIT
 NAME="mimizan-$VERSION-aarch64-macos"
 mkdir -p "$STAGE/$NAME"
 "$PROJECT_DIR/dist/assemble_macos_app.sh" "$CLI" "$GUI" "$STAGE/$NAME/Mimizan Lab.app" "$VERSION"
+cp "$COMPARE" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
 
 DIST="$PROJECT_DIR/dist"

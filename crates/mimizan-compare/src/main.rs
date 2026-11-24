@@ -18,6 +18,7 @@
 //! demosaicers use a neutral profile, camera white balance and an sRGB
 //! TIFF. DHT is dcraw_emu at the camera white balance in sRGB.
 
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 use anyhow::{bail, Context, Result};

@@ -115,6 +115,8 @@ cp "$MAC_APPSTORE_PROFILE" "$APP/Contents/embedded.provisionprofile"
 # warns about that. The window does not call it.
 rm -f "$APP/Contents/MacOS/mimizan"
 test ! -e "$APP/Contents/MacOS/mimizan"
+# The loupe is packed beside the download, never into this bundle.
+test ! -e "$APP/Contents/MacOS/mimizan-compare"
 test -x "$APP/Contents/MacOS/mimizan-gui"
 # The profile arrives mode 600. productbuild would ship it readable by root
 # only, and Apple rejects that (90255). The rest of the bundle is opened the

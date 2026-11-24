@@ -2,9 +2,12 @@
 # Builds the release artefacts for mimizan.
 #
 # Result (always under dist/, not committed):
-#   dist/mimizan_<version>_amd64.deb                 both binaries, cameras/, look/,
+#   dist/mimizan_<version>_amd64.deb                 the programs, cameras/, look/,
 #                                                     desktop file, README, license
 #   dist/mimizan-<version>-x86_64-linux.tar.gz       the same as a plain tarball
+#
+# mimizan-compare is the loupe. It is built and packed with the download.
+# The Store packages are made elsewhere and do not carry it.
 #
 # Usage:  dist/make_release.sh [--skip-build]
 #
@@ -16,12 +19,13 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${CARGO_TARGET_DIR:-$PROJECT_DIR/target}"
 CLI="$TARGET_DIR/dist/mimizan"
 GUI="$TARGET_DIR/dist/mimizan-gui"
+COMPARE="$TARGET_DIR/dist/mimizan-compare"
 
 if [[ "${1:-}" != "--skip-build" ]]; then
     echo "==> cargo build --profile dist"
-    (cd "$PROJECT_DIR" && cargo build --profile dist -p mimizan-cli -p mimizan-gui)
+    (cd "$PROJECT_DIR" && cargo build --profile dist -p mimizan-cli -p mimizan-gui -p mimizan-compare)
 fi
-for b in "$CLI" "$GUI"; do
+for b in "$CLI" "$GUI" "$COMPARE"; do
     [[ -x "$b" ]] || { echo "ERROR: $b missing"; exit 1; }
     echo "==> binary: $b ($(du -h "$b" | cut -f1))"
 done
@@ -42,7 +46,7 @@ STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
 NAME="mimizan-$VERSION-x86_64-linux"
 mkdir -p "$STAGE/$NAME"
-cp "$CLI" "$GUI" "$STAGE/$NAME/"
+cp "$CLI" "$GUI" "$COMPARE" "$STAGE/$NAME/"
 cp -r "$PROJECT_DIR/cameras" "$PROJECT_DIR/look" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/README.md" "$PROJECT_DIR/LICENSE" "$STAGE/$NAME/"
 cp "$PROJECT_DIR/dist/mimizan-gui.desktop" "$STAGE/$NAME/"
@@ -62,6 +66,7 @@ if command -v cargo-deb >/dev/null; then
     for f in \
         ./usr/bin/mimizan \
         ./usr/bin/mimizan-gui \
+        ./usr/bin/mimizan-compare \
         ./usr/share/mimizan/cameras/nikon_z_f.json \
         ./usr/share/mimizan/look/neutral.json \
         ./usr/share/applications/mimizan-gui.desktop \
