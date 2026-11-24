@@ -281,6 +281,91 @@ pub fn hit(b: &Brush, cx: f64, cy: f64, k: f64, x: f64, y: f64, slop: f64) -> Op
     handles(b, cx, cy, k).into_iter().find(|&(_, hx, hy)| (x - hx).hypot(y - hy) <= slop).map(|h| h.0)
 }
 
+/// The open brush with every handle back on the picture.
+///
+/// A press has to start on the picture, and the picture clips what is
+/// drawn. A handle dragged past the edge is then neither seen nor
+/// taken hold of, and the brush is kept with the program, so a new
+/// version still opens the same shape. Whichever half-axis or penumbra
+/// crosses the edge is shortened until its handle sits inside `rect`
+/// by a handle's width. The other axis, the stops, the angle and the
+/// light stay. A brush that already fits is returned unchanged.
+pub fn contain(
+    mut b: Brush,
+    cx: f64,
+    cy: f64,
+    k: f64,
+    rect: egui::Rect,
+    back: &mimizan_core::straighten::Affine,
+) -> Brush {
+    let inner = rect.shrink(HANDLE_PT + 2.0);
+    if !inner.is_positive() || !(k.is_finite() && k > 0.0) {
+        return b;
+    }
+    if handles_inside(&b, cx, cy, k, inner, rect, back) {
+        return b;
+    }
+    let along = |dx: f64, dy: f64| reach(cx, cy, dx, dy, inner, rect, back);
+    match b.tool {
+        Tool::Hand => {
+            let (s, c) = b.hand.tip.angle.to_radians().sin_cos();
+            let rx_max = along(c, s).min(along(-c, -s)) - f64::from(ROTATE_PT) / k;
+            // The penumbra handle sits a fixed stalk past ry, even with no feather.
+            let down = along(-s, c);
+            let ry_max = down.min(along(s, -c)) - f64::from(FEATHER_PT) / k;
+            b.hand.tip.rx = b.hand.tip.rx.clamp(MIN_AXIS, rx_max.max(MIN_AXIS).min(SIZE_LIMIT));
+            b.hand.tip.ry = b.hand.tip.ry.clamp(MIN_AXIS, ry_max.max(MIN_AXIS).min(SIZE_LIMIT));
+            let feather_max = down - b.hand.tip.ry - f64::from(FEATHER_PT) / k;
+            b.hand.tip.feather = b.hand.tip.feather.clamp(0.0, feather_max.max(0.0).min(SIZE_LIMIT));
+        }
+        Tool::Card => {
+            let (s, c) = b.card.angle.to_radians().sin_cos();
+            let feather_max = along(-c, -s) - f64::from(FEATHER_PT) / k;
+            b.card.feather = b.card.feather.clamp(0.0, feather_max.max(0.0).min(SIZE_LIMIT));
+        }
+    }
+    b
+}
+
+/// How far from `(cx, cy)` along a unit direction the picture still holds
+/// the point, in normalised units.
+fn reach(
+    cx: f64,
+    cy: f64,
+    dx: f64,
+    dy: f64,
+    inner: egui::Rect,
+    rect: egui::Rect,
+    back: &mimizan_core::straighten::Affine,
+) -> f64 {
+    if !inner.contains(norm_to_stage(cx, cy, rect, back)) {
+        return 0.0;
+    }
+    let mut lo = 0.0;
+    let mut hi = SIZE_LIMIT + 1.0;
+    for _ in 0..24 {
+        let mid = (lo + hi) * 0.5;
+        if inner.contains(norm_to_stage(cx + dx * mid, cy + dy * mid, rect, back)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn handles_inside(
+    b: &Brush,
+    cx: f64,
+    cy: f64,
+    k: f64,
+    inner: egui::Rect,
+    rect: egui::Rect,
+    back: &mimizan_core::straighten::Affine,
+) -> bool {
+    handles(b, cx, cy, k).into_iter().all(|(_, x, y)| inner.contains(norm_to_stage(x, y, rect, back)))
+}
+
 /// The brush after a drag of `hit` from `start` to `to`, the brush shown
 /// at `centre`. `fine` scales the stops' drag (a tenth with
 /// Shift). A handle dragged to where it sits changes nothing.
@@ -614,5 +699,43 @@ mod tests {
             });
         assert_eq!(ring.len(), 72);
         assert!((ring[0].x - (rect.center().x + 60.0)).abs() < 1e-3);
+    }
+
+    /// A tip dragged past the picture comes back until every handle is on
+    /// it. One that already fits is left exactly as it was, stops included.
+    #[test]
+    fn a_shape_past_the_picture_can_still_be_held() {
+        let rect = Rect::from_min_size(Pos2::new(100.0, 50.0), Vec2::new(600.0, 400.0));
+        let unit_to_pic = straighten::Affine { a: 3000.0, b: 0.0, c: 0.0, d: 2000.0, tx: 0.0, ty: 0.0 };
+        let back = burn::normalize(3000, 2000).after(&unit_to_pic).inverse().unwrap();
+        let k = points_per_unit(rect, &back);
+        let (cx, cy) = (0.0, 0.0);
+        let inner = rect.shrink(HANDLE_PT + 2.0);
+        let inside = |b: &Brush| {
+            handles(b, cx, cy, k)
+                .into_iter()
+                .all(|(_, x, y)| inner.contains(norm_to_stage(x, y, rect, &back)))
+        };
+        let modest = hand(0.08, 0.08, 15.0, 0.03);
+        assert_eq!(contain(modest, cx, cy, k, rect, &back), modest);
+        let wide = hand(3.0, 0.05, 0.0, 0.02);
+        let held = contain(wide, cx, cy, k, rect, &back);
+        assert!(inside(&held), "{held:?}");
+        assert!(held.hand.tip.rx < 0.5);
+        assert!((held.hand.tip.ry - 0.05).abs() < 1e-12);
+        assert!((held.hand.tip.feather - 0.02).abs() < 1e-12);
+        for angle in [0.0, 20.0, 70.0] {
+            let huge = hand(3.0, 2.0, angle, 1.0);
+            let held = contain(huge, cx, cy, k, rect, &back);
+            assert!(inside(&held), "{angle}: {held:?}");
+            assert!(held.hand.tip.rx < huge.hand.tip.rx && held.hand.tip.ry < huge.hand.tip.ry);
+            assert!((held.stops() - huge.stops()).abs() < 1e-12);
+            assert!((held.hand.tip.angle - angle).abs() < 1e-12);
+        }
+        let card = card(-90.0, SIZE_LIMIT);
+        let held = contain(card, cx, cy, k, rect, &back);
+        assert!(inside(&held), "{held:?}");
+        assert!(held.card.feather < SIZE_LIMIT);
+        assert!((held.card.angle - card.card.angle).abs() < 1e-12);
     }
 }

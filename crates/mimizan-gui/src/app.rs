@@ -2305,6 +2305,23 @@ impl App {
         }
     }
 
+    /// An open brush whose handles have left the picture is pulled back
+    /// in, so they can be taken hold of again. A shape already kept is
+    /// written back then, unless a handle is still in the hand.
+    fn settle_brush(&mut self, centre: (f64, f64), k: f64, rect: Rect, back: &straighten::Affine) {
+        if self.burn_locked {
+            return;
+        }
+        let next = brush::contain(self.brush, centre.0, centre.1, k, rect, back);
+        if next == self.brush {
+            return;
+        }
+        self.brush = next;
+        if self.brush_set && !matches!(self.burn_drag, Some(BrushDrag::Handle { .. })) {
+            self.persist();
+        }
+    }
+
     /// The burn tool on the stage. Open, a press on a handle of the tip
     /// sets the brush, a click on a light chooses it, and nothing else
     /// moves. Locked, a primary press
@@ -2331,6 +2348,9 @@ impl App {
         let centre = self.brush_centre(rect, &to_norm);
         if !down_on {
             self.burn_drag = None;
+        }
+        self.settle_brush(centre, k, rect, &back);
+        if !down_on {
             if let Some(p) = response.hover_pos().filter(|p| rect.contains(*p)) {
                 let icon = if self.burn_locked {
                     CursorIcon::None
@@ -2385,6 +2405,7 @@ impl App {
             BrushDrag::Handle { hit, origin, centre, start } => {
                 let fine = if ui.input(|i| i.modifiers.shift) { 0.1 } else { 1.0 };
                 self.brush = brush::dragged(&origin, hit, centre, start, (x, y), k, fine);
+                self.settle_brush(centre, k, rect, &back);
                 ui.ctx().set_cursor_icon(brush_cursor(hit, true));
             }
             BrushDrag::Paint { index, last } => {

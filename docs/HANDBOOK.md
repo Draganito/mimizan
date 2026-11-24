@@ -11,9 +11,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.20.12/mimizan_0.20.12-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.20.12-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.20.12/mimizan-0.20.12-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. `mimizan-compare.exe` is in the same folder; the Store package has no loupe. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.20.12/mimizan-0.20.12-aarch64-macos.zip) — unzip it. `mimizan-compare` sits next to `Mimizan Lab.app`. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to the app and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.20.13/mimizan_0.20.13-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.20.13-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.20.13/mimizan-0.20.13-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. `mimizan-compare.exe` is in the same folder; the Store package has no loupe. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.20.13/mimizan-0.20.13-aarch64-macos.zip) — unzip it. `mimizan-compare` sits next to `Mimizan Lab.app`. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to the app and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" mimizan-compare && codesign --force --deep -s - "Mimizan Lab.app" && codesign --force -s - mimizan-compare
