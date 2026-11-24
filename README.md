@@ -4,7 +4,7 @@
 
 A darkroom for the digital negative, with two processes.
 
-You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process. That is true of a Bayer file until you ask otherwise. A Fuji X-Trans RAF opens in the same window. The first time, it is written out as a linear DNG beside the RAF, highlights kept, and that file is a demosaic: three colour values a pixel, worked out from the readings around it. The plate then takes those three channels as it takes any linear DNG. The figures for that demosaic are [below](#fuji-x-trans). The same writing is there for a Bayer file, and it stays off. *least-squares demosaic* in the Negative window writes a linear DNG beside the RAW and the darkroom opens that DNG the way it opens the X-Trans one. The figures are [below](#bayer-the-least-squares-demosaic).
+You open a colour RAW. Mimizan Lab reads the Bayer mosaic as a signal, lifts the colour off its carriers and keeps the luminance underneath: a negative in which every pixel is a sum of photosites the sensor measured. No demosaicing, in either process. That is true of a Bayer file until you ask otherwise. A Fuji X-Trans RAF opens in the same window. The first time, it is written out as a linear DNG beside the RAF, highlights kept, and that file is a demosaic: three colour values a pixel, worked out from the readings around it. The plate then takes those three channels as it takes any linear DNG. The figures for that demosaic are [below](#fuji-x-trans). For a Bayer file the frequency separation stays the path. *least-squares demosaic* in the Negative window is the alternative, and it stays off: on, it writes a linear DNG beside the RAW and the darkroom opens that DNG the way it opens the X-Trans one. The figures are [below](#bayer-the-least-squares-demosaic).
 
 > **On the 24 Kodak pictures, sampled with the X-Trans tile and compared with the original, this program leads RawTherapee's Markesteijn on every picture.**
 
@@ -178,19 +178,81 @@ Ahead of Markesteijn on all 24 pictures in each condition: by 5.6 dB pixel-sharp
 
 ## Bayer, the least-squares demosaic
 
-*least-squares demosaic* is in the Negative window, under Development. It is off. On, a Bayer file is written once as a linear DNG beside the RAW, named with `.mimizan` before `.dng`, highlights kept, and the RAW leaves the strip. Every later open with the checkbox on reads that DNG and does not look at the mosaic again. A newer version of the program writes the DNG again, so the picture is the separation that version makes. The darkroom from there is the linear DNG's: three channels, nothing separated a second time, the plate printing them as it prints the X-Trans DNG. Off, the file stays the measured separation, every pixel a sum of photosites, and the DNG is not a tile of the strip. The choice is remembered.
+The frequency separation stays the path: every pixel a sum of photosites the sensor measured, and nothing is estimated. *least-squares demosaic* is the alternative. It is in the Negative window, under Development, and it is off. On, a Bayer file is written once as a linear DNG beside the RAW, named with `.mimizan` before `.dng`, highlights kept, and the RAW leaves the strip. Every later open with the checkbox on reads that DNG and does not look at the mosaic again. A newer version of the program writes the DNG again, so the picture is the separation that version makes. The darkroom from there is the linear DNG's: three channels, nothing separated a second time, the plate printing them as it prints the X-Trans DNG. Off, the file stays the measured separation, and the DNG is not a tile of the strip. The choice is remembered.
 
-The separation is the one measured on X-Trans, on the 2×2 mosaic written as a 6×6 tile. The eight line priors of that bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. A one-pixel checker that runs along a horizontal line is taken off; the line stays.
+The separation is the one measured on X-Trans, on the 2×2 mosaic written as a 6×6 tile. The eight line priors of that bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. The frequency separation is not mixed into it. A one-pixel checker that runs along a horizontal line is taken off; the line stays.
 
-On the 24 Kodak pictures, the same three conditions as the plate and the X-Trans note, CPSNR on sRGB-encoded values with 16 px of the edge left out, against the sixteen demosaicers of libraw and RawTherapee. The mean leads in each condition. Not every picture does.
+### On the Kodak set
 
-| Condition | Leads | Mean | Behind |
-|---|---|---|---|
-| Pixel-sharp | 19/24 | 40.35 dB | five pictures, by 0.10 to 0.29 dB, all against LMMSE |
-| Behind a lens (σ 0.75 px) | 22/24 | 48.98 dB | kodim06 by 0.76 dB against DCB, kodim19 by 0.66 dB against LMMSE |
-| Twice the size | 11/24 | 46.39 dB | up to 1.63 dB, kodim16 against DCB; the gap is green and red on fine structure |
+The 24 pictures of the Kodak set, the same three conditions as the plate and the X-Trans note, against the sixteen demosaicers of libraw and RawTherapee. CPSNR, and the PSNR of red, green and blue, in dB on sRGB-encoded values; 16 px of the edge are left out. The last column is how many of the 24 pictures a method leads. The bench is `mimizan bench bayer`. It is not part of the packages.
 
-The bench is `mimizan bench bayer`. It is not part of the packages.
+Pixel-sharp:
+
+| Method | CPSNR | R | G | B | leads |
+|---|---|---|---|---|---|
+| Mimizan Bayer LS | 40.37 | 40.22 | 43.00 | 38.98 | 19/24 |
+| VNG (libraw) | 33.26 | 32.94 | 36.60 | 31.77 | 0/24 |
+| PPG (libraw) | 33.29 | 34.08 | 36.20 | 31.27 | 0/24 |
+| AHD (libraw) | 33.83 | 34.78 | 37.64 | 31.50 | 0/24 |
+| DCB (libraw) | 32.49 | 33.11 | 34.52 | 30.83 | 0/24 |
+| DHT (libraw) | 35.35 | 34.78 | 37.13 | 34.75 | 0/24 |
+| AAHD (libraw) | 34.26 | 35.21 | 37.55 | 32.04 | 0/24 |
+| fast (RawTherapee) | 33.70 | 33.56 | 35.17 | 33.11 | 0/24 |
+| VNG4 (RawTherapee) | 33.24 | 33.23 | 34.39 | 32.69 | 0/24 |
+| AHD (RawTherapee) | 34.65 | 34.07 | 37.75 | 33.78 | 0/24 |
+| EAHD (RawTherapee) | 34.88 | 34.43 | 37.83 | 33.99 | 0/24 |
+| HPHD (RawTherapee) | 35.60 | 35.46 | 37.96 | 34.78 | 0/24 |
+| DCB (RawTherapee) | 35.87 | 35.69 | 38.70 | 34.90 | 0/24 |
+| LMMSE (RawTherapee) | 39.42 | 39.14 | 42.29 | 38.27 | 5/24 |
+| IGV (RawTherapee) | 35.69 | 35.48 | 38.53 | 34.82 | 0/24 |
+| AMaZE (RawTherapee) | 36.49 | 36.04 | 39.93 | 35.42 | 0/24 |
+| RCD (RawTherapee) | 35.46 | 35.32 | 36.91 | 34.88 | 0/24 |
+
+Behind a lens (σ 0.75 px):
+
+| Method | CPSNR | R | G | B | leads |
+|---|---|---|---|---|---|
+| Mimizan Bayer LS | 49.03 | 48.56 | 51.46 | 47.98 | 22/24 |
+| VNG (libraw) | 41.00 | 41.76 | 44.31 | 39.03 | 0/24 |
+| PPG (libraw) | 41.97 | 44.37 | 47.67 | 38.99 | 0/24 |
+| AHD (libraw) | 41.90 | 44.58 | 48.43 | 38.74 | 0/24 |
+| DCB (libraw) | 41.10 | 43.50 | 45.06 | 38.38 | 0/24 |
+| DHT (libraw) | 45.01 | 43.65 | 47.34 | 45.46 | 0/24 |
+| AAHD (libraw) | 42.95 | 44.94 | 48.22 | 40.10 | 0/24 |
+| fast (RawTherapee) | 42.45 | 42.42 | 45.35 | 41.88 | 0/24 |
+| VNG4 (RawTherapee) | 41.12 | 41.24 | 43.32 | 40.61 | 0/24 |
+| AHD (RawTherapee) | 43.55 | 43.34 | 48.09 | 42.53 | 0/24 |
+| EAHD (RawTherapee) | 43.56 | 43.40 | 48.03 | 42.58 | 0/24 |
+| HPHD (RawTherapee) | 42.98 | 43.14 | 45.93 | 42.21 | 0/24 |
+| DCB (RawTherapee) | 46.02 | 46.18 | 51.55 | 44.61 | 1/24 |
+| LMMSE (RawTherapee) | 46.16 | 44.99 | 49.27 | 45.95 | 1/24 |
+| IGV (RawTherapee) | 40.59 | 40.36 | 43.93 | 39.85 | 0/24 |
+| AMaZE (RawTherapee) | 45.61 | 45.55 | 49.64 | 44.51 | 0/24 |
+| RCD (RawTherapee) | 46.19 | 45.91 | 50.05 | 45.18 | 0/24 |
+
+Twice the size:
+
+| Method | CPSNR | R | G | B | leads |
+|---|---|---|---|---|---|
+| Mimizan Bayer LS | 46.45 | 46.23 | 48.46 | 45.36 | 12/24 |
+| VNG (libraw) | 41.01 | 41.76 | 43.95 | 39.09 | 0/24 |
+| PPG (libraw) | 42.65 | 44.24 | 47.89 | 39.93 | 0/24 |
+| AHD (libraw) | 42.43 | 44.06 | 47.89 | 39.65 | 0/24 |
+| DCB (libraw) | 41.63 | 43.68 | 44.37 | 39.27 | 0/24 |
+| DHT (libraw) | 42.19 | 41.72 | 44.46 | 41.51 | 0/24 |
+| AAHD (libraw) | 42.37 | 43.20 | 46.32 | 40.11 | 0/24 |
+| fast (RawTherapee) | 42.33 | 42.20 | 45.16 | 41.58 | 0/24 |
+| VNG4 (RawTherapee) | 41.25 | 41.42 | 43.05 | 40.71 | 0/24 |
+| AHD (RawTherapee) | 43.21 | 42.80 | 47.30 | 42.20 | 0/24 |
+| EAHD (RawTherapee) | 43.21 | 42.83 | 47.27 | 42.21 | 0/24 |
+| HPHD (RawTherapee) | 42.19 | 42.18 | 44.50 | 41.52 | 0/24 |
+| DCB (RawTherapee) | 45.22 | 45.42 | 49.73 | 43.78 | 6/24 |
+| LMMSE (RawTherapee) | 44.75 | 44.09 | 47.65 | 44.04 | 3/24 |
+| IGV (RawTherapee) | 40.34 | 40.16 | 43.49 | 39.37 | 0/24 |
+| AMaZE (RawTherapee) | 44.51 | 44.45 | 47.74 | 43.46 | 0/24 |
+| RCD (RawTherapee) | 45.42 | 45.32 | 49.21 | 44.16 | 3/24 |
+
+The mean leads in each condition: by 0.95 dB pixel-sharp against LMMSE, by 2.84 dB behind a lens against RCD, by 1.03 dB at twice the size against RCD. Not every picture does. Pixel-sharp, five pictures stay behind LMMSE, by 0.08 to 0.25 dB. Behind a lens, kodim06 stays behind DCB by 0.70 dB and kodim19 behind LMMSE by 0.55 dB. At twice the size, twelve pictures stay behind, by up to 1.57 dB (kodim16 against DCB); the gap is green and red on fine structure.
 
 ## A session
 
