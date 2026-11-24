@@ -690,8 +690,9 @@ fn thumb_from_image(mut picture: image::DynamicImage, long_edge: usize) -> Thumb
     let (width, height) = (rgb_img.width() as usize, rgb_img.height() as usize);
     let rgb = rgb_img.into_raw();
     let mut gray = vec![0u8; width * height];
-    for (g, px) in gray.iter_mut().zip(rgb.chunks_exact(3)) {
-        *g = (0.2126 * f32::from(px[0]) + 0.7152 * f32::from(px[1]) + 0.0722 * f32::from(px[2])).round() as u8;
+    for (g, px) in gray.iter_mut().zip(rgb.as_chunks::<3>().0) {
+        *g =
+            (0.2126 * f32::from(px[0]) + 0.7152 * f32::from(px[1]) + 0.0722 * f32::from(px[2])).round() as u8;
     }
     Thumb { width, height, gray, rgb }
 }

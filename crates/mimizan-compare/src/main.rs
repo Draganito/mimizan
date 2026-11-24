@@ -94,7 +94,8 @@ struct View {
 }
 
 fn main() -> eframe::Result {
-    let initial = std::env::args_os().nth(1).map(|p| PathBuf::from(p).display().to_string()).unwrap_or_default();
+    let initial =
+        std::env::args_os().nth(1).map(|p| PathBuf::from(p).display().to_string()).unwrap_or_default();
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1440.0, 860.0])
         .with_min_inner_size([800.0, 500.0])
@@ -233,9 +234,10 @@ impl eframe::App for App {
             if i.key_pressed(egui::Key::ArrowLeft) {
                 self.which = (self.which + RIVALS.len() - 1) % RIVALS.len();
             }
-            for (n, key) in [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5]
-                .into_iter()
-                .enumerate()
+            for (n, key) in
+                [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5]
+                    .into_iter()
+                    .enumerate()
             {
                 if i.key_pressed(key) {
                     self.which = n;
@@ -257,7 +259,9 @@ impl eframe::App for App {
                 {
                     self.open_dialog();
                 }
-                let edit = ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(420.0).hint_text("RAW file"));
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.path).desired_width(420.0).hint_text("RAW file"),
+                );
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.working {
                     self.develop(false);
                 }
@@ -332,7 +336,9 @@ impl eframe::App for App {
 
 impl App {
     fn frame(&self) -> Option<egui::Vec2> {
-        let pic = self.pictures[0].as_ref().or_else(|| self.pictures.get(self.which + 1).and_then(|p| p.as_ref()))?;
+        let pic = self.pictures[0]
+            .as_ref()
+            .or_else(|| self.pictures.get(self.which + 1).and_then(|p| p.as_ref()))?;
         Some(egui::vec2(pic.width as f32, pic.height as f32))
     }
 
@@ -427,31 +433,29 @@ fn develop_all(raw: &Path, again: bool, tx: mpsc::Sender<Note>) {
             let tx_r = tx.clone();
             let work = work.clone();
             let raw = raw.to_path_buf();
-            scope.spawn(move || {
-                loop {
-                    let n = {
-                        let Ok(guard) = job_rx.lock() else { break };
-                        let Ok(n) = guard.recv() else { break };
-                        n
+            scope.spawn(move || loop {
+                let n = {
+                    let Ok(guard) = job_rx.lock() else { break };
+                    let Ok(n) = guard.recv() else { break };
+                    n
+                };
+                let rival = &RIVALS[n];
+                let slot = n + 1;
+                let out = work.join(format!("{}.tif", rival.key));
+                if !again && out.is_file() {
+                    let _ = tx_r.send(Note::Status(format!("Reading {}…", rival.label)));
+                } else {
+                    let _ = tx_r.send(Note::Status(format!("Developing {}…", rival.label)));
+                    let run = match rival.kind {
+                        Kind::RawTherapee(method) => develop_rawtherapee(&raw, &work, method, &out),
+                        Kind::Dht => develop_dht(&raw, &out),
                     };
-                    let rival = &RIVALS[n];
-                    let slot = n + 1;
-                    let out = work.join(format!("{}.tif", rival.key));
-                    if !again && out.is_file() {
-                        let _ = tx_r.send(Note::Status(format!("Reading {}…", rival.label)));
-                    } else {
-                        let _ = tx_r.send(Note::Status(format!("Developing {}…", rival.label)));
-                        let run = match rival.kind {
-                            Kind::RawTherapee(method) => develop_rawtherapee(&raw, &work, method, &out),
-                            Kind::Dht => develop_dht(&raw, &out),
-                        };
-                        if let Err(e) = run {
-                            let _ = tx_r.send(Note::Missed { slot, error: format!("{}: {e}", rival.label) });
-                            continue;
-                        }
+                    if let Err(e) = run {
+                        let _ = tx_r.send(Note::Missed { slot, error: format!("{}: {e}", rival.label) });
+                        continue;
                     }
-                    send_picture(&tx_r, slot, &out);
                 }
+                send_picture(&tx_r, slot, &out);
             });
         }
     });
@@ -474,7 +478,14 @@ fn develop_mimizan(raw: &Path, work: &Path, out: &Path) -> Result<()> {
     let negative = work.join("negative.tif");
     let cameras = find_cameras();
     let mut cmd = Command::new(&bin);
-    cmd.arg("--log").arg("warn").arg("negative").arg(raw).arg("-o").arg(&negative).arg("--plate").arg("camera");
+    cmd.arg("--log")
+        .arg("warn")
+        .arg("negative")
+        .arg(raw)
+        .arg("-o")
+        .arg(&negative)
+        .arg("--plate")
+        .arg("camera");
     if let Some(dir) = &cameras {
         cmd.arg("--cameras").arg(dir);
     }
@@ -525,12 +536,18 @@ fn develop_dht(raw: &Path, out: &Path) -> Result<()> {
     if !produced.is_file() {
         bail!("dcraw_emu wrote no {}", produced.display());
     }
-    std::fs::rename(&produced, out).with_context(|| format!("moving {} to {}", produced.display(), out.display()))?;
+    std::fs::rename(&produced, out)
+        .with_context(|| format!("moving {} to {}", produced.display(), out.display()))?;
     Ok(())
 }
 
 fn run(cmd: &mut Command, name: &str) -> Result<()> {
-    let output = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output().with_context(|| name.to_owned())?;
+    let output = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| name.to_owned())?;
     if output.status.success() {
         return Ok(());
     }
@@ -686,7 +703,13 @@ fn image_norm(pane: egui::Rect, shown: egui::Vec2, pan: egui::Vec2, screen: egui
     (screen - top_left) / shown
 }
 
-fn pan_keeping(pane: egui::Rect, old: egui::Vec2, new: egui::Vec2, pan: egui::Vec2, cursor: egui::Pos2) -> egui::Vec2 {
+fn pan_keeping(
+    pane: egui::Rect,
+    old: egui::Vec2,
+    new: egui::Vec2,
+    pan: egui::Vec2,
+    cursor: egui::Pos2,
+) -> egui::Vec2 {
     let norm = image_norm(pane, old, pan, cursor);
     (cursor - pane.center()) + new * 0.5 - new * norm
 }
