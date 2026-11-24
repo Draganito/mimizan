@@ -35,7 +35,7 @@ const RAW_EXTENSIONS: &[&str] = &[
 /// Does the extension name a RAW format (case-insensitive)? A hidden file
 /// is none: on a FAT or exFAT card macOS writes `._DSC_1.NEF` beside each
 /// RAW, with the RAW's extension and none of its pixels.
-fn is_raw(path: &Path) -> bool {
+pub(crate) fn is_raw(path: &Path) -> bool {
     let hidden = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'));
     !hidden
         && path
@@ -408,6 +408,9 @@ pub struct ThumbJob {
     pub modified: SystemTime,
     /// [`Entry::let_go`] of the tile when it asked.
     pub let_go: u32,
+    /// The Negative window's least-squares demosaic. A RAW whose DNG is
+    /// written is then the DNG, and with it off that DNG is not a tile.
+    pub bayer_ls: bool,
 }
 
 /// What the thumbnail thread has made in the folder scan it is on. The
@@ -583,6 +586,15 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
         }
         crate::fuji::Place::NotXtrans => {}
     }
+    // The least-squares path: the RAW gives way to its DNG while the
+    // checkbox is on, and that DNG is not a tile while it is off.
+    if job.bayer_ls {
+        if !crate::bayer::is_ours(&job.path) && crate::bayer::dng_is_ready(&crate::bayer::dng_of(&job.path)) {
+            return Ok(ThumbReady::Covered);
+        }
+    } else if crate::bayer::is_ours(&job.path) {
+        return Ok(ThumbReady::Covered);
+    }
     let key = cache_key(&job.path, job.size, job.modified);
     if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
         return Ok(ThumbReady::Picture(hit.0, Box::new(hit.1)));
@@ -687,6 +699,9 @@ pub struct Persisted {
     /// The process a file opens in when it has no recipe: the plate
     /// (`true`) or the monochrome negative. `None` means monochrome.
     pub plate: Option<bool>,
+    /// Bayer files open through the least-squares demosaic. `None` means
+    /// the measured separation.
+    pub bayer_ls: Option<bool>,
     /// The plate's taking filters and primaries last used.
     pub plate_filters: Option<PlateFilters>,
     pub plate_space: Option<PlateSpace>,
@@ -879,6 +894,7 @@ mod tests {
             size: 1,
             modified: SystemTime::UNIX_EPOCH,
             let_go,
+            bayer_ls: false,
         };
         let mut made = Made::default();
         made.scan(1);

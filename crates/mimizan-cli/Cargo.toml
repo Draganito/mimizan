@@ -45,7 +45,10 @@ demosaicing: the luminance and the two chrominances are separated from the
 mosaic (pixel-adaptive frequency separation) and written as 16-bit linear
 TIFF with a mask sidecar; the negative is printed through a split-grade
 paper model, the plate through the same paper into an RGB file with its
-profile. Includes the mimizan CLI and the mimizan-gui desktop app."""
+profile. A checkbox in the window writes a Bayer file out instead as a
+linear DNG, by the least-squares demosaic, and opens it the way a Fuji
+X-Trans file is opened. Includes the mimizan CLI and the mimizan-gui
+desktop app."""
 assets = [
     ["target/release/mimizan", "usr/bin/", "755"],
     ["target/release/mimizan-gui", "usr/bin/", "755"],

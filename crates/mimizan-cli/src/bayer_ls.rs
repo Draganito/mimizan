@@ -50,20 +50,42 @@ impl Default for Knobs {
 /// photosite, row-major, in the light the sensor recorded, and `width` is
 /// the row length. The frame must continue the tile when it is mirrored.
 pub fn demosaic(linear: &[f64], width: usize, knobs: &Knobs) -> Rgb {
+    separate(linear, linear, width, knobs, &|_| {}).0
+}
+
+/// [`demosaic`], with the prior searched on `fit` rather than on `linear`.
+/// A burnt photosite is kept in `linear` and left out of `fit`, so the
+/// highlight does not decide the prior and still reaches the picture.
+/// `progress` is told the share of the first step that is done.
+pub fn separate(
+    linear: &[f64],
+    fit: &[f64],
+    width: usize,
+    knobs: &Knobs,
+    progress: &dyn Fn(f64),
+) -> (Rgb, Prior) {
     assert!(width > 0 && linear.len().is_multiple_of(width), "the mosaic is not a rectangle");
+    assert_eq!(linear.len(), fit.len(), "the prior is searched on another frame");
     let height = linear.len() / width;
     let tile = XTile::from_name(BAYER6).expect("the Bayer tile");
     assert!(tile.mirrors(width, height), "this frame does not mirror the Bayer tile");
     let tone = Curve::Srgb;
-    let m = tone.mosaic(&Plane::from_vec(width, height, linear.to_vec()));
     let p = XParams::default();
     let start = Prior { lens: 0.3, ..Prior::default() };
-    let found = xtrans::fit_prior(&m, &tile, &p, start, 8, [true; 6]);
+    let found = xtrans::fit_prior(
+        &tone.mosaic(&Plane::from_vec(width, height, fit.to_vec())),
+        &tile,
+        &p,
+        start,
+        8,
+        [true; 6],
+    );
+    let m = tone.mosaic(&Plane::from_vec(width, height, linear.to_vec()));
     let priors = bayer_priors(found, knobs.lines);
     let sel = Selection { sigma: knobs.sigma, sharp: knobs.sharp, bias: knobs.bias };
-    let sep = xtrans::separate_bank(&m, &tile, &p, &priors, &sel);
+    let sep = xtrans::separate_bank_watched(&m, &tile, &p, &priors, &sel, progress);
     let refine = Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
-    xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb()
+    (xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb(), found)
 }
 
 /// The priors weighed per pixel.

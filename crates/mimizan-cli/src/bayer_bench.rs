@@ -5,10 +5,10 @@
 //! channel are on sRGB-encoded values, 16 px of the edge left out, which is
 //! how the X-Trans measurement was made.
 
-use crate::bayer_ls::{self, Knobs};
 use crate::kodak::{has_tool, run_external, stem_of, tool_version, Tool, METHODS};
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use mimizan_cli::bayer_ls::{self, Knobs};
 use mimizan_core::cfa::BayerPhase;
 use mimizan_core::kodak::{self, colour_quality, ColourQuality};
 use mimizan_core::plane::Plane;

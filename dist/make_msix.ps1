@@ -178,7 +178,7 @@ try {
     <Application Id="Lab" Executable="mimizan-gui.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
         DisplayName="Mimizan Lab"
-        Description="A darkroom for the digital negative."
+        Description="A darkroom for the digital negative. A Bayer file can be written out as a linear DNG."
         BackgroundColor="#000000"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">

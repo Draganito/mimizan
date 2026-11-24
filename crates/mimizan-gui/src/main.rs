@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 mod app;
+mod bayer;
 mod browser;
 mod brush;
 mod cpu;

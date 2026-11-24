@@ -1,7 +1,6 @@
 //! `mimizan`: the command-line front end of Mimizan Lab.
 
 mod bayer_bench;
-mod bayer_ls;
 mod calibrate;
 mod cmd;
 mod kodak;

@@ -672,17 +672,15 @@ fn sidecar_of(raw: &Path) -> Option<PathBuf> {
 /// size when the strip has read it, else the current session's own, the
 /// next file being most often from the same camera. Nothing to go by
 /// without either.
-fn opening_memory(target: Option<(usize, usize, bool)>, current: Option<u64>) -> Option<u64> {
+fn opening_memory(target: Option<(usize, usize, bool)>, current: Option<u64>, bayer_ls: bool) -> Option<u64> {
     target
-        .map(
-            |(w, h, xtrans)| {
-                if xtrans {
-                    crate::fuji::convert_memory(w, h)
-                } else {
-                    develop_memory_of_size(w, h)
-                }
-            },
-        )
+        .map(|(w, h, xtrans)| {
+            if xtrans || bayer_ls {
+                crate::fuji::convert_memory(w, h)
+            } else {
+                develop_memory_of_size(w, h)
+            }
+        })
         .or(current)
 }
 
@@ -734,6 +732,10 @@ pub struct App {
     /// next file without a recipe opens in, and what the switch shows
     /// with nothing open.
     plate_default: bool,
+    /// Bayer files open through the least-squares demosaic: a linear DNG
+    /// beside the RAW, then the three channels, as an X-Trans file does.
+    /// Off, the file stays the measured separation.
+    bayer_ls: bool,
     /// The plate's filters and primaries last chosen, so switching the
     /// process back on returns to them.
     plate_last: PlateParams,
@@ -1020,6 +1022,7 @@ impl App {
             strip_negative: persisted.strip_negative.unwrap_or(true),
             strip_negative_plate: persisted.strip_negative_plate.unwrap_or(false),
             plate_default: persisted.plate.unwrap_or(false),
+            bayer_ls: persisted.bayer_ls.unwrap_or(false),
             plate_last: PlateParams {
                 filters: persisted.plate_filters.unwrap_or_default(),
                 space: persisted.plate_space.unwrap_or_default(),
@@ -1161,6 +1164,7 @@ impl App {
             panels: Some(self.panels),
             strip_height: Some(self.strip_height),
             plate: Some(self.plate_default),
+            bayer_ls: Some(self.bayer_ls),
             plate_filters: Some(self.plate_last.filters),
             plate_space: Some(self.plate_last.space),
             ruler: Some(self.ruler),
@@ -2790,7 +2794,7 @@ impl App {
             .and_then(|e| e.meta.as_ref())
             .map(|m| (m.width, m.height, m.xtrans));
         let current = self.session.as_ref().map(|s| develop_memory(&s.frame));
-        if let Some(need) = opening_memory(target, current) {
+        if let Some(need) = opening_memory(target, current, self.bayer_ls) {
             self.make_room(need);
         }
         // The file's own development, read from the recipe beside it
@@ -2800,7 +2804,12 @@ impl App {
         let beside =
             sidecar_of(&path).filter(|p| !own_file && p.is_file()).and_then(|p| Recipe::load(&p).ok());
         let develop = develop_for_open(self.develop_params(), own_file, beside.as_ref());
-        self.heavy.send(Job::Open { path, develop, cameras_dir: self.cameras_dir.clone() });
+        self.heavy.send(Job::Open {
+            path,
+            develop,
+            cameras_dir: self.cameras_dir.clone(),
+            bayer_ls: self.bayer_ls,
+        });
     }
 
     /// Let the session go before a development of `need` bytes when that
@@ -4107,7 +4116,7 @@ impl App {
         let Some(s) = self.session.clone() else {
             ui.label("Open a RAW file or drop it here.");
             ui.add_space(8.0);
-            ui.label(RichText::new("Bayer sensors: Nikon Z f (NEF) and other rawler-supported cameras, in either process, the monochrome negative or the three-colour plate. Monochrome sensors (DNG without CFA) pass through without separation, and so does a linear DNG, which has its three channels already.").weak());
+            ui.label(RichText::new("Bayer sensors: Nikon Z f (NEF) and other rawler-supported cameras, in either process, the monochrome negative or the three-colour plate. Monochrome sensors (DNG without CFA) pass through without separation, and so does a linear DNG, which has its three channels already. A Fuji X-Trans RAF is written out as that kind of DNG the first time it is opened. *least-squares demosaic* in Development does the same for a Bayer file.").weak());
             return;
         };
         let n = &s.negative;
@@ -4264,10 +4273,15 @@ impl App {
                 );
                 return;
             }
+            if !s.is_channels() || crate::bayer::is_ours(&s.path) {
+                self.bayer_demosaic_box(ui, &s);
+            }
             ui.label(RichText::new("Changes here recompute the picture.").weak());
             ui.label(
                 RichText::new(if s.is_channels() {
                     "The file's three channels: nothing to separate, the mask does not apply."
+                } else if self.bayer_ls {
+                    "Least-squares demosaic: three colour values a pixel, written beside the file as a DNG."
                 } else {
                     "Separation, no demosaic."
                 })
@@ -4340,6 +4354,70 @@ impl App {
             });
         });
         ui.collapsing("CPU", |ui| self.cpu_section(ui));
+    }
+
+    /// *least-squares demosaic*. On, a Bayer file is written out as a linear
+    /// DNG and opened as that DNG, the way an X-Trans file is. Off, the RAW
+    /// stays on the measured separation. The choice is the darkroom's, and
+    /// the strip follows it.
+    fn bayer_demosaic_box(&mut self, ui: &mut egui::Ui, s: &Session) {
+        let mut on = self.bayer_ls;
+        let changed = ui
+            .add_enabled(self.busy.is_none(), egui::Checkbox::new(&mut on, "least-squares demosaic"))
+            .on_hover_text(
+                "Write a linear DNG beside this file by the least-squares separation, and open that \
+                 DNG. The darkroom then treats it as it treats a Fuji X-Trans file: three colour values \
+                 a pixel, and the plate prints those channels. Nothing is separated a second time. Off, \
+                 the file stays the measured separation, every pixel a sum of photosites. The DNG is \
+                 named with .mimizan before .dng, and a later open with this on reads it and does not \
+                 write it again.",
+            )
+            .changed();
+        if !changed {
+            return;
+        }
+        self.bayer_ls = on;
+        self.persist();
+        self.retile_bayer();
+        let path = s.path.clone();
+        if on {
+            if !crate::bayer::is_ours(&path) {
+                self.open(path);
+            }
+        } else if let Some(raw) = crate::bayer::raw_of(&path) {
+            if raw != path {
+                self.open(raw);
+            }
+        } else {
+            self.log("the RAW this DNG was written from is not beside it");
+        }
+    }
+
+    /// The strip shows the file the checkbox opens. With it on, a RAW whose
+    /// DNG is already written gives way to that DNG. With it off, the DNG
+    /// gives way to the RAW.
+    fn retile_bayer(&mut self) {
+        let sort = self.sort;
+        let on = self.bayer_ls;
+        let Some(folder) = self.folder.as_mut() else {
+            return;
+        };
+        let entries: Vec<PathBuf> = folder.entries.iter().map(|e| e.path.clone()).collect();
+        for path in entries {
+            if on {
+                if crate::bayer::is_ours(&path) {
+                    continue;
+                }
+                let dng = crate::bayer::dng_of(&path);
+                if crate::bayer::dng_is_ready(&dng) {
+                    folder.show_instead(&path, &dng, sort);
+                }
+            } else if crate::bayer::is_ours(&path) {
+                if let Some(raw) = crate::bayer::raw_of(&path) {
+                    folder.show_instead(&path, &raw, sort);
+                }
+            }
+        }
     }
 
     /// What the process line explains: for a plate, the weights the
@@ -6792,6 +6870,7 @@ impl App {
                         size: e.size,
                         modified: e.modified,
                         let_go: e.let_go,
+                        bayer_ls: self.bayer_ls,
                     }
                 })
                 .collect();
@@ -8087,14 +8166,17 @@ mod crop_drag_tests {
         // 24 MP picture on the stage. Without the strip's size the session's
         // own stands in; without either there is nothing to go by.
         let small = develop_memory_of_size(6048, 4032);
-        let big = opening_memory(Some((9504, 6336, false)), Some(small)).unwrap();
+        let big = opening_memory(Some((9504, 6336, false)), Some(small), false).unwrap();
         assert!(big > small * 2, "{big} vs {small}");
         // An X-Trans file of the same pixels is the conversion, which
-        // holds about four times a Bayer development.
-        let writing = opening_memory(Some((6048, 4032, true)), Some(small)).unwrap();
+        // holds about four times a Bayer development. The least-squares
+        // Bayer path writes a DNG of the same kind, and holds the same.
+        let writing = opening_memory(Some((6048, 4032, true)), Some(small), false).unwrap();
         assert!(writing > small * 3, "{writing} vs {small}");
-        assert_eq!(opening_memory(None, Some(small)), Some(small));
-        assert_eq!(opening_memory(None, None), None);
+        let bayer = opening_memory(Some((6048, 4032, false)), Some(small), true).unwrap();
+        assert_eq!(bayer, writing);
+        assert_eq!(opening_memory(None, Some(small), false), Some(small));
+        assert_eq!(opening_memory(None, None, true), None);
     }
 
     /// A re-development the machine cannot hold takes the picture with

@@ -44,7 +44,7 @@ use tracing::info;
 #[allow(clippy::large_enum_variant)]
 pub enum Job {
     /// Decode and develop a file.
-    Open { path: PathBuf, develop: Develop, cameras_dir: PathBuf },
+    Open { path: PathBuf, develop: Develop, cameras_dir: PathBuf, bayer_ls: bool },
     /// Develop the already decoded frame again with other parameters. The
     /// frame alone, not the session: the UI may let the session go while
     /// this runs, so its planes are not held beside the new ones.
@@ -231,16 +231,18 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
         ctx.request_repaint();
     };
     match job {
-        Job::Open { path, develop, cameras_dir } => match open(&path, develop, &cameras_dir, &status) {
-            Ok(s) => Ok(Event::Opened(Arc::new(s))),
-            // The decoded frame is gone with the error; the UI decodes it
-            // again once it has made room.
-            Err(e) if e.is::<Refused>() => Ok(Event::Refused {
-                job: Box::new(Job::Open { path, develop, cameras_dir }),
-                message: format!("{e:#}"),
-            }),
-            Err(e) => Err(e),
-        },
+        Job::Open { path, develop, cameras_dir, bayer_ls } => {
+            match open(&path, develop, &cameras_dir, bayer_ls, &status) {
+                Ok(s) => Ok(Event::Opened(Arc::new(s))),
+                // The decoded frame is gone with the error; the UI decodes it
+                // again once it has made room.
+                Err(e) if e.is::<Refused>() => Ok(Event::Refused {
+                    job: Box::new(Job::Open { path, develop, cameras_dir, bayer_ls }),
+                    message: format!("{e:#}"),
+                }),
+                Err(e) => Err(e),
+            }
+        }
         Job::Redevelop { source, develop } => match check_memory(&source.path, &source.frame, &status) {
             Ok(()) => redevelop(source, develop, &status).map(|s| Event::Opened(Arc::new(s))),
             Err(e) => Ok(Event::Refused {
@@ -395,13 +397,19 @@ fn refused(name: &str, what: &str, w: usize, h: usize, while_: &str, need: u64, 
     ))
 }
 
-fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(String)) -> Result<Session> {
+fn open(
+    path: &Path,
+    develop: Develop,
+    cameras_dir: &Path,
+    bayer_ls: bool,
+    status: &dyn Fn(String),
+) -> Result<Session> {
     // An X-Trans RAF is opened as the DNG beside it. The first time, that
     // DNG is written here, highlights kept; after that only the DNG is read.
     match crate::fuji::place(path) {
         crate::fuji::Place::Ready(dng) => {
             status(format!("opening {}", dng.display()));
-            return open(&dng, develop, cameras_dir, status);
+            return open(&dng, develop, cameras_dir, false, status);
         }
         crate::fuji::Place::Needs(head) => {
             // The conversion is the wide part, and it is not the DNG's
@@ -447,11 +455,58 @@ fn open(path: &Path, develop: Develop, cameras_dir: &Path, status: &dyn Fn(Strin
                 }
             };
             status(format!("opening {}", head.dng.display()));
-            let mut session = open(&head.dng, develop, cameras_dir, status)?;
+            let mut session = open(&head.dng, develop, cameras_dir, false, status)?;
             session.xtrans_note = report.map(|r| crate::fuji::written_note(&r));
             return Ok(session);
         }
         crate::fuji::Place::NotXtrans => {}
+    }
+    // The same way, when the Negative window asks for it: a Bayer file is
+    // written once as a linear DNG and that DNG is what opens.
+    if bayer_ls {
+        match crate::bayer::place(path) {
+            crate::bayer::Place::Ready(dng) => {
+                status(format!("opening {}", dng.display()));
+                return open(&dng, develop, cameras_dir, false, status);
+            }
+            crate::bayer::Place::Needs(head) => {
+                let need = crate::fuji::convert_memory(head.width, head.height);
+                let room = Room::read();
+                if !room.holds(need) {
+                    let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    return Err(anyhow::Error::new(refused(
+                        &name,
+                        "converted",
+                        head.width,
+                        head.height,
+                        "the DNG is written",
+                        need,
+                        room,
+                    )));
+                }
+                if room.on_swap(need) {
+                    status("the swap holds the rest".into());
+                }
+                if head.dng.is_file() && !crate::bayer::dng_is_ready(&head.dng) {
+                    let _ = std::fs::remove_file(&head.dng);
+                }
+                let written = crate::bayer::write(&head, status);
+                let note = match written {
+                    Ok(note) => Some(note),
+                    Err(e) => {
+                        if !crate::bayer::dng_is_ready(&head.dng) {
+                            return Err(anyhow::Error::msg(e));
+                        }
+                        None
+                    }
+                };
+                status(format!("opening {}", head.dng.display()));
+                let mut session = open(&head.dng, develop, cameras_dir, false, status)?;
+                session.xtrans_note = note;
+                return Ok(session);
+            }
+            crate::bayer::Place::NotBayer => {}
+        }
     }
     status(format!("decoding {}", path.display()));
     let t = Instant::now();
@@ -1332,6 +1387,7 @@ mod tests {
             path: "none.nef".into(),
             develop: Develop::default(),
             cameras_dir: PathBuf::new(),
+            bayer_ls: false,
         });
         assert!(!heavy.writing(), "opening a file writes none");
         heavy.send(export_job(&session, "a.tif".into()));

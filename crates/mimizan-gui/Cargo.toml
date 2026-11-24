@@ -21,6 +21,9 @@ store = ["mimizan-mac/store"]
 
 [dependencies]
 mimizan-core = { path = "../mimizan-core" }
+# The least-squares demosaic the Negative window can write out. The bench
+# that measured it lives in the same crate.
+mimizan-cli = { path = "../mimizan-cli" }
 # The X-Trans conversion. The desktop writes its DNG and then opens that
 # file on the ordinary linear path. Pinned to the measured program.
 mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
