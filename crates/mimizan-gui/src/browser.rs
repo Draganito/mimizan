@@ -8,7 +8,9 @@
 //! and the camera file's weights (`mimizan_core::thumb`), cached on disk
 //! as an 8-bit PNG keyed by path, size and modification time. An X-Trans
 //! RAF that has no DNG beside it is the camera's JPEG instead
-//! (`fuji`); once that DNG is there the RAF leaves the strip.
+//! (`fuji`); once that DNG is there the RAF leaves the strip. A Bayer
+//! least-squares DNG is the preview it already carries, not a second
+//! decode of its three full-size channels.
 
 use mimizan_core::calib::CameraFile;
 use mimizan_core::decode::Exposure;
@@ -600,6 +602,18 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
     if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
         return Ok(ThumbReady::Picture(hit.0, Box::new(hit.1)));
     }
+    // The three full-size channels are what the darkroom opens. The strip
+    // shows the preview the DNG was written with, which is the camera's
+    // JPEG. Decoding the linear picture here left the tile on "…" for as
+    // long as that decode took, and a failure left it blank.
+    if crate::bayer::is_ours(&job.path) {
+        if let Some((thumb, meta)) = dng_preview(&job.path) {
+            if let Some(d) = cache {
+                cache_store(d, &key, &thumb, &meta);
+            }
+            return Ok(ThumbReady::Picture(thumb, Box::new(meta)));
+        }
+    }
     let frame = pipeline::decode(&job.path).map_err(|e| e.to_string())?;
     let wb = frame.wb_as_shot.unwrap_or([1.0; 3]);
     let weights = CameraFile::find(cameras_dir, &frame.clean_make, &frame.clean_model)
@@ -619,6 +633,67 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
         cache_store(d, &key, &thumb, &meta);
     }
     Ok(ThumbReady::Picture(thumb, Box::new(meta)))
+}
+
+/// The preview stored in a Bayer least-squares DNG, shrunk for the strip,
+/// and the size of the linear picture behind it. `None` when the file has
+/// neither a preview nor a thumbnail: the caller then bins the channels.
+fn dng_preview(path: &Path) -> Option<(Thumb, Meta)> {
+    use rawler::decoders::{RawDecodeParams, WellKnownIFD};
+    use rawler::rawsource::RawSource;
+    use rawler::tags::TiffCommonTag;
+    let source = RawSource::new(path).ok()?;
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let params = RawDecodeParams::default();
+    let image = decoder
+        .preview_image(&source, &params)
+        .ok()
+        .flatten()
+        .or_else(|| decoder.thumbnail_image(&source, &params).ok().flatten())?;
+    let thumb = thumb_from_image(image, THUMB_LONG_EDGE);
+    let md = decoder.raw_metadata(&source, &params).ok();
+    let (width, height) = decoder
+        .ifd(WellKnownIFD::Raw)
+        .ok()
+        .flatten()
+        .and_then(|ifd| {
+            let w = ifd.get_entry(TiffCommonTag::ImageWidth)?.force_usize(0);
+            let h = ifd.get_entry(TiffCommonTag::ImageLength)?.force_usize(0);
+            (w > 0 && h > 0).then_some((w, h))
+        })
+        .unwrap_or((thumb.width, thumb.height));
+    Some((
+        thumb,
+        Meta {
+            make: md.as_ref().map(|m| m.make.clone()).unwrap_or_default(),
+            model: md.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
+            exposure: md.as_ref().map(mimizan_core::decode::exposure_from).unwrap_or_default(),
+            width,
+            height,
+            xtrans: false,
+        },
+    ))
+}
+
+/// `picture` fitted so its long side is at most `long_edge`, as grey and
+/// as colour. The grey is the same weights the camera JPEG uses.
+fn thumb_from_image(mut picture: image::DynamicImage, long_edge: usize) -> Thumb {
+    let (w, h) = (picture.width() as usize, picture.height() as usize);
+    let long = w.max(h).max(1);
+    let edge = long_edge.max(1);
+    if long > edge {
+        let tw = (w * edge / long).max(1) as u32;
+        let th = (h * edge / long).max(1) as u32;
+        picture = picture.resize(tw, th, image::imageops::FilterType::Triangle);
+    }
+    let rgb_img = picture.into_rgb8();
+    let (width, height) = (rgb_img.width() as usize, rgb_img.height() as usize);
+    let rgb = rgb_img.into_raw();
+    let mut gray = vec![0u8; width * height];
+    for (g, px) in gray.iter_mut().zip(rgb.chunks_exact(3)) {
+        *g = (0.2126 * f32::from(px[0]) + 0.7152 * f32::from(px[1]) + 0.0722 * f32::from(px[2])).round() as u8;
+    }
+    Thumb { width, height, gray, rgb }
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +948,18 @@ mod tests {
         assert_eq!((older.tiff_eight_bit, older.grey_as_rgb, older.sheet_free), (None, None, None));
         assert_eq!(Persisted::from_json(b"not json"), Persisted::default());
         assert_eq!(Persisted::from_json(b"[1, 2]"), Persisted::default());
+    }
+
+    #[test]
+    fn a_preview_is_shrunk_to_the_strip_and_keeps_its_grey() {
+        let picture = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(8, 4, |x, _| {
+            image::Rgb([if x < 4 { 220 } else { 10 }, 20, 30])
+        }));
+        let thumb = thumb_from_image(picture, 4);
+        assert_eq!(thumb.width.max(thumb.height), 4);
+        assert_eq!(thumb.gray.len(), thumb.width * thumb.height);
+        assert_eq!(thumb.rgb.len(), 3 * thumb.gray.len());
+        assert!(thumb.rgb[0] > thumb.rgb[thumb.rgb.len() - 3]);
     }
 
     #[test]

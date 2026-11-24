@@ -1322,6 +1322,9 @@ impl App {
                     browser::count_raws(f.generation, f.subdirs.iter().map(|d| d.path.clone()).collect())
                 });
                 self.folder = Some(f);
+                // The checkbox decides which file is the tile. A scan lists
+                // the RAW and its DNG both; this leaves the one that opens.
+                self.retile_bayer();
             }
             Err(e) => {
                 self.log(format!("folder {}: {e}", path.display()));
