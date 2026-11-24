@@ -31,6 +31,21 @@ const CAST_NEUTRAL: f64 = 0.012;
 /// The colour is compared after a blur of this many pixels. The cast on a
 /// resolution line is slow; a one-pixel flicker is not what this removes.
 const CAST_SIGMA: f64 = 3.0;
+/// A horizontal line, in linear light: it has to differ from the rows above
+/// and below by at least this before a checker on it is touched.
+const CHECK_FLOOR: f64 = 0.008;
+/// The sub-Nyquist horizontal contrast must stay under this times the
+/// vertical one. A period-2 checker has none, so the gate is open; a real
+/// horizontal edge closes it.
+const CHECK_RATIO: f64 = 1.0;
+/// The checker has to keep alternating for this many pixels. A short stroke
+/// does not.
+const CHECK_RUN: usize = 8;
+/// The most linear light taken off one pixel. The checker on the Z f lines
+/// is inside this; a larger oscillation keeps the rest.
+const CHECK_CAP: f64 = 0.012;
+/// Below this, a Nyquist sample is not a flicker worth following.
+const CHECK_FLICKER: f64 = 0.0015;
 
 /// RGGB, repeated so the period is 6. Row-major.
 pub const BAYER6: &str = "RGRGRGGBGBGBRGRGRGGBGBGBRGRGRGGBGBGB";
@@ -105,7 +120,8 @@ pub fn separate(
     let sep = xtrans::separate_bank_watched(&m, &tile, &p, &priors, &sel, progress);
     let refine = Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
     let rgb = xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb();
-    (without_grey_cast(rgb, linear, width), found)
+    let rgb = without_grey_cast(rgb, linear, width);
+    (without_line_checker(rgb), found)
 }
 
 /// The priors weighed per pixel.
@@ -222,6 +238,83 @@ fn luma(r: &[f64], g: &[f64], b: &[f64]) -> Vec<f64> {
     r.iter().zip(g).zip(b).map(|((rv, gv), bv)| (rv + 2.0 * gv + bv) / 4.0).collect()
 }
 
+/// Take a one-pixel checker off a horizontal line.
+///
+/// On the Z f 50–30 lines the brightness itself alternates by a few levels,
+/// in step with the photosites, and that is the checker one sees. It keeps
+/// the same phase for many pixels and the line has almost no slower
+/// horizontal change, which a real edge does. Where both hold, half of that
+/// Nyquist sample is put back, and no more than [`CHECK_CAP`]. On the 24
+/// Kodak pictures the colour PSNR moves by a few hundredths of a decibel.
+fn without_line_checker(rgb: Rgb) -> Rgb {
+    let (width, height) = (rgb.r.width, rgb.r.height);
+    let (c1, c2) = chroma(&rgb.r.data, &rgb.g.data, &rgb.b.data);
+    let lum = luma(&rgb.r.data, &rgb.g.data, &rgb.b.data);
+    let mut out_l = lum.clone();
+    let mut out_1 = c1.clone();
+    let mut out_2 = c2.clone();
+    if width < 3 || height < 3 {
+        return rgb;
+    }
+    for y in 1..height - 1 {
+        for x in 1..width - 1 {
+            let i = y * width + x;
+            let up = (lum[i] - lum[i - width]).abs();
+            let down = (lum[i] - lum[i + width]).abs();
+            let gv = up.max(down);
+            let gh = (lum[i + 1] - lum[i - 1]).abs();
+            if gv <= CHECK_FLOOR || gh >= CHECK_RATIO * gv || checker_run(&lum, width, x, y) < CHECK_RUN {
+                continue;
+            }
+            let t = ((CHECK_RATIO * gv - gh) / (CHECK_RATIO * gv)).clamp(0.0, 1.0);
+            let pull = |src: &[f64], dst: &mut [f64]| {
+                let nyq = src[i] - 0.5 * (src[i - 1] + src[i + 1]);
+                dst[i] = src[i] - (0.5 * t * nyq).clamp(-CHECK_CAP, CHECK_CAP);
+            };
+            pull(&lum, &mut out_l);
+            pull(&c1, &mut out_1);
+            pull(&c2, &mut out_2);
+        }
+    }
+    from_luma(&out_l, &out_1, &out_2, width, height)
+}
+
+/// How far the horizontal Nyquist sample keeps flipping sign.
+fn checker_run(lum: &[f64], width: usize, x: usize, y: usize) -> usize {
+    let nyq = |x: usize| {
+        let i = y * width + x;
+        lum[i] - 0.5 * (lum[i - 1] + lum[i + 1])
+    };
+    let s0 = nyq(x);
+    if s0.abs() < CHECK_FLICKER {
+        return 0;
+    }
+    let mut n = 1usize;
+    let mut prev = s0;
+    let mut xx = x;
+    while xx > 1 && n < 24 {
+        let s = nyq(xx - 1);
+        if s * prev >= 0.0 || s.abs() < CHECK_FLICKER {
+            break;
+        }
+        n += 1;
+        prev = s;
+        xx -= 1;
+    }
+    prev = s0;
+    xx = x;
+    while xx + 2 < width && n < 24 {
+        let s = nyq(xx + 1);
+        if s * prev >= 0.0 || s.abs() < CHECK_FLICKER {
+            break;
+        }
+        n += 1;
+        prev = s;
+        xx += 1;
+    }
+    n
+}
+
 fn mix(ls: &[f64], sep: &[f64], mask: &[f64]) -> Vec<f64> {
     ls.iter().zip(sep).zip(mask).map(|((a, s), t)| (1.0 - t) * a + t * s).collect()
 }
@@ -245,7 +338,7 @@ fn from_luma(lum: &[f64], c1: &[f64], c2: &[f64], width: usize, height: usize) -
 
 #[cfg(test)]
 mod tests {
-    use super::{chroma, from_luma, luma, without_grey_cast};
+    use super::{chroma, from_luma, luma, without_grey_cast, without_line_checker};
     use mimizan_lab_xtrans::plane::{Plane, Rgb};
 
     fn picture(r: f64, g: f64, b: f64, n: usize) -> Rgb {
@@ -293,5 +386,37 @@ mod tests {
         let (d1, _) = chroma(&got.r.data, &got.g.data, &got.b.data);
         let mid = n * n / 2 + n / 2;
         assert!((d1[mid] - c1[mid]).abs() < 1e-6, "the red moved");
+    }
+
+    #[test]
+    fn a_checker_on_a_horizontal_line_goes_and_the_line_stays() {
+        let (w, h) = (48usize, 16usize);
+        let mut v = vec![0.15; w * h];
+        for x in 0..w {
+            v[8 * w + x] = if x % 2 == 0 { 0.200 } else { 0.186 };
+        }
+        let src = from_luma(&v, &vec![0.0; w * h], &vec![0.0; w * h], w, h);
+        let got = without_line_checker(src);
+        let l = luma(&got.r.data, &got.g.data, &got.b.data);
+        let i = 8 * w + 20;
+        let nyq = l[i] - 0.5 * (l[i - 1] + l[i + 1]);
+        assert!(nyq.abs() < 1e-6, "the checker stays {nyq}");
+        assert!(l[i] > l[i - w] + 0.02, "the line was flattened into the ground");
+    }
+
+    #[test]
+    fn a_vertical_grating_is_not_a_horizontal_checker() {
+        let (w, h) = (48usize, 16usize);
+        let mut v = vec![0.0; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                v[y * w + x] = if x % 2 == 0 { 0.10 } else { 0.30 };
+            }
+        }
+        let src = from_luma(&v, &vec![0.0; w * h], &vec![0.0; w * h], w, h);
+        let got = without_line_checker(src);
+        let l = luma(&got.r.data, &got.g.data, &got.b.data);
+        let i = 8 * w + 20;
+        assert!((l[i] - 0.10).abs() < 1e-9, "the vertical lines moved");
     }
 }

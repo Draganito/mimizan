@@ -40,7 +40,7 @@ them: Negative, Enlarger, Print.
 most of the time. *least-squares demosaic* writes a Bayer file out as a
 linear DNG beside it and opens that DNG, the same way a Fuji X-Trans file
 is opened. On, a grey line keeps the separation's colour where the least
-squares had painted one, and the luminance stays. Leave it off and the file
+squares had painted one, and the luminance stays. A one-pixel checker along a horizontal line is taken off, and the line stays. Leave it off and the file
 stays the measured separation, every pixel a sum of photosites. *Apply*
 develops again when you have changed something.
 What you chose stays with this file, in its recipe; the next file opens
