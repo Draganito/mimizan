@@ -11,9 +11,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan_0.20.6-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.20.6-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan-0.20.6-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan-0.20.6-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.20.7/mimizan_0.20.7-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.20.7-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.20.7/mimizan-0.20.7-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.20.7/mimizan-0.20.7-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -44,7 +44,7 @@ squares had painted one, and the luminance stays. Leave it off and the file
 stays the measured separation, every pixel a sum of photosites. *Apply*
 develops again when you have changed something.
 What you chose stays with this file, in its recipe; the next file opens
-with its own. The demosaic checkbox is the program's, and it is remembered.
+with its own. The demosaic checkbox is the program's, and it is remembered. A newer version writes the DNG again.
 
 **Enlarger** (below) is the paper.
 

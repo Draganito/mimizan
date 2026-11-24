@@ -17,7 +17,7 @@ use rawler::rawsource::RawSource;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -59,10 +59,87 @@ pub fn dng_of(raw: &Path) -> PathBuf {
 }
 
 /// A DNG that is there and holds something. An empty file is not one:
-/// the writer will not replace a file that exists, and an empty one would
-/// otherwise block the RAW for good.
+/// an empty one would otherwise block the RAW for good.
 pub fn dng_is_ready(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// This build wrote `path`. An older DNG beside the RAW is written again:
+/// the separation has changed, and opening the old file would show the
+/// picture the previous version left there.
+pub fn dng_is_current(path: &Path) -> bool {
+    dng_is_ready(path) && software_of(path).as_deref() == Some(SOFTWARE)
+}
+
+/// TIFF tag 305, the `Software` string, from the first directories.
+fn software_of(path: &Path) -> Option<String> {
+    let mut f = BufReader::new(File::open(path).ok()?);
+    let mut hdr = [0u8; 8];
+    f.read_exact(&mut hdr).ok()?;
+    let le = match &hdr[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    if u16_at(&hdr[2..4], le) != 42 {
+        return None;
+    }
+    let mut offset = u64::from(u32_at(&hdr[4..8], le));
+    for _ in 0..8 {
+        if offset == 0 {
+            break;
+        }
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut nbuf = [0u8; 2];
+        f.read_exact(&mut nbuf).ok()?;
+        let count = usize::from(u16_at(&nbuf, le));
+        if count > 4096 {
+            return None;
+        }
+        for _ in 0..count {
+            let mut ent = [0u8; 12];
+            f.read_exact(&mut ent).ok()?;
+            let tag = u16_at(&ent[..2], le);
+            let kind = u16_at(&ent[2..4], le);
+            let n = u32_at(&ent[4..8], le) as usize;
+            // 305 is Software, 2 is ASCII.
+            if tag == 305 && kind == 2 && (1..512).contains(&n) {
+                let bytes = if n <= 4 {
+                    ent[8..8 + n].to_vec()
+                } else {
+                    let at = u64::from(u32_at(&ent[8..12], le));
+                    let back = f.stream_position().ok()?;
+                    f.seek(SeekFrom::Start(at)).ok()?;
+                    let mut buf = vec![0u8; n];
+                    f.read_exact(&mut buf).ok()?;
+                    f.seek(SeekFrom::Start(back)).ok()?;
+                    buf
+                };
+                let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+                return String::from_utf8(bytes[..end].to_vec()).ok();
+            }
+        }
+        let mut next = [0u8; 4];
+        f.read_exact(&mut next).ok()?;
+        offset = u64::from(u32_at(&next, le));
+    }
+    None
+}
+
+fn u16_at(b: &[u8], le: bool) -> u16 {
+    if le {
+        u16::from_le_bytes([b[0], b[1]])
+    } else {
+        u16::from_be_bytes([b[0], b[1]])
+    }
+}
+
+fn u32_at(b: &[u8], le: bool) -> u32 {
+    if le {
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    } else {
+        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+    }
 }
 
 /// The RAW a DNG written here came from, when that RAW is still beside it.
@@ -90,33 +167,42 @@ pub fn raw_of(path: &Path) -> Option<PathBuf> {
 }
 
 /// The head only. A file this path does not write out is [`Place::NotBayer`].
+/// A DNG this build already wrote is that too: it opens as it stands. One
+/// an older build wrote is written again from the RAW beside it.
 pub fn place(path: &Path) -> Place {
-    if is_ours(path) {
-        return Place::NotBayer;
-    }
-    let Ok(source) = RawSource::new(path) else {
+    let raw = if is_ours(path) {
+        if dng_is_current(path) {
+            return Place::NotBayer;
+        }
+        match raw_of(path) {
+            Some(raw) if raw.is_file() => raw,
+            _ => return Place::NotBayer,
+        }
+    } else {
+        path.to_path_buf()
+    };
+    let Some(head) = head_of(&raw) else {
         return Place::NotBayer;
     };
-    let Ok(decoder) = rawler::get_decoder(&source) else {
-        return Place::NotBayer;
-    };
-    let Ok(img) = decoder.raw_image(&source, &RawDecodeParams::default(), true) else {
-        return Place::NotBayer;
-    };
-    if bayer_name(&img).is_none() {
-        return Place::NotBayer;
+    if dng_is_current(&head.dng) {
+        return Place::Ready(head.dng);
     }
-    let dng = dng_of(path);
-    if dng_is_ready(&dng) {
-        return Place::Ready(dng);
-    }
-    Place::Needs(Head { raw: path.to_path_buf(), dng, width: img.width, height: img.height })
+    Place::Needs(head)
+}
+
+/// Width and height of a Bayer file this path writes out.
+fn head_of(raw: &Path) -> Option<Head> {
+    let source = RawSource::new(raw).ok()?;
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let img = decoder.raw_image(&source, &RawDecodeParams::default(), true).ok()?;
+    bayer_name(&img)?;
+    Some(Head { raw: raw.to_path_buf(), dng: dng_of(raw), width: img.width, height: img.height })
 }
 
 /// Write the DNG of `head`. The highlights stay in the file, as they do for
 /// an X-Trans plate. `tell` hears each step, and the share of the separation.
 pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
-    if head.dng.exists() {
+    if dng_is_current(&head.dng) {
         return Err(format!("{} is there already", head.dng.display()));
     }
     let started = Instant::now();
@@ -139,8 +225,12 @@ pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
         let file = out.into_inner().map_err(|e| format!("{}: {e}", part.display()))?;
         file.sync_all().map_err(|e| format!("{}: {e}", part.display()))
     });
-    let renamed = written
-        .and_then(|()| fs::rename(&part, &head.dng).map_err(|e| format!("{}: {e}", head.dng.display())));
+    let renamed = written.and_then(|()| {
+        if head.dng.exists() {
+            fs::remove_file(&head.dng).map_err(|e| format!("{}: {e}", head.dng.display()))?;
+        }
+        fs::rename(&part, &head.dng).map_err(|e| format!("{}: {e}", head.dng.display()))
+    });
     if let Err(e) = renamed {
         let _ = fs::remove_file(&part);
         return Err(e);
@@ -334,6 +424,34 @@ mod tests {
         assert!(dng_is_ready(&dng));
         fs::write(&dng, b"").unwrap();
         assert!(!dng_is_ready(&dng));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tiff_with_software(text: &str) -> Vec<u8> {
+        let bytes = format!("{text}\0").into_bytes();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&8u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&305u16.to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&26u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&bytes);
+        out
+    }
+
+    #[test]
+    fn an_older_dng_is_not_this_version() {
+        let dir = std::env::temp_dir().join(format!("mimizan-bayer-sw-{}", std::process::id()));
+        let _ = fs::create_dir(&dir);
+        let path = dir.join("shot.dng");
+        fs::write(&path, tiff_with_software("Mimizan Lab 0.20.5 (Bayer least squares)")).unwrap();
+        assert!(!dng_is_current(&path));
+        fs::write(&path, tiff_with_software(SOFTWARE)).unwrap();
+        assert!(dng_is_current(&path));
         let _ = fs::remove_dir_all(&dir);
     }
 

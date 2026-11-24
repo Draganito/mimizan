@@ -4369,8 +4369,8 @@ impl App {
                  DNG. The darkroom then treats it as it treats a Fuji X-Trans file: three colour values \
                  a pixel, and the plate prints those channels. Nothing is separated a second time. Off, \
                  the file stays the measured separation, every pixel a sum of photosites. The DNG is \
-                 named with .mimizan before .dng, and a later open with this on reads it and does not \
-                 write it again.",
+                 named with .mimizan before .dng. A later open with this on reads it. A newer \
+                 version of the program writes it again.",
             )
             .changed();
         if !changed {
@@ -4409,7 +4409,7 @@ impl App {
                     continue;
                 }
                 let dng = crate::bayer::dng_of(&path);
-                if crate::bayer::dng_is_ready(&dng) {
+                if crate::bayer::dng_is_current(&dng) {
                     folder.show_instead(&path, &dng, sort);
                 }
             } else if crate::bayer::is_ours(&path) {

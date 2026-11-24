@@ -589,7 +589,8 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
     // The least-squares path: the RAW gives way to its DNG while the
     // checkbox is on, and that DNG is not a tile while it is off.
     if job.bayer_ls {
-        if !crate::bayer::is_ours(&job.path) && crate::bayer::dng_is_ready(&crate::bayer::dng_of(&job.path)) {
+        if !crate::bayer::is_ours(&job.path) && crate::bayer::dng_is_current(&crate::bayer::dng_of(&job.path))
+        {
             return Ok(ThumbReady::Covered);
         }
     } else if crate::bayer::is_ours(&job.path) {
