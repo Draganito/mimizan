@@ -1926,6 +1926,7 @@ dependencies = [
  "anyhow",
  "eframe",
  "egui",
+ "egui-file-dialog",
  "image",
 ]
 

@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 egui = "0.36"
+egui-file-dialog = "0.15"
 # TIFF only. The workspace image crate has no TIFF feature, and this
 # viewer reads the developed files the tools wrote.
 image = { version = "0.25", default-features = false, features = ["tiff"] }

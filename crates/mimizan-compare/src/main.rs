@@ -10,6 +10,9 @@
 //! mimizan-compare photo.NEF
 //! ```
 //!
+//! With no path, Open picks the file. A path on the command line still
+//! develops at once, and a file dropped on the window does too.
+//!
 //! The developed TIFFs land in `photo.mimizan-compare/` beside the RAW and
 //! are kept. A second open reads them. *Develop again* writes them over.
 //!
@@ -22,6 +25,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{bail, Context, Result};
+use egui_file_dialog::{DialogState, FileDialog, OpeningMode};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -47,6 +51,13 @@ enum Kind {
     Dht,
 }
 
+/// Extensions the darkroom lists as a RAW file. The dialog matches them
+/// without caring about case; *All files* stays, for a name it does not know.
+const RAW_EXTENSIONS: &[&str] = &[
+    "nef", "nrw", "dng", "cr2", "cr3", "crw", "arw", "srf", "sr2", "raf", "rw2", "pef", "orf", "erf", "mef",
+    "mos", "iiq", "3fr", "fff", "kdc", "dcr", "dcs", "mrw", "x3f", "tfr", "ari", "srw", "raw",
+];
+
 #[derive(Clone)]
 struct Picture {
     width: usize,
@@ -64,6 +75,7 @@ enum Note {
 /// `slot` 0 is Mimizan. The rivals follow in [`RIVALS`] order.
 struct App {
     path: String,
+    dialog: FileDialog,
     view: View,
     fitted: bool,
     which: usize,
@@ -99,13 +111,14 @@ impl App {
         let n = 1 + RIVALS.len();
         let mut app = Self {
             path,
+            dialog: file_dialog(),
             view: View { mag: 1.0, pan: egui::Vec2::ZERO },
             fitted: false,
             which: 0,
             pictures: (0..n).map(|_| None).collect(),
             textures: (0..n).map(|_| None).collect(),
             errors: (0..n).map(|_| None).collect(),
-            status: "A RAW file, then Develop.".into(),
+            status: "Open a RAW file, or drop one here.".into(),
             working: false,
             rx: None,
         };
@@ -113,6 +126,24 @@ impl App {
             app.develop(false);
         }
         app
+    }
+
+    /// The folder the dialog opens in: the file on screen, or home.
+    fn open_beside(&self) -> PathBuf {
+        dialog_directory(self.path.trim())
+    }
+
+    fn open_dialog(&mut self) {
+        if self.working {
+            return;
+        }
+        self.dialog.config_mut().initial_directory = self.open_beside();
+        self.dialog.pick_file();
+    }
+
+    fn take_file(&mut self, path: PathBuf) {
+        self.path = path.display().to_string();
+        self.develop(false);
     }
 
     fn develop(&mut self, again: bool) {
@@ -180,13 +211,21 @@ impl eframe::App for App {
         self.poll(&ctx);
         if let Some(file) = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).next()) {
             if !self.working {
-                self.path = file.display().to_string();
-                self.develop(false);
+                self.take_file(file);
             }
         }
+        self.dialog.update(&ctx);
+        if let Some(path) = self.dialog.take_picked() {
+            self.take_file(path);
+        }
+        let picking = matches!(self.dialog.state(), DialogState::Open);
+        let mut open = false;
         ctx.input(|i| {
-            if self.working {
+            if self.working || picking {
                 return;
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::O) {
+                open = true;
             }
             if i.key_pressed(egui::Key::ArrowRight) {
                 self.which = (self.which + 1) % RIVALS.len();
@@ -203,11 +242,25 @@ impl eframe::App for App {
                 }
             }
         });
+        if open {
+            self.open_dialog();
+        }
+        let title = window_title(self.path.trim());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
 
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label("RAW");
-                ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(420.0));
+                if ui
+                    .add_enabled(!self.working, egui::Button::new("Open…"))
+                    .on_hover_text("Pick a RAW file. Ctrl+O, or ⌘O. A file dropped on the window opens too.")
+                    .clicked()
+                {
+                    self.open_dialog();
+                }
+                let edit = ui.add(egui::TextEdit::singleline(&mut self.path).desired_width(420.0).hint_text("RAW file"));
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.working {
+                    self.develop(false);
+                }
                 if ui.add_enabled(!self.working, egui::Button::new("Develop")).clicked() {
                     self.develop(false);
                 }
@@ -496,6 +549,48 @@ fn load_picture(path: &Path) -> Result<Picture> {
     Ok(Picture { width: width as usize, height: height as usize, rgba: image.into_raw() })
 }
 
+fn file_dialog() -> FileDialog {
+    FileDialog::new()
+        .opening_mode(OpeningMode::AlwaysInitialDir)
+        .default_file_filter("RAW")
+        .add_file_filter("RAW", egui_file_dialog::Filter::new(is_raw_path))
+}
+
+/// Where Open starts. A typed or open file uses its folder. Otherwise home,
+/// and the working directory when there is no home.
+fn dialog_directory(typed: &str) -> PathBuf {
+    let path = PathBuf::from(typed.trim());
+    if path.is_dir() {
+        return path;
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && parent.is_dir() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        if home.is_dir() {
+            return home;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn window_title(path: &str) -> String {
+    let name = Path::new(path).file_name().and_then(|s| s.to_str()).filter(|s| !s.is_empty());
+    match name {
+        Some(name) => format!("Mimizan compare — {name}"),
+        None => "Mimizan compare".to_string(),
+    }
+}
+
+fn is_raw_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| RAW_EXTENSIONS.iter().any(|ext| e.eq_ignore_ascii_case(ext)))
+}
+
 fn work_dir(raw: &Path) -> PathBuf {
     let stem = raw.file_stem().and_then(|s| s.to_str()).unwrap_or("picture");
     let parent = raw.parent().unwrap_or_else(|| Path::new("."));
@@ -621,6 +716,28 @@ mod tests {
         let after = image_norm(pane, new, kept, cursor);
         assert!((before.x - after.x).abs() < 1e-4);
         assert!((before.y - after.y).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_raw_name_is_case_insensitive_and_a_jpeg_is_not() {
+        assert!(is_raw_path(Path::new("/photos/DSC_100.NEF")));
+        assert!(is_raw_path(Path::new("shot.raf")));
+        assert!(is_raw_path(Path::new("plate.dng")));
+        assert!(!is_raw_path(Path::new("plate.jpg")));
+        assert!(!is_raw_path(Path::new("noext")));
+    }
+
+    #[test]
+    fn the_dialog_opens_beside_the_file() {
+        let dir = std::env::temp_dir().join(format!("mimizan-compare-open-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        let file = dir.join("DSC.NEF");
+        assert_eq!(dialog_directory(&file.display().to_string()), dir);
+        assert_eq!(dialog_directory(&dir.display().to_string()), dir);
+        assert!(dialog_directory("").is_dir());
+        assert_eq!(window_title(""), "Mimizan compare");
+        assert_eq!(window_title("/photos/DSC.NEF"), "Mimizan compare — DSC.NEF");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
