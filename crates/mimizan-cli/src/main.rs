@@ -1,5 +1,7 @@
 //! `mimizan`: the command-line front end of Mimizan Lab.
 
+mod bayer_bench;
+mod bayer_ls;
 mod calibrate;
 mod cmd;
 mod kodak;
@@ -247,6 +249,9 @@ enum BenchCmd {
     Kodak(kodak::KodakArgs),
     /// The same mosaics in colour: the three-colour plate vs the demosaicers' RGB (CPSNR)
     Plate(plate_bench::PlateBenchArgs),
+    /// Bayer mosaics in colour: the X-Trans least-squares demosaic on the
+    /// 2×2 tile, against the same demosaicers (CPSNR)
+    Bayer(bayer_bench::BayerBenchArgs),
 }
 
 /// `--bits` of `print`: the two depths a print's TIFF is written in.
@@ -361,6 +366,7 @@ fn main() -> Result<()> {
         Cmd::Measure { cmd } => measure::measure(&cmd),
         Cmd::Bench { cmd: BenchCmd::Kodak(a) } => kodak::kodak(&a),
         Cmd::Bench { cmd: BenchCmd::Plate(a) } => plate_bench::plate_bench(&a),
+        Cmd::Bench { cmd: BenchCmd::Bayer(a) } => bayer_bench::bayer_bench(&a),
         Cmd::Calibrate { cmd } => calibrate::calibrate(&cmd),
     }
 }

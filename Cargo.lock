@@ -1911,6 +1911,7 @@ dependencies = [
  "image",
  "mimalloc",
  "mimizan-core",
+ "mimizan-lab-xtrans",
  "serde",
  "serde_json",
  "sysinfo",
