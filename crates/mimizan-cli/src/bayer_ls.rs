@@ -8,9 +8,12 @@
 //! runs under the sRGB curve and comes back to linear light, as a camera
 //! file does. Nothing here is treated as burnt out.
 
-use mimizan_lab_xtrans::convert;
+use mimizan_lab_xtrans::convert::{self, Developed, Frame, WHITE};
 use mimizan_lab_xtrans::plane::{Plane, Rgb};
 use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, Selection, XParams, XTile};
+use rawler::rawimage::RawPhotometricInterpretation;
+use rawler::{RawImage, RawImageData};
+use rayon::prelude::*;
 use std::f64::consts::PI;
 
 /// A horizontal line, in linear light: it has to differ from the rows above
@@ -232,9 +235,168 @@ fn from_luma(lum: &[f64], c1: &[f64], c2: &[f64], width: usize, height: usize) -
     }
 }
 
+/// The picture, in the camera's own channels. The frame's corner is a red
+/// photosite, so the tile is the RGGB one the bench measured. `tell` hears
+/// each step.
+pub fn develop(img: &RawImage, tell: &dyn Fn(String)) -> Result<Developed, String> {
+    let name = bayer_pattern(img).ok_or("the file holds no Bayer mosaic")?;
+    let (rx, ry) = red_site(&name).ok_or("the mosaic has no red photosite")?;
+    let (cx, cy, cw, ch) = crop_of(img)?;
+    let x0 = cx + usize::from(cx % 2 != rx);
+    let y0 = cy + usize::from(cy % 2 != ry);
+    let width = (cx + cw).saturating_sub(x0);
+    let height = (cy + ch).saturating_sub(y0);
+    if width < 24 || height < 24 {
+        return Err("the frame is too small to separate".into());
+    }
+    let RawImageData::Integer(raw) = &img.data else {
+        return Err("the mosaic is not in whole numbers".into());
+    };
+    if img.cpp != 1 || raw.len() != img.width * img.height {
+        return Err("the mosaic does not have one value per photosite".into());
+    }
+    let white = f64::from(*img.whitelevel.0.first().ok_or("the file gives no white level")?);
+    let levels = &img.blacklevel;
+    if levels.cpp != 1 || levels.levels.len() != levels.width * levels.height || levels.levels.is_empty() {
+        return Err("the file's black levels are not per photosite".into());
+    }
+    let blacks: Vec<f64> = levels.levels.iter().map(|l| f64::from(l.as_f32())).collect();
+    let black_at = |x: usize, y: usize| blacks[(y % levels.height) * levels.width + x % levels.width];
+    let black = blacks.iter().sum::<f64>() / blacks.len() as f64;
+    if !(white.is_finite() && black.is_finite() && white > black && black >= 0.0 && white <= 65535.0) {
+        return Err(format!("black {black} and white {white} are no range"));
+    }
+
+    let mut mosaic = vec![0.0; width * height];
+    mosaic.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+        let src = y0 + y;
+        let line = &raw[src * img.width + x0..][..width];
+        for (x, (v, sample)) in row.iter_mut().zip(line).enumerate() {
+            *v = (f64::from(*sample) - black_at(x0 + x, src)) / (white - black);
+        }
+    });
+    let burnt: usize = (0..height)
+        .into_par_iter()
+        .map(|y| {
+            let src = y0 + y;
+            raw[src * img.width + x0..][..width].iter().filter(|v| f64::from(**v) >= white - 1.0).count()
+        })
+        .sum::<usize>();
+
+    // The balance: the camera's, or the one that makes the frame grey.
+    // Green is 1. The frame's corner is red, then green, then green, then blue.
+    let from_file = [img.wb_coeffs[0], img.wb_coeffs[1], img.wb_coeffs[2]].map(f64::from);
+    let balance_from_file = from_file.iter().all(|v| v.is_finite() && *v > 0.0);
+    let balance = if balance_from_file {
+        [from_file[0] / from_file[1], 1.0, from_file[2] / from_file[1]]
+    } else {
+        let mut sums = [(0.0, 0.0); 3];
+        for (i, v) in mosaic.iter().enumerate() {
+            let c = channel_at(i % width, i / width);
+            sums[c] = (sums[c].0 + v, sums[c].1 + 1.0);
+        }
+        let mean = sums.map(|(s, n)| (s / n).max(1e-6));
+        [mean[1] / mean[0], 1.0, mean[1] / mean[2]]
+    };
+    mosaic.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+        for (x, v) in row.iter_mut().enumerate() {
+            *v *= balance[channel_at(x, y)];
+        }
+    });
+    // A photosite at white measures nothing but "at least this much".
+    // The prior is searched on the mosaic cut there, and the picture keeps
+    // what was recorded above it.
+    let ceiling = balance.iter().copied().fold(f64::INFINITY, f64::min);
+    let fit: Vec<f64> = mosaic.par_iter().map(|v| v.min(ceiling)).collect();
+
+    tell("searching the prior".into());
+    tell("separating luminance and colour".into());
+    let (rgb, prior) = separate(&mosaic, &fit, width, &Knobs::default(), &|share| {
+        tell(format!("separating luminance and colour, {:.0}%", share.clamp(0.0, 1.0) * 100.0));
+    });
+
+    let mut data = vec![0u16; width * height * 3];
+    let below: usize = data
+        .par_chunks_mut(3 * width)
+        .enumerate()
+        .map(|(y, row)| {
+            let lines = [rgb.r.row(y), rgb.g.row(y), rgb.b.row(y)];
+            let mut below = 0;
+            for (x, px) in row.chunks_mut(3).enumerate() {
+                for (c, v) in px.iter_mut().enumerate() {
+                    let level = (lines[c][x] / balance[c] * f64::from(WHITE)).round();
+                    below += usize::from(level < 0.0);
+                    *v = level.clamp(0.0, f64::from(WHITE)) as u16;
+                }
+            }
+            below
+        })
+        .sum();
+    let tile = XTile::from_name(BAYER6).expect("the Bayer tile");
+    Ok(Developed {
+        frame: Frame { x: x0, y: y0, width, height, tile },
+        data,
+        below,
+        balance,
+        balance_from_file,
+        prior,
+        burnt,
+        sums: [0.0; 3],
+        seconds: [0.0; 3],
+    })
+}
+
+fn bayer_pattern(img: &RawImage) -> Option<String> {
+    let RawPhotometricInterpretation::Cfa(config) = &img.photometric else {
+        return None;
+    };
+    if config.cfa.width != 2 || config.cfa.height != 2 || config.cfa.name.len() != 4 {
+        return None;
+    }
+    Some(config.cfa.name.clone())
+}
+
+/// Column and row, inside the 2×2, of the red photosite.
+fn red_site(name: &str) -> Option<(usize, usize)> {
+    let b = name.as_bytes();
+    (0..4).find(|i| b[*i].eq_ignore_ascii_case(&b'R')).map(|i| (i % 2, i / 2))
+}
+
+fn crop_of(img: &RawImage) -> Result<(usize, usize, usize, usize), String> {
+    let crop = img
+        .crop_area
+        .or(img.active_area)
+        .map_or((0, 0, img.width, img.height), |r| (r.p.x, r.p.y, r.d.w, r.d.h));
+    if crop.0 + crop.2 > img.width || crop.1 + crop.3 > img.height || crop.2 == 0 || crop.3 == 0 {
+        return Err("the file's crop lies outside its mosaic".into());
+    }
+    Ok(crop)
+}
+
+/// 0 red, 1 green, 2 blue, on a frame whose corner is red.
+fn channel_at(x: usize, y: usize) -> usize {
+    match (x % 2, y % 2) {
+        (0, 0) => 0,
+        (1, 1) => 2,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{from_luma, luma, without_line_checker};
+    use super::{channel_at, from_luma, luma, red_site, without_line_checker};
+
+    #[test]
+    fn the_red_photosite_names_the_tile() {
+        assert_eq!(red_site("RGGB"), Some((0, 0)));
+        assert_eq!(red_site("BGGR"), Some((1, 1)));
+        assert_eq!(red_site("GRBG"), Some((1, 0)));
+        assert_eq!(red_site("GBRG"), Some((0, 1)));
+        assert_eq!(channel_at(0, 0), 0);
+        assert_eq!(channel_at(1, 0), 1);
+        assert_eq!(channel_at(0, 1), 1);
+        assert_eq!(channel_at(1, 1), 2);
+    }
 
     #[test]
     fn a_checker_on_a_horizontal_line_goes_and_the_line_stays() {

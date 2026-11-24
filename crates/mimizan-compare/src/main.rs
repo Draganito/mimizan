@@ -1,10 +1,12 @@
 //! A loupe for one RAW file.
 //!
-//! The left pane is the Mimizan base plate print. The right pane is one of
-//! the five demosaicers that sit closest to the least-squares separation
-//! behind a lens: RCD, LMMSE, DCB, AMaZE, then DHT. Scroll zooms both panes
-//! together, a drag pans both, a click on the right pane steps to the next
-//! demosaicer.
+//! The left pane is one Mimizan algorithm. *Separation* is the Bayer
+//! frequency separation. *Least squares* is the Bayer least-squares
+//! demosaic. *X-Trans* is that demosaic on an X-Trans file. The right pane
+//! is a rival that reads the same mosaic: RCD, LMMSE, DCB, AMaZE and DHT
+//! on Bayer, and Markesteijn in four, three, two and one pass on X-Trans.
+//! Scroll zooms both panes together, a drag pans both, a click on the
+//! right pane steps to the next demosaicer.
 //!
 //! ```text
 //! mimizan-compare photo.NEF
@@ -16,10 +18,10 @@
 //! The developed TIFFs land in `photo.mimizan-compare/` beside the RAW and
 //! are kept. A second open reads them. *Develop again* writes them over.
 //!
-//! Mimizan is `mimizan negative --plate camera` and `mimizan print` at the
-//! base paper, 8-bit, with the sharpening off. The four RawTherapee
-//! demosaicers use a neutral profile, camera white balance and an sRGB
-//! TIFF. DHT is dcraw_emu at the camera white balance in sRGB.
+//! Both panes are the demosaic only, then one camera matrix and the sRGB
+//! curve. Nothing else: no paper, no lamps, no sharpening, no noise
+//! reduction, no highlight recovery, no automatic brightness.
+//!
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
@@ -29,16 +31,81 @@ use egui_file_dialog::{DialogState, FileDialog, OpeningMode};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 /// The five, in the order the lens measurement ranked them.
 const RIVALS: &[Rival] = &[
-    Rival { key: "rcd", label: "RCD", kind: Kind::RawTherapee("rcd") },
-    Rival { key: "lmmse", label: "LMMSE", kind: Kind::RawTherapee("lmmse") },
-    Rival { key: "dcb", label: "DCB", kind: Kind::RawTherapee("dcb") },
-    Rival { key: "amaze", label: "AMaZE", kind: Kind::RawTherapee("amaze") },
+    Rival { key: "rcd", label: "RCD", kind: Kind::Bayer("rcd") },
+    Rival { key: "lmmse", label: "LMMSE", kind: Kind::Bayer("lmmse") },
+    Rival { key: "dcb", label: "DCB", kind: Kind::Bayer("dcb") },
+    Rival { key: "amaze", label: "AMaZE", kind: Kind::Bayer("amaze") },
     Rival { key: "dht", label: "DHT", kind: Kind::Dht },
 ];
+
+/// Markesteijn, the demosaic an X-Trans file is measured against.
+const XTRANS_RIVALS: &[Rival] = &[
+    Rival { key: "x4", label: "4-pass", kind: Kind::Xtrans("4-pass") },
+    Rival { key: "x3", label: "3-pass", kind: Kind::Xtrans("3-pass (best)") },
+    Rival { key: "x2", label: "2-pass", kind: Kind::Xtrans("2-pass") },
+    Rival { key: "x1", label: "1-pass", kind: Kind::Xtrans("1-pass (medium)") },
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Algo {
+    Separation,
+    LeastSquares,
+    Xtrans,
+}
+
+const ALGOS: [Algo; 3] = [Algo::Separation, Algo::LeastSquares, Algo::Xtrans];
+
+impl Algo {
+    fn label(self) -> &'static str {
+        match self {
+            Algo::Separation => "Separation",
+            Algo::LeastSquares => "Least squares",
+            Algo::Xtrans => "X-Trans",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Algo::Separation => "mimizan",
+            Algo::LeastSquares => "bayer-ls",
+            Algo::Xtrans => "xtrans",
+        }
+    }
+
+    fn fits(self, sensor: Sensor) -> bool {
+        matches!(
+            (self, sensor),
+            (Algo::Xtrans, Sensor::Xtrans) | (Algo::Separation | Algo::LeastSquares, Sensor::Bayer)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sensor {
+    Bayer,
+    Xtrans,
+}
+
+impl Sensor {
+    fn home(self) -> Algo {
+        match self {
+            Sensor::Bayer => Algo::Separation,
+            Sensor::Xtrans => Algo::Xtrans,
+        }
+    }
+
+    fn rivals(self) -> &'static [Rival] {
+        match self {
+            Sensor::Bayer => RIVALS,
+            Sensor::Xtrans => XTRANS_RIVALS,
+        }
+    }
+}
 
 struct Rival {
     key: &'static str,
@@ -47,7 +114,10 @@ struct Rival {
 }
 
 enum Kind {
-    RawTherapee(&'static str),
+    /// A RawTherapee Bayer demosaic. The name is the profile's method.
+    Bayer(&'static str),
+    /// A RawTherapee X-Trans demosaic. The name is the profile's method.
+    Xtrans(&'static str),
     Dht,
 }
 
@@ -67,15 +137,26 @@ struct Picture {
 
 enum Note {
     Status(String),
-    Ready { slot: usize, picture: Picture },
-    Missed { slot: usize, error: String },
+    /// The file's mosaic, sent before any picture.
+    Sensor(Sensor),
+    Ready {
+        slot: usize,
+        picture: Picture,
+    },
+    Missed {
+        slot: usize,
+        error: String,
+    },
     Finished,
 }
 
 /// `slot` 0 is Mimizan. The rivals follow in [`RIVALS`] order.
 struct App {
     path: String,
+    algo: Algo,
+    sensor: Option<Sensor>,
     dialog: FileDialog,
+    preview: Preview,
     view: View,
     fitted: bool,
     which: usize,
@@ -112,7 +193,10 @@ impl App {
         let n = 1 + RIVALS.len();
         let mut app = Self {
             path,
+            algo: Algo::Separation,
+            sensor: None,
             dialog: file_dialog(),
+            preview: Preview::default(),
             view: View { mag: 1.0, pan: egui::Vec2::ZERO },
             fitted: false,
             which: 0,
@@ -127,6 +211,10 @@ impl App {
             app.develop(false);
         }
         app
+    }
+
+    fn rivals(&self) -> &'static [Rival] {
+        self.sensor.map(Sensor::rivals).unwrap_or(RIVALS)
     }
 
     /// The folder the dialog opens in: the file on screen, or home.
@@ -164,7 +252,30 @@ impl App {
         self.status = "Developing…".into();
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
-        thread::spawn(move || develop_all(&raw, again, tx));
+        let algo = self.algo;
+        thread::spawn(move || develop_all(&raw, again, algo, false, tx));
+    }
+
+    /// The other Mimizan algorithm, the rivals staying as they are.
+    fn develop_left(&mut self) {
+        if self.working {
+            return;
+        }
+        let raw = PathBuf::from(self.path.trim());
+        if !raw.is_file() {
+            self.status = format!("No such file: {}", raw.display());
+            return;
+        }
+        self.working = true;
+        self.fitted = false;
+        self.pictures[0] = None;
+        self.textures[0] = None;
+        self.errors[0] = None;
+        self.status = format!("Developing {}…", self.algo.label());
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        let algo = self.algo;
+        thread::spawn(move || develop_all(&raw, false, algo, true, tx));
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -173,8 +284,31 @@ impl App {
         while let Ok(note) = rx.try_recv() {
             match note {
                 Note::Status(s) => self.status = s,
+                Note::Sensor(sensor) => {
+                    self.sensor = Some(sensor);
+                    if !self.algo.fits(sensor) {
+                        self.algo = sensor.home();
+                    }
+                    let n = 1 + sensor.rivals().len();
+                    self.pictures.resize_with(n, || None);
+                    self.textures.resize_with(n, || None);
+                    self.errors.resize_with(n, || None);
+                    if self.which >= sensor.rivals().len() {
+                        self.which = 0;
+                    }
+                }
                 Note::Ready { slot, picture } => {
-                    let name = if slot == 0 { "mimizan" } else { RIVALS[slot - 1].key };
+                    if slot >= self.pictures.len() {
+                        continue;
+                    }
+                    let name = if slot == 0 {
+                        self.algo.key().to_string()
+                    } else {
+                        self.rivals()
+                            .get(slot - 1)
+                            .map(|r| r.key.to_string())
+                            .unwrap_or_else(|| format!("slot{slot}"))
+                    };
                     self.textures[slot] = Some(ctx.load_texture(
                         name,
                         egui::ColorImage::from_rgba_unmultiplied(
@@ -190,7 +324,11 @@ impl App {
                     self.pictures[slot] = Some(picture);
                     self.errors[slot] = None;
                 }
-                Note::Missed { slot, error } => self.errors[slot] = Some(error),
+                Note::Missed { slot, error } => {
+                    if slot < self.errors.len() {
+                        self.errors[slot] = Some(error);
+                    }
+                }
                 Note::Finished => finished = true,
             }
         }
@@ -215,7 +353,14 @@ impl eframe::App for App {
                 self.take_file(file);
             }
         }
-        self.dialog.update(&ctx);
+        {
+            let dialog = &mut self.dialog;
+            let preview = &mut self.preview;
+            dialog.set_right_panel_width(300.0);
+            dialog.update_with_right_panel_ui(&ctx, &mut |ui, dia| {
+                preview.panel(ui, &ctx, dia);
+            });
+        }
         if let Some(path) = self.dialog.take_picked() {
             self.take_file(path);
         }
@@ -228,18 +373,19 @@ impl eframe::App for App {
             if i.modifiers.command && i.key_pressed(egui::Key::O) {
                 open = true;
             }
+            let count = self.rivals().len().max(1);
             if i.key_pressed(egui::Key::ArrowRight) {
-                self.which = (self.which + 1) % RIVALS.len();
+                self.which = (self.which + 1) % count;
             }
             if i.key_pressed(egui::Key::ArrowLeft) {
-                self.which = (self.which + RIVALS.len() - 1) % RIVALS.len();
+                self.which = (self.which + count - 1) % count;
             }
             for (n, key) in
                 [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5]
                     .into_iter()
                     .enumerate()
             {
-                if i.key_pressed(key) {
+                if i.key_pressed(key) && n < self.rivals().len() {
                     self.which = n;
                 }
             }
@@ -272,7 +418,31 @@ impl eframe::App for App {
                     self.develop(true);
                 }
                 ui.separator();
-                for (n, rival) in RIVALS.iter().enumerate() {
+                for algo in ALGOS {
+                    let on = self.algo == algo;
+                    let response =
+                        ui.add_enabled(!self.working, egui::Button::new(algo.label()).selected(on));
+                    if response.clicked() && self.algo != algo {
+                        match self.sensor {
+                            Some(sensor) if !algo.fits(sensor) => {
+                                self.errors[0] = Some(match sensor {
+                                    Sensor::Bayer => {
+                                        "This file is Bayer. Separation and Least squares read it.".into()
+                                    }
+                                    Sensor::Xtrans => "This file is X-Trans. X-Trans reads it.".into(),
+                                });
+                            }
+                            Some(_) => {
+                                self.errors[0] = None;
+                                self.algo = algo;
+                                self.develop_left();
+                            }
+                            None => self.algo = algo,
+                        }
+                    }
+                }
+                ui.separator();
+                for (n, rival) in self.rivals().iter().enumerate() {
                     let on = self.which == n;
                     if ui.add_enabled(!self.working, egui::Button::new(rival.label).selected(on)).clicked() {
                         self.which = n;
@@ -296,7 +466,7 @@ impl eframe::App for App {
             if let Some(err) = &self.errors[0] {
                 ui.colored_label(egui::Color32::from_rgb(190, 70, 60), err);
             }
-            if let Some(err) = &self.errors[self.which + 1] {
+            if let Some(err) = self.errors.get(self.which + 1).and_then(|e| e.as_ref()) {
                 ui.colored_label(egui::Color32::from_rgb(190, 70, 60), err);
             }
         });
@@ -323,13 +493,14 @@ impl eframe::App for App {
             let right_hit = ui.interact(right, right_id, egui::Sense::click_and_drag());
             self.gesture(ui, left, &left_hit);
             self.gesture(ui, right, &right_hit);
+            let n = self.rivals().len().max(1);
             if right_hit.clicked() && !right_hit.double_clicked() {
-                self.which = (self.which + 1) % RIVALS.len();
+                self.which = (self.which + 1) % n;
             }
-            let frame = self.frame();
-            paint(ui, left, "Mimizan", self.textures[0].as_ref(), frame, &self.view);
-            let label = RIVALS[self.which].label;
-            paint(ui, right, label, self.textures[self.which + 1].as_ref(), frame, &self.view);
+            paint(ui, left, self.algo.label(), self.textures[0].as_ref(), &self.view);
+            let label = self.rivals().get(self.which).map(|r| r.label).unwrap_or("");
+            let right_tex = self.textures.get(self.which + 1).and_then(|t| t.as_ref());
+            paint(ui, right, label, right_tex, &self.view);
         });
     }
 }
@@ -370,18 +541,12 @@ impl App {
     }
 }
 
-fn paint(
-    ui: &egui::Ui,
-    pane: egui::Rect,
-    title: &str,
-    texture: Option<&egui::TextureHandle>,
-    frame: Option<egui::Vec2>,
-    view: &View,
-) {
+fn paint(ui: &egui::Ui, pane: egui::Rect, title: &str, texture: Option<&egui::TextureHandle>, view: &View) {
     let painter = ui.painter_at(pane);
     painter.rect_filled(pane, 0.0, egui::Color32::from_rgb(18, 18, 18));
-    if let (Some(texture), Some(frame)) = (texture, frame) {
-        let shown = frame * view.mag;
+    if let Some(texture) = texture {
+        let [w, h] = texture.size();
+        let shown = egui::vec2(w as f32, h as f32) * view.mag;
         let dest = egui::Rect::from_min_size(origin(pane, shown, view.pan), shown);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(texture.id(), dest, uv, egui::Color32::WHITE);
@@ -397,39 +562,97 @@ fn paint(
     );
 }
 
-fn develop_all(raw: &Path, again: bool, tx: mpsc::Sender<Note>) {
+/// The finished pictures were made by this view. An older folder is
+/// developed again, because those files went through the paper.
+const VIEW: &str = "srgb-matrix-1";
+
+fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tx: mpsc::Sender<Note>) {
     let work = work_dir(raw);
     if let Err(e) = std::fs::create_dir_all(&work) {
         let _ = tx.send(Note::Missed { slot: 0, error: e.to_string() });
         let _ = tx.send(Note::Finished);
         return;
     }
-    let mimizan_tif = work.join("mimizan.tif");
+    let sensor = match sensor_of(raw) {
+        Ok(sensor) => sensor,
+        Err(e) => {
+            let _ = tx.send(Note::Missed { slot: 0, error: e.to_string() });
+            let _ = tx.send(Note::Finished);
+            return;
+        }
+    };
+    let _ = tx.send(Note::Sensor(sensor));
+    let orientation = camera_orientation(raw);
+    if !algo.fits(sensor) {
+        algo = sensor.home();
+    }
+    let rivals: &'static [Rival] = sensor.rivals();
+    let fresh = !again && same_view(&work);
+    let shared = Arc::new(Shared { cv: Condvar::new(), meta: Mutex::new(None) });
+    let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     thread::scope(|scope| {
-        scope.spawn(|| {
-            let tx_m = tx.clone();
-            if !again && mimizan_tif.is_file() {
-                let _ = tx_m.send(Note::Status("Reading the Mimizan print…".into()));
-            } else {
-                let _ = tx_m.send(Note::Status("Developing the Mimizan print…".into()));
-                if let Err(e) = develop_mimizan(raw, &work, &mimizan_tif) {
+        let shared_m = Arc::clone(&shared);
+        let failed_m = Arc::clone(&failed);
+        let tx_m = tx.clone();
+        let work_m = work.clone();
+        let raw_m = raw.to_path_buf();
+        scope.spawn(move || {
+            let out = work_m.join(format!("{}.tif", algo.key()));
+            let meta = match algo {
+                Algo::Separation => {
+                    if fresh && out.is_file() {
+                        let _ = tx_m.send(Note::Status("Reading the Mimizan separation…".into()));
+                        read_plate(&work_m.join("negative.tif"))
+                    } else {
+                        let _ = tx_m.send(Note::Status("Developing the Mimizan separation…".into()));
+                        show_mimizan(&raw_m, &work_m, &out, again)
+                    }
+                }
+                Algo::LeastSquares => {
+                    let _ = tx_m.send(Note::Status("Reading the camera matrix…".into()));
+                    ensure_plate(&raw_m, &work_m, again)
+                }
+                Algo::Xtrans => {
+                    let _ = tx_m.send(Note::Status("Reading the camera matrix…".into()));
+                    xtrans_meta(&raw_m)
+                }
+            };
+            publish(&shared_m, &meta);
+            let shown = meta.and_then(|meta| {
+                if algo == Algo::Separation || (fresh && out.is_file()) {
+                    return Ok(meta);
+                }
+                let made = match algo {
+                    Algo::LeastSquares => develop_least_squares(&raw_m, &meta, &out, &tx_m),
+                    Algo::Xtrans => develop_xtrans(&raw_m, &meta, &out, &tx_m),
+                    Algo::Separation => Ok(()),
+                };
+                made.map(|()| meta)
+            });
+            match shown {
+                Ok(_) => send_picture(&tx_m, 0, &out, true, orientation),
+                Err(e) => {
+                    failed_m.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = tx_m.send(Note::Missed { slot: 0, error: e.to_string() });
-                    return;
                 }
             }
-            send_picture(&tx_m, 0, &mimizan_tif);
         });
-        // Two at a time. Five RawTherapee processes beside the print
-        // thrash a small machine.
+        if only_left {
+            return;
+        }
+        // Two at a time. The rivals start at once and wait for the matrix
+        // only when they apply it.
         let (jobs, job_rx) = mpsc::channel::<usize>();
-        for n in 0..RIVALS.len() {
+        for n in 0..rivals.len() {
             let _ = jobs.send(n);
         }
         drop(jobs);
-        let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
+        let job_rx = Arc::new(Mutex::new(job_rx));
         for _ in 0..2 {
-            let job_rx = std::sync::Arc::clone(&job_rx);
+            let job_rx = Arc::clone(&job_rx);
+            let shared_r = Arc::clone(&shared);
+            let failed_r = Arc::clone(&failed);
             let tx_r = tx.clone();
             let work = work.clone();
             let raw = raw.to_path_buf();
@@ -439,32 +662,80 @@ fn develop_all(raw: &Path, again: bool, tx: mpsc::Sender<Note>) {
                     let Ok(n) = guard.recv() else { break };
                     n
                 };
-                let rival = &RIVALS[n];
+                let rival = &rivals[n];
                 let slot = n + 1;
                 let out = work.join(format!("{}.tif", rival.key));
-                if !again && out.is_file() {
+                if fresh && out.is_file() {
                     let _ = tx_r.send(Note::Status(format!("Reading {}…", rival.label)));
                 } else {
                     let _ = tx_r.send(Note::Status(format!("Developing {}…", rival.label)));
+                    let linear = work.join(format!("{}.linear.tif", rival.key));
                     let run = match rival.kind {
-                        Kind::RawTherapee(method) => develop_rawtherapee(&raw, &work, method, &out),
-                        Kind::Dht => develop_dht(&raw, &out),
+                        Kind::Dht => develop_dht(&raw, &linear),
+                        Kind::Bayer(_) | Kind::Xtrans(_) => develop_rawtherapee(&raw, &work, rival, &linear),
                     };
+                    let encoded = !matches!(rival.kind, Kind::Dht);
+                    let run = run.and_then(|_| {
+                        let meta = wait_plate(&shared_r)?;
+                        finish_demosaic(&linear, &meta, &out, encoded)
+                    });
+                    let _ = std::fs::remove_file(&linear);
                     if let Err(e) = run {
+                        failed_r.store(true, std::sync::atomic::Ordering::Relaxed);
                         let _ = tx_r.send(Note::Missed { slot, error: format!("{}: {e}", rival.label) });
                         continue;
                     }
                 }
-                send_picture(&tx_r, slot, &out);
+                send_picture(&tx_r, slot, &out, false, orientation);
             });
         }
     });
+    if !only_left && !failed.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = std::fs::write(work.join("view.txt"), VIEW);
+    }
     let _ = tx.send(Note::Finished);
 }
 
-fn send_picture(tx: &mpsc::Sender<Note>, slot: usize, path: &Path) {
+fn same_view(work: &Path) -> bool {
+    std::fs::read_to_string(work.join("view.txt")).ok().as_deref() == Some(VIEW)
+}
+
+struct Shared {
+    cv: Condvar,
+    meta: Mutex<Option<Result<PlateMeta, String>>>,
+}
+
+fn publish(shared: &Shared, meta: &Result<PlateMeta>) {
+    {
+        let mut slot = shared.meta.lock().expect("plate lock");
+        *slot = Some(match meta {
+            Ok(meta) => Ok(meta.clone()),
+            Err(e) => Err(e.to_string()),
+        });
+    }
+    shared.cv.notify_all();
+}
+
+fn wait_plate(shared: &Shared) -> Result<PlateMeta> {
+    let mut slot = shared.meta.lock().expect("plate lock");
+    while slot.is_none() {
+        slot = shared.cv.wait(slot).expect("plate lock");
+    }
+    match slot.as_ref().expect("plate was set") {
+        Ok(meta) => Ok(meta.clone()),
+        Err(e) => bail!("{e}"),
+    }
+}
+
+fn send_picture(tx: &mpsc::Sender<Note>, slot: usize, path: &Path, ours: bool, orientation: u8) {
     match load_picture(path) {
-        Ok(picture) => {
+        Ok(mut picture) => {
+            // The rivals come back already turned, the way RawTherapee and
+            // dcraw show the file. Ours is the sensor as it was read.
+            if ours {
+                let (rgba, width, height) = turn(&picture.rgba, picture.width, picture.height, orientation);
+                picture = Picture { width, height, rgba };
+            }
             let _ = tx.send(Note::Ready { slot, picture });
         }
         Err(e) => {
@@ -473,7 +744,75 @@ fn send_picture(tx: &mpsc::Sender<Note>, slot: usize, path: &Path) {
     }
 }
 
-fn develop_mimizan(raw: &Path, work: &Path, out: &Path) -> Result<()> {
+/// EXIF orientation, the same choice the negative uses: the raw IFD, and
+/// the EXIF value when that IFD says the frame is not turned.
+fn camera_orientation(path: &Path) -> u8 {
+    let Ok(source) = rawler::rawsource::RawSource::new(path) else {
+        return 1;
+    };
+    let Ok(decoder) = rawler::get_decoder(&source) else {
+        return 1;
+    };
+    let params = rawler::decoders::RawDecodeParams::default();
+    let Ok(img) = decoder.raw_image(&source, &params, true) else {
+        return 1;
+    };
+    let exif = decoder.raw_metadata(&source, &params).ok().and_then(|md| md.exif.orientation);
+    use rawler::Orientation as O;
+    match img.orientation {
+        O::Normal | O::Unknown => exif.filter(|o| (1..=8).contains(o)).map(|o| o as u8).unwrap_or(1),
+        O::HorizontalFlip => 2,
+        O::Rotate180 => 3,
+        O::VerticalFlip => 4,
+        O::Transpose => 5,
+        O::Rotate90 => 6,
+        O::Transverse => 7,
+        O::Rotate270 => 8,
+    }
+}
+
+/// The stored pixels, turned the way the camera asked. Four bytes a pixel.
+fn turn(px: &[u8], width: usize, height: usize, orientation: u8) -> (Vec<u8>, usize, usize) {
+    if orientation <= 1 || width == 0 || height == 0 || px.len() != width * height * 4 {
+        return (px.to_vec(), width, height);
+    }
+    let (nw, nh) = match orientation {
+        5..=8 => (height, width),
+        _ => (width, height),
+    };
+    let mut out = vec![0u8; nw * nh * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let (dx, dy) = match orientation {
+                2 => (width - 1 - x, y),
+                3 => (width - 1 - x, height - 1 - y),
+                4 => (x, height - 1 - y),
+                5 => (y, x),
+                6 => (height - 1 - y, x),
+                7 => (height - 1 - y, width - 1 - x),
+                8 => (y, width - 1 - x),
+                _ => (x, y),
+            };
+            let s = (y * width + x) * 4;
+            let d = (dy * nw + dx) * 4;
+            out[d..d + 4].copy_from_slice(&px[s..s + 4]);
+        }
+    }
+    (out, nw, nh)
+}
+
+/// The plate already on disk is encoded again. `again` writes it over.
+fn show_mimizan(raw: &Path, work: &Path, out: &Path, again: bool) -> Result<PlateMeta> {
+    let negative = work.join("negative.tif");
+    if again || !negative.is_file() {
+        return develop_mimizan(raw, work, out);
+    }
+    let (meta, gray) = read_plate_samples(&negative)?;
+    write_display(out, meta.frame_w, meta.frame_h, &encode_plate(&gray, &meta))?;
+    Ok(meta)
+}
+
+fn develop_mimizan(raw: &Path, work: &Path, out: &Path) -> Result<PlateMeta> {
     let bin = find_mimizan();
     let negative = work.join("negative.tif");
     let cameras = find_cameras();
@@ -490,34 +829,25 @@ fn develop_mimizan(raw: &Path, work: &Path, out: &Path) -> Result<()> {
         cmd.arg("--cameras").arg(dir);
     }
     run(&mut cmd, "mimizan negative")?;
-    let mut cmd = Command::new(&bin);
-    cmd.arg("--log")
-        .arg("warn")
-        .arg("print")
-        .arg(&negative)
-        .arg("-o")
-        .arg(out)
-        .arg("--paper")
-        .arg("0,0")
-        .arg("--usm-amount")
-        .arg("0")
-        .arg("--bits")
-        .arg("8");
-    if let Some(dir) = &cameras {
-        cmd.arg("--cameras").arg(dir);
-    }
-    run(&mut cmd, "mimizan print")?;
-    if !out.is_file() {
-        bail!("mimizan print wrote no {}", out.display());
-    }
-    Ok(())
+    let (meta, gray) = read_plate_samples(&negative)?;
+    write_display(out, meta.frame_w, meta.frame_h, &encode_plate(&gray, &meta))?;
+    Ok(meta)
 }
 
-fn develop_rawtherapee(raw: &Path, work: &Path, method: &str, out: &Path) -> Result<()> {
-    let pp3 = work.join(format!("rt_{method}.pp3"));
-    std::fs::write(&pp3, rt_profile(method))?;
+fn read_plate(negative: &Path) -> Result<PlateMeta> {
+    Ok(read_plate_samples(negative)?.0)
+}
+
+fn develop_rawtherapee(raw: &Path, work: &Path, rival: &Rival, out: &Path) -> Result<()> {
+    let (bayer, xtrans) = match rival.kind {
+        Kind::Bayer(method) => (method, "3-pass (best)"),
+        Kind::Xtrans(method) => ("rcd", method),
+        Kind::Dht => bail!("DHT is developed by dcraw"),
+    };
+    let pp3 = work.join(format!("rt_{}.pp3", rival.key));
+    std::fs::write(&pp3, rt_profile(bayer, xtrans))?;
     let mut cmd = Command::new("rawtherapee-cli");
-    cmd.args(["-q", "-Y", "-t", "-b8", "-o"]).arg(out).arg("-p").arg(&pp3).arg("-c").arg(raw);
+    cmd.args(["-q", "-Y", "-t", "-b16", "-o"]).arg(out).arg("-p").arg(&pp3).arg("-c").arg(raw);
     run(&mut cmd, "rawtherapee-cli")?;
     if !out.is_file() {
         bail!("rawtherapee-cli wrote no {}", out.display());
@@ -525,19 +855,158 @@ fn develop_rawtherapee(raw: &Path, work: &Path, method: &str, out: &Path) -> Res
     Ok(())
 }
 
-fn develop_dht(raw: &Path, out: &Path) -> Result<()> {
-    let suffix = ".mimizan-compare-dht.tif";
-    let mut name = raw.as_os_str().to_os_string();
-    name.push(suffix);
-    let produced = PathBuf::from(name);
-    let mut cmd = Command::new("dcraw_emu");
-    cmd.args(["-w", "-o", "1", "-H", "0", "-q", "11", "-T", "-Z", suffix]).arg(raw);
-    run(&mut cmd, "dcraw_emu")?;
-    if !produced.is_file() {
-        bail!("dcraw_emu wrote no {}", produced.display());
+/// The negative's matrix, developed when the folder does not have it yet.
+fn ensure_plate(raw: &Path, work: &Path, again: bool) -> Result<PlateMeta> {
+    let negative = work.join("negative.tif");
+    if again || !negative.is_file() {
+        develop_mimizan(raw, work, &work.join("mimizan.tif"))
+    } else {
+        read_plate(&negative)
     }
-    std::fs::rename(&produced, out)
-        .with_context(|| format!("moving {} to {}", produced.display(), out.display()))?;
+}
+
+fn sensor_of(path: &Path) -> Result<Sensor> {
+    let img = load_image(path, true)?;
+    match &img.photometric {
+        rawler::rawimage::RawPhotometricInterpretation::Cfa(cfg)
+            if cfg.cfa.width == 6
+                && cfg.cfa.height == 6
+                && mimizan_lab_xtrans::xtrans::XTile::from_name(&cfg.cfa.name).is_some() =>
+        {
+            Ok(Sensor::Xtrans)
+        }
+        rawler::rawimage::RawPhotometricInterpretation::Cfa(cfg)
+            if cfg.cfa.width == 2 && cfg.cfa.height == 2 =>
+        {
+            Ok(Sensor::Bayer)
+        }
+        _ => bail!("this file is neither a Bayer nor an X-Trans mosaic"),
+    }
+}
+
+fn load_image(path: &Path, dummy: bool) -> Result<rawler::RawImage> {
+    let source = rawler::rawsource::RawSource::new(path).context("cannot be read")?;
+    let decoder = rawler::get_decoder(&source).context("not a raw file this program reads")?;
+    decoder
+        .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), dummy)
+        .context("cannot be decoded")
+}
+
+/// The matrix the separation uses, taken from the file the same way.
+fn camera_rows(img: &rawler::RawImage) -> Result<[[f64; 3]; 3]> {
+    use rawler::imgop::xyz::Illuminant as I;
+    let from_flat = |m: &[f32]| -> Option<[[f64; 3]; 3]> {
+        if m.len() < 9 || m.iter().take(9).all(|v| *v == 0.0) {
+            return None;
+        }
+        let row = |i: usize| [f64::from(m[3 * i]), f64::from(m[3 * i + 1]), f64::from(m[3 * i + 2])];
+        Some([row(0), row(1), row(2)])
+    };
+    let preferred = [I::D65, I::D55, I::Daylight, I::D50, I::D75, I::FineWeather, I::CloudyWeather];
+    let found = preferred
+        .iter()
+        .find_map(|k| img.color_matrix.get(k).and_then(|m| from_flat(m)))
+        .or_else(|| {
+            let mut keys: Vec<_> = img.color_matrix.keys().collect();
+            keys.sort_by_key(|k| **k as u16);
+            keys.into_iter().find_map(|k| from_flat(&img.color_matrix[k]))
+        })
+        .or_else(|| {
+            let m = img.xyz_to_cam;
+            let nonzero = m.iter().take(3).flatten().any(|v| *v != 0.0);
+            nonzero.then(|| {
+                let row = |i: usize| [f64::from(m[i][0]), f64::from(m[i][1]), f64::from(m[i][2])];
+                [row(0), row(1), row(2)]
+            })
+        })
+        .context("the file has no colour matrix")?;
+    mimizan_core::plate::PlateWeights::camera(&found, mimizan_core::plate::PlateSpace::Srgb)
+        .map(|w| w.rows)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+fn xtrans_meta(raw: &Path) -> Result<PlateMeta> {
+    let head = load_image(raw, true)?;
+    match meta_of_xtrans(&head) {
+        Ok(meta) => Ok(meta),
+        Err(_) => meta_of_xtrans(&load_image(raw, false)?),
+    }
+}
+
+fn meta_of_xtrans(img: &rawler::RawImage) -> Result<PlateMeta> {
+    let frame = mimizan_lab_xtrans::convert::frame_of(img).map_err(anyhow::Error::msg)?;
+    Ok(PlateMeta {
+        range: 1.0,
+        rows: camera_rows(img)?,
+        frame_w: frame.width,
+        frame_h: frame.height,
+        crop: Crop { x: frame.x, y: frame.y, w: frame.width, h: frame.height },
+    })
+}
+
+fn develop_least_squares(raw: &Path, meta: &PlateMeta, out: &Path, tx: &mpsc::Sender<Note>) -> Result<()> {
+    let _ = tx.send(Note::Status("Developing the least-squares demosaic…".into()));
+    let img = load_image(raw, false)?;
+    let dev = mimizan_cli::bayer_ls::develop(&img, &|s| {
+        let _ = tx.send(Note::Status(s));
+    })
+    .map_err(anyhow::Error::msg)?;
+    let rgb = encode_balanced(&dev.data, dev.frame.width, dev.frame.height, dev.balance, meta.rows);
+    write_display(out, dev.frame.width, dev.frame.height, &rgb)
+}
+
+fn develop_xtrans(raw: &Path, meta: &PlateMeta, out: &Path, tx: &mpsc::Sender<Note>) -> Result<()> {
+    let _ = tx.send(Note::Status("Developing the X-Trans demosaic…".into()));
+    let img = load_image(raw, false)?;
+    let dev = mimizan_lab_xtrans::convert::develop_watched(
+        &img,
+        &mimizan_lab_xtrans::convert::Settings { keep_highlights: true },
+        &|s| {
+            let _ = tx.send(Note::Status(s.to_string()));
+        },
+        &|share| {
+            let _ = tx.send(Note::Status(format!(
+                "separating luminance and colour, {:.0}%",
+                share.clamp(0.0, 1.0) * 100.0
+            )));
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    let rgb = encode_balanced(&dev.data, dev.frame.width, dev.frame.height, dev.balance, meta.rows);
+    write_display(out, dev.frame.width, dev.frame.height, &rgb)
+}
+
+/// Unbalanced camera channels, 0 at black and [`WHITE`](mimizan_lab_xtrans::convert::WHITE)
+/// at white, times the balance, then the shared matrix and the sRGB curve.
+fn encode_balanced(
+    data: &[u16],
+    width: usize,
+    height: usize,
+    balance: [f64; 3],
+    rows: [[f64; 3]; 3],
+) -> Vec<u8> {
+    let white = f64::from(mimizan_lab_xtrans::convert::WHITE);
+    let mut rgb = vec![0u8; width * height * 3];
+    for (i, px) in data.as_chunks::<3>().0.iter().take(width * height).enumerate() {
+        let cam = [0, 1, 2].map(|c| f64::from(px[c]) / white * balance[c]);
+        let lin = project(cam, rows);
+        let o = i * 3;
+        rgb[o] = display_byte(lin[0]);
+        rgb[o + 1] = display_byte(lin[1]);
+        rgb[o + 2] = display_byte(lin[2]);
+    }
+    rgb
+}
+
+fn develop_dht(raw: &Path, out: &Path) -> Result<()> {
+    let mut cmd = Command::new("dcraw_emu");
+    // Linear 16-bit (-4), camera channels (-o 0), camera white balance,
+    // highlights clipped. -4 already refuses the automatic brightness.
+    cmd.args(["-4", "-o", "0", "-w", "-H", "0", "-q", "11", "-T", "-Z"]).arg(out).arg(raw);
+    run(&mut cmd, "dcraw_emu")?;
+    if !out.is_file() {
+        bail!("dcraw_emu wrote no {}", out.display());
+    }
     Ok(())
 }
 
@@ -564,6 +1033,239 @@ fn load_picture(path: &Path) -> Result<Picture> {
     let image = image::open(path).with_context(|| format!("reading {}", path.display()))?.into_rgba8();
     let (width, height) = image.dimensions();
     Ok(Picture { width: width as usize, height: height as usize, rgba: image.into_raw() })
+}
+
+/// The picture beside the file list. The camera's embedded preview, kept
+/// for the files already opened this time.
+struct Preview {
+    shown: PathBuf,
+    texture: Option<egui::TextureHandle>,
+    missing: bool,
+    rx: Option<Receiver<Loaded>>,
+    cache: Vec<(PathBuf, Cached)>,
+}
+
+struct Loaded {
+    path: PathBuf,
+    picture: Option<Picture>,
+}
+
+enum Cached {
+    Image(egui::TextureHandle),
+    Missing,
+}
+
+impl Default for Preview {
+    fn default() -> Self {
+        Self { shown: PathBuf::new(), texture: None, missing: false, rx: None, cache: Vec::new() }
+    }
+}
+
+impl Preview {
+    fn panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, dia: &FileDialog) {
+        let Some(entry) = dia.selected_entry().filter(|e| e.is_file()) else {
+            ui.label("Select a file.");
+            return;
+        };
+        let path = entry.to_path_buf();
+        ui.label(entry.file_name());
+        self.ensure(ctx, &path);
+        self.poll(ctx);
+        if let Some(texture) = &self.texture {
+            let [w, h] = texture.size();
+            let max_w = ui.available_width().max(1.0);
+            let max_h = ui.available_height().max(1.0);
+            let scale = (max_w / w as f32).min(max_h / h as f32);
+            let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+            ui.image((texture.id(), size));
+        } else if self.missing {
+            ui.label("This file has no preview.");
+        } else {
+            ui.label("Reading the preview…");
+            ctx.request_repaint();
+        }
+    }
+
+    fn ensure(&mut self, ctx: &egui::Context, path: &Path) {
+        if self.shown == path && (self.texture.is_some() || self.missing || self.rx.is_some()) {
+            return;
+        }
+        self.shown = path.to_path_buf();
+        self.rx = None;
+        if let Some((_, cached)) = self.cache.iter().find(|(p, _)| p == path) {
+            match cached {
+                Cached::Image(texture) => {
+                    self.texture = Some(texture.clone());
+                    self.missing = false;
+                }
+                Cached::Missing => {
+                    self.texture = None;
+                    self.missing = true;
+                }
+            }
+            return;
+        }
+        self.texture = None;
+        self.missing = false;
+        let (tx, rx) = mpsc::channel();
+        self.rx = Some(rx);
+        let path = path.to_path_buf();
+        thread::spawn(move || {
+            let picture = load_preview(&path);
+            let _ = tx.send(Loaded { path, picture });
+        });
+        ctx.request_repaint();
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.rx else { return };
+        let Ok(loaded) = rx.try_recv() else {
+            ctx.request_repaint();
+            return;
+        };
+        self.rx = None;
+        if loaded.path != self.shown {
+            return;
+        }
+        match loaded.picture {
+            Some(picture) => {
+                let texture = ctx.load_texture(
+                    loaded.path.display().to_string(),
+                    egui::ColorImage::from_rgba_unmultiplied([picture.width, picture.height], &picture.rgba),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.texture = Some(texture.clone());
+                self.missing = false;
+                self.remember(loaded.path, Cached::Image(texture));
+            }
+            None => {
+                self.texture = None;
+                self.missing = true;
+                self.remember(loaded.path, Cached::Missing);
+            }
+        }
+    }
+
+    fn remember(&mut self, path: PathBuf, cached: Cached) {
+        self.cache.retain(|(p, _)| p != &path);
+        self.cache.push((path, cached));
+        if self.cache.len() > 24 {
+            self.cache.remove(0);
+        }
+    }
+}
+
+fn load_preview(path: &Path) -> Option<Picture> {
+    let image = if is_raw_path(path) { raw_preview(path)? } else { image::open(path).ok()? };
+    let rgba = image.into_rgba8();
+    let (width, height) = rgba.dimensions();
+    let (mut rgba, mut width, mut height) = (rgba.into_raw(), width as usize, height as usize);
+    if is_raw_path(path) {
+        let orientation = camera_orientation(path);
+        if matches!(orientation, 5..=8) && width > height {
+            (rgba, width, height) = turn(&rgba, width, height, orientation);
+        }
+    }
+    Some(fit_preview(rgba, width, height, 480))
+}
+
+fn raw_preview(path: &Path) -> Option<image::DynamicImage> {
+    // The largest embedded JPEG is often the full frame. The dialog wants
+    // the small one, which a camera keeps beside the raw.
+    if let Some(bytes) = embedded_jpeg(path) {
+        if let Ok(image) = image::load_from_memory(&bytes) {
+            return Some(image);
+        }
+    }
+    let source = rawler::rawsource::RawSource::new(path).ok()?;
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let params = rawler::decoders::RawDecodeParams::default();
+    decoder.thumbnail_image(&source, &params).ok().flatten()
+}
+
+/// The largest JPEG in the file that is still a preview: at least 8 KB,
+/// at most 512 KB. Bigger than that is the full frame.
+fn embedded_jpeg(path: &Path) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    let mut best: Option<std::ops::Range<usize>> = None;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 {
+            if let Some(end) = jpeg_end(&bytes, i) {
+                let len = end - i;
+                if (8 * 1024..=512 * 1024).contains(&len) && best.as_ref().is_none_or(|r| len > r.len()) {
+                    best = Some(i..end);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    best.map(|range| bytes[range].to_vec())
+}
+
+/// The byte after a JPEG that starts at `start` (the FF D8), if the markers
+/// parse. Entropy data uses FF 00 for a literal FF, so a real end marker is
+/// not hidden in it.
+fn jpeg_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut j = start + 2;
+    while j + 1 < bytes.len() {
+        if bytes[j] != 0xFF {
+            j += 1;
+            continue;
+        }
+        while j < bytes.len() && bytes[j] == 0xFF {
+            j += 1;
+        }
+        let marker = *bytes.get(j)?;
+        j += 1;
+        if marker == 0xD9 {
+            return Some(j);
+        }
+        if marker == 0xD8 || marker == 0x00 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        let seglen = u16::from_be_bytes([*bytes.get(j)?, *bytes.get(j + 1)?]) as usize;
+        if seglen < 2 || j + seglen > bytes.len() {
+            return None;
+        }
+        j += seglen;
+        if marker == 0xDA {
+            while j + 1 < bytes.len() {
+                if bytes[j] != 0xFF {
+                    j += 1;
+                    continue;
+                }
+                let next = bytes[j + 1];
+                if next == 0x00 {
+                    j += 2;
+                    continue;
+                }
+                if next == 0xD9 {
+                    return Some(j + 2);
+                }
+                return None;
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn fit_preview(rgba: Vec<u8>, width: usize, height: usize, edge: u32) -> Picture {
+    let long = width.max(height).max(1) as u32;
+    let Some(image) = image::RgbaImage::from_raw(width as u32, height as u32, rgba) else {
+        return Picture { width: 0, height: 0, rgba: Vec::new() };
+    };
+    if long <= edge {
+        let (width, height) = (image.width() as usize, image.height() as usize);
+        return Picture { width, height, rgba: image.into_raw() };
+    }
+    let tw = (image.width() * edge / long).max(1);
+    let th = (image.height() * edge / long).max(1);
+    let out = image::imageops::resize(&image, tw, th, image::imageops::FilterType::Triangle);
+    Picture { width: tw as usize, height: th as usize, rgba: out.into_raw() }
 }
 
 fn file_dialog() -> FileDialog {
@@ -666,8 +1368,10 @@ fn find_cameras() -> Option<PathBuf> {
 }
 
 /// Neutral RawTherapee profile: the named demosaicer, camera white balance,
-/// no sharpening and no noise reduction, sRGB TIFF.
-fn rt_profile(method: &str) -> String {
+/// camera channels left as they are. No sharpening, no noise reduction, no
+/// highlight recovery, no baseline exposure. The sRGB curve is only so the
+/// 16-bit file has a known encoding; it is undone before the shared matrix.
+fn rt_profile(bayer: &str, xtrans: &str) -> String {
     format!(
         "[Version]\nAppVersion=5.11\nVersion=351\n\n\
 [Exposure]\nAuto=false\nClip=0\nCompensation=0\nBrightness=0\nContrast=0\nSaturation=0\nBlack=0\n\
@@ -676,15 +1380,222 @@ CurveFromHistogramMatching=false\nClampOOG=true\nCurveMode=Standard\nCurveMode2=
 [HLRecovery]\nEnabled=false\nMethod=Blend\n\n\
 [White Balance]\nEnabled=true\nSetting=Camera\nTemperature=6504\nGreen=1\nEqual=1\n\n\
 [Color Management]\nInputProfile=(none)\nToneCurve=false\nApplyLookTable=false\nApplyBaselineExposureOffset=false\n\
-ApplyHueSatMap=false\nDCPIlluminant=0\nWorkingProfile=sRGB\nOutputProfile=RTv4_sRGB\nOutputProfileIntent=Relative\nOutputBPC=true\n\n\
+ApplyHueSatMap=false\nDCPIlluminant=0\nWorkingProfile=sRGB\nOutputProfile=RTv4_sRGB\nOutputProfileIntent=Relative\nOutputBPC=false\n\n\
 [Sharpening]\nEnabled=false\n\n[SharpenEdge]\nEnabled=false\n\n[SharpenMicro]\nEnabled=false\n\n\
 [Impulse Denoising]\nEnabled=false\n\n[Defringing]\nEnabled=false\n\n[Directional Pyramid Denoising]\nEnabled=false\n\n\
 [RAW]\nCA=false\nHotPixelFilter=false\nDeadPixelFilter=false\nPreExposure=1\n\n\
-[RAW Bayer]\nMethod={method}\nBorder=0\nCcSteps=0\nPreBlack0=0\nPreBlack1=0\nPreBlack2=0\nPreBlack3=0\n\
-PreTwoGreen=true\nLineDenoise=0\nGreenEqThreshold=0\nDCBIterations=2\nDCBEnhance=true\nLMMSEIterations=2\n\
+[RAW Bayer]\nMethod={bayer}\nBorder=0\nCcSteps=0\nPreBlack0=0\nPreBlack1=0\nPreBlack2=0\nPreBlack3=0\n\
+PreTwoGreen=true\nLineDenoise=0\nGreenEqThreshold=0\nDCBIterations=2\nDCBEnhance=false\nLMMSEIterations=2\n\
 DualDemosaicAutoContrast=false\nDualDemosaicContrast=0\nPDAFLinesFilter=false\n\n\
-[RAW X-Trans]\nMethod=3-pass (best)\n"
+[RAW X-Trans]\nMethod={xtrans}\n"
     )
+}
+
+/// The camera plate: its matrix, the range the negative was stored with,
+/// and the crop of the active area.
+#[derive(Clone)]
+struct PlateMeta {
+    range: f64,
+    rows: [[f64; 3]; 3],
+    frame_w: usize,
+    frame_h: usize,
+    crop: Crop,
+}
+
+#[derive(Clone, Copy)]
+struct Crop {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+}
+
+fn read_plate_samples(path: &Path) -> Result<(PlateMeta, Vec<u16>)> {
+    let (width, height, samples, desc) = read_tiff_u16(path, 1)?;
+    let meta = plate_meta(&desc, width, height)?;
+    Ok((meta, samples))
+}
+
+fn plate_meta(desc: &str, width: usize, height: usize) -> Result<PlateMeta> {
+    let v: serde_json::Value = serde_json::from_str(desc).context("the negative has no plate description")?;
+    // A plate whose samples stay within 1 omits `range`. The print reads
+    // that as 1, and so does this view.
+    let range = match v.get("range") {
+        None => 1.0,
+        Some(n) => n
+            .as_f64()
+            .filter(|r| r.is_finite() && *r >= 1.0)
+            .context("the negative states a range below 1")?,
+    };
+    let plate = v.get("plate").context("the negative is not a plate")?;
+    let frames = plate.get("frames").and_then(|f| f.as_array()).context("the plate states no frames")?;
+    let names: Vec<&str> = frames.iter().filter_map(|f| f.as_str()).collect();
+    if names != ["blue", "green", "red"] {
+        bail!("the plate frames are {}, and this view reads blue, green, red", names.join(", "));
+    }
+    let frame_h =
+        plate.get("frame_height").and_then(|n| n.as_u64()).context("the plate states no frame height")?
+            as usize;
+    if frame_h == 0 || frame_h * 3 != height {
+        bail!("the plate is {width}x{height}, not three frames of {frame_h}");
+    }
+    let weights = plate.get("weights").and_then(|w| w.as_array()).context("the plate states no matrix")?;
+    if weights.len() != 3 {
+        bail!("the plate matrix has {} rows", weights.len());
+    }
+    let mut rows = [[0.0; 3]; 3];
+    for (row, values) in rows.iter_mut().zip(weights) {
+        let values = values.as_array().context("a plate matrix row is not a row")?;
+        if values.len() != 3 {
+            bail!("a plate matrix row has {} numbers", values.len());
+        }
+        for (out, value) in row.iter_mut().zip(values) {
+            *out = value.as_f64().filter(|n| n.is_finite()).context("a plate matrix number is not finite")?;
+        }
+    }
+    let crop = v.get("report").and_then(|r| r.get("crop")).map(read_crop).transpose()?.unwrap_or(Crop {
+        x: 0,
+        y: 0,
+        w: width,
+        h: frame_h,
+    });
+    Ok(PlateMeta { range, rows, frame_w: width, frame_h, crop })
+}
+
+fn read_crop(v: &serde_json::Value) -> Result<Crop> {
+    let n = |key: &str| -> Result<usize> {
+        v.get(key)
+            .and_then(|n| n.as_u64())
+            .map(|n| n as usize)
+            .with_context(|| format!("the crop has no {key}"))
+    };
+    Ok(Crop { x: n("x")?, y: n("y")?, w: n("w")?, h: n("h")? })
+}
+
+/// The three stored frames, blue, green, red, as 8-bit sRGB. They are
+/// already the camera matrix. `range` undoes the scaling of the file.
+fn encode_plate(gray: &[u16], meta: &PlateMeta) -> Vec<u8> {
+    let (w, h) = (meta.frame_w, meta.frame_h);
+    let mut rgb = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let at = |frame: usize| {
+                let v = f64::from(gray[(frame * h + y) * w + x]) / 65535.0 * meta.range;
+                display_byte(v)
+            };
+            let i = (y * w + x) * 3;
+            rgb[i] = at(2);
+            rgb[i + 1] = at(1);
+            rgb[i + 2] = at(0);
+        }
+    }
+    rgb
+}
+
+/// A rival's linear camera channels through the plate matrix and the sRGB
+/// curve, cropped to the active area the negative kept.
+fn finish_demosaic(linear: &Path, meta: &PlateMeta, out: &Path, encoded: bool) -> Result<()> {
+    let (width, height, samples, _) = read_tiff_u16(linear, 3)?;
+    let crop = placed(width, height, meta.crop);
+    let mut rgb = vec![0u8; crop.w * crop.h * 3];
+    for y in 0..crop.h {
+        for x in 0..crop.w {
+            let p = ((crop.y + y) * width + crop.x + x) * 3;
+            let cam = [samples[p], samples[p + 1], samples[p + 2]].map(|v| {
+                let x = f64::from(v) / 65535.0;
+                if encoded {
+                    srgb_decode(x)
+                } else {
+                    x
+                }
+            });
+            let lin = project(cam, meta.rows);
+            let i = (y * crop.w + x) * 3;
+            rgb[i] = display_byte(lin[0]);
+            rgb[i + 1] = display_byte(lin[1]);
+            rgb[i + 2] = display_byte(lin[2]);
+        }
+    }
+    write_display(out, crop.w, crop.h, &rgb)
+}
+
+/// The crop, when it lies inside `width`×`height`. A file that is already
+/// the active area is kept whole.
+fn placed(width: usize, height: usize, crop: Crop) -> Crop {
+    if crop.w == width && crop.h == height {
+        return Crop { x: 0, y: 0, w: width, h: height };
+    }
+    if crop.w > 0
+        && crop.h > 0
+        && crop.x.saturating_add(crop.w) <= width
+        && crop.y.saturating_add(crop.h) <= height
+    {
+        return crop;
+    }
+    Crop { x: 0, y: 0, w: width, h: height }
+}
+
+fn project(cam: [f64; 3], rows: [[f64; 3]; 3]) -> [f64; 3] {
+    [
+        rows[0][0] * cam[0] + rows[0][1] * cam[1] + rows[0][2] * cam[2],
+        rows[1][0] * cam[0] + rows[1][1] * cam[1] + rows[1][2] * cam[2],
+        rows[2][0] * cam[0] + rows[2][1] * cam[1] + rows[2][2] * cam[2],
+    ]
+}
+
+/// sRGB inverse electro-optical transfer, the curve the RawTherapee file
+/// was written with.
+fn srgb_decode(v: f64) -> f64 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB electro-optical transfer.
+fn srgb_encode(v: f64) -> f64 {
+    if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn display_byte(linear: f64) -> u8 {
+    let v = srgb_encode(linear.clamp(0.0, 1.0));
+    (v * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+fn read_tiff_u16(path: &Path, samples: usize) -> Result<(usize, usize, Vec<u16>, String)> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut decoder = tiff::decoder::Decoder::new(file)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .with_context(|| format!("reading {}", path.display()))?
+        .with_limits(tiff::decoder::Limits::unlimited());
+    let desc = decoder.get_tag_ascii_string(tiff::tags::Tag::ImageDescription).unwrap_or_default();
+    let (width, height) = decoder.dimensions().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let got = decoder.colortype().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let image = decoder.read_image().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tiff::decoder::DecodingResult::U16(data) = image else {
+        bail!("{} is not 16-bit", path.display());
+    };
+    let (width, height) = (width as usize, height as usize);
+    if data.len() != width * height * samples {
+        bail!(
+            "{} has {} samples a pixel ({got:?}), and this view reads {samples}",
+            path.display(),
+            data.len() / width.max(1) / height.max(1)
+        );
+    }
+    Ok((width, height, data, desc))
+}
+
+fn write_display(path: &Path, width: usize, height: usize, rgb: &[u8]) -> Result<()> {
+    let image = image::RgbImage::from_raw(width as u32, height as u32, rgb.to_vec())
+        .with_context(|| format!("the display is {width}x{height}"))?;
+    image.save(path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 fn fit_mag(pane: egui::Vec2, image: egui::Vec2) -> f32 {
@@ -717,6 +1628,32 @@ fn pan_keeping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_file_has_no_preview() {
+        assert!(load_preview(Path::new("/no/such/file.nef")).is_none());
+    }
+
+    #[test]
+    fn the_preview_fits_the_panel() {
+        let px = vec![0u8; 8 * 4 * 4];
+        let fitted = fit_preview(px, 8, 4, 4);
+        assert_eq!((fitted.width, fitted.height), (4, 2));
+        assert_eq!(fitted.rgba.len(), 4 * 2 * 4);
+    }
+
+    #[test]
+    fn a_turned_camera_stands_up() {
+        // Two pixels, red then green. Orientation 8 is rotate 270° clockwise,
+        // so the green one is on top.
+        let px = [255, 0, 0, 255, 0, 255, 0, 255];
+        let (out, w, h) = turn(&px, 2, 1, 8);
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(out, [0, 255, 0, 255, 255, 0, 0, 255]);
+        let (same, w, h) = turn(&px, 2, 1, 1);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(same, px);
+    }
 
     #[test]
     fn the_centre_of_the_pane_is_the_centre_of_the_picture() {
@@ -764,9 +1701,72 @@ mod tests {
     }
 
     #[test]
+    fn an_algorithm_reads_the_mosaic_it_was_measured_on() {
+        assert!(Algo::Separation.fits(Sensor::Bayer));
+        assert!(Algo::LeastSquares.fits(Sensor::Bayer));
+        assert!(!Algo::Xtrans.fits(Sensor::Bayer));
+        assert!(Algo::Xtrans.fits(Sensor::Xtrans));
+        assert!(!Algo::Separation.fits(Sensor::Xtrans));
+        assert_eq!(Sensor::Bayer.home(), Algo::Separation);
+        assert_eq!(Sensor::Xtrans.home(), Algo::Xtrans);
+        assert_eq!(Sensor::Xtrans.rivals().len(), 4);
+        assert!(rt_profile("rcd", "1-pass (medium)").contains("[RAW X-Trans]\nMethod=1-pass (medium)"));
+    }
+
+    #[test]
+    fn balanced_camera_channels_take_the_matrix_once() {
+        let white = mimizan_lab_xtrans::convert::WHITE;
+        let rows = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let rgb = encode_balanced(&[white, 0, 0], 1, 1, [1.0, 1.0, 1.0], rows);
+        assert_eq!(rgb, vec![255, 0, 0]);
+        let doubled = encode_balanced(&[white / 2, 0, 0], 1, 1, [2.0, 1.0, 1.0], rows);
+        assert_eq!(doubled[0], 255);
+    }
+
+    #[test]
     fn the_profile_names_the_demosaicer() {
-        let text = rt_profile("lmmse");
+        let text = rt_profile("lmmse", "3-pass (best)");
         assert!(text.contains("Method=lmmse"));
+        assert!(text.contains("Method=3-pass (best)"));
         assert!(text.contains("Sharpening]\nEnabled=false"));
+        assert!(text.contains("DCBEnhance=false"));
+        assert!(text.contains("HLRecovery]\nEnabled=false"));
+        assert!(text.contains("ApplyBaselineExposureOffset=false"));
+        assert!(text.contains("OutputBPC=false"));
+    }
+
+    #[test]
+    fn the_curve_is_the_srgb_curve_and_white_is_white() {
+        assert_eq!(display_byte(0.0), 0);
+        assert_eq!(display_byte(1.0), 255);
+        assert_eq!(display_byte(2.0), 255);
+        assert_eq!(display_byte(-1.0), 0);
+        let mid = srgb_encode(0.5);
+        assert!((mid - 0.735356983).abs() < 1e-6);
+        assert!((srgb_decode(mid) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_matrix_is_applied_once_and_the_active_area_is_kept() {
+        let rows = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_eq!(project([0.2, 0.4, 0.6], rows), [0.2, 0.4, 0.6]);
+        let full = placed(100, 80, Crop { x: 8, y: 4, w: 100, h: 80 });
+        assert_eq!((full.x, full.y), (0, 0));
+        let crop = placed(200, 100, Crop { x: 8, y: 4, w: 100, h: 80 });
+        assert_eq!((crop.x, crop.y, crop.w, crop.h), (8, 4, 100, 80));
+    }
+
+    #[test]
+    fn the_plate_description_gives_the_matrix_and_the_crop() {
+        let desc = r#"{"range":1.5,"report":{"crop":{"x":8,"y":4,"w":6,"h":4}},"plate":{"frames":["blue","green","red"],"frame_height":4,"weights":[[1,0,0],[0,1,0],[0,0,1]]}}"#;
+        let meta = plate_meta(desc, 6, 12).unwrap();
+        assert_eq!(meta.range, 1.5);
+        assert_eq!((meta.crop.x, meta.crop.y, meta.crop.w, meta.crop.h), (8, 4, 6, 4));
+        let gray = vec![0u16; 6 * 12];
+        let rgb = encode_plate(&gray, &meta);
+        assert_eq!(rgb.len(), 6 * 4 * 3);
+        assert!(rgb.iter().all(|&v| v == 0));
+        let bare = r#"{"report":{"crop":{"x":8,"y":4,"w":6,"h":4}},"plate":{"frames":["blue","green","red"],"frame_height":4,"weights":[[1,0,0],[0,1,0],[0,0,1]]}}"#;
+        assert_eq!(plate_meta(bare, 6, 12).unwrap().range, 1.0);
     }
 }

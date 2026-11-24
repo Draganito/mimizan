@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 mimizan-core = { path = "../mimizan-core" }
+rawler.workspace = true
+rayon.workspace = true
 # The least-squares demultiplexer measured on X-Trans. It solves any 6×6
 # tile, and the Bayer bench runs it on the 2×2 mosaic written as one.
 mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }

@@ -13,11 +13,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+mimizan-cli = { path = "../mimizan-cli" }
+mimizan-core = { path = "../mimizan-core" }
+mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
+rawler.workspace = true
 egui = "0.36"
 egui-file-dialog = "0.15"
+serde_json.workspace = true
+tiff.workspace = true
 # TIFF only. The workspace image crate has no TIFF feature, and this
 # viewer reads the developed files the tools wrote.
-image = { version = "0.25", default-features = false, features = ["tiff"] }
+image = { version = "0.25", default-features = false, features = ["tiff", "jpeg", "png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }

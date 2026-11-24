@@ -1904,7 +1904,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-cli"
-version = "0.20.11"
+version = "0.20.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -1912,6 +1912,8 @@ dependencies = [
  "mimalloc",
  "mimizan-core",
  "mimizan-lab-xtrans",
+ "rawler",
+ "rayon",
  "serde",
  "serde_json",
  "sysinfo",
@@ -1921,18 +1923,24 @@ dependencies = [
 
 [[package]]
 name = "mimizan-compare"
-version = "0.20.11"
+version = "0.20.12"
 dependencies = [
  "anyhow",
  "eframe",
  "egui",
  "egui-file-dialog",
  "image",
+ "mimizan-cli",
+ "mimizan-core",
+ "mimizan-lab-xtrans",
+ "rawler",
+ "serde_json",
+ "tiff 0.10.3",
 ]
 
 [[package]]
 name = "mimizan-core"
-version = "0.20.11"
+version = "0.20.12"
 dependencies = [
  "criterion",
  "image",
@@ -1950,7 +1958,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-gui"
-version = "0.20.11"
+version = "0.20.12"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1988,7 +1996,7 @@ dependencies = [
 
 [[package]]
 name = "mimizan-mac"
-version = "0.20.11"
+version = "0.20.12"
 dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
