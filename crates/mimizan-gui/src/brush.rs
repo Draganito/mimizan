@@ -313,15 +313,15 @@ pub fn contain(
             // The penumbra handle sits a fixed stalk past ry, even with no feather.
             let down = along(-s, c);
             let ry_max = down.min(along(s, -c)) - f64::from(FEATHER_PT) / k;
-            b.hand.tip.rx = b.hand.tip.rx.clamp(MIN_AXIS, rx_max.max(MIN_AXIS).min(SIZE_LIMIT));
-            b.hand.tip.ry = b.hand.tip.ry.clamp(MIN_AXIS, ry_max.max(MIN_AXIS).min(SIZE_LIMIT));
+            b.hand.tip.rx = b.hand.tip.rx.clamp(MIN_AXIS, rx_max.clamp(MIN_AXIS, SIZE_LIMIT));
+            b.hand.tip.ry = b.hand.tip.ry.clamp(MIN_AXIS, ry_max.clamp(MIN_AXIS, SIZE_LIMIT));
             let feather_max = down - b.hand.tip.ry - f64::from(FEATHER_PT) / k;
-            b.hand.tip.feather = b.hand.tip.feather.clamp(0.0, feather_max.max(0.0).min(SIZE_LIMIT));
+            b.hand.tip.feather = b.hand.tip.feather.clamp(0.0, feather_max.clamp(0.0, SIZE_LIMIT));
         }
         Tool::Card => {
             let (s, c) = b.card.angle.to_radians().sin_cos();
             let feather_max = along(-c, -s) - f64::from(FEATHER_PT) / k;
-            b.card.feather = b.card.feather.clamp(0.0, feather_max.max(0.0).min(SIZE_LIMIT));
+            b.card.feather = b.card.feather.clamp(0.0, feather_max.clamp(0.0, SIZE_LIMIT));
         }
     }
     b
