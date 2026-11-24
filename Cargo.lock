@@ -1920,6 +1920,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimizan-compare"
+version = "0.20.9"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "image",
+]
+
+[[package]]
 name = "mimizan-core"
 version = "0.20.9"
 dependencies = [

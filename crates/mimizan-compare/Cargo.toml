@@ -1,0 +1,28 @@
+[package]
+name = "mimizan-compare"
+description = "Loupe: the Mimizan print beside the five closest demosaicers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mimizan-compare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+egui = "0.36"
+# TIFF only. The workspace image crate has no TIFF feature, and this
+# viewer reads the developed files the tools wrote.
+image = { version = "0.25", default-features = false, features = ["tiff"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
