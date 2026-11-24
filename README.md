@@ -180,7 +180,7 @@ Ahead of Markesteijn on all 24 pictures in each condition: by 5.6 dB pixel-sharp
 
 *least-squares demosaic* is in the Negative window, under Development. It is off. On, a Bayer file is written once as a linear DNG beside the RAW, named with `.mimizan` before `.dng`, highlights kept, and the RAW leaves the strip. Every later open with the checkbox on reads that DNG and does not look at the mosaic again. The darkroom from there is the linear DNG's: three channels, nothing separated a second time, the plate printing them as it prints the X-Trans DNG. Off, the file stays the measured separation, every pixel a sum of photosites, and the DNG is not a tile of the strip. The choice is remembered.
 
-The separation is the one measured on X-Trans, on the 2×2 mosaic written as a 6×6 tile. The eight line priors of that bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found.
+The separation is the one measured on X-Trans, on the 2×2 mosaic written as a 6×6 tile. The eight line priors of that bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. Where that share is a cast on a grey line, and the frequency separation is grey there, the separation's colour replaces it. The luminance stays the one the least squares solved.
 
 On the 24 Kodak pictures, the same three conditions as the plate and the X-Trans note, CPSNR on sRGB-encoded values with 16 px of the edge left out, against the sixteen demosaicers of libraw and RawTherapee. The mean leads in each condition. Not every picture does.
 
@@ -220,17 +220,17 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 
 The separation works in double precision on the whole frame: a 24-megapixel file holds about 1.8 GB while it is developed, 45 megapixels 3.4 GB, 61 megapixels 4.5 GB, and the open picture keeps most of that afterwards. When the next file would not fit beside the open one, the desktop lets the open one go first. What still does not fit in the free memory is begun through the swap: on Linux for as long as the swap has room, and on macOS and Windows the page file grows and the file is started. A file past the swap as well is refused with the figures in the log rather than started.
 
-Debian and Ubuntu: [mimizan_0.20.5-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.20.5/mimizan_0.20.5-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.20.6-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan_0.20.6-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.20.5-1_amd64.deb
+sudo apt install ./mimizan_0.20.6-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, and the `mimizan` command.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.20.5-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.5/mimizan-0.20.5-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
+Windows, 64-bit Intel and AMD: [mimizan-0.20.6-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan-0.20.6-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the two programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed.
 
-Apple silicon: [mimizan-0.20.5-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.5/mimizan-0.20.5-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open. A signed and sandboxed build of the window, without the command, is uploaded to App Store Connect for TestFlight; it is not on the Mac App Store yet. That build alone has a purchase: the JPEG at full size is free there, and the TIFF and the negative for another program are one purchase, made once and shared with the iPhone. This download, Linux and Windows have no purchase and lock nothing.
+Apple silicon: [mimizan-0.20.6-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan-0.20.6-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`. The programs use the frameworks that come with macOS. The first launch is a right-click and Open. A signed and sandboxed build of the window, without the command, is uploaded to App Store Connect for TestFlight; it is not on the Mac App Store yet. That build alone has a purchase: the JPEG at full size is free there, and the TIFF and the negative for another program are one purchase, made once and shared with the iPhone. This download, Linux and Windows have no purchase and lock nothing.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 

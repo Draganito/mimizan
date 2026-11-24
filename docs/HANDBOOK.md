@@ -11,9 +11,9 @@ No account. No network. The pictures stay on your computer.
 
 **Computer**
 
-- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.20.5/mimizan_0.20.5-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.20.5-1_amd64.deb`
-- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.20.5/mimizan-0.20.5-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
-- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.20.5/mimizan-0.20.5-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
+- [Linux (Debian/Ubuntu)](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan_0.20.6-1_amd64.deb) — open the file, or `sudo apt install ./mimizan_0.20.6-1_amd64.deb`
+- [Windows](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan-0.20.6-x86_64-windows.zip) — unzip it and start `mimizan-gui.exe`. Leave `cameras` and `look` next to the programs. Or the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5).
+- [Mac, Apple silicon](https://github.com/Draganito/mimizan/releases/download/v0.20.6/mimizan-0.20.6-aarch64-macos.zip) — unzip it. macOS blocks the unsigned download and says the app is damaged. Open a Terminal next to `Mimizan Lab.app` and run:
 
 ```bash
 xattr -cr "Mimizan Lab.app" && codesign --force --deep -s - "Mimizan Lab.app"
@@ -39,8 +39,10 @@ them: Negative, Enlarger, Print.
 **Negative** (left) is the file. Leave the white balance on *as shot*
 most of the time. *least-squares demosaic* writes a Bayer file out as a
 linear DNG beside it and opens that DNG, the same way a Fuji X-Trans file
-is opened. Leave it off and the file stays the measured separation, every
-pixel a sum of photosites. *Apply* develops again when you have changed something.
+is opened. On, a grey line keeps the separation's colour where the least
+squares had painted one, and the luminance stays. Leave it off and the file
+stays the measured separation, every pixel a sum of photosites. *Apply*
+develops again when you have changed something.
 What you chose stays with this file, in its recipe; the next file opens
 with its own. The demosaic checkbox is the program's, and it is remembered.
 
