@@ -6,13 +6,14 @@
 //! follows where the picture has two colours. It reads which photosite is
 //! which colour, and that pattern is the Bayer tile written out to six,
 //! which is the period the older solver asked for. The separation runs under
-//! the sRGB curve and comes back to linear light, as a camera file does.
-//! Nothing here is treated as burnt out.
+//! a tone curve, the one of [`TONES`] the mosaic itself speaks for, and
+//! comes back to linear light, as a camera file does. Nothing here is
+//! treated as burnt out.
 
-use crate::bayer2;
-use mimizan_lab_xtrans::convert::{self, Developed, Frame, WHITE};
+use crate::bayer2::{self, Spectrum, Weighing};
+use mimizan_lab_xtrans::convert::{Developed, Frame, WHITE};
 use mimizan_lab_xtrans::plane::{Plane, Rgb};
-use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, Selection, XTile};
+use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, XTile};
 use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
@@ -38,6 +39,92 @@ const CHECK_FLICKER: f64 = 0.0015;
 /// the solve itself is on the 2×2. Row-major.
 pub const BAYER6: &str = "RGRGRGGBGBGBRGRGRGGBGBGBRGRGRGGBGBGB";
 
+/// The slope of the sRGB curve at black.
+const BLACK_SLOPE: f64 = 12.92;
+
+/// A tone curve the separation runs under.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Tone {
+    /// The sRGB curve, its straight foot continued below zero and its
+    /// power above one.
+    Srgb,
+    /// A power of the light, moved by `foot` so that it is as steep at
+    /// black as the sRGB curve and no steeper, and straight below black.
+    /// Zero stays zero and one stays one. Made by [`Tone::power`].
+    Power { exponent: f64, foot: f64 },
+}
+
+/// The curves a mosaic may choose from.
+///
+/// A picture a lens has drawn is smooth in light, and the sRGB curve bends
+/// it: what was below the sensor's limit is partly above it afterwards. A
+/// picture with its own fine detail is steadier under the sRGB curve,
+/// which is where its noise and its edges are the same size at every
+/// level. The two powers lie between that curve and the light itself.
+pub const TONES: [f64; 2] = [0.6, 0.7];
+
+impl Tone {
+    /// The power `exponent`, between 0 and 1, with its foot.
+    pub fn power(exponent: f64) -> Tone {
+        assert!(exponent > 0.0 && exponent < 1.0, "the curve is a root of the light");
+        let g = exponent;
+        let mut foot: f64 = 0.0;
+        for _ in 0..40 {
+            let span = (1.0 + foot).powf(g) - foot.powf(g);
+            foot = (BLACK_SLOPE * span / g).powf(1.0 / (g - 1.0));
+        }
+        Tone::Power { exponent, foot }
+    }
+
+    /// From light to the curve.
+    pub fn to(self, v: f64) -> f64 {
+        match self {
+            Tone::Srgb => Curve::Srgb.to(v),
+            Tone::Power { .. } if v < 0.0 => BLACK_SLOPE * v,
+            Tone::Power { exponent: g, foot: e } => {
+                ((v + e).powf(g) - e.powf(g)) / ((1.0 + e).powf(g) - e.powf(g))
+            }
+        }
+    }
+
+    /// From the curve back to light.
+    pub fn back(self, v: f64) -> f64 {
+        match self {
+            Tone::Srgb => Curve::Srgb.back(v),
+            Tone::Power { .. } if v < 0.0 => v / BLACK_SLOPE,
+            Tone::Power { exponent: g, foot: e } => {
+                (v * ((1.0 + e).powf(g) - e.powf(g)) + e.powf(g)).powf(1.0 / g) - e
+            }
+        }
+    }
+
+    /// How steep the curve is at the light `v`.
+    pub fn slope(self, v: f64) -> f64 {
+        match self {
+            Tone::Srgb if v <= 0.003_130_8 => BLACK_SLOPE,
+            Tone::Srgb => 1.055 / 2.4 * v.powf(1.0 / 2.4 - 1.0),
+            Tone::Power { .. } if v < 0.0 => BLACK_SLOPE,
+            Tone::Power { exponent: g, foot: e } => {
+                g * (v + e).powf(g - 1.0) / ((1.0 + e).powf(g) - e.powf(g))
+            }
+        }
+    }
+
+    /// The mosaic under the curve.
+    pub fn mosaic(self, m: &Plane) -> Plane {
+        Plane::from_vec(m.width, m.height, m.data.par_iter().map(|v| self.to(*v)).collect())
+    }
+}
+
+impl std::fmt::Display for Tone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Tone::Srgb => write!(f, "sRGB"),
+            Tone::Power { exponent, .. } => write!(f, "power {exponent}"),
+        }
+    }
+}
+
 /// What may be moved while the method is being measured. The defaults are
 /// the separation measured on the Kodak set: the X-Trans bank without its
 /// line priors, plus eight directions whose luminance falls only as `f¹`.
@@ -45,14 +132,20 @@ pub const BAYER6: &str = "RGRGRGGBGBGBRGRGRGGBGBGBRGRGRGGBGBGB";
 pub struct Knobs {
     /// Gaussian σ of the window the priors are weighed in, px.
     pub sigma: f64,
+    /// Gaussian σ of the window their left-out error is taken in, px.
+    pub near: f64,
+    /// Share of the left-out error in the weight; 0 weighs by the likelihood alone.
+    pub left_out: f64,
     /// How many pixels' worth of evidence that weight is given.
     pub sharp: f64,
     /// Head start of the prior the search found, in the units of the score.
     pub bias: f64,
-    /// The eight priors for lines near the sensor's limit. They were measured
-    /// for the X-Trans tile, which holds every colour in every row. A Bayer
-    /// row does not, and on a saturated picture they take the colour out.
-    pub lines: bool,
+    /// How often the lens and the noise are moved towards what the mosaic
+    /// gives them, after the search. 0 leaves the search's Gaussian lens.
+    pub lens_rounds: usize,
+    /// The curve to separate under. `None` is the one of sRGB and
+    /// [`TONES`] the mosaic speaks for.
+    pub tone: Option<Tone>,
     /// How often the second step is repeated.
     pub rounds: usize,
     /// The test that keeps the second step only where the luminance gets
@@ -64,7 +157,18 @@ pub struct Knobs {
 
 impl Default for Knobs {
     fn default() -> Self {
-        Self { sigma: 6.0, sharp: 20.0, bias: 0.0, lines: false, rounds: 1, check: 4.0, hold: 0.15 }
+        Self {
+            sigma: 6.0,
+            near: 1.0,
+            left_out: 0.5,
+            sharp: 20.0,
+            bias: 0.0,
+            lens_rounds: 100,
+            tone: None,
+            rounds: 1,
+            check: 4.0,
+            hold: 0.15,
+        }
     }
 }
 
@@ -75,59 +179,140 @@ pub fn demosaic(linear: &[f64], width: usize, knobs: &Knobs) -> Rgb {
     separate(linear, linear, width, knobs, &|_| {}).0
 }
 
+/// A photosite this near the frame's highest value is taken to be burnt.
+const BURNT: f64 = 0.99;
+
+/// The curve the mosaic `fit`, in light, speaks for, of sRGB and [`TONES`].
+///
+/// Under each curve the spectrum is searched, coarsely, and two things are
+/// asked of it, the same two a spectrum of the bank is asked at a pixel,
+/// here over the frame and in the measure of the light: how probable the
+/// light is ([`bayer2::likelihood`]) and how well a photosite is told from
+/// the others ([`bayer2::told`]). They are weighed as the bank weighs
+/// them, with `left_out`.
+///
+/// That sum is a mean of logarithms, and a dark part of the picture
+/// counts in it as much as a light one. In the picture it does not: an
+/// error in the dark is seen larger. So a power is taken only when the
+/// photosites are also told better in the mean square, the error measured
+/// under the sRGB curve, where a picture is looked at
+/// ([`bayer2::missed`]).
+///
+/// A burnt photosite does not say how steep a curve is at white. It is a
+/// value the light was at least, which is as probable under one curve as
+/// under another, and a sky burnt out would otherwise choose the curve
+/// that is steepest there.
+pub fn tone_of(fit: &Plane, knobs: &Knobs) -> Tone {
+    let said = tone_scores(fit, knobs);
+    let mut best = said[0];
+    for other in &said[1..] {
+        if other.missed < said[0].missed && other.against < best.against {
+            best = *other;
+        }
+    }
+    best.tone
+}
+
+/// What the mosaic says of one curve. Smaller is better, both.
+#[derive(Clone, Copy, Debug)]
+struct Said {
+    tone: Tone,
+    /// The likelihood of the light and the left-out error in it, weighed as the bank weighs them.
+    against: f64,
+    /// The mean square of the left-out error under the sRGB curve.
+    missed: f64,
+}
+
+/// sRGB first, then [`TONES`].
+fn tone_scores(fit: &Plane, knobs: &Knobs) -> Vec<Said> {
+    let top = BURNT * fit.data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let start = Prior { lens: 0.3, ..Prior::default() };
+    let share = knobs.left_out.clamp(0.0, 1.0);
+    let plane = |of: &(dyn Fn(f64) -> f64 + Sync)| {
+        Plane::from_vec(fit.width, fit.height, fit.data.par_iter().map(|v| of(*v)).collect())
+    };
+    let mut said = Vec::new();
+    for tone in std::iter::once(Tone::Srgb).chain(TONES.map(Tone::power)) {
+        let m = tone.mosaic(fit);
+        let found = bayer2::fit_spectrum(&m, start, 4, knobs.lens_rounds);
+        let slope = plane(&|v| tone.slope(v));
+        let stretch = plane(&|v| if v >= top { 0.0 } else { tone.slope(v).ln() });
+        let mut against = 0.0;
+        if share < 1.0 {
+            against -= (1.0 - share) * bayer2::likelihood(&m, &found, &stretch);
+        }
+        if share > 0.0 {
+            against += share * bayer2::told(&m, &found, &slope, knobs.near, 1.0 / f64::from(WHITE));
+        }
+        let missed = bayer2::missed(&m, &found, &plane(&|v| tone.slope(v) / Tone::Srgb.slope(v)));
+        said.push(Said { tone, against, missed });
+    }
+    said
+}
+
 /// [`demosaic`], with the prior searched on `fit` rather than on `linear`.
 /// A burnt photosite is kept in `linear` and left out of `fit`, so the
 /// highlight does not decide the prior and still reaches the picture.
-/// `progress` is told the share of the first step that is done.
+/// `progress` is told the share of the first step that is done. The curve
+/// it ran under comes back with the picture and the prior.
 pub fn separate(
     linear: &[f64],
     fit: &[f64],
     width: usize,
     knobs: &Knobs,
     progress: &dyn Fn(f64),
-) -> (Rgb, Prior) {
+) -> (Rgb, Prior, Tone) {
     assert!(width > 0 && linear.len().is_multiple_of(width), "the mosaic is not a rectangle");
     assert_eq!(linear.len(), fit.len(), "the prior is searched on another frame");
     let height = linear.len() / width;
     let tile = XTile::from_name(BAYER6).expect("the Bayer tile");
     assert!(tile.mirrors(width, height), "this frame does not mirror the Bayer tile");
-    let tone = Curve::Srgb;
+    let fit = Plane::from_vec(width, height, fit.to_vec());
+    let tone = knobs.tone.unwrap_or_else(|| tone_of(&fit, knobs));
     let start = Prior { lens: 0.3, ..Prior::default() };
     // Every set, not every eighth. An eighth is enough on a smooth picture
     // and not on a fine one: kodim19 and kodim22 moved by half a decibel
     // once the search was shown the whole mosaic.
-    let found =
-        bayer2::fit_prior(&tone.mosaic(&Plane::from_vec(width, height, fit.to_vec())), start, 1, [true; 6]);
+    let found = bayer2::fit_spectrum(&tone.mosaic(&fit), start, 1, knobs.lens_rounds);
     let m = tone.mosaic(&Plane::from_vec(width, height, linear.to_vec()));
-    let priors = bayer_priors(found, knobs.lines);
-    let sel = Selection { sigma: knobs.sigma, sharp: knobs.sharp, bias: knobs.bias };
+    let priors = bayer_priors(&found);
+    let sel = Weighing {
+        sigma: knobs.sigma,
+        near: knobs.near,
+        left_out: knobs.left_out,
+        sharp: knobs.sharp,
+        bias: knobs.bias,
+    };
     let (c1, c2) = bayer2::separate_bank(&m, &priors, &sel, progress);
     let sep = xtrans::from_chroma(&m, &tile, c1, c2);
     let refine = Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
     let rgb = xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb();
-    (without_line_checker(rgb), found)
+    (without_line_checker(rgb), found.prior, tone)
 }
 
-/// The priors weighed per pixel.
+/// The spectra weighed per pixel.
 ///
-/// The bank measured for X-Trans, without the eight line priors unless
-/// asked. Those priors assume every row holds red, green and blue, which
-/// is true of the X-Trans tile and false of a Bayer row, and on a saturated
-/// picture they take the colour out (kodim03 and kodim15, about 7 dB).
+/// The one found; that one with a sixteenth, a quarter, four and sixteen
+/// times the colour; and sixteen with a direction. Eight hold four times
+/// the colour to their direction with `cos⁸`. In the other eight the
+/// luminance falls only as `f¹`, so a fine edge can keep its contrast, and
+/// the direction is held with `cos³²`: a Bayer edge is one photosite wide.
+/// Their colour stays the one found, and it still falls with frequency. A
+/// colour that does not fall is taken on a saturated picture and the
+/// colour goes: that is what the X-Trans line priors did here (kodim03
+/// and kodim15, about 7 dB), and they are not in this bank.
 ///
-/// In their place, eight directions. The luminance falls only as `f¹`, so a
-/// fine edge can keep its contrast, and the direction is held with `cos³²`
-/// rather than the `cos⁸` of the bank: a Bayer edge is one photosite wide.
-/// The colour stays the one the search found, and it still falls with
-/// frequency. A colour that does not fall is taken on a saturated picture
-/// and the colour goes.
-fn bayer_priors(found: Prior, lines: bool) -> Vec<Prior> {
-    let mut priors = convert::bank(found);
-    if !lines {
-        priors.truncate(13);
-    }
-    let along = Prior { alpha: found.alpha.min(1.0), ..found };
-    priors.extend((0..8).map(|j| Prior { oriented: Some((PI * j as f64 / 8.0, 32.0)), ..along }));
+/// All of them are behind the lens the mosaic was found to have.
+pub fn bayer_priors(found: &Spectrum) -> Vec<Spectrum> {
+    let colour = |f: f64| found.with(Prior { chroma: found.prior.chroma.map(|c| c * f), ..found.prior });
+    let towards = |q: Spectrum, k: f64| {
+        (0..8).map(move |j| q.with(Prior { oriented: Some((PI * j as f64 / 8.0, k)), ..q.prior }))
+    };
+    let along = found.with(Prior { alpha: found.prior.alpha.min(1.0), ..found.prior });
+    let mut priors = vec![found.clone()];
+    priors.extend([0.0625, 0.25, 4.0, 16.0].map(colour));
+    priors.extend(towards(colour(4.0), 8.0));
+    priors.extend(towards(along, 32.0));
     priors
 }
 
@@ -149,7 +334,7 @@ fn luma(r: &[f64], g: &[f64], b: &[f64]) -> Vec<f64> {
 /// horizontal change, which a real edge does. Where both hold, half of that
 /// Nyquist sample is put back, and no more than [`CHECK_CAP`]. On the 24
 /// Kodak pictures the colour PSNR moves by a few hundredths of a decibel.
-fn without_line_checker(rgb: Rgb) -> Rgb {
+pub fn without_line_checker(rgb: Rgb) -> Rgb {
     let (width, height) = (rgb.r.width, rgb.r.height);
     let (c1, c2) = chroma(&rgb.r.data, &rgb.g.data, &rgb.b.data);
     let lum = luma(&rgb.r.data, &rgb.g.data, &rgb.b.data);
@@ -310,8 +495,7 @@ pub fn develop(img: &RawImage, tell: &dyn Fn(String)) -> Result<Developed, Strin
     let fit: Vec<f64> = mosaic.par_iter().map(|v| v.min(ceiling)).collect();
 
     tell("searching the prior".into());
-    tell("separating luminance and colour".into());
-    let (rgb, prior) = separate(&mosaic, &fit, width, &Knobs::default(), &|share| {
+    let (rgb, prior, _) = separate(&mosaic, &fit, width, &Knobs::default(), &|share| {
         tell(format!("separating luminance and colour, {:.0}%", share.clamp(0.0, 1.0) * 100.0));
     });
 
@@ -384,7 +568,103 @@ fn channel_at(x: usize, y: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{channel_at, demosaic, from_luma, luma, red_site, without_line_checker, Knobs};
+    use super::{
+        bayer2, bayer_priors, channel_at, demosaic, from_luma, luma, red_site, tone_scores,
+        without_line_checker, Knobs, Plane, Prior, Spectrum, Tone, Weighing, BLACK_SLOPE,
+    };
+    use std::f64::consts::PI;
+
+    #[test]
+    fn a_curve_comes_back_and_is_as_steep_as_it_says() {
+        for tone in [Tone::Srgb, Tone::power(0.6), Tone::power(0.7)] {
+            assert!(tone.to(0.0).abs() < 1e-12, "{tone} moves black");
+            assert!((tone.to(1.0) - 1.0).abs() < 1e-12, "{tone} moves white");
+            for v in [-0.02, -1e-4, 1e-5, 2e-3, 0.02, 0.18, 0.7, 1.0, 1.3] {
+                let back = tone.back(tone.to(v));
+                assert!((back - v).abs() < 1e-12, "{tone} takes {v} to {back}");
+                let d = 1e-7;
+                let rise = (tone.to(v + d) - tone.to(v - d)) / (2.0 * d);
+                assert!(
+                    (rise / tone.slope(v) - 1.0).abs() < 1e-5,
+                    "{tone} at {v}: {rise} for {}",
+                    tone.slope(v)
+                );
+            }
+            for v in [-1e-12, 1e-12] {
+                let s = tone.slope(v);
+                assert!((s / BLACK_SLOPE - 1.0).abs() < 1e-6, "{tone} is {s} steep at black");
+            }
+        }
+    }
+
+    /// A mosaic of many waves, in light. Under `tone` it is a sum of
+    /// waves; the three channels share most of them.
+    fn waves(w: usize, h: usize, tone: Tone, seed: u64) -> Plane {
+        let mut s = seed;
+        let mut next = move || {
+            s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        // Frequency, direction, strength, and a phase for each channel.
+        let parts: Vec<(f64, f64, f64, [f64; 3])> = (0..240)
+            .map(|k| {
+                let f = 0.004 * (0.45f64 / 0.004).powf(next());
+                let dir = PI * next();
+                let phase = 2.0 * PI * next();
+                // One wave in six is a colour: slow, and not the same in the channels.
+                let own = if k % 6 == 0 { [0.0, 2.0 * next(), 4.0 * next()] } else { [0.0; 3] };
+                let f = if k % 6 == 0 { f.min(0.08) } else { f };
+                (f * dir.cos(), f * dir.sin(), f.powf(-1.3), own.map(|o| phase + o))
+            })
+            .collect();
+        let field: Vec<[f64; 3]> = (0..w * h)
+            .map(|i| {
+                let (x, y) = ((i % w) as f64, (i / w) as f64);
+                let mut v = [0.0; 3];
+                for (fx, fy, a, phase) in &parts {
+                    for (c, p) in v.iter_mut().zip(phase) {
+                        *c += a * (2.0 * PI * (fx * x + fy * y) + p).cos();
+                    }
+                }
+                v
+            })
+            .collect();
+        let span = field.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
+        let data = field
+            .iter()
+            .enumerate()
+            .map(|(i, v)| tone.back(0.5 + 0.45 * v[channel_at(i % w, i / w)] / span))
+            .collect();
+        Plane::from_vec(w, h, data)
+    }
+
+    #[test]
+    fn the_light_speaks_for_the_curve_it_was_drawn_under() {
+        // The two powers are near each other, and waves drawn under one
+        // may speak for the other. They do not speak for the sRGB curve,
+        // and waves drawn under that speak for neither power.
+        let (w, h) = (160usize, 128usize);
+        let said = |tone: Tone| tone_scores(&waves(w, h, tone, 17), &Knobs::default());
+        let srgb = said(Tone::Srgb);
+        assert!(srgb[1..].iter().all(|s| s.against > srgb[0].against), "drawn under sRGB: {srgb:?}");
+        let power = said(Tone::power(0.7));
+        assert!(power[2].against < power[0].against, "drawn under power 0.7: {power:?}");
+    }
+
+    #[test]
+    fn a_burnt_sky_does_not_choose_the_curve() {
+        // White is where the sRGB curve is flattest of the three. Were the
+        // burnt photosites asked how steep a curve is, they would all say
+        // the same thing, and there are many of them.
+        let (w, h) = (160usize, 128usize);
+        let mut frame = waves(w, h, Tone::Srgb, 17);
+        let top = frame.data.iter().copied().fold(0.0, f64::max);
+        for v in &mut frame.data[..w * h / 2] {
+            *v = top;
+        }
+        let said = tone_scores(&frame, &Knobs::default());
+        assert!(said[1..].iter().all(|s| s.against > said[0].against), "half the frame burnt: {said:?}");
+    }
 
     #[test]
     fn the_red_photosite_names_the_tile() {
@@ -428,6 +708,76 @@ mod tests {
         let l = luma(&got.r.data, &got.g.data, &got.b.data);
         let i = 8 * w + 20;
         assert!((l[i] - 0.10).abs() < 1e-9, "the vertical lines moved");
+    }
+
+    /// A picture with edges in every direction and three unlike channels.
+    fn scene(w: usize, h: usize) -> impl Fn(usize, usize) -> [f64; 3] {
+        move |x: usize, y: usize| {
+            let (u, v) = (x as f64 / w as f64, y as f64 / h as f64);
+            let ring = ((u - 0.4).hypot(v - 0.55) * 23.0).sin();
+            let bar = if (3.0 * u + 5.0 * v).fract() < 0.5 { 0.12 } else { -0.08 };
+            [0.42 + 0.20 * ring + bar, 0.38 + 0.16 * ring - 0.5 * bar, 0.30 - 0.12 * ring + 0.7 * bar * u]
+        }
+    }
+
+    fn mosaic_of(w: usize, h: usize, at: &dyn Fn(usize, usize) -> [f64; 3]) -> Vec<f64> {
+        (0..w * h).map(|i| at(i % w, i / w)[channel_at(i % w, i / w)]).collect()
+    }
+
+    /// How far a demosaiced frame is from the scene it was cut from, root mean square.
+    fn error_of(w: usize, h: usize, at: &dyn Fn(usize, usize) -> [f64; 3]) -> f64 {
+        let got = demosaic(&mosaic_of(w, h, at), w, &Knobs::default());
+        let mut sum = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                let (i, want) = (y * w + x, at(x, y));
+                sum += (got.r.data[i] - want[0]).powi(2)
+                    + (got.g.data[i] - want[1]).powi(2)
+                    + (got.b.data[i] - want[2]).powi(2);
+            }
+        }
+        (sum / (3 * w * h) as f64).sqrt()
+    }
+
+    #[test]
+    fn an_odd_frame_is_separated() {
+        // A sensor whose red is not in the corner loses a row or a column,
+        // and an even crop comes out odd. It is the same picture, less one
+        // row or one column, and it is told as well.
+        let at = scene(64, 48);
+        let even = error_of(64, 48, &at);
+        for (w, h) in [(63usize, 48usize), (64, 47), (63, 47)] {
+            let odd = error_of(w, h, &at);
+            assert!(odd < 1.1 * even, "{w}×{h} is {odd} from the scene, the even frame {even}");
+        }
+    }
+
+    #[test]
+    fn a_frame_turned_about_its_diagonal_gives_the_same_colours_turned() {
+        // Red stays in the corner and blue beside it, so nothing but the
+        // directions of the bank changes, and those change into each other.
+        let (w, h) = (72usize, 56usize);
+        let at = scene(w, h);
+        let turned = move |x: usize, y: usize| at(y, x);
+        let bank = bayer_priors(&Spectrum::plain(Prior {
+            lens: 0.4,
+            noise: 1e-3,
+            chroma: [0.02, 0.01],
+            ..Prior::default()
+        }));
+        let weighing = Weighing::default();
+        let straight = Plane::from_vec(w, h, mosaic_of(w, h, &scene(w, h)));
+        let across = Plane::from_vec(h, w, mosaic_of(h, w, &turned));
+        let (a1, a2) = bayer2::separate_bank(&straight, &bank, &weighing, &|_| {});
+        let (b1, b2) = bayer2::separate_bank(&across, &bank, &weighing, &|_| {});
+        let mut worst = 0.0f64;
+        for y in 0..h {
+            for x in 0..w {
+                worst = worst.max((a1.data[y * w + x] - b1.data[x * h + y]).abs());
+                worst = worst.max((a2.data[y * w + x] - b2.data[x * h + y]).abs());
+            }
+        }
+        assert!(worst < 1e-9, "the turned frame differs by {worst}");
     }
 
     #[test]

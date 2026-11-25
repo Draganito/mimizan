@@ -8,7 +8,7 @@
 use crate::kodak::{has_tool, run_external, stem_of, tool_version, Tool, METHODS};
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use mimizan_cli::bayer_ls::{self, Knobs};
+use mimizan_cli::bayer_ls::{self, Knobs, Tone};
 use mimizan_core::cfa::BayerPhase;
 use mimizan_core::kodak::{self, colour_quality, ColourQuality};
 use mimizan_core::plane::Plane;
@@ -46,15 +46,24 @@ pub struct BayerBenchArgs {
     /// Gaussian σ of the window the priors are weighed in
     #[arg(long, default_value_t = 6.0)]
     pub sigma: f64,
+    /// Gaussian σ of the window the left-out error of the priors is taken in
+    #[arg(long, default_value_t = 1.0)]
+    pub near: f64,
+    /// Share of the left-out error in the weight; 0 = the likelihood alone
+    #[arg(long, default_value_t = 0.5)]
+    pub left_out: f64,
     /// How many pixels' worth of evidence that weight is given
     #[arg(long, default_value_t = 20.0)]
     pub sharp: f64,
     /// Head start of the prior the search found
     #[arg(long, default_value_t = 0.0)]
     pub bias: f64,
-    /// Put back the eight line priors measured for the X-Trans tile
-    #[arg(long)]
-    pub lines: bool,
+    /// How often the lens and the noise are moved towards the mosaic's own after the search; 0 = the search's Gaussian lens
+    #[arg(long, default_value_t = 100)]
+    pub lens_rounds: usize,
+    /// The curve to separate under: `auto` (the one the mosaic speaks for), `srgb`, or the exponent of a power
+    #[arg(long, default_value = "auto")]
+    pub tone: String,
     /// How often the second step is repeated
     #[arg(long, default_value_t = 1)]
     pub rounds: usize,
@@ -75,6 +84,8 @@ struct ImageResult {
     demosaic: Vec<Option<ColourQuality>>,
     /// The least-squares Bayer demosaic.
     bayer: ColourQuality,
+    /// The curve it was separated under.
+    tone: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -89,12 +100,15 @@ struct Report {
     images: Vec<ImageResult>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct KnobDump {
     sigma: f64,
+    near: f64,
+    left_out: f64,
     sharp: f64,
     bias: f64,
-    lines: bool,
+    lens_rounds: usize,
+    tone: String,
     rounds: usize,
     check: f64,
     hold: f64,
@@ -106,11 +120,22 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
         bail!("the least-squares tile is RGGB; other phases are not measured yet");
     }
     std::fs::create_dir_all(&a.out)?;
+    let tone = match a.tone.as_str() {
+        "auto" => None,
+        "srgb" => Some(Tone::Srgb),
+        power => match power.parse::<f64>() {
+            Ok(g) if g > 0.0 && g < 1.0 => Some(Tone::power(g)),
+            _ => bail!("--tone is auto, srgb or an exponent between 0 and 1, not {power}"),
+        },
+    };
     let knobs = Knobs {
         sigma: a.sigma,
+        near: a.near,
+        left_out: a.left_out,
         sharp: a.sharp,
         bias: a.bias,
-        lines: a.lines,
+        lens_rounds: a.lens_rounds,
+        tone,
         rounds: a.rounds,
         check: a.check,
         hold: a.hold,
@@ -190,7 +215,7 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
             }
         }
         let linear: Vec<f64> = fb.samples.iter().map(|v| f64::from(*v) / 65535.0).collect();
-        let got = bayer_ls::demosaic(&linear, w, &knobs);
+        let (got, _, tone) = bayer_ls::separate(&linear, &linear, w, &knobs, &|_| {});
         let est = Rgb {
             r: Plane::from_vec(w, h, got.r.data),
             g: Plane::from_vec(w, h, got.g.data),
@@ -199,10 +224,10 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
         let bayer = colour_quality(&est, &rgb, a.border);
         let best_ext = demosaic.iter().flatten().map(|q| q.cpsnr_db).fold(f64::NEG_INFINITY, f64::max);
         eprintln!(
-            "{stem}: bayer {:.2} dB (R {:.2} G {:.2} B {:.2}), best demosaicer {:.2} dB",
+            "{stem}: bayer {:.2} dB (R {:.2} G {:.2} B {:.2}) under {tone}, best demosaicer {:.2} dB",
             bayer.cpsnr_db, bayer.psnr_r_db, bayer.psnr_g_db, bayer.psnr_b_db, best_ext
         );
-        images.push(ImageResult { stem, width: w, height: h, demosaic, bayer });
+        images.push(ImageResult { stem, width: w, height: h, demosaic, bayer, tone: tone.to_string() });
     }
 
     let report = Report {
@@ -212,9 +237,12 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
         blur: a.blur,
         knobs: KnobDump {
             sigma: knobs.sigma,
+            near: knobs.near,
+            left_out: knobs.left_out,
             sharp: knobs.sharp,
             bias: knobs.bias,
-            lines: knobs.lines,
+            lens_rounds: knobs.lens_rounds,
+            tone: a.tone.clone(),
             rounds: knobs.rounds,
             check: knobs.check,
             hold: knobs.hold,

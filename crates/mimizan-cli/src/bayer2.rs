@@ -4,9 +4,12 @@
 //! at `(½, ½)` and the red-blue carriers at `(½, 0)` and `(0, ½)`. Frequencies
 //! that differ by those steps are one set, four bins, and the most probable
 //! luminance and both chrominances of the set are one 4×4 solve. The prior
-//! is the one the mosaic itself makes most probable, a bank of those priors
-//! is weighed per pixel, and the second step (a line through two colours)
-//! is the one the 6×6 solver uses: it reads the photosite, not the period.
+//! is the one the mosaic itself makes most probable, and the lens in front
+//! of it is measured from the mosaic radius by radius. A bank of those
+//! spectra is weighed per pixel, by how probable the mosaic around the
+//! pixel is under each and by how well each tells a photosite from all the
+//! others. The second step (a line through two colours) is the one the 6×6
+//! solver uses: it reads the photosite, not the period.
 //!
 //! The transform is the same convention as that solver. The forward transform
 //! is unnormalised and the inverse is divided by the number of samples, so a
@@ -16,7 +19,7 @@ use mimizan_lab_xtrans::filter::{
     convolve_cols_signed_into, convolve_rows_mod_into, gaussian_kernel, reflect,
 };
 use mimizan_lab_xtrans::plane::Plane;
-use mimizan_lab_xtrans::xtrans::{Prior, Selection};
+use mimizan_lab_xtrans::xtrans::Prior;
 use rayon::prelude::*;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -148,10 +151,63 @@ fn bin_freq(i: usize, n: usize) -> f64 {
     }
 }
 
-fn power(prior: &Prior, fu: f64, fv: f64) -> (f64, f64) {
+/// Width of one step of a measured lens, in c/px.
+const LENS_STEP: f64 = 0.01;
+/// Steps of a measured lens: out to the corner of the spectrum, 1/√2.
+const LENS_STEPS: usize = 72;
+
+/// What the picture's spectrum is taken to be.
+///
+/// The power laws, the chrominance shares, the noise and the direction are
+/// the [`Prior`]'s. The lens need not be its Gaussian: `lens` is what the
+/// lens passes of the power at each radius, in steps of [`LENS_STEP`], and
+/// it replaces the prior's own. A picture enlarged to twice its size, or
+/// one a real lens drew, is flat and then ends; a Gaussian that ends as
+/// early has taken the middle frequencies with it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spectrum {
+    pub prior: Prior,
+    /// What the lens passes of the power, by radius. `None` is the prior's Gaussian.
+    pub lens: Option<Arc<Vec<f64>>>,
+}
+
+impl Spectrum {
+    /// The prior alone, behind its Gaussian lens.
+    pub fn plain(prior: Prior) -> Self {
+        Self { prior, lens: None }
+    }
+
+    /// The same lens in front of another prior.
+    pub fn with(&self, prior: Prior) -> Self {
+        Self { prior, lens: self.lens.clone() }
+    }
+
+    /// What the lens passes of the power at `r` c/px.
+    fn pass(&self, r: f64) -> f64 {
+        match &self.lens {
+            None => (-4.0 * PI * PI * self.prior.lens * self.prior.lens * r * r).exp(),
+            Some(t) => {
+                // Between the centres of two steps, along a straight line in the logarithm.
+                let x = (r / LENS_STEP - 0.5).max(0.0);
+                let i = (x.floor() as usize).min(t.len() - 2);
+                let f = (x - i as f64).min(1.0);
+                (t[i].max(1e-300).ln() * (1.0 - f) + t[i + 1].max(1e-300).ln() * f).exp()
+            }
+        }
+    }
+
+    /// The two power laws at `r²`, luminance and chrominance, without lens or direction.
+    fn laws(&self, r2: f64) -> (f64, f64) {
+        let p = &self.prior;
+        let base = (p.f0 * p.f0 + r2) / (p.f0 * p.f0 + 0.0625);
+        (base.powf(-p.alpha / 2.0), base.powf(-p.alpha_c / 2.0))
+    }
+}
+
+/// Luminance power and the two chrominance powers.
+fn power(spec: &Spectrum, fu: f64, fv: f64) -> (f64, [f64; 2]) {
+    let prior = &spec.prior;
     let r2 = fu * fu + fv * fv;
-    let base = (prior.f0 * prior.f0 + r2) / (prior.f0 * prior.f0 + 0.0625);
-    let lens = (-4.0 * PI * PI * prior.lens * prior.lens * r2).exp();
     let dir = match prior.oriented {
         Some((theta, k)) if r2 > 0.0 => {
             let c = (fu * theta.cos() + fv * theta.sin()) / r2.sqrt();
@@ -163,19 +219,21 @@ fn power(prior: &Prior, fu: f64, fv: f64) -> (f64, f64) {
         }
         _ => 1.0,
     };
-    (lens * dir * base.powf(-prior.alpha / 2.0), lens * dir * base.powf(-prior.alpha_c / 2.0))
+    let through = spec.pass(r2.sqrt()) * dir;
+    let (l, c) = spec.laws(r2);
+    (through * l, [0, 1].map(|k| through * prior.chroma[k] * c))
 }
 
 /// Powers at bin `(u, v)`. A bin at half the sampling rate stands for `+½`
 /// and `−½` alike, which an oriented prior tells apart, so it gets the mean.
-fn bin_power(prior: &Prior, u: usize, v: usize, tw: usize, th: usize) -> (f64, f64) {
+fn bin_power(spec: &Spectrum, u: usize, v: usize, tw: usize, th: usize) -> (f64, [f64; 2]) {
     let (fu, fv) = (bin_freq(u, tw), bin_freq(v, th));
-    let p = power(prior, fu, fv);
-    if prior.oriented.is_none() || (2 * u != tw && 2 * v != th) {
+    let p = power(spec, fu, fv);
+    if spec.prior.oriented.is_none() || (2 * u != tw && 2 * v != th) {
         return p;
     }
-    let q = if 2 * u == tw { power(prior, -fu, fv) } else { power(prior, fu, -fv) };
-    (0.5 * (p.0 + q.0), 0.5 * (p.1 + q.1))
+    let q = if 2 * u == tw { power(spec, -fu, fv) } else { power(spec, fu, -fv) };
+    (0.5 * (p.0 + q.0), [0.5 * (p.1[0] + q.1[0]), 0.5 * (p.1[1] + q.1[1])])
 }
 
 /// The row of sets that holds the conjugates of row `v0`: none for the two
@@ -198,7 +256,7 @@ fn set_matrix(
     tw: usize,
     th: usize,
     nz: &[Vec<(usize, usize, C64)>; 2],
-    prior: &Prior,
+    spec: &Spectrum,
     u0: usize,
     v0: usize,
     g: &mut [C64; N * N],
@@ -209,15 +267,15 @@ fn set_matrix(
     for b in 0..2 {
         for a in 0..2 {
             let i = b * 2 + a;
-            let (l, c) = bin_power(prior, u0 + a * qw, v0 + b * qh, tw, th);
+            let (l, c) = bin_power(spec, u0 + a * qw, v0 + b * qh, tw, th);
             sl[i] = l;
-            sc[0][i] = c * prior.chroma[0];
-            sc[1][i] = c * prior.chroma[1];
+            sc[0][i] = c[0];
+            sc[1][i] = c[1];
         }
     }
     *g = [C64::new(0.0, 0.0); N * N];
     for i in 0..N {
-        g[i * N + i] = C64::new(sl[i] + prior.noise, 0.0);
+        g[i * N + i] = C64::new(sl[i] + spec.prior.noise, 0.0);
     }
     for (kind, list) in nz.iter().enumerate() {
         for b in 0..2 {
@@ -309,39 +367,65 @@ struct Factored {
     powers: Vec<[[f64; N]; 2]>,
     /// `log det G` per pixel of the window.
     logdet: f64,
+    /// The diagonal of `G⁻¹` in the frame, at each of the four photosites
+    /// of the period: `[y % 2][x % 2]`.
+    inverse: [[f64; 2]; 2],
 }
 
 impl Factored {
-    fn build(lat: &Lattice, prior: &Prior) -> Self {
+    fn build(lat: &Lattice, spec: &Spectrum) -> Self {
         let (tw, th) = (lat.tw, lat.th);
         let (qw, qh) = (tw / 2, th / 2);
         let rows = qh / 2 + 1;
         let mut factors = vec![C64::new(0.0, 0.0); rows * qw * N * N];
         let mut powers = vec![[[0.0; N]; 2]; rows * qw];
         let nz = &lat.nz;
-        let logdet: f64 = factors
+        let (logdet, inverse) = factors
             .par_chunks_mut(qw * N * N)
             .zip(powers.par_chunks_mut(qw))
             .enumerate()
             .map(|(v0, (frow, prow))| {
                 let mut logdet = 0.0;
+                let mut inverse = [0.0; N];
                 for u0 in 0..qw {
                     let g = &mut frow[u0 * N * N..(u0 + 1) * N * N];
                     let mut cell = [C64::new(0.0, 0.0); N * N];
-                    prow[u0] = set_matrix(tw, th, nz, prior, u0, v0, &mut cell);
+                    prow[u0] = set_matrix(tw, th, nz, spec, u0, v0, &mut cell);
                     cholesky(&mut cell, N);
                     g.copy_from_slice(&cell);
                     logdet += (0..N).map(|i| 2.0 * cell[i * N + i].re.ln()).sum::<f64>();
+                    // Column j of G⁻¹, and what it adds to the diagonal at each photosite.
+                    for j in 0..N {
+                        let mut col = [C64::new(0.0, 0.0); N];
+                        col[j] = C64::new(1.0, 0.0);
+                        solve(&cell, &mut col, N);
+                        for (i, v) in col.iter().enumerate() {
+                            let (da, db) = ((i ^ j) & 1, ((i ^ j) >> 1) & 1);
+                            for (p, sum) in inverse.iter_mut().enumerate() {
+                                let odd = (da * (p & 1) + db * (p >> 1)) % 2 == 1;
+                                *sum += if odd { -v.re } else { v.re };
+                            }
+                        }
+                    }
                 }
                 // The row stands for its mirror as well, unless it is its own.
-                if mirrored(v0, qh).is_some() {
-                    2.0 * logdet
-                } else {
-                    logdet
-                }
+                let times = if mirrored(v0, qh).is_some() { 2.0 } else { 1.0 };
+                (times * logdet, inverse.map(|v| times * v))
             })
-            .sum();
-        Self { factors, powers, logdet: logdet / (tw * th) as f64 }
+            .reduce(
+                || (0.0, [0.0; N]),
+                |a, b| (a.0 + b.0, [a.1[0] + b.1[0], a.1[1] + b.1[1], a.1[2] + b.1[2], a.1[3] + b.1[3]]),
+            );
+        let n = (tw * th) as f64;
+        let inverse = [[inverse[0] / n, inverse[1] / n], [inverse[2] / n, inverse[3] / n]];
+        Self { factors, powers, logdet: logdet / n, inverse }
+    }
+
+    /// How far the photosite at `(x, y)` is from what all the others say
+    /// of it, from `z = G⁻¹m` there. Leaving one photosite out needs no
+    /// second solve: it is `z_i / (G⁻¹)_ii`.
+    fn apart(&self, z: f64, x: usize, y: usize) -> f64 {
+        z / self.inverse[y % 2][x % 2]
     }
 }
 
@@ -352,6 +436,39 @@ fn spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
         let row = m.row(reflect(oy + y as isize, m.height));
         for x in 0..tw {
             spec[y * tw + x] = C64::new(row[reflect(ox + x as isize, m.width)], 0.0);
+        }
+    }
+    fft.run(&mut spec, false);
+    spec
+}
+
+/// A raised cosine over `n` photosites: nothing at both ends, one in the middle.
+fn fade(n: usize) -> Vec<f64> {
+    (0..n).map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f64 + 0.5) / n as f64).cos()).collect()
+}
+
+/// The spectrum of one window, the window fading to nothing at its sides
+/// as a raised cosine.
+///
+/// A window cut out of a picture does not close on itself, and the step
+/// from one side to the other is in the spectrum of the cut as a floor
+/// that falls only as `1/f²`. Behind a lens the picture falls faster, and
+/// where the lens ends the floor is all there is. The fade takes the step
+/// away; it mixes each bin only with its neighbours, and the carriers stay
+/// where they are.
+///
+/// The search and the lens are both on this. Measured on the Kodak set
+/// under the sRGB curve, against a search on windows that do not fade:
+/// 0.34 dB better behind a lens, 0.26 dB better at twice the size and
+/// 0.12 dB worse pixel-sharp, where the step is the picture's own.
+fn faded_spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
+    let (tw, th) = (fft.w, fft.h);
+    let (fx, fy) = (fade(tw), fade(th));
+    let mut spec = vec![C64::new(0.0, 0.0); tw * th];
+    for y in 0..th {
+        let row = m.row(reflect(oy + y as isize, m.height));
+        for x in 0..tw {
+            spec[y * tw + x] = C64::new(fx[x] * fy[y] * row[reflect(ox + x as isize, m.width)], 0.0);
         }
     }
     fft.run(&mut spec, false);
@@ -417,6 +534,33 @@ fn demod(lat: &Lattice, fact: &Factored, spec: &[C64], chroma: &mut [C64], energ
     }
 }
 
+/// How the spectra of a bank are weighed at a pixel.
+///
+/// Two things are asked of a spectrum there. The first is how probable the
+/// mosaic around the pixel is under it, `z·m` and `log det G`, taken over
+/// a region `sigma` wide. The second is how well it tells each photosite
+/// from all the others, the photosite itself left out, over a region
+/// `near` wide. The likelihood is steady and says what kind of picture the
+/// region is. The left-out error is taken from far fewer photosites and
+/// says on which side of an edge the pixel lies. The score is the two
+/// logarithms, the second with the share `left_out`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Weighing {
+    pub sigma: f64,
+    pub near: f64,
+    pub left_out: f64,
+    /// How fast a spectrum falls behind the best one.
+    pub sharp: f64,
+    /// Added to the score of the first spectrum of the bank.
+    pub bias: f64,
+}
+
+impl Default for Weighing {
+    fn default() -> Self {
+        Self { sigma: 6.0, near: 1.0, left_out: 0.5, sharp: 20.0, bias: 0.0 }
+    }
+}
+
 struct Frame {
     sx: usize,
     sy: usize,
@@ -424,11 +568,13 @@ struct Frame {
 }
 
 fn frame_of(w: usize, h: usize) -> Frame {
-    assert!(w >= 2 && h >= 2 && w.is_multiple_of(2) && h.is_multiple_of(2), "a Bayer frame has even sides");
-    // The margin and the step are even, so every window still starts on red.
+    assert!(w >= 2 && h >= 2, "a Bayer frame has two rows and two columns");
+    // The margin and the step are even, so every window starts on red. A
+    // side may be odd: what a window holds past the frame is the frame
+    // mirrored about a photosite, and that keeps the colour.
     let sx = TILE.min(w);
     let sy = TILE.min(h);
-    debug_assert!(sx.is_multiple_of(2) && sy.is_multiple_of(2) && MARGIN.is_multiple_of(2));
+    debug_assert!(TILE.is_multiple_of(2) && MARGIN.is_multiple_of(2));
     Frame { sx, sy, margin: MARGIN }
 }
 
@@ -449,11 +595,11 @@ struct Pass<'a> {
     fact: &'a Factored,
     fr: &'a Frame,
     head: f64,
-    sigma: f64,
+    weighing: &'a Weighing,
 }
 
 fn window_of(pass: &Pass<'_>, spec: &[C64], x0: usize, y0: usize) -> Kept {
-    let Pass { m, lat, fact, fr, head, sigma } = *pass;
+    let Pass { m, lat, fact, fr, head, weighing } = *pass;
     let (ox, oy) = (x0 as isize - fr.margin as isize, y0 as isize - fr.margin as isize);
     let mut chroma = vec![C64::new(0.0, 0.0); lat.tw * lat.th];
     let mut energy = vec![C64::new(0.0, 0.0); lat.tw * lat.th];
@@ -461,19 +607,26 @@ fn window_of(pass: &Pass<'_>, spec: &[C64], x0: usize, y0: usize) -> Kept {
     lat.fft.run(&mut chroma, true);
     lat.fft.run(&mut energy, true);
     let (tw, th) = (lat.tw, lat.th);
-    let mut e = Plane::zeros(tw, th);
-    for y in 0..th {
-        let row = m.row(reflect(oy + y as isize, m.height));
-        let out = e.row_mut(y);
-        for x in 0..tw {
-            out[x] = energy[y * tw + x].re * row[reflect(ox + x as isize, m.width)];
+    let smoothed = |sigma: f64, of: &dyn Fn(f64, f64, usize, usize) -> f64| -> Plane {
+        let mut e = Plane::zeros(tw, th);
+        for y in 0..th {
+            let row = m.row(reflect(oy + y as isize, m.height));
+            let out = e.row_mut(y);
+            for (x, o) in out.iter_mut().enumerate() {
+                *o = of(energy[y * tw + x].re, row[reflect(ox + x as isize, m.width)], x, y);
+            }
         }
-    }
-    let k = gaussian_kernel(sigma);
-    let mut rows = Plane::zeros(tw, th);
-    let mut smooth = Plane::zeros(tw, th);
-    convolve_rows_mod_into(&e, &k, |_, _| 1.0, &mut rows);
-    convolve_cols_signed_into(&rows, &k, |_| 1.0, &mut smooth);
+        let k = gaussian_kernel(sigma);
+        let mut rows = Plane::zeros(tw, th);
+        let mut smooth = Plane::zeros(tw, th);
+        convolve_rows_mod_into(&e, &k, |_, _| 1.0, &mut rows);
+        convolve_cols_signed_into(&rows, &k, |_| 1.0, &mut smooth);
+        smooth
+    };
+    let share = weighing.left_out.clamp(0.0, 1.0);
+    // `z·m` over the region is the mosaic's own power there, in the prior's measure.
+    let likely = (share < 1.0).then(|| smoothed(weighing.sigma, &|z, v, _, _| z * v));
+    let apart = (share > 0.0).then(|| smoothed(weighing.near, &|z, _, x, y| fact.apart(z, x, y).powi(2)));
     let (nx, ny) = (fr.sx.min(m.width - x0), fr.sy.min(m.height - y0));
     let mut kept = Kept { c1: vec![0.0; nx * ny], c2: vec![0.0; nx * ny], score: vec![0.0; nx * ny] };
     for y in 0..ny {
@@ -482,18 +635,25 @@ fn window_of(pass: &Pass<'_>, spec: &[C64], x0: usize, y0: usize) -> Kept {
             let s = (y + fr.margin) * tw + (x + fr.margin);
             kept.c1[i] = chroma[s].re;
             kept.c2[i] = chroma[s].im;
-            kept.score[i] = smooth.data[s].max(1e-30).ln() + fact.logdet - head;
+            let mut score = -head;
+            if let Some(p) = &likely {
+                score += (1.0 - share) * (p.data[s].max(1e-30).ln() + fact.logdet);
+            }
+            if let Some(p) = &apart {
+                score += share * p.data[s].max(1e-30).ln();
+            }
+            kept.score[i] = score;
         }
     }
     kept
 }
 
-/// The two chrominances under several priors at once, chosen between per pixel
-/// by how probable the mosaic around the pixel is. One prior is that prior alone.
+/// The two chrominances under several spectra at once, weighed per pixel
+/// as [`Weighing`] says. One spectrum is that spectrum alone.
 ///
 /// `C1` is `G − (R + B)/2` and `C2` is `(R − B)/2`, the same two the second
 /// step reads. The frame's corner is red.
-pub fn separate_bank(m: &Plane, priors: &[Prior], sel: &Selection, done: &dyn Fn(f64)) -> (Plane, Plane) {
+pub fn separate_bank(m: &Plane, priors: &[Spectrum], sel: &Weighing, done: &dyn Fn(f64)) -> (Plane, Plane) {
     assert!(!priors.is_empty(), "there is no prior to separate under");
     let (w, h) = (m.width, m.height);
     let fr = frame_of(w, h);
@@ -526,7 +686,7 @@ pub fn separate_bank(m: &Plane, priors: &[Prior], sel: &Selection, done: &dyn Fn
     for (k, prior) in priors.iter().enumerate() {
         let fact = Factored::build(&lat, prior);
         let head = if k == 0 { sel.bias } else { 0.0 };
-        let pass = Pass { m, lat: &lat, fact: &fact, fr: &fr, head, sigma: sel.sigma };
+        let pass = Pass { m, lat: &lat, fact: &fact, fr: &fr, head, weighing: sel };
         let kept: Vec<Kept> =
             specs.par_iter().zip(&at).map(|(spec, &(x0, y0))| window_of(&pass, spec, x0, y0)).collect();
         for (run, got) in running.iter_mut().zip(&kept) {
@@ -578,7 +738,7 @@ pub fn separate_bank(m: &Plane, priors: &[Prior], sel: &Selection, done: &dyn Fn
 /// the mean, which is not part of the power law, and it is left out: its
 /// Nyquist bins are luminance as much as colour, and counting them pulls
 /// the colour up. Every `stride`-th set in each direction is counted.
-fn evidence(lat: &Lattice, specs: &[Vec<C64>], prior: &Prior, stride: usize) -> f64 {
+fn evidence(lat: &Lattice, specs: &[Vec<C64>], prior: &Spectrum, stride: usize) -> f64 {
     let (tw, th) = (lat.tw, lat.th);
     let (qw, qh) = (tw / 2, th / 2);
     let both = qw.is_multiple_of(stride) && qh.is_multiple_of(stride);
@@ -629,20 +789,9 @@ pub fn fit_prior(m: &Plane, start: Prior, stride: usize, free: [bool; 6]) -> Pri
     let (w, h) = (m.width, m.height);
     let fr = frame_of(w, h);
     let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
-    let pick = |n: usize, s: usize| -> Vec<usize> {
-        let all: Vec<usize> = (0..n).step_by(s).collect();
-        match all.len() {
-            0..=3 => all,
-            k => vec![all[0], all[k / 2], all[k - 1]],
-        }
-    };
-    let mg = fr.margin as isize;
-    let at: Vec<(isize, isize)> = pick(h, fr.sy)
-        .into_iter()
-        .flat_map(|y0| pick(w, fr.sx).into_iter().map(move |x0| (x0 as isize - mg, y0 as isize - mg)))
-        .collect();
+    let at = fit_windows(w, h, &fr);
     let lat = Lattice::new(tw, th);
-    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| spectrum(m, &lat.fft, ox, oy)).collect();
+    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| faded_spectrum(m, &lat.fft, ox, oy)).collect();
     let x0 = [
         start.alpha,
         start.alpha_c,
@@ -670,7 +819,7 @@ pub fn fit_prior(m: &Plane, start: Prior, stride: usize, free: [bool; 6]) -> Pri
             ..start
         }
     };
-    let cost = |z: &[f64]| -evidence(&lat, &specs, &to_prior(z), stride);
+    let cost = |z: &[f64]| -evidence(&lat, &specs, &Spectrum::plain(to_prior(z)), stride);
     let steps = [0.6, 0.6, 1.0, 1.0, 2.0, 0.35];
     let z_start: Vec<f64> = dims.iter().map(|i| x0[*i]).collect();
     // Little noise behind no lens explains a noisy mosaic nearly as well as
@@ -735,6 +884,349 @@ pub fn fit_prior(m: &Plane, start: Prior, stride: usize, free: [bool; 6]) -> Pri
     to_prior(&ends[0].0)
 }
 
+/// How probable the light itself is when `m` is that light under a tone
+/// curve and `spec` is the spectrum found for `m`: twice the logarithm
+/// per photosite, the level left free, up to a constant that no curve
+/// changes. Larger is better.
+///
+/// `stretch` is the logarithm of the curve's slope at each photosite. A
+/// curve that pulls the values apart makes them less probable by as much,
+/// and without that every curve that flattens the picture would win.
+/// The windows are the search's, faded, and the slope is weighed as they
+/// are.
+pub fn likelihood(m: &Plane, spec: &Spectrum, stretch: &Plane) -> f64 {
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| faded_spectrum(m, &lat.fft, ox, oy)).collect();
+    let (fx, fy) = (fade(tw), fade(th));
+    let (mut sum, mut weight) = (0.0, 0.0);
+    for &(ox, oy) in &at {
+        for (y, down) in fy.iter().enumerate() {
+            let row = stretch.row(reflect(oy + y as isize, h));
+            for (x, across) in fx.iter().enumerate() {
+                let f = (across * down).powi(2);
+                sum += f * row[reflect(ox + x as isize, w)];
+                weight += f;
+            }
+        }
+    }
+    evidence(&lat, &specs, spec, 1) + 2.0 * sum / weight
+}
+
+/// How far each photosite is from what all the others say of it under
+/// `spec`: the mean square over the search's windows, each error divided
+/// by `slope` at its photosite, which takes it from the curve `m` is under
+/// to another.
+pub fn missed(m: &Plane, spec: &Spectrum, slope: &Plane) -> f64 {
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let fact = Factored::build(&lat, spec);
+    let (sum, count) = at
+        .par_iter()
+        .map(|&(ox, oy)| {
+            let one = spectrum(m, &lat.fft, ox, oy);
+            let mut chroma = vec![C64::new(0.0, 0.0); tw * th];
+            let mut energy = vec![C64::new(0.0, 0.0); tw * th];
+            demod(&lat, &fact, &one, &mut chroma, &mut energy);
+            lat.fft.run(&mut energy, true);
+            let (mut sum, mut count) = (0.0, 0.0);
+            for y in fr.margin..th - fr.margin {
+                let row = slope.row(reflect(oy + y as isize, h));
+                for x in fr.margin..tw - fr.margin {
+                    let by = row[reflect(ox + x as isize, w)];
+                    sum += (fact.apart(energy[y * tw + x].re, x, y) / by).powi(2);
+                    count += 1.0;
+                }
+            }
+            (sum, count)
+        })
+        .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    sum / count
+}
+
+/// How well the light at a photosite is told from all the others when `m`
+/// is that light under a tone curve and `spec` is the spectrum found for
+/// `m`: the mean logarithm of the left-out error, squared, taken back to
+/// light by the curve's `slope` there and over a region `near` wide.
+/// Smaller is better, and it is in the measure of [`likelihood`]. `floor`
+/// is the least error there is to tell, in light. The windows are the
+/// search's.
+pub fn told(m: &Plane, spec: &Spectrum, slope: &Plane, near: f64, floor: f64) -> f64 {
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let fact = Factored::build(&lat, spec);
+    let k = gaussian_kernel(near);
+    let (sum, count) = at
+        .par_iter()
+        .map(|&(ox, oy)| {
+            let one = spectrum(m, &lat.fft, ox, oy);
+            let mut chroma = vec![C64::new(0.0, 0.0); tw * th];
+            let mut energy = vec![C64::new(0.0, 0.0); tw * th];
+            demod(&lat, &fact, &one, &mut chroma, &mut energy);
+            lat.fft.run(&mut energy, true);
+            let mut e = Plane::zeros(tw, th);
+            for y in 0..th {
+                let row = slope.row(reflect(oy + y as isize, h));
+                let out = e.row_mut(y);
+                for (x, o) in out.iter_mut().enumerate() {
+                    let by = row[reflect(ox + x as isize, w)];
+                    *o = (fact.apart(energy[y * tw + x].re, x, y) / by).powi(2);
+                }
+            }
+            let mut rows = Plane::zeros(tw, th);
+            let mut smooth = Plane::zeros(tw, th);
+            convolve_rows_mod_into(&e, &k, |_, _| 1.0, &mut rows);
+            convolve_cols_signed_into(&rows, &k, |_| 1.0, &mut smooth);
+            let (mut sum, mut count) = (0.0, 0.0);
+            for y in fr.margin..th - fr.margin {
+                for x in fr.margin..tw - fr.margin {
+                    sum += (smooth.data[y * tw + x] + floor * floor).ln();
+                    count += 1.0;
+                }
+            }
+            (sum, count)
+        })
+        .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    sum / count
+}
+
+/// The spectrum under which the mosaic itself is most probable.
+///
+/// The prior first, by [`fit_prior`]: two power laws behind a Gaussian
+/// lens. Then, with everything else held, what a Gaussian cannot say: the
+/// lens radius by radius, and with it the noise. See [`measure_spectrum`].
+pub fn fit_spectrum(m: &Plane, start: Prior, stride: usize, rounds: usize) -> Spectrum {
+    measure_spectrum(m, fit_prior(m, start, stride, [true; 6]), rounds)
+}
+
+/// The least the noise is taken for: this share of what the luminance has
+/// at the sensor's limit, 0.5 c/px, behind the lens found.
+///
+/// A round moves the noise by little, and after a hundred a picture as
+/// sharp as its pixels has a noise thousands of times under its finest
+/// luminance. The separation then takes all there is at the limit for
+/// luminance, the chrominance's carrier with it. Measured pixel-sharp: the
+/// Kodak set 0.19 dB better, 16 pictures by up to 0.80 dB and 3 worse by
+/// up to 0.26 dB; the McMaster set 0.01 dB worse. The least is set after
+/// the rounds. Held in every round, the lens is found around it, and six
+/// Kodak pictures behind a lens are 0.08 dB worse instead of 0.04 dB
+/// better.
+const NOISE_SHARE: f64 = 0.1;
+
+/// The lens by radius and the noise, around a prior already found.
+///
+/// Both are variances, and expectation-maximisation moves each to the mean
+/// of what the mosaic gives it: every round the luminance and the two
+/// chrominances most probable at a bin say how much power they have there
+/// against what the spectrum allowed them, and the lens at that radius
+/// becomes the mean of the three. The mosaic is never less probable after
+/// a round than before.
+///
+/// The lens does not rise with frequency. Where the luminance near the
+/// sensor's limit and a slow chrominance fall on the same bins, the mosaic
+/// cannot say which it is, and a lens that may rise takes the chrominance's
+/// carrier for luminance.
+///
+/// `rounds` is 100 where the pictures are made. Measured on seven Kodak pictures, 300
+/// and 1000 rounds make the mosaic more probable still and the picture
+/// worse, by up to 0.2 and 0.4 dB: the noise grows at the cost of the
+/// lens's last part.
+///
+/// The noise that comes out is at least [`NOISE_SHARE`] of the luminance
+/// at the sensor's limit.
+pub fn measure_spectrum(m: &Plane, prior: Prior, rounds: usize) -> Spectrum {
+    if rounds == 0 {
+        return Spectrum::plain(prior);
+    }
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| faded_spectrum(m, &lat.fft, ox, oy)).collect();
+    let (qw, qh) = (tw / 2, th / 2);
+
+    // The search leaves the level free. Here it is the mosaic's own, between 0.05 and 0.2 c/px.
+    let gaussian = Spectrum::plain(Prior { oriented: None, ..prior });
+    let (mut have, mut want) = (0.0, 0.0);
+    for v in 0..th {
+        for u in 0..tw {
+            let (fu, fv) = (bin_freq(u, tw), bin_freq(v, th));
+            if (0.05..0.2).contains(&fu.hypot(fv)) {
+                have += specs.iter().map(|s| s[v * tw + u].norm_sqr()).sum::<f64>() / specs.len() as f64;
+                want += power(&gaussian, fu, fv).0;
+            }
+        }
+    }
+    let level = have / want;
+    // A lens that passes everything, to start from: a round takes away
+    // what is not there much faster than it adds what is.
+    let mut lens = vec![level; LENS_STEPS];
+    let mut noise = level * prior.noise;
+    let step_of = |r: f64| ((r / LENS_STEP) as usize).min(LENS_STEPS - 1);
+
+    #[derive(Clone)]
+    struct Sums {
+        lens: Vec<f64>,
+        count: Vec<f64>,
+        noise: f64,
+        bins: f64,
+    }
+    let zero = || Sums { lens: vec![0.0; LENS_STEPS], count: vec![0.0; LENS_STEPS], noise: 0.0, bins: 0.0 };
+    for _ in 0..rounds {
+        let spec =
+            Spectrum { prior: Prior { noise, oriented: None, ..prior }, lens: Some(Arc::new(lens.clone())) };
+        let sums = (0..=qh / 2)
+            .into_par_iter()
+            .map(|v0| {
+                let mut a = zero();
+                let times = if mirrored(v0, qh).is_some() { 2.0 } else { 1.0 };
+                for u0 in 0..qw {
+                    if u0 == 0 && v0 == 0 {
+                        continue;
+                    }
+                    let mut g = [C64::new(0.0, 0.0); N * N];
+                    set_matrix(tw, th, &lat.nz, &spec, u0, v0, &mut g);
+                    // Per bin of the set: its step of the lens, and the power
+                    // of the luminance and of the two chrominances there.
+                    let mut step = [0usize; N];
+                    let mut parts = [[0.0; 3]; N];
+                    for b in 0..2 {
+                        for a2 in 0..2 {
+                            let i = b * 2 + a2;
+                            let (u, v) = (u0 + a2 * qw, v0 + b * qh);
+                            let (l, c) = bin_power(&spec, u, v, tw, th);
+                            step[i] = step_of(bin_freq(u, tw).hypot(bin_freq(v, th)));
+                            parts[i] = [l, c[0], c[1]];
+                        }
+                    }
+                    cholesky(&mut g, N);
+                    let mut inv = [[C64::new(0.0, 0.0); N]; N];
+                    for j in 0..N {
+                        let mut col = [C64::new(0.0, 0.0); N];
+                        col[j] = C64::new(1.0, 0.0);
+                        solve(&g, &mut col, N);
+                        for i in 0..N {
+                            inv[i][j] = col[i];
+                        }
+                    }
+                    for one in &specs {
+                        let mut z = [C64::new(0.0, 0.0); N];
+                        set_spectrum(one, tw, u0, v0, qw, qh, &mut z);
+                        solve(&g, &mut z, N);
+                        for i in 0..N {
+                            // A variance `s` the mosaic sees through `a` becomes
+                            // `s·(1 + s·(|aᴴz|² − aᴴG⁻¹a))`. Noise and
+                            // luminance are seen at their own bin.
+                            let more = z[i].norm_sqr() - inv[i][i].re;
+                            a.noise += times * (1.0 + noise * more);
+                            let mut ratios = 1.0 + parts[i][0] * more;
+                            for (kind, list) in lat.from.iter().enumerate() {
+                                let n = list.len() / N;
+                                let mine = &list[i * n..(i + 1) * n];
+                                let mut seen = C64::new(0.0, 0.0);
+                                let mut known = 0.0;
+                                for &(p, ap) in mine {
+                                    seen += ap.conj() * z[p];
+                                    for &(q, aq) in mine {
+                                        known += (ap.conj() * inv[p][q] * aq).re;
+                                    }
+                                }
+                                ratios += 1.0 + parts[i][1 + kind] * (seen.norm_sqr() - known);
+                            }
+                            a.lens[step[i]] += times * ratios;
+                            a.count[step[i]] += times * 3.0;
+                        }
+                        a.bins += times * N as f64;
+                    }
+                }
+                a
+            })
+            .reduce(zero, |mut a, b| {
+                for i in 0..LENS_STEPS {
+                    a.lens[i] += b.lens[i];
+                    a.count[i] += b.count[i];
+                }
+                a.noise += b.noise;
+                a.bins += b.bins;
+                a
+            });
+        for b in 0..LENS_STEPS {
+            if sums.count[b] > 0.0 {
+                lens[b] *= (sums.lens[b] / sums.count[b]).max(1e-6);
+            } else if b > 0 {
+                lens[b] = lens[b - 1];
+            }
+        }
+        falling(&mut lens, &sums.count);
+        noise *= (sums.noise / sums.bins).max(1e-6);
+    }
+    // Back to the prior's own measure: the lens passes everything at rest.
+    let top = lens[0];
+    for v in &mut lens {
+        *v /= top;
+    }
+    let found = Spectrum { prior: Prior { noise: noise / top, ..prior }, lens: Some(Arc::new(lens)) };
+    let limit = found.laws(0.25).0 * found.pass(0.5);
+    Spectrum {
+        prior: Prior { noise: found.prior.noise.max(NOISE_SHARE * limit), ..found.prior },
+        lens: found.lens,
+    }
+}
+
+/// The nearest sequence that does not rise, in the logarithm, each value
+/// weighed by `weight`: pool adjacent violators.
+fn falling(values: &mut [f64], weight: &[f64]) {
+    let mut blocks: Vec<(f64, f64, usize)> = Vec::new();
+    for (v, w) in values.iter().zip(weight) {
+        let w = w.max(1.0);
+        blocks.push((v.max(1e-300).ln() * w, w, 1));
+        while blocks.len() > 1 {
+            let k = blocks.len();
+            if blocks[k - 2].0 / blocks[k - 2].1 >= blocks[k - 1].0 / blocks[k - 1].1 {
+                break;
+            }
+            let (sum, w, n) = blocks.pop().expect("two blocks");
+            let last = blocks.last_mut().expect("one block");
+            last.0 += sum;
+            last.1 += w;
+            last.2 += n;
+        }
+    }
+    let mut at = 0;
+    for (sum, w, n) in blocks {
+        for v in &mut values[at..at + n] {
+            *v = (sum / w).exp();
+        }
+        at += n;
+    }
+}
+
+/// Where the search looks: up to nine windows, the corners, the edges and the middle.
+fn fit_windows(w: usize, h: usize, fr: &Frame) -> Vec<(isize, isize)> {
+    let pick = |n: usize, s: usize| -> Vec<usize> {
+        let all: Vec<usize> = (0..n).step_by(s).collect();
+        match all.len() {
+            0..=3 => all,
+            k => vec![all[0], all[k / 2], all[k - 1]],
+        }
+    };
+    let mg = fr.margin as isize;
+    pick(h, fr.sy)
+        .into_iter()
+        .flat_map(|y0| pick(w, fr.sx).into_iter().map(move |x0| (x0 as isize - mg, y0 as isize - mg)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,6 +1261,546 @@ mod tests {
         assert!((y[1].re - 2.0).abs() < 1e-9 && y[1].im.abs() < 1e-9);
     }
 
+    /// A mosaic with no order in it, the same on every run.
+    fn scattered(w: usize, h: usize, seed: u64) -> Plane {
+        let mut s = seed;
+        let data = (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                (s >> 11) as f64 / (1u64 << 53) as f64
+            })
+            .collect();
+        Plane::from_vec(w, h, data)
+    }
+
+    /// `a·x = b` for a symmetric positive `a`, by elimination with pivoting.
+    fn solve_dense(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Vec<f64> {
+        for col in 0..n {
+            let pivot =
+                (col..n).max_by(|&i, &j| a[i * n + col].abs().total_cmp(&a[j * n + col].abs())).unwrap();
+            for k in 0..n {
+                a.swap(col * n + k, pivot * n + k);
+            }
+            b.swap(col, pivot);
+            for row in col + 1..n {
+                let f = a[row * n + col] / a[col * n + col];
+                for k in col..n {
+                    a[row * n + k] -= f * a[col * n + k];
+                }
+                b[row] -= f * b[col];
+            }
+        }
+        for row in (0..n).rev() {
+            for k in row + 1..n {
+                b[row] -= a[row * n + k] * b[k];
+            }
+            b[row] /= a[row * n + row];
+        }
+        b
+    }
+
+    /// Which way a photosite leans in each chrominance.
+    fn patterns(w: usize) -> (impl Fn(usize) -> f64, impl Fn(usize) -> f64) {
+        let pg = move |i: usize| if (i % w) % 2 != (i / w) % 2 { 0.5 } else { -0.5 };
+        let pd = move |i: usize| match ((i % w) % 2, (i / w) % 2) {
+            (0, 0) => 1.0,
+            (1, 1) => -1.0,
+            _ => 0.0,
+        };
+        (pg, pd)
+    }
+
+    /// The covariance of every pair of photosites of a periodic frame, summed
+    /// from the prior's spectrum, and the chrominance's own for every lag.
+    /// Nothing here knows of sets, carriers or mirrored rows.
+    fn dense_covariance(w: usize, h: usize, prior: &Spectrum) -> (Vec<f64>, Vec<[f64; 2]>) {
+        let n = w * h;
+        let mut lag_l = vec![0.0; n];
+        let mut lag_c = vec![[0.0; 2]; n];
+        for dy in 0..h {
+            for dx in 0..w {
+                let (mut l, mut c) = (0.0, [0.0; 2]);
+                for v in 0..h {
+                    for u in 0..w {
+                        let (pl, pc) = bin_power(prior, u, v, w, h);
+                        let turn =
+                            (2.0 * PI * ((u * dx) as f64 / w as f64 + (v * dy) as f64 / h as f64)).cos();
+                        l += pl * turn;
+                        c[0] += pc[0] * turn;
+                        c[1] += pc[1] * turn;
+                    }
+                }
+                lag_l[dy * w + dx] = l / n as f64;
+                lag_c[dy * w + dx] = [c[0] / n as f64, c[1] / n as f64];
+            }
+        }
+        let (pg, pd) = patterns(w);
+        let mut cov = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let d = lag_of(i, j, w, h);
+                cov[i * n + j] = lag_l[d]
+                    + pg(i) * pg(j) * lag_c[d][0]
+                    + pd(i) * pd(j) * lag_c[d][1]
+                    + if i == j { prior.prior.noise } else { 0.0 };
+            }
+        }
+        (cov, lag_c)
+    }
+
+    fn lag_of(i: usize, j: usize, w: usize, h: usize) -> usize {
+        ((j / w + h - i / w) % h) * w + (j % w + w - i % w) % w
+    }
+
+    /// The most probable chrominances of a periodic frame: one system of
+    /// `w·h` unknowns, photosite against photosite.
+    fn dense_chroma(m: &Plane, prior: &Spectrum) -> (Vec<f64>, Vec<f64>) {
+        let (w, h) = (m.width, m.height);
+        let n = w * h;
+        let (cov, lag_c) = dense_covariance(w, h, prior);
+        let (pg, pd) = patterns(w);
+        let z = solve_dense(cov, m.data.clone(), n);
+        let mut c1 = vec![0.0; n];
+        let mut c2 = vec![0.0; n];
+        for i in 0..n {
+            for (j, zj) in z.iter().enumerate() {
+                let d = lag_of(i, j, w, h);
+                c1[i] += lag_c[d][0] * pg(j) * zj;
+                c2[i] += lag_c[d][1] * pd(j) * zj;
+            }
+        }
+        (c1, c2)
+    }
+
+    /// `ln det` of a symmetric positive matrix, by its real Cholesky factor.
+    fn dense_logdet(mut a: Vec<f64>, n: usize) -> f64 {
+        let mut sum = 0.0;
+        for j in 0..n {
+            let mut d = a[j * n + j];
+            for k in 0..j {
+                d -= a[j * n + k] * a[j * n + k];
+            }
+            assert!(d > 0.0, "the covariance is not positive");
+            let d = d.sqrt();
+            a[j * n + j] = d;
+            sum += 2.0 * d.ln();
+            for i in j + 1..n {
+                let mut v = a[i * n + j];
+                for k in 0..j {
+                    v -= a[i * n + k] * a[j * n + k];
+                }
+                a[i * n + j] = v / d;
+            }
+        }
+        sum
+    }
+
+    /// How probable a periodic frame is, the level left free and the set at
+    /// the origin left out, from the covariance of every pair of photosites.
+    fn dense_evidence(m: &Plane, prior: &Spectrum) -> f64 {
+        let (w, h) = (m.width, m.height);
+        let n = w * h;
+        let (cov, _) = dense_covariance(w, h, prior);
+        // The four pictures of the set at the origin: flat, and the three checkers.
+        let modes: Vec<Vec<f64>> = [(0, 0), (1, 0), (0, 1), (1, 1)]
+            .iter()
+            .map(|&(a, b)| {
+                (0..n)
+                    .map(
+                        |i| if (a * (i % w) + b * (i / w)) % 2 == 0 { 1.0 } else { -1.0 } / (n as f64).sqrt(),
+                    )
+                    .collect()
+            })
+            .collect();
+        let mut rest = m.data.clone();
+        for mode in &modes {
+            let along: f64 = mode.iter().zip(&m.data).map(|(a, b)| a * b).sum();
+            for (r, a) in rest.iter_mut().zip(mode) {
+                *r -= along * a;
+            }
+        }
+        let z = solve_dense(cov.clone(), rest.clone(), n);
+        let q: f64 = rest.iter().zip(&z).map(|(a, b)| a * b).sum();
+        let mut block = vec![0.0; 16];
+        for (a, ma) in modes.iter().enumerate() {
+            for (b, mb) in modes.iter().enumerate() {
+                let mut s = 0.0;
+                for i in 0..n {
+                    for j in 0..n {
+                        s += ma[i] * cov[i * n + j] * mb[j];
+                    }
+                }
+                block[a * 4 + b] = s;
+            }
+        }
+        let d = dense_logdet(cov, n) - dense_logdet(block, 4);
+        let count = (n - 4) as f64;
+        // The transform is not normalised: a spectrum's square is `w·h` times the frame's.
+        -(count * (n as f64 * q / count).ln() + d) / count
+    }
+
+    /// Unit normal numbers with no order in them, the same on every run.
+    fn normal(n: usize, seed: u64) -> Vec<f64> {
+        let flat = scattered(2 * n, 1, seed).data;
+        (0..n)
+            .map(|i| (-2.0 * (1.0 - flat[2 * i]).ln()).sqrt() * (2.0 * PI * flat[2 * i + 1]).cos())
+            .collect()
+    }
+
+    /// A periodic mosaic drawn from a spectrum: a luminance, two
+    /// chrominances and noise, each with the power the spectrum gives it.
+    fn drawn(w: usize, h: usize, spec: &Spectrum, seed: u64) -> Plane {
+        let fft = Fft2::new(w, h);
+        let n = w * h;
+        let field = |kind: usize| -> Vec<f64> {
+            let mut f: Vec<C64> =
+                normal(n, seed + kind as u64).into_iter().map(|v| C64::new(v, 0.0)).collect();
+            fft.run(&mut f, false);
+            for v in 0..h {
+                for u in 0..w {
+                    let (l, c) = bin_power(spec, u, v, w, h);
+                    f[v * w + u] *= [l, c[0], c[1]][kind].sqrt();
+                }
+            }
+            fft.run(&mut f, true);
+            f.iter().map(|c| c.re).collect()
+        };
+        let (l, c1, c2) = (field(0), field(1), field(2));
+        let noise = normal(n, seed + 3);
+        let (pg, pd) = patterns(w);
+        let data = (0..n)
+            .map(|i| l[i] + pg(i) * c1[i] + pd(i) * c2[i] + spec.prior.noise.sqrt() * noise[i])
+            .collect();
+        Plane::from_vec(w, h, data)
+    }
+
+    /// How far each photosite of the windows is from what all the others say
+    /// of it under `spec`: the mean square, inside the margin.
+    fn left_out(lat: &Lattice, specs: &[Vec<C64>], spec: &Spectrum, margin: usize) -> f64 {
+        let fact = Factored::build(lat, spec);
+        let (tw, th) = (lat.tw, lat.th);
+        let (qw, qh) = (tw / 2, th / 2);
+        let sums: (f64, f64) = specs
+            .par_iter()
+            .map(|one| {
+                let mut z = vec![C64::new(0.0, 0.0); tw * th];
+                for v0 in 0..=qh / 2 {
+                    let mirror = mirrored(v0, qh);
+                    for u0 in 0..qw {
+                        let set = v0 * qw + u0;
+                        let g = &fact.factors[set * N * N..(set + 1) * N * N];
+                        let mut y = [C64::new(0.0, 0.0); N];
+                        set_spectrum(one, tw, u0, v0, qw, qh, &mut y);
+                        solve(g, &mut y, N);
+                        for b in 0..2 {
+                            for a in 0..2 {
+                                let (x, yb) = (u0 + a * qw, v0 + b * qh);
+                                z[yb * tw + x] = y[b * 2 + a];
+                                if let Some(mv) = mirror {
+                                    z[(mv + (1 - b) * qh) * tw + (tw - x) % tw] = y[b * 2 + a].conj();
+                                }
+                            }
+                        }
+                    }
+                }
+                lat.fft.run(&mut z, true);
+                let (mut sum, mut n) = (0.0, 0.0);
+                for y in margin..th - margin {
+                    for x in margin..tw - margin {
+                        sum += fact.apart(z[y * tw + x].re, x, y).powi(2);
+                        n += 1.0;
+                    }
+                }
+                (sum, n)
+            })
+            .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        sums.0 / sums.1
+    }
+
+    /// The prior, one of its six numbers moved.
+    fn moved(prior: Prior, which: usize, by: f64) -> Prior {
+        match which {
+            0 => Prior { alpha: prior.alpha * by, ..prior },
+            1 => Prior { alpha_c: prior.alpha_c * by, ..prior },
+            2 => Prior { chroma: [prior.chroma[0] * by, prior.chroma[1]], ..prior },
+            3 => Prior { chroma: [prior.chroma[0], prior.chroma[1] * by], ..prior },
+            4 => Prior { noise: prior.noise * by, ..prior },
+            _ => Prior { lens: prior.lens * by, ..prior },
+        }
+    }
+
+    #[test]
+    fn a_frame_is_most_probable_under_the_spectrum_it_was_drawn_from() {
+        let prior = Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 2e-3,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        };
+        let (w, h) = (192usize, 160usize);
+        let m = drawn(w, h, &Spectrum::plain(prior), 71);
+        let lat = Lattice::new(w, h);
+        let specs = [spectrum(&m, &lat.fft, 0, 0)];
+        let own = evidence(&lat, &specs, &Spectrum::plain(prior), 1);
+        for which in 0..6 {
+            for by in [1.0 / 1.3, 1.3] {
+                let other = evidence(&lat, &specs, &Spectrum::plain(moved(prior, which, by)), 1);
+                assert!(
+                    other < own,
+                    "number {which} times {by} makes the frame more probable: {other} over {own}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_light_under_a_curve_twice_as_steep_is_as_probable() {
+        let spec = Spectrum::plain(Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 2e-3,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        });
+        let (w, h) = (96usize, 80usize);
+        let m = drawn(w, h, &spec, 5);
+        let slope = Plane::from_vec(w, h, scattered(w, h, 9).data.iter().map(|v| 0.5 + v).collect());
+        let log = |p: &Plane, by: f64| Plane::from_vec(w, h, p.data.iter().map(|v| (by * v).ln()).collect());
+        let times = |p: &Plane, by: f64| Plane::from_vec(w, h, p.data.iter().map(|v| by * v).collect());
+        let (once, twice) =
+            (likelihood(&m, &spec, &log(&slope, 1.0)), likelihood(&times(&m, 2.0), &spec, &log(&slope, 2.0)));
+        assert!((once - twice).abs() < 1e-9, "{once} and {twice}");
+        let (once, twice) =
+            (told(&m, &spec, &slope, 1.0, 0.0), told(&times(&m, 2.0), &spec, &times(&slope, 2.0), 1.0, 0.0));
+        assert!((once - twice).abs() < 1e-9, "{once} and {twice}");
+    }
+
+    #[test]
+    fn a_light_is_most_probable_under_the_curve_its_frame_was_drawn_under() {
+        // The frame is the square root of a light. Under the root the
+        // light is the frame again; as it is, it is the frame squared.
+        let spec = Spectrum::plain(Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 2e-3,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        });
+        let (w, h) = (192usize, 160usize);
+        let frame = drawn(w, h, &spec, 23);
+        let span = frame.data.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let root = Plane::from_vec(w, h, frame.data.iter().map(|v| 1.0 + 0.8 * v / span).collect());
+        let light = Plane::from_vec(w, h, root.data.iter().map(|v| v * v).collect());
+        let steep = Plane::from_vec(w, h, root.data.iter().map(|v| 0.5 / v).collect());
+        let level = Plane::from_vec(w, h, vec![1.0; w * h]);
+        let log = |p: &Plane| Plane::from_vec(w, h, p.data.iter().map(|v| v.ln()).collect());
+        let start = Prior { lens: 0.3, ..Prior::default() };
+        let under = fit_spectrum(&root, start, 1, 20);
+        let bare = fit_spectrum(&light, start, 1, 20);
+        let (own, other) = (likelihood(&root, &under, &log(&steep)), likelihood(&light, &bare, &log(&level)));
+        assert!(own > other, "the light is more probable as it is: {other} over {own}");
+        let (own, other) = (told(&root, &under, &steep, 1.0, 0.0), told(&light, &bare, &level, 1.0, 0.0));
+        assert!(own < other, "a photosite is told better in the light as it is: {other} under {own}");
+    }
+
+    #[test]
+    fn a_photosite_is_told_best_under_the_spectrum_the_frame_was_drawn_from() {
+        let prior = Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 0.03,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        };
+        let (w, h) = (192usize, 160usize);
+        let m = drawn(w, h, &Spectrum::plain(prior), 73);
+        let lat = Lattice::new(w, h);
+        let specs = [spectrum(&m, &lat.fft, 0, 0)];
+        let own = left_out(&lat, &specs, &Spectrum::plain(prior), 0);
+        for which in 0..6 {
+            for by in [0.5, 2.0] {
+                let other = left_out(&lat, &specs, &Spectrum::plain(moved(prior, which, by)), 0);
+                assert!(
+                    other > own,
+                    "number {which} times {by} tells the photosites better: {other} under {own}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_lens_a_frame_was_drawn_through_is_found() {
+        // Flat to 0.2 c/px and gone by 0.4: nothing a Gaussian is like.
+        let prior = Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 1e-4,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        };
+        let through = |r: f64| 1.0 / (1.0 + (r / 0.22).powi(6));
+        let lens: Vec<f64> = (0..LENS_STEPS).map(|b| through((b as f64 + 0.5) * LENS_STEP)).collect();
+        let truth = Spectrum { prior, lens: Some(Arc::new(lens)) };
+        let m = drawn(384, 320, &truth, 91);
+        let found = measure_spectrum(&m, prior, 100);
+        let table = found.lens.as_ref().expect("a lens by radius");
+        let at = |r: f64| table[(r / LENS_STEP) as usize] / table[5];
+        for r in [0.105, 0.155, 0.205, 0.255, 0.305, 0.355, 0.405, 0.455] {
+            let (got, want) = (at(r), through(r) / through(0.055));
+            assert!(
+                got < 1.7 * want && want < 1.7 * got,
+                "at {r} c/px the lens passes {got}, drawn with {want}"
+            );
+        }
+        // The Gaussian the search starts from is far from it where the lens ends.
+        let gaussian = Spectrum::plain(prior);
+        assert!(gaussian.pass(0.405) / gaussian.pass(0.055) > 3.0 * through(0.405) / through(0.055));
+    }
+
+    #[test]
+    fn the_noise_is_not_taken_for_far_less_than_the_luminance_at_the_limit() {
+        let quiet = Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.3,
+            noise: 1e-7,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        };
+        let at_limit = |s: &Spectrum| s.laws(0.25).0 * s.pass(0.5);
+        let found = measure_spectrum(&drawn(384, 320, &Spectrum::plain(quiet), 17), quiet, 100);
+        let least = NOISE_SHARE * at_limit(&found);
+        assert!(
+            (found.prior.noise / least - 1.0).abs() < 1e-9,
+            "a frame without noise has {} and not {least}",
+            found.prior.noise
+        );
+        // A noise that is there is left as it was measured.
+        let loud = Prior { noise: 0.1, ..quiet };
+        let found = measure_spectrum(&drawn(384, 320, &Spectrum::plain(loud), 17), loud, 100);
+        let least = NOISE_SHARE * at_limit(&found);
+        assert!(found.prior.noise > 3.0 * least, "{} is near the least, {least}", found.prior.noise);
+        assert!(
+            found.prior.noise > 0.05 && found.prior.noise < 0.2,
+            "drawn with 0.1, found {}",
+            found.prior.noise
+        );
+    }
+
+    #[test]
+    fn a_photosite_left_out_is_where_the_others_put_it() {
+        let plain = Prior { lens: 0.4, noise: 3e-3, chroma: [0.08, 0.03], ..Prior::default() };
+        let cases = [
+            (12usize, 8usize, Spectrum::plain(plain)),
+            (8, 12, Spectrum::plain(Prior { oriented: Some((0.3, 8.0)), ..plain })),
+            (10, 6, measured(plain)),
+        ];
+        for (k, (w, h, prior)) in cases.into_iter().enumerate() {
+            let m = scattered(w, h, 29 + k as u64);
+            let n = w * h;
+            let (cov, _) = dense_covariance(w, h, &prior);
+            let lat = Lattice::new(w, h);
+            let fact = Factored::build(&lat, &prior);
+            let spec = spectrum(&m, &lat.fft, 0, 0);
+            let mut chroma = vec![C64::new(0.0, 0.0); n];
+            let mut z = vec![C64::new(0.0, 0.0); n];
+            demod(&lat, &fact, &spec, &mut chroma, &mut z);
+            lat.fft.run(&mut z, true);
+            for i in 0..n {
+                // Every photosite but this one, and what they say of this one.
+                let others: Vec<usize> = (0..n).filter(|j| *j != i).collect();
+                let mut rest = vec![0.0; (n - 1) * (n - 1)];
+                for (a, &ja) in others.iter().enumerate() {
+                    for (b, &jb) in others.iter().enumerate() {
+                        rest[a * (n - 1) + b] = cov[ja * n + jb];
+                    }
+                }
+                let seen: Vec<f64> = others.iter().map(|&j| m.data[j]).collect();
+                let x = solve_dense(rest, seen, n - 1);
+                let said: f64 = others.iter().zip(&x).map(|(&j, v)| cov[i * n + j] * v).sum();
+                let want = m.data[i] - said;
+                let got = fact.apart(z[i].re, i % w, i / w);
+                assert!((got - want).abs() < 1e-8, "case {k}: photosite {i} is {got} apart, not {want}");
+            }
+        }
+    }
+
+    fn spectral_chroma(m: &Plane, prior: &Spectrum) -> (Vec<f64>, Vec<f64>) {
+        let (w, h) = (m.width, m.height);
+        let lat = Lattice::new(w, h);
+        let fact = Factored::build(&lat, prior);
+        let spec = spectrum(m, &lat.fft, 0, 0);
+        let mut chroma = vec![C64::new(0.0, 0.0); w * h];
+        let mut energy = vec![C64::new(0.0, 0.0); w * h];
+        demod(&lat, &fact, &spec, &mut chroma, &mut energy);
+        lat.fft.run(&mut chroma, true);
+        (chroma.iter().map(|c| c.re).collect(), chroma.iter().map(|c| c.im).collect())
+    }
+
+    /// A lens that is no Gaussian: flat, and then it ends.
+    fn measured(prior: Prior) -> Spectrum {
+        let lens = (0..LENS_STEPS).map(|b| 1.0 / (1.0 + (b as f64 / 22.0).powi(6))).collect();
+        Spectrum { prior, lens: Some(Arc::new(lens)) }
+    }
+
+    #[test]
+    fn the_sets_solve_what_the_whole_frame_solves() {
+        let plain = Prior { lens: 0.4, noise: 3e-3, chroma: [0.08, 0.03], ..Prior::default() };
+        let of = Spectrum::plain;
+        let cases = [
+            (12usize, 8usize, of(plain)),
+            (10, 6, of(plain)),
+            (8, 12, of(Prior { alpha: 1.6, alpha_c: 3.5, ..plain })),
+            (12, 8, of(Prior { oriented: Some((0.3, 8.0)), ..plain })),
+            (10, 6, of(Prior { oriented: Some((PI * 3.0 / 8.0, 32.0)), ..plain })),
+            (8, 12, of(Prior { oriented: Some((PI / 2.0, 8.0)), ..plain })),
+            (12, 8, measured(plain)),
+            (10, 6, measured(Prior { oriented: Some((1.1, 8.0)), ..plain })),
+        ];
+        for (k, (w, h, prior)) in cases.into_iter().enumerate() {
+            let m = scattered(w, h, 17 + k as u64);
+            let (d1, d2) = dense_chroma(&m, &prior);
+            let (s1, s2) = spectral_chroma(&m, &prior);
+            let mut worst = 0.0f64;
+            let mut size = 0.0f64;
+            for i in 0..w * h {
+                worst = worst.max((d1[i] - s1[i]).abs()).max((d2[i] - s2[i]).abs());
+                size = size.max(d1[i].abs()).max(d2[i].abs());
+            }
+            assert!(size > 1e-3, "case {k}: the frame has no colour to compare");
+            assert!(
+                worst < 1e-9 * size.max(1.0),
+                "case {k}: {w}×{h} differs from the dense solve by {worst}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_evidence_is_the_likelihood_of_the_whole_frame() {
+        let plain = Prior { lens: 0.4, noise: 3e-3, chroma: [0.08, 0.03], ..Prior::default() };
+        let of = Spectrum::plain;
+        let cases = [
+            (12usize, 8usize, of(plain)),
+            (10, 6, of(Prior { alpha: 1.6, alpha_c: 3.5, noise: 0.05, ..plain })),
+            (8, 12, of(Prior { oriented: Some((0.3, 8.0)), ..plain })),
+            (12, 8, measured(plain)),
+        ];
+        for (k, (w, h, prior)) in cases.into_iter().enumerate() {
+            let m = scattered(w, h, 5 + k as u64);
+            let lat = Lattice::new(w, h);
+            let spec = spectrum(&m, &lat.fft, 0, 0);
+            let got = evidence(&lat, &[spec], &prior, 1);
+            let want = dense_evidence(&m, &prior);
+            assert!((got - want).abs() < 1e-9 * want.abs().max(1.0), "case {k}: {got} is not {want}");
+        }
+    }
+
     fn flat(w: usize, h: usize, rgb: [f64; 3]) -> Plane {
         let mut m = vec![0.0; w * h];
         for y in 0..h {
@@ -784,7 +1816,7 @@ mod tests {
     }
 
     fn apart(m: &Plane, prior: &Prior) -> (Plane, Plane, mimizan_lab_xtrans::plane::Rgb) {
-        let (c1, c2) = separate_bank(m, &[*prior], &Selection::default(), &|_| {});
+        let (c1, c2) = separate_bank(m, &[Spectrum::plain(*prior)], &Weighing::default(), &|_| {});
         let rgb = xtrans::from_chroma(m, &tile(), c1.clone(), c2.clone()).rgb();
         (c1, c2, rgb)
     }
