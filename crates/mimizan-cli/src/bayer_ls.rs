@@ -1,16 +1,18 @@
-//! A Bayer demosaic by the least-squares separation that leads on X-Trans.
+//! A Bayer demosaic by least squares on the 2×2 period.
 //!
-//! The 2×2 mosaic is written as a 6×6 tile, which is the period the solver
-//! works on. Luminance and both chrominances of the frequencies that tile
-//! ties together are solved at once, under the prior the mosaic itself
-//! makes most probable, and a bank of those priors is weighed per pixel.
-//! A second step follows where the picture has two colours. The separation
-//! runs under the sRGB curve and comes back to linear light, as a camera
-//! file does. Nothing here is treated as burnt out.
+//! Luminance and both chrominances of the four frequencies that period ties
+//! together are solved at once, under the prior the mosaic itself makes most
+//! probable, and a bank of those priors is weighed per pixel. A second step
+//! follows where the picture has two colours. It reads which photosite is
+//! which colour, and that pattern is the Bayer tile written out to six,
+//! which is the period the older solver asked for. The separation runs under
+//! the sRGB curve and comes back to linear light, as a camera file does.
+//! Nothing here is treated as burnt out.
 
+use crate::bayer2;
 use mimizan_lab_xtrans::convert::{self, Developed, Frame, WHITE};
 use mimizan_lab_xtrans::plane::{Plane, Rgb};
-use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, Selection, XParams, XTile};
+use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, Selection, XTile};
 use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
@@ -32,7 +34,8 @@ const CHECK_CAP: f64 = 0.012;
 /// Below this, a Nyquist sample is not a flicker worth following.
 const CHECK_FLICKER: f64 = 0.0015;
 
-/// RGGB, repeated so the period is 6. Row-major.
+/// RGGB, written out so the period is 6. The second step reads this pattern;
+/// the solve itself is on the 2×2. Row-major.
 pub const BAYER6: &str = "RGRGRGGBGBGBRGRGRGGBGBGBRGRGRGGBGBGB";
 
 /// What may be moved while the method is being measured. The defaults are
@@ -89,20 +92,17 @@ pub fn separate(
     let tile = XTile::from_name(BAYER6).expect("the Bayer tile");
     assert!(tile.mirrors(width, height), "this frame does not mirror the Bayer tile");
     let tone = Curve::Srgb;
-    let p = XParams::default();
     let start = Prior { lens: 0.3, ..Prior::default() };
-    let found = xtrans::fit_prior(
-        &tone.mosaic(&Plane::from_vec(width, height, fit.to_vec())),
-        &tile,
-        &p,
-        start,
-        8,
-        [true; 6],
-    );
+    // Every set, not every eighth. An eighth is enough on a smooth picture
+    // and not on a fine one: kodim19 and kodim22 moved by half a decibel
+    // once the search was shown the whole mosaic.
+    let found =
+        bayer2::fit_prior(&tone.mosaic(&Plane::from_vec(width, height, fit.to_vec())), start, 1, [true; 6]);
     let m = tone.mosaic(&Plane::from_vec(width, height, linear.to_vec()));
     let priors = bayer_priors(found, knobs.lines);
     let sel = Selection { sigma: knobs.sigma, sharp: knobs.sharp, bias: knobs.bias };
-    let sep = xtrans::separate_bank_watched(&m, &tile, &p, &priors, &sel, progress);
+    let (c1, c2) = bayer2::separate_bank(&m, &priors, &sel, progress);
+    let sep = xtrans::from_chroma(&m, &tile, c1, c2);
     let refine = Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
     let rgb = xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb();
     (without_line_checker(rgb), found)
@@ -384,7 +384,7 @@ fn channel_at(x: usize, y: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{channel_at, from_luma, luma, red_site, without_line_checker};
+    use super::{channel_at, demosaic, from_luma, luma, red_site, without_line_checker, Knobs};
 
     #[test]
     fn the_red_photosite_names_the_tile() {
@@ -428,5 +428,35 @@ mod tests {
         let l = luma(&got.r.data, &got.g.data, &got.b.data);
         let i = 8 * w + 20;
         assert!((l[i] - 0.10).abs() < 1e-9, "the vertical lines moved");
+    }
+
+    #[test]
+    fn two_flat_colours_meet_on_a_line_and_both_come_back() {
+        let (w, h) = (128usize, 96usize);
+        let left = [0.72, 0.34, 0.22];
+        let right = [0.22, 0.34, 0.78];
+        let mut mosaic = vec![0.0; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let rgb = if x < w / 2 { left } else { right };
+                mosaic[y * w + x] = match (x % 2, y % 2) {
+                    (0, 0) => rgb[0],
+                    (1, 1) => rgb[2],
+                    _ => rgb[1],
+                };
+            }
+        }
+        let got = demosaic(&mosaic, w, &Knobs::default());
+        let mut worst = 0.0f64;
+        for y in 24..h - 24 {
+            for x in [24usize, w - 25] {
+                let rgb = if x < w / 2 { left } else { right };
+                let i = y * w + x;
+                worst = worst.max((got.r.data[i] - rgb[0]).abs());
+                worst = worst.max((got.g.data[i] - rgb[1]).abs());
+                worst = worst.max((got.b.data[i] - rgb[2]).abs());
+            }
+        }
+        assert!(worst < 0.03, "a flat colour beside an edge moved by {worst}");
     }
 }

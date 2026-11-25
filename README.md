@@ -180,7 +180,7 @@ Ahead of Markesteijn on all 24 pictures in each condition: by 5.6 dB pixel-sharp
 
 The frequency separation stays the path: every pixel a sum of photosites the sensor measured, and nothing is estimated. *least-squares demosaic* is the alternative. It is in the Negative window, under Development, and it is off. On, a Bayer file is written once as a linear DNG beside the RAW, named with `.mimizan` before `.dng`, highlights kept, and the RAW leaves the strip. Every later open with the checkbox on reads that DNG and does not look at the mosaic again. A newer version of the program writes the DNG again, so the picture is the separation that version makes. The darkroom from there is the linear DNG's: three channels, nothing separated a second time, the plate printing them as it prints the X-Trans DNG. Off, the file stays the measured separation, and the DNG is not a tile of the strip. The choice is remembered.
 
-The separation is the one measured on X-Trans, on the 2×2 mosaic written as a 6×6 tile. The eight line priors of that bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. The frequency separation is not mixed into it. A one-pixel checker that runs along a horizontal line is taken off; the line stays.
+The separation is solved on the 2×2 period. Four frequencies that differ by half a cycle are one solve: the luminance and both chrominances, under the prior the mosaic itself makes most probable. The search counts every such set. Counting every eighth, which is what writing the mosaic out to six and solving that did, leaves a fine colour short of the prior it has. The eight line priors of the X-Trans bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. The frequency separation is not mixed into it. A one-pixel checker that runs along a horizontal line is taken off; the line stays.
 
 ### On the Kodak set
 
@@ -190,7 +190,7 @@ Pixel-sharp:
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| Mimizan Bayer LS | 40.37 | 40.22 | 43.00 | 38.98 | 19/24 |
+| Mimizan Bayer LS | 40.58 | 40.43 | 43.25 | 39.17 | 22/24 |
 | VNG (libraw) | 33.26 | 32.94 | 36.60 | 31.77 | 0/24 |
 | PPG (libraw) | 33.29 | 34.08 | 36.20 | 31.27 | 0/24 |
 | AHD (libraw) | 33.83 | 34.78 | 37.64 | 31.50 | 0/24 |
@@ -203,7 +203,7 @@ Pixel-sharp:
 | EAHD (RawTherapee) | 34.88 | 34.43 | 37.83 | 33.99 | 0/24 |
 | HPHD (RawTherapee) | 35.60 | 35.46 | 37.96 | 34.78 | 0/24 |
 | DCB (RawTherapee) | 35.87 | 35.69 | 38.70 | 34.90 | 0/24 |
-| LMMSE (RawTherapee) | 39.42 | 39.14 | 42.29 | 38.27 | 5/24 |
+| LMMSE (RawTherapee) | 39.42 | 39.14 | 42.29 | 38.27 | 2/24 |
 | IGV (RawTherapee) | 35.69 | 35.48 | 38.53 | 34.82 | 0/24 |
 | AMaZE (RawTherapee) | 36.49 | 36.04 | 39.93 | 35.42 | 0/24 |
 | RCD (RawTherapee) | 35.46 | 35.32 | 36.91 | 34.88 | 0/24 |
@@ -212,7 +212,7 @@ Behind a lens (σ 0.75 px):
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| Mimizan Bayer LS | 49.03 | 48.56 | 51.46 | 47.98 | 22/24 |
+| Mimizan Bayer LS | 49.60 | 49.12 | 52.18 | 48.51 | 24/24 |
 | VNG (libraw) | 41.00 | 41.76 | 44.31 | 39.03 | 0/24 |
 | PPG (libraw) | 41.97 | 44.37 | 47.67 | 38.99 | 0/24 |
 | AHD (libraw) | 41.90 | 44.58 | 48.43 | 38.74 | 0/24 |
@@ -224,8 +224,8 @@ Behind a lens (σ 0.75 px):
 | AHD (RawTherapee) | 43.55 | 43.34 | 48.09 | 42.53 | 0/24 |
 | EAHD (RawTherapee) | 43.56 | 43.40 | 48.03 | 42.58 | 0/24 |
 | HPHD (RawTherapee) | 42.98 | 43.14 | 45.93 | 42.21 | 0/24 |
-| DCB (RawTherapee) | 46.02 | 46.18 | 51.55 | 44.61 | 1/24 |
-| LMMSE (RawTherapee) | 46.16 | 44.99 | 49.27 | 45.95 | 1/24 |
+| DCB (RawTherapee) | 46.02 | 46.18 | 51.55 | 44.61 | 0/24 |
+| LMMSE (RawTherapee) | 46.16 | 44.99 | 49.27 | 45.95 | 0/24 |
 | IGV (RawTherapee) | 40.59 | 40.36 | 43.93 | 39.85 | 0/24 |
 | AMaZE (RawTherapee) | 45.61 | 45.55 | 49.64 | 44.51 | 0/24 |
 | RCD (RawTherapee) | 46.19 | 45.91 | 50.05 | 45.18 | 0/24 |
@@ -234,7 +234,7 @@ Twice the size:
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| Mimizan Bayer LS | 46.45 | 46.23 | 48.46 | 45.36 | 12/24 |
+| Mimizan Bayer LS | 47.03 | 46.82 | 49.17 | 45.87 | 16/24 |
 | VNG (libraw) | 41.01 | 41.76 | 43.95 | 39.09 | 0/24 |
 | PPG (libraw) | 42.65 | 44.24 | 47.89 | 39.93 | 0/24 |
 | AHD (libraw) | 42.43 | 44.06 | 47.89 | 39.65 | 0/24 |
@@ -246,13 +246,13 @@ Twice the size:
 | AHD (RawTherapee) | 43.21 | 42.80 | 47.30 | 42.20 | 0/24 |
 | EAHD (RawTherapee) | 43.21 | 42.83 | 47.27 | 42.21 | 0/24 |
 | HPHD (RawTherapee) | 42.19 | 42.18 | 44.50 | 41.52 | 0/24 |
-| DCB (RawTherapee) | 45.22 | 45.42 | 49.73 | 43.78 | 6/24 |
-| LMMSE (RawTherapee) | 44.75 | 44.09 | 47.65 | 44.04 | 3/24 |
+| DCB (RawTherapee) | 45.22 | 45.42 | 49.73 | 43.78 | 5/24 |
+| LMMSE (RawTherapee) | 44.75 | 44.09 | 47.65 | 44.04 | 2/24 |
 | IGV (RawTherapee) | 40.34 | 40.16 | 43.49 | 39.37 | 0/24 |
 | AMaZE (RawTherapee) | 44.51 | 44.45 | 47.74 | 43.46 | 0/24 |
-| RCD (RawTherapee) | 45.42 | 45.32 | 49.21 | 44.16 | 3/24 |
+| RCD (RawTherapee) | 45.42 | 45.32 | 49.21 | 44.16 | 1/24 |
 
-The mean leads in each condition: by 0.95 dB pixel-sharp against LMMSE, by 2.84 dB behind a lens against RCD, by 1.03 dB at twice the size against RCD. Not every picture does. Pixel-sharp, five pictures stay behind LMMSE, by 0.08 to 0.25 dB. Behind a lens, kodim06 stays behind DCB by 0.70 dB and kodim19 behind LMMSE by 0.55 dB. At twice the size, twelve pictures stay behind, by up to 1.57 dB (kodim16 against DCB); the gap is green and red on fine structure.
+The mean leads in each condition: by 1.16 dB pixel-sharp against LMMSE, by 3.41 dB behind a lens against RCD, by 1.61 dB at twice the size against RCD. Not every picture does. Pixel-sharp, kodim08 stays behind LMMSE by 0.08 dB and kodim09 by 0.38 dB. Behind a lens, every picture leads. At twice the size, eight pictures stay behind, by up to 0.94 dB (kodim12 against DCB).
 
 ## A session
 

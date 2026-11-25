@@ -248,8 +248,8 @@ enum BenchCmd {
     Kodak(kodak::KodakArgs),
     /// The same mosaics in colour: the three-colour plate vs the demosaicers' RGB (CPSNR)
     Plate(plate_bench::PlateBenchArgs),
-    /// Bayer mosaics in colour: the X-Trans least-squares demosaic on the
-    /// 2×2 tile, against the same demosaicers (CPSNR)
+    /// Bayer mosaics in colour: the least-squares demosaic on the 2×2
+    /// period, against the same demosaicers (CPSNR)
     Bayer(bayer_bench::BayerBenchArgs),
 }
 
