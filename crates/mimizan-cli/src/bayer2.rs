@@ -452,10 +452,10 @@ fn spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
 /// away; it mixes each bin only with its neighbours, and the carriers stay
 /// where they are.
 ///
-/// The lens is measured on this. The search is not: measured on the Kodak
-/// set, the prior found on faded windows is 0.4 dB better at twice the
-/// size, on the eight pictures tried, and 0.1 dB worse pixel-sharp, six
-/// of the twenty-four by 0.3 to 0.5 dB.
+/// The search and the lens are both on this. Measured on the Kodak set
+/// under the sRGB curve, against a search on windows that do not fade:
+/// 0.34 dB better behind a lens, 0.26 dB better at twice the size and
+/// 0.12 dB worse pixel-sharp, where the step is the picture's own.
 fn faded_spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
     let (tw, th) = (fft.w, fft.h);
     let fade = |n: usize| -> Vec<f64> {
@@ -789,7 +789,7 @@ pub fn fit_prior(m: &Plane, start: Prior, stride: usize, free: [bool; 6]) -> Pri
     let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
     let at = fit_windows(w, h, &fr);
     let lat = Lattice::new(tw, th);
-    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| spectrum(m, &lat.fft, ox, oy)).collect();
+    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| faded_spectrum(m, &lat.fft, ox, oy)).collect();
     let x0 = [
         start.alpha,
         start.alpha_c,
@@ -905,8 +905,7 @@ pub fn fit_spectrum(m: &Plane, start: Prior, stride: usize, rounds: usize) -> Sp
 /// cannot say which it is, and a lens that may rise takes the chrominance's
 /// carrier for luminance.
 ///
-/// The windows are faded here, which the search's are not. `rounds` is
-/// 100 where the pictures are made. Measured on seven Kodak pictures, 300
+/// `rounds` is 100 where the pictures are made. Measured on seven Kodak pictures, 300
 /// and 1000 rounds make the mosaic more probable still and the picture
 /// worse, by up to 0.2 and 0.4 dB: the noise grows at the cost of the
 /// lens's last part.
