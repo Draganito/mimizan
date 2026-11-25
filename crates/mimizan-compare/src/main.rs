@@ -15,6 +15,10 @@
 //! With no path, Open picks the file. A path on the command line still
 //! develops at once, and a file dropped on the window does too.
 //!
+//! RawTherapee and dcraw are the names on the path, unless *RawTherapee…*
+//! or *dcraw…* has pointed at the program. The choice is kept beside this
+//! program, in `mimizan-compare.tools`.
+//!
 //! The developed TIFFs land in `photo.mimizan-compare/` beside the RAW and
 //! are kept. A second open reads them. *Develop again* writes them over.
 //!
@@ -166,6 +170,10 @@ struct App {
     status: String,
     working: bool,
     rx: Option<Receiver<Note>>,
+    /// The two programs the rivals are developed with, chosen by hand.
+    tools: Tools,
+    tool_dialog: FileDialog,
+    asking: Option<WhichTool>,
 }
 
 struct View {
@@ -206,6 +214,9 @@ impl App {
             status: "Open a RAW file, or drop one here.".into(),
             working: false,
             rx: None,
+            tools: load_tools(),
+            tool_dialog: tool_dialog(),
+            asking: None,
         };
         if !app.path.is_empty() {
             app.develop(false);
@@ -253,7 +264,8 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let algo = self.algo;
-        thread::spawn(move || develop_all(&raw, again, algo, false, tx));
+        let tools = self.tools.clone();
+        thread::spawn(move || develop_all(&raw, again, algo, false, tools, tx));
     }
 
     /// The other Mimizan algorithm, the rivals staying as they are.
@@ -275,7 +287,8 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         let algo = self.algo;
-        thread::spawn(move || develop_all(&raw, false, algo, true, tx));
+        let tools = self.tools.clone();
+        thread::spawn(move || develop_all(&raw, false, algo, true, tools, tx));
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -353,7 +366,9 @@ impl eframe::App for App {
                 self.take_file(file);
             }
         }
-        {
+        if self.asking.is_some() {
+            self.tool_dialog.update(&ctx);
+        } else {
             let dialog = &mut self.dialog;
             let preview = &mut self.preview;
             dialog.set_right_panel_width(300.0);
@@ -361,10 +376,24 @@ impl eframe::App for App {
                 preview.panel(ui, &ctx, dia);
             });
         }
-        if let Some(path) = self.dialog.take_picked() {
-            self.take_file(path);
+        if let Some(path) = self.tool_dialog.take_picked() {
+            if let Some(which) = self.asking.take() {
+                self.tools.set(which, path.clone());
+                self.status = match save_tools(&self.tools) {
+                    Ok(()) => format!("Using {}", path.display()),
+                    Err(e) => format!("Using {}. The choice was not kept: {e}", path.display()),
+                };
+            }
+        } else if self.asking.is_some() && !matches!(self.tool_dialog.state(), DialogState::Open) {
+            self.asking = None;
         }
-        let picking = matches!(self.dialog.state(), DialogState::Open);
+        if self.asking.is_none() {
+            if let Some(path) = self.dialog.take_picked() {
+                self.take_file(path);
+            }
+        }
+        let picking = matches!(self.dialog.state(), DialogState::Open)
+            || matches!(self.tool_dialog.state(), DialogState::Open);
         let mut open = false;
         ctx.input(|i| {
             if self.working || picking {
@@ -449,6 +478,9 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
+                self.tool_button(ui, WhichTool::RawTherapee, "RawTherapee…");
+                self.tool_button(ui, WhichTool::Dcraw, "dcraw…");
+                ui.separator();
                 if ui.button("Fit").clicked() {
                     self.fitted = false;
                 }
@@ -506,6 +538,27 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn tool_button(&mut self, ui: &mut egui::Ui, which: WhichTool, label: &str) {
+        let chosen = self.tools.get(which).to_path_buf();
+        let tip = if chosen.as_os_str().is_empty() {
+            format!("Choose {}. The name on the path is used until then.", which.name())
+        } else {
+            chosen.display().to_string()
+        };
+        if ui.add_enabled(!self.working, egui::Button::new(label)).on_hover_text(tip).clicked() {
+            self.open_tool(which);
+        }
+    }
+
+    fn open_tool(&mut self, which: WhichTool) {
+        if self.working {
+            return;
+        }
+        self.tool_dialog.config_mut().initial_directory = tool_directory(self.tools.get(which));
+        self.asking = Some(which);
+        self.tool_dialog.pick_file();
+    }
+
     fn frame(&self) -> Option<egui::Vec2> {
         let pic = self.pictures[0]
             .as_ref()
@@ -566,7 +619,14 @@ fn paint(ui: &egui::Ui, pane: egui::Rect, title: &str, texture: Option<&egui::Te
 /// developed again, because those files went through the paper.
 const VIEW: &str = "srgb-matrix-1";
 
-fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tx: mpsc::Sender<Note>) {
+fn develop_all(
+    raw: &Path,
+    again: bool,
+    mut algo: Algo,
+    only_left: bool,
+    tools: Tools,
+    tx: mpsc::Sender<Note>,
+) {
     let work = work_dir(raw);
     if let Err(e) = std::fs::create_dir_all(&work) {
         let _ = tx.send(Note::Missed { slot: 0, error: e.to_string() });
@@ -656,6 +716,7 @@ fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tx: mps
             let tx_r = tx.clone();
             let work = work.clone();
             let raw = raw.to_path_buf();
+            let tools = tools.clone();
             scope.spawn(move || loop {
                 let n = {
                     let Ok(guard) = job_rx.lock() else { break };
@@ -671,8 +732,10 @@ fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tx: mps
                     let _ = tx_r.send(Note::Status(format!("Developing {}…", rival.label)));
                     let linear = work.join(format!("{}.linear.tif", rival.key));
                     let run = match rival.kind {
-                        Kind::Dht => develop_dht(&raw, &linear),
-                        Kind::Bayer(_) | Kind::Xtrans(_) => develop_rawtherapee(&raw, &work, rival, &linear),
+                        Kind::Dht => develop_dht(&raw, &linear, tools.dcraw()),
+                        Kind::Bayer(_) | Kind::Xtrans(_) => {
+                            develop_rawtherapee(&raw, &work, rival, &linear, tools.rawtherapee())
+                        }
                     };
                     let encoded = !matches!(rival.kind, Kind::Dht);
                     let run = run.and_then(|_| {
@@ -838,7 +901,7 @@ fn read_plate(negative: &Path) -> Result<PlateMeta> {
     Ok(read_plate_samples(negative)?.0)
 }
 
-fn develop_rawtherapee(raw: &Path, work: &Path, rival: &Rival, out: &Path) -> Result<()> {
+fn develop_rawtherapee(raw: &Path, work: &Path, rival: &Rival, out: &Path, bin: &Path) -> Result<()> {
     let (bayer, xtrans) = match rival.kind {
         Kind::Bayer(method) => (method, "3-pass (best)"),
         Kind::Xtrans(method) => ("rcd", method),
@@ -846,11 +909,12 @@ fn develop_rawtherapee(raw: &Path, work: &Path, rival: &Rival, out: &Path) -> Re
     };
     let pp3 = work.join(format!("rt_{}.pp3", rival.key));
     std::fs::write(&pp3, rt_profile(bayer, xtrans))?;
-    let mut cmd = Command::new("rawtherapee-cli");
+    let mut cmd = Command::new(bin);
     cmd.args(["-q", "-Y", "-t", "-b16", "-o"]).arg(out).arg("-p").arg(&pp3).arg("-c").arg(raw);
-    run(&mut cmd, "rawtherapee-cli")?;
+    let name = bin.display().to_string();
+    run(&mut cmd, &name)?;
     if !out.is_file() {
-        bail!("rawtherapee-cli wrote no {}", out.display());
+        bail!("{name} wrote no {}", out.display());
     }
     Ok(())
 }
@@ -998,14 +1062,15 @@ fn encode_balanced(
     rgb
 }
 
-fn develop_dht(raw: &Path, out: &Path) -> Result<()> {
-    let mut cmd = Command::new("dcraw_emu");
+fn develop_dht(raw: &Path, out: &Path, bin: &Path) -> Result<()> {
+    let mut cmd = Command::new(bin);
     // Linear 16-bit (-4), camera channels (-o 0), camera white balance,
     // highlights clipped. -4 already refuses the automatic brightness.
     cmd.args(["-4", "-o", "0", "-w", "-H", "0", "-q", "11", "-T", "-Z"]).arg(out).arg(raw);
-    run(&mut cmd, "dcraw_emu")?;
+    let name = bin.display().to_string();
+    run(&mut cmd, &name)?;
     if !out.is_file() {
-        bail!("dcraw_emu wrote no {}", out.display());
+        bail!("{name} wrote no {}", out.display());
     }
     Ok(())
 }
@@ -1268,6 +1333,131 @@ fn fit_preview(rgba: Vec<u8>, width: usize, height: usize, edge: u32) -> Picture
     Picture { width: tw as usize, height: th as usize, rgba: out.into_raw() }
 }
 
+/// Which of the two rival programs a button is choosing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WhichTool {
+    RawTherapee,
+    Dcraw,
+}
+
+impl WhichTool {
+    fn name(self) -> &'static str {
+        match self {
+            WhichTool::RawTherapee => "rawtherapee-cli",
+            WhichTool::Dcraw => "dcraw_emu",
+        }
+    }
+}
+
+/// The programs the rivals are run with. An empty path means the name on
+/// the path.
+#[derive(Clone, Default)]
+struct Tools {
+    rawtherapee: PathBuf,
+    dcraw: PathBuf,
+}
+
+impl Tools {
+    fn get(&self, which: WhichTool) -> &Path {
+        match which {
+            WhichTool::RawTherapee => &self.rawtherapee,
+            WhichTool::Dcraw => &self.dcraw,
+        }
+    }
+
+    fn set(&mut self, which: WhichTool, path: PathBuf) {
+        match which {
+            WhichTool::RawTherapee => self.rawtherapee = path,
+            WhichTool::Dcraw => self.dcraw = path,
+        }
+    }
+
+    fn rawtherapee(&self) -> &Path {
+        program(&self.rawtherapee, WhichTool::RawTherapee.name())
+    }
+
+    fn dcraw(&self) -> &Path {
+        program(&self.dcraw, WhichTool::Dcraw.name())
+    }
+}
+
+fn program<'a>(chosen: &'a Path, name: &'a str) -> &'a Path {
+    if chosen.as_os_str().is_empty() {
+        Path::new(name)
+    } else {
+        chosen
+    }
+}
+
+fn tool_dialog() -> FileDialog {
+    FileDialog::new().opening_mode(OpeningMode::AlwaysInitialDir)
+}
+
+/// Where the program dialog starts: the folder of the choice, then
+/// `Program Files` on Windows, then home.
+fn tool_directory(current: &Path) -> PathBuf {
+    if let Some(parent) = current.parent() {
+        if !parent.as_os_str().is_empty() && parent.is_dir() {
+            return parent.to_path_buf();
+        }
+    }
+    if let Some(programs) = std::env::var_os("ProgramFiles") {
+        let programs = PathBuf::from(programs);
+        if programs.is_dir() {
+            return programs;
+        }
+    }
+    dialog_directory("")
+}
+
+fn tools_file() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.with_file_name("mimizan-compare.tools"))
+}
+
+fn load_tools() -> Tools {
+    let Some(path) = tools_file() else {
+        return Tools::default();
+    };
+    std::fs::read_to_string(path).map(|text| decode_tools(&text)).unwrap_or_default()
+}
+
+fn save_tools(tools: &Tools) -> Result<()> {
+    let path = tools_file().context("the program's own folder is not known")?;
+    std::fs::write(&path, encode_tools(&tools.rawtherapee, &tools.dcraw))
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+fn encode_tools(rawtherapee: &Path, dcraw: &Path) -> String {
+    let mut out = String::new();
+    if !rawtherapee.as_os_str().is_empty() {
+        out.push_str("rawtherapee-cli=");
+        out.push_str(&rawtherapee.display().to_string());
+        out.push('\n');
+    }
+    if !dcraw.as_os_str().is_empty() {
+        out.push_str("dcraw_emu=");
+        out.push_str(&dcraw.display().to_string());
+        out.push('\n');
+    }
+    out
+}
+
+fn decode_tools(text: &str) -> Tools {
+    let mut tools = Tools::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let path = PathBuf::from(value);
+        match key {
+            "rawtherapee-cli" => tools.rawtherapee = path,
+            "dcraw_emu" => tools.dcraw = path,
+            _ => {}
+        }
+    }
+    tools
+}
+
 fn file_dialog() -> FileDialog {
     FileDialog::new()
         .opening_mode(OpeningMode::AlwaysInitialDir)
@@ -1322,19 +1512,32 @@ fn find_mimizan() -> PathBuf {
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let sibling = dir.join("mimizan");
+            let sibling = named(dir, "mimizan");
             if sibling.is_file() {
                 return sibling;
             }
         }
     }
-    for candidate in ["target/release/mimizan", "target/debug/mimizan"] {
-        let path = PathBuf::from(candidate);
+    for candidate in ["target/release", "target/debug"] {
+        let path = named(Path::new(candidate), "mimizan");
         if path.is_file() {
             return path;
         }
     }
     PathBuf::from("mimizan")
+}
+
+/// `stem` in `dir`, or `stem.exe` where the program is built that way.
+fn named(dir: &Path, stem: &str) -> PathBuf {
+    let path = dir.join(stem);
+    if path.is_file() {
+        return path;
+    }
+    let exe = dir.join(format!("{stem}.exe"));
+    if exe.is_file() {
+        return exe;
+    }
+    path
 }
 
 fn find_cameras() -> Option<PathBuf> {
@@ -1698,6 +1901,21 @@ mod tests {
         assert_eq!(window_title(""), "Mimizan compare");
         assert_eq!(window_title("/photos/DSC.NEF"), "Mimizan compare — DSC.NEF");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chosen_program_is_read_back_and_an_empty_one_is_the_name() {
+        let rt = Path::new("C:/Program Files/RawTherapee/5.11/rawtherapee-cli.exe");
+        let dcraw = Path::new("D:/libraw/bin/dcraw_emu.exe");
+        let text = encode_tools(rt, dcraw);
+        let tools = decode_tools(&text);
+        assert_eq!(tools.rawtherapee(), rt);
+        assert_eq!(tools.dcraw(), dcraw);
+        let only = decode_tools("dcraw_emu=D:/libraw/bin/dcraw_emu.exe\n");
+        assert_eq!(only.rawtherapee(), Path::new("rawtherapee-cli"));
+        assert_eq!(only.dcraw(), dcraw);
+        assert_eq!(decode_tools("").rawtherapee(), Path::new("rawtherapee-cli"));
+        assert_eq!(decode_tools("").dcraw(), Path::new("dcraw_emu"));
     }
 
     #[test]
