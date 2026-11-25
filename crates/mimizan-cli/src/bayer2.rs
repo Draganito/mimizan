@@ -424,11 +424,13 @@ struct Frame {
 }
 
 fn frame_of(w: usize, h: usize) -> Frame {
-    assert!(w >= 2 && h >= 2 && w.is_multiple_of(2) && h.is_multiple_of(2), "a Bayer frame has even sides");
-    // The margin and the step are even, so every window still starts on red.
+    assert!(w >= 2 && h >= 2, "a Bayer frame has two rows and two columns");
+    // The margin and the step are even, so every window starts on red. A
+    // side may be odd: what a window holds past the frame is the frame
+    // mirrored about a photosite, and that keeps the colour.
     let sx = TILE.min(w);
     let sy = TILE.min(h);
-    debug_assert!(sx.is_multiple_of(2) && sy.is_multiple_of(2) && MARGIN.is_multiple_of(2));
+    debug_assert!(TILE.is_multiple_of(2) && MARGIN.is_multiple_of(2));
     Frame { sx, sy, margin: MARGIN }
 }
 

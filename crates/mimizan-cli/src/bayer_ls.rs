@@ -430,6 +430,48 @@ mod tests {
         assert!((l[i] - 0.10).abs() < 1e-9, "the vertical lines moved");
     }
 
+    /// A picture with edges in every direction and three unlike channels.
+    fn scene(w: usize, h: usize) -> impl Fn(usize, usize) -> [f64; 3] {
+        move |x: usize, y: usize| {
+            let (u, v) = (x as f64 / w as f64, y as f64 / h as f64);
+            let ring = ((u - 0.4).hypot(v - 0.55) * 23.0).sin();
+            let bar = if (3.0 * u + 5.0 * v).fract() < 0.5 { 0.12 } else { -0.08 };
+            [0.42 + 0.20 * ring + bar, 0.38 + 0.16 * ring - 0.5 * bar, 0.30 - 0.12 * ring + 0.7 * bar * u]
+        }
+    }
+
+    fn mosaic_of(w: usize, h: usize, at: &dyn Fn(usize, usize) -> [f64; 3]) -> Vec<f64> {
+        (0..w * h).map(|i| at(i % w, i / w)[channel_at(i % w, i / w)]).collect()
+    }
+
+    /// How far a demosaiced frame is from the scene it was cut from, root mean square.
+    fn error_of(w: usize, h: usize, at: &dyn Fn(usize, usize) -> [f64; 3]) -> f64 {
+        let got = demosaic(&mosaic_of(w, h, at), w, &Knobs::default());
+        let mut sum = 0.0;
+        for y in 0..h {
+            for x in 0..w {
+                let (i, want) = (y * w + x, at(x, y));
+                sum += (got.r.data[i] - want[0]).powi(2)
+                    + (got.g.data[i] - want[1]).powi(2)
+                    + (got.b.data[i] - want[2]).powi(2);
+            }
+        }
+        (sum / (3 * w * h) as f64).sqrt()
+    }
+
+    #[test]
+    fn an_odd_frame_is_separated() {
+        // A sensor whose red is not in the corner loses a row or a column,
+        // and an even crop comes out odd. It is the same picture, less one
+        // row or one column, and it is told as well.
+        let at = scene(64, 48);
+        let even = error_of(64, 48, &at);
+        for (w, h) in [(63usize, 48usize), (64, 47), (63, 47)] {
+            let odd = error_of(w, h, &at);
+            assert!(odd < 1.1 * even, "{w}×{h} is {odd} from the scene, the even frame {even}");
+        }
+    }
+
     #[test]
     fn two_flat_colours_meet_on_a_line_and_both_come_back() {
         let (w, h) = (128usize, 96usize);
