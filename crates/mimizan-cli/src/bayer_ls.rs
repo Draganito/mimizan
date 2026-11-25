@@ -9,10 +9,10 @@
 //! the sRGB curve and comes back to linear light, as a camera file does.
 //! Nothing here is treated as burnt out.
 
-use crate::bayer2;
-use mimizan_lab_xtrans::convert::{self, Developed, Frame, WHITE};
+use crate::bayer2::{self, Spectrum, Weighing};
+use mimizan_lab_xtrans::convert::{Developed, Frame, WHITE};
 use mimizan_lab_xtrans::plane::{Plane, Rgb};
-use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, Selection, XTile};
+use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, XTile};
 use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::{RawImage, RawImageData};
 use rayon::prelude::*;
@@ -45,14 +45,17 @@ pub const BAYER6: &str = "RGRGRGGBGBGBRGRGRGGBGBGBRGRGRGGBGBGB";
 pub struct Knobs {
     /// Gaussian σ of the window the priors are weighed in, px.
     pub sigma: f64,
+    /// Gaussian σ of the window their left-out error is taken in, px.
+    pub near: f64,
+    /// Share of the left-out error in the weight; 0 weighs by the likelihood alone.
+    pub left_out: f64,
     /// How many pixels' worth of evidence that weight is given.
     pub sharp: f64,
     /// Head start of the prior the search found, in the units of the score.
     pub bias: f64,
-    /// The eight priors for lines near the sensor's limit. They were measured
-    /// for the X-Trans tile, which holds every colour in every row. A Bayer
-    /// row does not, and on a saturated picture they take the colour out.
-    pub lines: bool,
+    /// How often the lens and the noise are moved towards what the mosaic
+    /// gives them, after the search. 0 leaves the search's Gaussian lens.
+    pub lens_rounds: usize,
     /// How often the second step is repeated.
     pub rounds: usize,
     /// The test that keeps the second step only where the luminance gets
@@ -64,7 +67,17 @@ pub struct Knobs {
 
 impl Default for Knobs {
     fn default() -> Self {
-        Self { sigma: 6.0, sharp: 20.0, bias: 0.0, lines: false, rounds: 1, check: 4.0, hold: 0.15 }
+        Self {
+            sigma: 6.0,
+            near: 1.0,
+            left_out: 0.5,
+            sharp: 20.0,
+            bias: 0.0,
+            lens_rounds: 100,
+            rounds: 1,
+            check: 4.0,
+            hold: 0.15,
+        }
     }
 }
 
@@ -96,38 +109,51 @@ pub fn separate(
     // Every set, not every eighth. An eighth is enough on a smooth picture
     // and not on a fine one: kodim19 and kodim22 moved by half a decibel
     // once the search was shown the whole mosaic.
-    let found =
-        bayer2::fit_prior(&tone.mosaic(&Plane::from_vec(width, height, fit.to_vec())), start, 1, [true; 6]);
+    let found = bayer2::fit_spectrum(
+        &tone.mosaic(&Plane::from_vec(width, height, fit.to_vec())),
+        start,
+        1,
+        knobs.lens_rounds,
+    );
     let m = tone.mosaic(&Plane::from_vec(width, height, linear.to_vec()));
-    let priors = bayer_priors(found, knobs.lines);
-    let sel = Selection { sigma: knobs.sigma, sharp: knobs.sharp, bias: knobs.bias };
+    let priors = bayer_priors(&found);
+    let sel = Weighing {
+        sigma: knobs.sigma,
+        near: knobs.near,
+        left_out: knobs.left_out,
+        sharp: knobs.sharp,
+        bias: knobs.bias,
+    };
     let (c1, c2) = bayer2::separate_bank(&m, &priors, &sel, progress);
     let sep = xtrans::from_chroma(&m, &tile, c1, c2);
     let refine = Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
     let rgb = xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb();
-    (without_line_checker(rgb), found)
+    (without_line_checker(rgb), found.prior)
 }
 
-/// The priors weighed per pixel.
+/// The spectra weighed per pixel.
 ///
-/// The bank measured for X-Trans, without the eight line priors unless
-/// asked. Those priors assume every row holds red, green and blue, which
-/// is true of the X-Trans tile and false of a Bayer row, and on a saturated
-/// picture they take the colour out (kodim03 and kodim15, about 7 dB).
+/// The one found; that one with a sixteenth, a quarter, four and sixteen
+/// times the colour; and sixteen with a direction. Eight hold four times
+/// the colour to their direction with `cos⁸`. In the other eight the
+/// luminance falls only as `f¹`, so a fine edge can keep its contrast, and
+/// the direction is held with `cos³²`: a Bayer edge is one photosite wide.
+/// Their colour stays the one found, and it still falls with frequency. A
+/// colour that does not fall is taken on a saturated picture and the
+/// colour goes: that is what the X-Trans line priors did here (kodim03
+/// and kodim15, about 7 dB), and they are not in this bank.
 ///
-/// In their place, eight directions. The luminance falls only as `f¹`, so a
-/// fine edge can keep its contrast, and the direction is held with `cos³²`
-/// rather than the `cos⁸` of the bank: a Bayer edge is one photosite wide.
-/// The colour stays the one the search found, and it still falls with
-/// frequency. A colour that does not fall is taken on a saturated picture
-/// and the colour goes.
-fn bayer_priors(found: Prior, lines: bool) -> Vec<Prior> {
-    let mut priors = convert::bank(found);
-    if !lines {
-        priors.truncate(13);
-    }
-    let along = Prior { alpha: found.alpha.min(1.0), ..found };
-    priors.extend((0..8).map(|j| Prior { oriented: Some((PI * j as f64 / 8.0, 32.0)), ..along }));
+/// All of them are behind the lens the mosaic was found to have.
+pub fn bayer_priors(found: &Spectrum) -> Vec<Spectrum> {
+    let colour = |f: f64| found.with(Prior { chroma: found.prior.chroma.map(|c| c * f), ..found.prior });
+    let towards = |q: Spectrum, k: f64| {
+        (0..8).map(move |j| q.with(Prior { oriented: Some((PI * j as f64 / 8.0, k)), ..q.prior }))
+    };
+    let along = found.with(Prior { alpha: found.prior.alpha.min(1.0), ..found.prior });
+    let mut priors = vec![found.clone()];
+    priors.extend([0.0625, 0.25, 4.0, 16.0].map(colour));
+    priors.extend(towards(colour(4.0), 8.0));
+    priors.extend(towards(along, 32.0));
     priors
 }
 
@@ -149,7 +175,7 @@ fn luma(r: &[f64], g: &[f64], b: &[f64]) -> Vec<f64> {
 /// horizontal change, which a real edge does. Where both hold, half of that
 /// Nyquist sample is put back, and no more than [`CHECK_CAP`]. On the 24
 /// Kodak pictures the colour PSNR moves by a few hundredths of a decibel.
-fn without_line_checker(rgb: Rgb) -> Rgb {
+pub fn without_line_checker(rgb: Rgb) -> Rgb {
     let (width, height) = (rgb.r.width, rgb.r.height);
     let (c1, c2) = chroma(&rgb.r.data, &rgb.g.data, &rgb.b.data);
     let lum = luma(&rgb.r.data, &rgb.g.data, &rgb.b.data);
@@ -384,7 +410,10 @@ fn channel_at(x: usize, y: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{channel_at, demosaic, from_luma, luma, red_site, without_line_checker, Knobs};
+    use super::{
+        bayer2, bayer_priors, channel_at, demosaic, from_luma, luma, red_site, without_line_checker, Knobs,
+        Plane, Prior, Spectrum, Weighing,
+    };
 
     #[test]
     fn the_red_photosite_names_the_tile() {
@@ -470,6 +499,34 @@ mod tests {
             let odd = error_of(w, h, &at);
             assert!(odd < 1.1 * even, "{w}×{h} is {odd} from the scene, the even frame {even}");
         }
+    }
+
+    #[test]
+    fn a_frame_turned_about_its_diagonal_gives_the_same_colours_turned() {
+        // Red stays in the corner and blue beside it, so nothing but the
+        // directions of the bank changes, and those change into each other.
+        let (w, h) = (72usize, 56usize);
+        let at = scene(w, h);
+        let turned = move |x: usize, y: usize| at(y, x);
+        let bank = bayer_priors(&Spectrum::plain(Prior {
+            lens: 0.4,
+            noise: 1e-3,
+            chroma: [0.02, 0.01],
+            ..Prior::default()
+        }));
+        let weighing = Weighing::default();
+        let straight = Plane::from_vec(w, h, mosaic_of(w, h, &scene(w, h)));
+        let across = Plane::from_vec(h, w, mosaic_of(h, w, &turned));
+        let (a1, a2) = bayer2::separate_bank(&straight, &bank, &weighing, &|_| {});
+        let (b1, b2) = bayer2::separate_bank(&across, &bank, &weighing, &|_| {});
+        let mut worst = 0.0f64;
+        for y in 0..h {
+            for x in 0..w {
+                worst = worst.max((a1.data[y * w + x] - b1.data[x * h + y]).abs());
+                worst = worst.max((a2.data[y * w + x] - b2.data[x * h + y]).abs());
+            }
+        }
+        assert!(worst < 1e-9, "the turned frame differs by {worst}");
     }
 
     #[test]

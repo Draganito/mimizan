@@ -46,15 +46,21 @@ pub struct BayerBenchArgs {
     /// Gaussian σ of the window the priors are weighed in
     #[arg(long, default_value_t = 6.0)]
     pub sigma: f64,
+    /// Gaussian σ of the window the left-out error of the priors is taken in
+    #[arg(long, default_value_t = 1.0)]
+    pub near: f64,
+    /// Share of the left-out error in the weight; 0 = the likelihood alone
+    #[arg(long, default_value_t = 0.5)]
+    pub left_out: f64,
     /// How many pixels' worth of evidence that weight is given
     #[arg(long, default_value_t = 20.0)]
     pub sharp: f64,
     /// Head start of the prior the search found
     #[arg(long, default_value_t = 0.0)]
     pub bias: f64,
-    /// Put back the eight line priors measured for the X-Trans tile
-    #[arg(long)]
-    pub lines: bool,
+    /// How often the lens and the noise are moved towards the mosaic's own after the search; 0 = the search's Gaussian lens
+    #[arg(long, default_value_t = 100)]
+    pub lens_rounds: usize,
     /// How often the second step is repeated
     #[arg(long, default_value_t = 1)]
     pub rounds: usize,
@@ -92,9 +98,11 @@ struct Report {
 #[derive(Clone, Copy, Debug, Serialize)]
 struct KnobDump {
     sigma: f64,
+    near: f64,
+    left_out: f64,
     sharp: f64,
     bias: f64,
-    lines: bool,
+    lens_rounds: usize,
     rounds: usize,
     check: f64,
     hold: f64,
@@ -108,9 +116,11 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
     std::fs::create_dir_all(&a.out)?;
     let knobs = Knobs {
         sigma: a.sigma,
+        near: a.near,
+        left_out: a.left_out,
         sharp: a.sharp,
         bias: a.bias,
-        lines: a.lines,
+        lens_rounds: a.lens_rounds,
         rounds: a.rounds,
         check: a.check,
         hold: a.hold,
@@ -212,9 +222,11 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
         blur: a.blur,
         knobs: KnobDump {
             sigma: knobs.sigma,
+            near: knobs.near,
+            left_out: knobs.left_out,
             sharp: knobs.sharp,
             bias: knobs.bias,
-            lines: knobs.lines,
+            lens_rounds: knobs.lens_rounds,
             rounds: knobs.rounds,
             check: knobs.check,
             hold: knobs.hold,
