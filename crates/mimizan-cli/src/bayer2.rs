@@ -442,6 +442,11 @@ fn spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
     spec
 }
 
+/// A raised cosine over `n` photosites: nothing at both ends, one in the middle.
+fn fade(n: usize) -> Vec<f64> {
+    (0..n).map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f64 + 0.5) / n as f64).cos()).collect()
+}
+
 /// The spectrum of one window, the window fading to nothing at its sides
 /// as a raised cosine.
 ///
@@ -458,9 +463,6 @@ fn spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
 /// 0.12 dB worse pixel-sharp, where the step is the picture's own.
 fn faded_spectrum(m: &Plane, fft: &Fft2, ox: isize, oy: isize) -> Vec<C64> {
     let (tw, th) = (fft.w, fft.h);
-    let fade = |n: usize| -> Vec<f64> {
-        (0..n).map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f64 + 0.5) / n as f64).cos()).collect()
-    };
     let (fx, fy) = (fade(tw), fade(th));
     let mut spec = vec![C64::new(0.0, 0.0); tw * th];
     for y in 0..th {
@@ -880,6 +882,121 @@ pub fn fit_prior(m: &Plane, start: Prior, stride: usize, free: [bool; 6]) -> Pri
     }
     ends.sort_by(|a, b| a.1.total_cmp(&b.1));
     to_prior(&ends[0].0)
+}
+
+/// How probable the light itself is when `m` is that light under a tone
+/// curve and `spec` is the spectrum found for `m`: twice the logarithm
+/// per photosite, the level left free, up to a constant that no curve
+/// changes. Larger is better.
+///
+/// `stretch` is the logarithm of the curve's slope at each photosite. A
+/// curve that pulls the values apart makes them less probable by as much,
+/// and without that every curve that flattens the picture would win.
+/// The windows are the search's, faded, and the slope is weighed as they
+/// are.
+pub fn likelihood(m: &Plane, spec: &Spectrum, stretch: &Plane) -> f64 {
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let specs: Vec<Vec<C64>> = at.par_iter().map(|&(ox, oy)| faded_spectrum(m, &lat.fft, ox, oy)).collect();
+    let (fx, fy) = (fade(tw), fade(th));
+    let (mut sum, mut weight) = (0.0, 0.0);
+    for &(ox, oy) in &at {
+        for (y, down) in fy.iter().enumerate() {
+            let row = stretch.row(reflect(oy + y as isize, h));
+            for (x, across) in fx.iter().enumerate() {
+                let f = (across * down).powi(2);
+                sum += f * row[reflect(ox + x as isize, w)];
+                weight += f;
+            }
+        }
+    }
+    evidence(&lat, &specs, spec, 1) + 2.0 * sum / weight
+}
+
+/// How far each photosite is from what all the others say of it under
+/// `spec`: the mean square over the search's windows, each error divided
+/// by `slope` at its photosite, which takes it from the curve `m` is under
+/// to another.
+pub fn missed(m: &Plane, spec: &Spectrum, slope: &Plane) -> f64 {
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let fact = Factored::build(&lat, spec);
+    let (sum, count) = at
+        .par_iter()
+        .map(|&(ox, oy)| {
+            let one = spectrum(m, &lat.fft, ox, oy);
+            let mut chroma = vec![C64::new(0.0, 0.0); tw * th];
+            let mut energy = vec![C64::new(0.0, 0.0); tw * th];
+            demod(&lat, &fact, &one, &mut chroma, &mut energy);
+            lat.fft.run(&mut energy, true);
+            let (mut sum, mut count) = (0.0, 0.0);
+            for y in fr.margin..th - fr.margin {
+                let row = slope.row(reflect(oy + y as isize, h));
+                for x in fr.margin..tw - fr.margin {
+                    let by = row[reflect(ox + x as isize, w)];
+                    sum += (fact.apart(energy[y * tw + x].re, x, y) / by).powi(2);
+                    count += 1.0;
+                }
+            }
+            (sum, count)
+        })
+        .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    sum / count
+}
+
+/// How well the light at a photosite is told from all the others when `m`
+/// is that light under a tone curve and `spec` is the spectrum found for
+/// `m`: the mean logarithm of the left-out error, squared, taken back to
+/// light by the curve's `slope` there and over a region `near` wide.
+/// Smaller is better, and it is in the measure of [`likelihood`]. `floor`
+/// is the least error there is to tell, in light. The windows are the
+/// search's.
+pub fn told(m: &Plane, spec: &Spectrum, slope: &Plane, near: f64, floor: f64) -> f64 {
+    let (w, h) = (m.width, m.height);
+    let fr = frame_of(w, h);
+    let (tw, th) = ((fr.sx + 2 * fr.margin).div_ceil(2) * 2, (fr.sy + 2 * fr.margin).div_ceil(2) * 2);
+    let at = fit_windows(w, h, &fr);
+    let lat = Lattice::new(tw, th);
+    let fact = Factored::build(&lat, spec);
+    let k = gaussian_kernel(near);
+    let (sum, count) = at
+        .par_iter()
+        .map(|&(ox, oy)| {
+            let one = spectrum(m, &lat.fft, ox, oy);
+            let mut chroma = vec![C64::new(0.0, 0.0); tw * th];
+            let mut energy = vec![C64::new(0.0, 0.0); tw * th];
+            demod(&lat, &fact, &one, &mut chroma, &mut energy);
+            lat.fft.run(&mut energy, true);
+            let mut e = Plane::zeros(tw, th);
+            for y in 0..th {
+                let row = slope.row(reflect(oy + y as isize, h));
+                let out = e.row_mut(y);
+                for (x, o) in out.iter_mut().enumerate() {
+                    let by = row[reflect(ox + x as isize, w)];
+                    *o = (fact.apart(energy[y * tw + x].re, x, y) / by).powi(2);
+                }
+            }
+            let mut rows = Plane::zeros(tw, th);
+            let mut smooth = Plane::zeros(tw, th);
+            convolve_rows_mod_into(&e, &k, |_, _| 1.0, &mut rows);
+            convolve_cols_signed_into(&rows, &k, |_| 1.0, &mut smooth);
+            let (mut sum, mut count) = (0.0, 0.0);
+            for y in fr.margin..th - fr.margin {
+                for x in fr.margin..tw - fr.margin {
+                    sum += (smooth.data[y * tw + x] + floor * floor).ln();
+                    count += 1.0;
+                }
+            }
+            (sum, count)
+        })
+        .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    sum / count
 }
 
 /// The spectrum under which the mosaic itself is most probable.
@@ -1414,6 +1531,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_same_light_under_a_curve_twice_as_steep_is_as_probable() {
+        let spec = Spectrum::plain(Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 2e-3,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        });
+        let (w, h) = (96usize, 80usize);
+        let m = drawn(w, h, &spec, 5);
+        let slope = Plane::from_vec(w, h, scattered(w, h, 9).data.iter().map(|v| 0.5 + v).collect());
+        let log = |p: &Plane, by: f64| Plane::from_vec(w, h, p.data.iter().map(|v| (by * v).ln()).collect());
+        let times = |p: &Plane, by: f64| Plane::from_vec(w, h, p.data.iter().map(|v| by * v).collect());
+        let (once, twice) =
+            (likelihood(&m, &spec, &log(&slope, 1.0)), likelihood(&times(&m, 2.0), &spec, &log(&slope, 2.0)));
+        assert!((once - twice).abs() < 1e-9, "{once} and {twice}");
+        let (once, twice) =
+            (told(&m, &spec, &slope, 1.0, 0.0), told(&times(&m, 2.0), &spec, &times(&slope, 2.0), 1.0, 0.0));
+        assert!((once - twice).abs() < 1e-9, "{once} and {twice}");
+    }
+
+    #[test]
+    fn a_light_is_most_probable_under_the_curve_its_frame_was_drawn_under() {
+        // The frame is the square root of a light. Under the root the
+        // light is the frame again; as it is, it is the frame squared.
+        let spec = Spectrum::plain(Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.5,
+            noise: 2e-3,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        });
+        let (w, h) = (192usize, 160usize);
+        let frame = drawn(w, h, &spec, 23);
+        let span = frame.data.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let root = Plane::from_vec(w, h, frame.data.iter().map(|v| 1.0 + 0.8 * v / span).collect());
+        let light = Plane::from_vec(w, h, root.data.iter().map(|v| v * v).collect());
+        let steep = Plane::from_vec(w, h, root.data.iter().map(|v| 0.5 / v).collect());
+        let level = Plane::from_vec(w, h, vec![1.0; w * h]);
+        let log = |p: &Plane| Plane::from_vec(w, h, p.data.iter().map(|v| v.ln()).collect());
+        let start = Prior { lens: 0.3, ..Prior::default() };
+        let under = fit_spectrum(&root, start, 1, 20);
+        let bare = fit_spectrum(&light, start, 1, 20);
+        let (own, other) = (likelihood(&root, &under, &log(&steep)), likelihood(&light, &bare, &log(&level)));
+        assert!(own > other, "the light is more probable as it is: {other} over {own}");
+        let (own, other) = (told(&root, &under, &steep, 1.0, 0.0), told(&light, &bare, &level, 1.0, 0.0));
+        assert!(own < other, "a photosite is told better in the light as it is: {other} under {own}");
     }
 
     #[test]
