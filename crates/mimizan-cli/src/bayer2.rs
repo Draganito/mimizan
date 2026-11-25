@@ -1008,6 +1008,20 @@ pub fn fit_spectrum(m: &Plane, start: Prior, stride: usize, rounds: usize) -> Sp
     measure_spectrum(m, fit_prior(m, start, stride, [true; 6]), rounds)
 }
 
+/// The least the noise is taken for: this share of what the luminance has
+/// at the sensor's limit, 0.5 c/px, behind the lens found.
+///
+/// A round moves the noise by little, and after a hundred a picture as
+/// sharp as its pixels has a noise thousands of times under its finest
+/// luminance. The separation then takes all there is at the limit for
+/// luminance, the chrominance's carrier with it. Measured pixel-sharp: the
+/// Kodak set 0.19 dB better, 16 pictures by up to 0.80 dB and 3 worse by
+/// up to 0.26 dB; the McMaster set 0.01 dB worse. The least is set after
+/// the rounds. Held in every round, the lens is found around it, and six
+/// Kodak pictures behind a lens are 0.08 dB worse instead of 0.04 dB
+/// better.
+const NOISE_SHARE: f64 = 0.1;
+
 /// The lens by radius and the noise, around a prior already found.
 ///
 /// Both are variances, and expectation-maximisation moves each to the mean
@@ -1026,6 +1040,9 @@ pub fn fit_spectrum(m: &Plane, start: Prior, stride: usize, rounds: usize) -> Sp
 /// and 1000 rounds make the mosaic more probable still and the picture
 /// worse, by up to 0.2 and 0.4 dB: the noise grows at the cost of the
 /// lens's last part.
+///
+/// The noise that comes out is at least [`NOISE_SHARE`] of the luminance
+/// at the sensor's limit.
 pub fn measure_spectrum(m: &Plane, prior: Prior, rounds: usize) -> Spectrum {
     if rounds == 0 {
         return Spectrum::plain(prior);
@@ -1158,7 +1175,12 @@ pub fn measure_spectrum(m: &Plane, prior: Prior, rounds: usize) -> Spectrum {
     for v in &mut lens {
         *v /= top;
     }
-    Spectrum { prior: Prior { noise: noise / top, ..prior }, lens: Some(Arc::new(lens)) }
+    let found = Spectrum { prior: Prior { noise: noise / top, ..prior }, lens: Some(Arc::new(lens)) };
+    let limit = found.laws(0.25).0 * found.pass(0.5);
+    Spectrum {
+        prior: Prior { noise: found.prior.noise.max(NOISE_SHARE * limit), ..found.prior },
+        lens: found.lens,
+    }
 }
 
 /// The nearest sequence that does not rise, in the logarithm, each value
@@ -1639,6 +1661,36 @@ mod tests {
         // The Gaussian the search starts from is far from it where the lens ends.
         let gaussian = Spectrum::plain(prior);
         assert!(gaussian.pass(0.405) / gaussian.pass(0.055) > 3.0 * through(0.405) / through(0.055));
+    }
+
+    #[test]
+    fn the_noise_is_not_taken_for_far_less_than_the_luminance_at_the_limit() {
+        let quiet = Prior {
+            alpha: 2.4,
+            alpha_c: 3.2,
+            lens: 0.3,
+            noise: 1e-7,
+            chroma: [0.05, 0.02],
+            ..Prior::default()
+        };
+        let at_limit = |s: &Spectrum| s.laws(0.25).0 * s.pass(0.5);
+        let found = measure_spectrum(&drawn(384, 320, &Spectrum::plain(quiet), 17), quiet, 100);
+        let least = NOISE_SHARE * at_limit(&found);
+        assert!(
+            (found.prior.noise / least - 1.0).abs() < 1e-9,
+            "a frame without noise has {} and not {least}",
+            found.prior.noise
+        );
+        // A noise that is there is left as it was measured.
+        let loud = Prior { noise: 0.1, ..quiet };
+        let found = measure_spectrum(&drawn(384, 320, &Spectrum::plain(loud), 17), loud, 100);
+        let least = NOISE_SHARE * at_limit(&found);
+        assert!(found.prior.noise > 3.0 * least, "{} is near the least, {least}", found.prior.noise);
+        assert!(
+            found.prior.noise > 0.05 && found.prior.noise < 0.2,
+            "drawn with 0.1, found {}",
+            found.prior.noise
+        );
     }
 
     #[test]
