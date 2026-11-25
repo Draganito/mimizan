@@ -180,7 +180,11 @@ Ahead of Markesteijn on all 24 pictures in each condition: by 5.6 dB pixel-sharp
 
 The frequency separation stays the path: every pixel a sum of photosites the sensor measured, and nothing is estimated. *least-squares demosaic* is the alternative. It is in the Negative window, under Development, and it is off. On, a Bayer file is written once as a linear DNG beside the RAW, named with `.mimizan` before `.dng`, highlights kept, and the RAW leaves the strip. Every later open with the checkbox on reads that DNG and does not look at the mosaic again. A newer version of the program writes the DNG again, so the picture is the separation that version makes. The darkroom from there is the linear DNG's: three channels, nothing separated a second time, the plate printing them as it prints the X-Trans DNG. Off, the file stays the measured separation, and the DNG is not a tile of the strip. The choice is remembered.
 
-The separation is solved on the 2×2 period. Four frequencies that differ by half a cycle are one solve: the luminance and both chrominances, under the prior the mosaic itself makes most probable. The search counts every such set. Counting every eighth, which is what writing the mosaic out to six and solving that did, leaves a fine colour short of the prior it has. The eight line priors of the X-Trans bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. The frequency separation is not mixed into it. A one-pixel checker that runs along a horizontal line is taken off; the line stays.
+The separation is solved on the 2×2 period. Four frequencies that differ by half a cycle are one solve: the luminance and both chrominances, under the prior the mosaic itself makes most probable. The search counts every such set. Counting every eighth, which is what writing the mosaic out to six and solving that did, leaves a fine colour short of the prior it has. The eight line priors of the X-Trans bank are left out: a Bayer row does not hold red, green and blue, and on a saturated picture they take the colour out. In their place the bank weighs eight directions whose luminance falls only as f¹, held with cos³². The colour stays the share the search found. At a pixel the bank is weighed by two things in equal parts: how probable a spectrum makes the mosaic there, and how well it tells each photosite from all the others. The frequency separation is not mixed into it.
+
+The search has a Gaussian for the lens. After it the lens is measured, radius by radius, and the noise with it; the noise is taken for no less than a tenth of the luminance at the sensor's limit. The windows of the search and of the measuring fade to their edges, so the step where a window ends is not counted as the picture's.
+
+The mosaic chooses the tone curve it is separated under: the sRGB curve, or one of two powers, 0.6 and 0.7, that lie nearer the light. A power is taken where the mosaic is more probable under it and its photosites are also told better from the others, the error measured under the sRGB curve. A picture a lens has drawn smooth takes a power. A picture as sharp as its pixels stays under sRGB. A one-pixel checker that runs along a horizontal line is taken off; the line stays.
 
 ### On the Kodak set
 
@@ -190,7 +194,7 @@ Pixel-sharp:
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| Mimizan Bayer LS | 40.58 | 40.43 | 43.25 | 39.17 | 22/24 |
+| Mimizan Bayer LS | 41.02 | 40.85 | 43.70 | 39.61 | 24/24 |
 | VNG (libraw) | 33.26 | 32.94 | 36.60 | 31.77 | 0/24 |
 | PPG (libraw) | 33.29 | 34.08 | 36.20 | 31.27 | 0/24 |
 | AHD (libraw) | 33.83 | 34.78 | 37.64 | 31.50 | 0/24 |
@@ -203,7 +207,7 @@ Pixel-sharp:
 | EAHD (RawTherapee) | 34.88 | 34.43 | 37.83 | 33.99 | 0/24 |
 | HPHD (RawTherapee) | 35.60 | 35.46 | 37.96 | 34.78 | 0/24 |
 | DCB (RawTherapee) | 35.87 | 35.69 | 38.70 | 34.90 | 0/24 |
-| LMMSE (RawTherapee) | 39.42 | 39.14 | 42.29 | 38.27 | 2/24 |
+| LMMSE (RawTherapee) | 39.42 | 39.14 | 42.29 | 38.27 | 0/24 |
 | IGV (RawTherapee) | 35.69 | 35.48 | 38.53 | 34.82 | 0/24 |
 | AMaZE (RawTherapee) | 36.49 | 36.04 | 39.93 | 35.42 | 0/24 |
 | RCD (RawTherapee) | 35.46 | 35.32 | 36.91 | 34.88 | 0/24 |
@@ -212,7 +216,7 @@ Behind a lens (σ 0.75 px):
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| Mimizan Bayer LS | 49.60 | 49.12 | 52.18 | 48.51 | 24/24 |
+| Mimizan Bayer LS | 51.76 | 50.95 | 55.37 | 50.60 | 24/24 |
 | VNG (libraw) | 41.00 | 41.76 | 44.31 | 39.03 | 0/24 |
 | PPG (libraw) | 41.97 | 44.37 | 47.67 | 38.99 | 0/24 |
 | AHD (libraw) | 41.90 | 44.58 | 48.43 | 38.74 | 0/24 |
@@ -234,7 +238,7 @@ Twice the size:
 
 | Method | CPSNR | R | G | B | leads |
 |---|---|---|---|---|---|
-| Mimizan Bayer LS | 47.03 | 46.82 | 49.17 | 45.87 | 16/24 |
+| Mimizan Bayer LS | 49.88 | 49.57 | 52.67 | 48.51 | 24/24 |
 | VNG (libraw) | 41.01 | 41.76 | 43.95 | 39.09 | 0/24 |
 | PPG (libraw) | 42.65 | 44.24 | 47.89 | 39.93 | 0/24 |
 | AHD (libraw) | 42.43 | 44.06 | 47.89 | 39.65 | 0/24 |
@@ -246,13 +250,17 @@ Twice the size:
 | AHD (RawTherapee) | 43.21 | 42.80 | 47.30 | 42.20 | 0/24 |
 | EAHD (RawTherapee) | 43.21 | 42.83 | 47.27 | 42.21 | 0/24 |
 | HPHD (RawTherapee) | 42.19 | 42.18 | 44.50 | 41.52 | 0/24 |
-| DCB (RawTherapee) | 45.22 | 45.42 | 49.73 | 43.78 | 5/24 |
-| LMMSE (RawTherapee) | 44.75 | 44.09 | 47.65 | 44.04 | 2/24 |
+| DCB (RawTherapee) | 45.22 | 45.42 | 49.73 | 43.78 | 0/24 |
+| LMMSE (RawTherapee) | 44.75 | 44.09 | 47.65 | 44.04 | 0/24 |
 | IGV (RawTherapee) | 40.34 | 40.16 | 43.49 | 39.37 | 0/24 |
 | AMaZE (RawTherapee) | 44.51 | 44.45 | 47.74 | 43.46 | 0/24 |
-| RCD (RawTherapee) | 45.42 | 45.32 | 49.21 | 44.16 | 1/24 |
+| RCD (RawTherapee) | 45.42 | 45.32 | 49.21 | 44.16 | 0/24 |
 
-The mean leads in each condition: by 1.16 dB pixel-sharp against LMMSE, by 3.41 dB behind a lens against RCD, by 1.61 dB at twice the size against RCD. Not every picture does. Pixel-sharp, kodim08 stays behind LMMSE by 0.08 dB and kodim09 by 0.38 dB. Behind a lens, every picture leads. At twice the size, eight pictures stay behind, by up to 0.94 dB (kodim12 against DCB).
+The mean leads in each condition: by 1.60 dB pixel-sharp against LMMSE, by 5.58 dB behind a lens against RCD, by 4.46 dB at twice the size against RCD. Every picture leads in each. The least a picture leads by is 0.23 dB pixel-sharp (kodim09 against LMMSE), 2.32 dB behind a lens (kodim08) and 1.53 dB at twice the size (kodim11). Pixel-sharp and behind a lens all 24 stay under the sRGB curve. At twice the size 18 take a power.
+
+The numbers the method has were set on these pictures. The 18 pictures of the McMaster set, 500×500, were the check, and the rule that keeps a power from a picture as sharp as its pixels was made after four of them lost under one. There the mean is 37.35 dB pixel-sharp, 3.35 dB before DHT; 48.55 dB behind a lens, 6.92 dB before RCD; 48.05 dB at twice the size, 6.20 dB before RCD. Every picture leads behind a lens and at twice the size, by 3.15 dB at least. Pixel-sharp 17 of 18 lead, and mcm18 stays behind DHT by 0.02 dB. The pictures are not in the repository; `--images` takes their folder.
+
+Demosaicers that are trained networks are not in this comparison.
 
 ## A session
 
