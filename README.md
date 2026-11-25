@@ -14,9 +14,15 @@ You open a colour RAW. Mimizan Lab reads the mosaic as a signal: the luminance i
 
 The first measures, the other two estimate. Where this page says that no pixel is invented, it speaks of the frequency separation.
 
-> **On the 24 Kodak pictures, sampled with the X-Trans tile and compared with the original, this program leads RawTherapee's Markesteijn on every picture. Sampled with the Bayer tile, its least-squares demosaic leads the sixteen demosaicers of libraw and RawTherapee on every picture.**
-
 **The first photographic application that takes the black-and-white negative directly from the luma-chroma separation of the sensor signal ([Alleysson, Süsstrunk and Hérault 2005](https://doi.org/10.1109/TIP.2004.841200), [Dubois 2005](https://doi.org/10.1109/LSP.2005.859503)) without ever reconstructing an RGB image.**
+
+The two demosaics are still in development. The figures below are measured on synthetic mosaics, and they put both among the best. There is still a good deal of fine-tuning to do before either is ready for regular work, and the X-Trans one is much further along than the Bayer one. Both are heavy computing, and slow. That is why each is done once: the first time a file is opened, its DNG is written, and from then on the DNG is what opens.
+
+> **On the 24 Kodak pictures, compared with the original, each of the three leads on every picture.**
+>
+> - **The frequency separation**, in the grey of the negative, brought to the band limit of a photograph: by 2.7 dB in the mean before the best of the sixteen demosaicers of libraw and RawTherapee.
+> - **The least-squares demosaic for Bayer**, in colour, pixel-sharp, behind a lens and at twice the size: by 1.6, 5.6 and 4.5 dB in the mean before the best of the same sixteen.
+> - **The least-squares demosaic for X-Trans**, in colour, in the same three conditions: by 5.6, 8.0 and 5.8 dB in the mean before RawTherapee's Markesteijn.
 
 **Monochrome.** The negative is printed the way a split-grade enlarger prints a sheet of paper: one placing, a soft exposure and a hard one. A measured Ilford Multigrade, no hidden curve.
 
