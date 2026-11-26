@@ -896,7 +896,13 @@ fn clear_leftovers(work: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.ends_with(".linear.tif") || name.ends_with(".part") {
+        // A RawTherapee profile and the mask beside the negative are written
+        // for the tool and never read again. Older versions left them here.
+        if name.ends_with(".linear.tif")
+            || name.ends_with(".part")
+            || name.ends_with(".pp3")
+            || name == "negative.mask.tif"
+        {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -1187,7 +1193,10 @@ fn develop_mimizan(raw: &Path, work: &Path, file: &Path, out: &Out) -> Result<Pl
     }
     {
         let _running = Running::new(&out.tools);
-        run(&mut cmd, "mimizan", "It belongs beside this program.", out)?;
+        let ran = run(&mut cmd, "mimizan", "It belongs beside this program.", out);
+        // The mask is for a print. This view reads the plate and nothing else.
+        let _ = std::fs::remove_file(mimizan_core::print::sidecar_path(&negative));
+        ran?;
     }
     let (meta, gray) = read_plate_samples(&negative)?;
     write_display(file, meta.frame_w, meta.frame_h, &encode_plate(&gray, &meta))?;
@@ -1216,7 +1225,10 @@ fn develop_rawtherapee(
     let mut cmd = Command::new(bin);
     cmd.args(["-q", "-Y", "-t", "-b16", "-o"]).arg(file).arg("-p").arg(&pp3).arg("-c").arg(raw);
     let name = bin.display().to_string();
-    run(&mut cmd, &name, "RawTherapee… chooses the program.", out)?;
+    let ran = run(&mut cmd, &name, "RawTherapee… chooses the program.", out);
+    // The profile was the tool's instructions. Nothing reads it afterwards.
+    let _ = std::fs::remove_file(&pp3);
+    ran?;
     if !file.is_file() {
         bail!("{name} wrote no {}", file.display());
     }
@@ -2304,7 +2316,15 @@ mod tests {
     #[test]
     fn what_a_cut_off_development_left_is_cleared_and_the_pictures_stay() {
         let dir = scratch("leftovers");
-        for name in ["rcd.linear.tif", "amaze.tif.part", "rcd.tif", "negative.tif", "view.txt"] {
+        for name in [
+            "rcd.linear.tif",
+            "amaze.tif.part",
+            "rt_rcd.pp3",
+            "negative.mask.tif",
+            "rcd.tif",
+            "negative.tif",
+            "view.txt",
+        ] {
             std::fs::write(dir.join(name), b"x").unwrap();
         }
         clear_leftovers(&dir);
