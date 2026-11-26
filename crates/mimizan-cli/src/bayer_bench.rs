@@ -226,7 +226,7 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
             }
         }
         let linear: Vec<f64> = fb.samples.iter().map(|v| f64::from(*v) / 65535.0).collect();
-        let (got, _, tone) = bayer_ls::separate(&linear, &linear, w, &knobs, &|_| {});
+        let (got, _, tone) = bayer_ls::separate(linear.clone(), linear, w, &knobs, &|_| {});
         let est = Rgb {
             r: Plane::from_vec(w, h, got.r.data),
             g: Plane::from_vec(w, h, got.g.data),

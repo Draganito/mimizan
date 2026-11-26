@@ -113,7 +113,15 @@ impl Tone {
 
     /// The mosaic under the curve.
     pub fn mosaic(self, m: &Plane) -> Plane {
-        Plane::from_vec(m.width, m.height, m.data.par_iter().map(|v| self.to(*v)).collect())
+        self.mosaic_of(&m.data, m.width)
+    }
+
+    /// The mosaic under the curve. `samples` is one value a photosite,
+    /// `width` of them to a row.
+    pub fn mosaic_of(self, samples: &[f64], width: usize) -> Plane {
+        assert!(width > 0 && samples.len().is_multiple_of(width), "the mosaic is not a rectangle");
+        let height = samples.len() / width;
+        Plane::from_vec(width, height, samples.par_iter().map(|v| self.to(*v)).collect())
     }
 }
 
@@ -177,7 +185,8 @@ impl Default for Knobs {
 /// photosite, row-major, in the light the sensor recorded, and `width` is
 /// the row length. The frame must continue the tile when it is mirrored.
 pub fn demosaic(linear: &[f64], width: usize, knobs: &Knobs) -> Rgb {
-    separate(linear, linear, width, knobs, &|_| {}).0
+    let owned = linear.to_vec();
+    separate(owned.clone(), owned, width, knobs, &|_| {}).0
 }
 
 /// A photosite this near the frame's highest value is taken to be burnt.
@@ -257,8 +266,8 @@ fn tone_scores(fit: &Plane, knobs: &Knobs) -> Vec<Said> {
 /// `progress` is told the share of the first step that is done. The curve
 /// it ran under comes back with the picture and the prior.
 pub fn separate(
-    linear: &[f64],
-    fit: &[f64],
+    linear: Vec<f64>,
+    fit: Vec<f64>,
     width: usize,
     knobs: &Knobs,
     progress: &dyn Fn(f64),
@@ -268,26 +277,38 @@ pub fn separate(
     let height = linear.len() / width;
     let tile = XTile::from_name(BAYER6).expect("the Bayer tile");
     assert!(tile.mirrors(width, height), "this frame does not mirror the Bayer tile");
-    let fit = Plane::from_vec(width, height, fit.to_vec());
-    let tone = knobs.tone.unwrap_or_else(|| tone_of(&fit, knobs));
     let start = Prior { lens: 0.3, ..Prior::default() };
     // Every set, not every eighth. An eighth is enough on a smooth picture
     // and not on a fine one: kodim19 and kodim22 moved by half a decibel
     // once the search was shown the whole mosaic.
-    let found = bayer2::fit_spectrum(&tone.mosaic(&fit), start, 1, knobs.lens_rounds);
-    let m = tone.mosaic(&Plane::from_vec(width, height, linear.to_vec()));
-    let priors = bayer_priors(&found);
-    let sel = Weighing {
-        sigma: knobs.sigma,
-        near: knobs.near,
-        left_out: knobs.left_out,
-        sharp: knobs.sharp,
-        bias: knobs.bias,
+    // The plane the search reads is not used again.
+    let (tone, found) = {
+        let fit = Plane::from_vec(width, height, fit);
+        let tone = knobs.tone.unwrap_or_else(|| tone_of(&fit, knobs));
+        let found = bayer2::fit_spectrum(&tone.mosaic(&fit), start, 1, knobs.lens_rounds);
+        (tone, found)
     };
-    let (c1, c2) = bayer2::separate_bank(&m, &priors, &sel, progress);
-    let sep = xtrans::from_chroma(&m, &tile, c1, c2);
-    let refine = Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
-    let rgb = xtrans::refine(&m, &tile, &sep, &refine).mapped(|v| tone.back(v)).rgb();
+    let rgb = {
+        let m = tone.mosaic_of(&linear, width);
+        // On the curve. The buffer the samples came from is not read again.
+        drop(linear);
+        let priors = bayer_priors(&found);
+        let sel = Weighing {
+            sigma: knobs.sigma,
+            near: knobs.near,
+            left_out: knobs.left_out,
+            sharp: knobs.sharp,
+            bias: knobs.bias,
+        };
+        let (c1, c2) = bayer2::separate_bank(&m, &priors, &sel, progress);
+        let sep = xtrans::from_chroma(&m, &tile, c1, c2);
+        let refine =
+            Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
+        let refined = xtrans::refine(&m, &tile, &sep, &refine);
+        // The second step has read the mosaic and the first separation.
+        drop((m, sep));
+        refined.mapped(|v| tone.back(v)).rgb()
+    };
     (without_line_checker(rgb), found.prior, tone)
 }
 
@@ -495,7 +516,7 @@ pub fn develop(img: &RawImage, tell: &dyn Fn(String)) -> Result<Developed, Strin
     let fit: Vec<f64> = mosaic.par_iter().map(|v| v.min(ceiling)).collect();
 
     tell("searching the prior".into());
-    let (rgb, prior, _) = separate(&mosaic, &fit, width, &Knobs::default(), &|share| {
+    let (rgb, prior, _) = separate(mosaic, fit, width, &Knobs::default(), &|share| {
         tell(format!("separating luminance and colour, {:.0}%", share.clamp(0.0, 1.0) * 100.0));
     });
 
