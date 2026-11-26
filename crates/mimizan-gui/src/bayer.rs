@@ -12,6 +12,7 @@ use mimizan_lab_xtrans::convert::Developed;
 use mimizan_lab_xtrans::dng;
 use rawler::decoders::RawDecodeParams;
 use rawler::RawImage;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -137,6 +138,114 @@ fn is_raw_of_stem(stem: &str, other: &Path) -> bool {
     }
     other.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case(stem))
         && crate::browser::is_raw(other)
+}
+
+/// What a listed `.mimizan.dng` was written from, as far as the listing
+/// can say. One RAW is the file the checkbox opens. Several are not a
+/// choice. None means no RAW of the stem is listed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DngSource {
+    One(PathBuf),
+    None,
+    Several,
+}
+
+/// Which files the checkbox hides, and the source of every listed
+/// `.mimizan.dng`. `current` is this build's DNG; `bayer` is a Bayer
+/// mosaic. `current` is asked only of a `.mimizan.dng` listed beside a
+/// RAW of its stem, and `bayer` only where two or more files share a stem.
+pub(crate) struct Pairs {
+    /// RAWs hidden while least squares is on.
+    pub gives_way_on: Vec<PathBuf>,
+    /// `.mimizan.dng` files hidden while it is off.
+    pub gives_way_off: Vec<PathBuf>,
+    /// The source of each listed `.mimizan.dng`.
+    pub sources: Vec<(PathBuf, DngSource)>,
+}
+
+/// The pairs in `paths`, decided from that list. `current` and `bayer`
+/// are the two questions that still need the disk; everything else is
+/// the names.
+pub(crate) fn pairs(
+    paths: &[PathBuf],
+    current: impl Fn(&Path) -> bool,
+    bayer: impl Fn(&Path) -> bool,
+) -> Pairs {
+    let mut by_stem: HashMap<String, Vec<&Path>> = HashMap::new();
+    for path in paths {
+        let Some(key) = stem_key(path) else { continue };
+        by_stem.entry(key).or_default().push(path);
+    }
+    let mut gives_way_on = Vec::new();
+    let mut gives_way_off = Vec::new();
+    let mut sources = Vec::new();
+    for (stem, group) in &by_stem {
+        let ours: Vec<&Path> = group.iter().copied().filter(|p| is_ours(p)).collect();
+        let raws: Vec<PathBuf> =
+            group.iter().copied().filter(|p| is_raw_of_stem(stem, p)).map(Path::to_path_buf).collect();
+        let found = sources_among(raws.clone(), &bayer);
+        let source = match found.as_slice() {
+            [one] => DngSource::One(one.clone()),
+            [] => DngSource::None,
+            _ => DngSource::Several,
+        };
+        // A DNG with no RAW beside it is not opened to see if it is current.
+        let current_dngs: Vec<&Path> = if raws.is_empty() {
+            Vec::new()
+        } else {
+            ours.iter().copied().filter(|dng| current(dng)).collect()
+        };
+        for dng in &ours {
+            if matches!(source, DngSource::One(_)) {
+                gives_way_off.push((*dng).to_path_buf());
+            }
+            sources.push(((*dng).to_path_buf(), source.clone()));
+        }
+        if current_dngs.is_empty() {
+            continue;
+        }
+        // The same rule as the strip used to apply one file at a time.
+        // Several Bayer files of the stem share one DNG, so none gives way.
+        // One source gives way, and a file beside it does not. Where no
+        // file is a Bayer mosaic, each RAW whose DNG is current gives way.
+        match &source {
+            DngSource::Several => {}
+            DngSource::One(one) => {
+                if current_dngs.iter().any(|dng| same_dng(one, dng)) {
+                    gives_way_on.push(one.clone());
+                }
+            }
+            DngSource::None => {
+                for raw in &raws {
+                    if current_dngs.iter().any(|dng| same_dng(raw, dng)) {
+                        gives_way_on.push(raw.clone());
+                    }
+                }
+            }
+        }
+    }
+    gives_way_on.sort();
+    gives_way_off.sort();
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    Pairs { gives_way_on, gives_way_off, sources }
+}
+
+/// `dng` is the file `raw` would be written out as, apart from case.
+fn same_dng(raw: &Path, dng: &Path) -> bool {
+    let wanted = dng_of(raw);
+    match (wanted.file_name(), dng.file_name()) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+/// The lower-cased stem files of one picture share. A `.mimizan.dng`
+/// is named for the RAW it came from, not for the extra suffix.
+fn stem_key(path: &Path) -> Option<String> {
+    if let Some(stem) = stem_of_ours(path) {
+        return Some(stem.to_ascii_lowercase());
+    }
+    path.file_stem().and_then(|s| s.to_str()).map(|s| s.to_ascii_lowercase())
 }
 
 /// `other` is another RAW of `path`'s stem, in a listing the caller
@@ -379,6 +488,76 @@ mod tests {
             unwritten_note(&full),
             "the least-squares DNG was not written (no space left on the device); this file is on the measured separation"
         );
+    }
+
+    fn p(name: &str) -> PathBuf {
+        PathBuf::from("/photos").join(name)
+    }
+
+    /// The checkbox's pairs, from the names alone. `current` and `bayer`
+    /// stand in for the two questions that would otherwise read the disk.
+    #[test]
+    fn a_raw_and_its_dng_give_way_to_each_other() {
+        let raw = p("a.NEF");
+        let dng = p("a.mimizan.dng");
+        let current_n = std::cell::Cell::new(0u32);
+        let bayer_n = std::cell::Cell::new(0u32);
+        let got = pairs(
+            &[raw.clone(), dng.clone(), p("a.jpg")],
+            |path| {
+                current_n.set(current_n.get() + 1);
+                path == dng
+            },
+            |_| {
+                bayer_n.set(bayer_n.get() + 1);
+                true
+            },
+        );
+        assert_eq!(got.gives_way_on, vec![raw.clone()]);
+        assert_eq!(got.gives_way_off, vec![dng.clone()]);
+        assert_eq!(got.sources, vec![(dng.clone(), DngSource::One(raw.clone()))]);
+        assert_eq!(current_n.get(), 1, "the DNG beside its RAW is the one asked");
+        assert_eq!(bayer_n.get(), 0, "one RAW of the stem is the source whatever it is");
+
+        // The same stem in the other case is the same pair.
+        let upper = p("A.mimizan.dng");
+        let got = pairs(&[raw.clone(), upper.clone()], |path| path == upper, |path| path == raw);
+        assert_eq!(got.gives_way_on, vec![raw.clone()]);
+        assert_eq!(got.gives_way_off, vec![upper.clone()]);
+        assert_eq!(got.sources, vec![(upper, DngSource::One(raw.clone()))]);
+
+        // Two Bayer files of one stem are not a choice, on or off.
+        let cr2 = p("A.cr2");
+        let got = pairs(&[raw.clone(), cr2.clone(), dng.clone()], |_| true, |_| true);
+        assert!(got.gives_way_on.is_empty());
+        assert!(got.gives_way_off.is_empty());
+        assert_eq!(got.sources, vec![(dng.clone(), DngSource::Several)]);
+
+        // A linear export beside the RAW is not a second source, and not
+        // another Bayer file, so the RAW still gives way.
+        let export = p("a.dng");
+        let got = pairs(&[raw.clone(), export.clone(), dng.clone()], |path| path == dng, |path| path == raw);
+        assert_eq!(got.gives_way_on, vec![raw.clone()]);
+        assert_eq!(got.gives_way_off, vec![dng.clone()]);
+        assert_eq!(got.sources, vec![(dng.clone(), DngSource::One(raw.clone()))]);
+
+        // A DNG with no RAW is left as it is, and not opened to check it.
+        let lone = p("b.mimizan.dng");
+        let got = pairs(
+            std::slice::from_ref(&lone),
+            |_| panic!("a DNG with no RAW is not asked whether it is current"),
+            |_| panic!("a lone file is not asked whether it is a mosaic"),
+        );
+        assert!(got.gives_way_on.is_empty());
+        assert!(got.gives_way_off.is_empty());
+        assert_eq!(got.sources, vec![(lone, DngSource::None)]);
+
+        // An older build's DNG gives way when the box is off, and does not
+        // take the RAW's place when the box is on.
+        let got = pairs(&[raw.clone(), dng.clone()], |_| false, |_| panic!("one RAW is not asked"));
+        assert!(got.gives_way_on.is_empty());
+        assert_eq!(got.gives_way_off, vec![dng.clone()]);
+        assert_eq!(got.sources, vec![(dng, DngSource::One(raw))]);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use mimizan_core::pipeline;
 use mimizan_core::plate::{PlateFilters, PlateSpace};
 use mimizan_core::thumb::{binned, browser_plate, Thumb};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
@@ -133,12 +133,21 @@ impl Entry {
 pub struct Folder {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
+    /// Files the checkbox is not showing. The picture stays with the file,
+    /// so turning the checkbox the other way shows the tile at once.
+    pub aside: Vec<Entry>,
     /// Bumped on every scan so thumbnails of an old listing are ignored.
     pub generation: u64,
     /// The last asking handed out in this scan. A let-go and a file put
     /// back both take the next value, so two askings of one path never
     /// share a number.
     pub asks: u32,
+    /// RAWs hidden while least squares is on.
+    gives_way_on: HashSet<PathBuf>,
+    /// `.mimizan.dng` files hidden while it is off.
+    gives_way_off: HashSet<PathBuf>,
+    /// What each listed `.mimizan.dng` was written from.
+    sources: HashMap<PathBuf, crate::bayer::DngSource>,
     /// Visible subfolders (not hidden ones), natural order: the strip shows
     /// them as tiles before the frames.
     pub subdirs: Vec<SubDir>,
@@ -206,7 +215,17 @@ impl Folder {
         subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
         let subdirs =
             subdirs.into_iter().map(|p| SubDir { name: dir_name(&p), path: p, raws: None }).collect();
-        let mut f = Self { path: path.to_path_buf(), entries, generation, asks: 0, subdirs };
+        let mut f = Self {
+            path: path.to_path_buf(),
+            entries,
+            aside: Vec::new(),
+            generation,
+            asks: 0,
+            gives_way_on: HashSet::new(),
+            gives_way_off: HashSet::new(),
+            sources: HashMap::new(),
+            subdirs,
+        };
         f.resort(sort);
         Ok(f)
     }
@@ -233,11 +252,63 @@ impl Folder {
         self.asks
     }
 
-    /// `asked` was an X-Trans RAF and `opened` is the DNG beside it. The
-    /// RAF leaves the strip. The DNG stays, or is added when the listing
-    /// did not have it yet. A file put back takes a new asking.
+    /// Remember which files give way, from the listing already in hand.
+    /// `current` and `bayer` are the two questions that still read a file.
+    pub fn pair(&mut self, current: impl Fn(&Path) -> bool, bayer: impl Fn(&Path) -> bool) {
+        let paths: Vec<PathBuf> =
+            self.entries.iter().chain(self.aside.iter()).map(|e| e.path.clone()).collect();
+        let decided = crate::bayer::pairs(&paths, current, bayer);
+        self.gives_way_on = decided.gives_way_on.into_iter().collect();
+        self.gives_way_off = decided.gives_way_off.into_iter().collect();
+        self.sources = decided.sources.into_iter().collect();
+    }
+
+    /// Show the files the checkbox opens. `on` hides the RAWs that give
+    /// way to their DNG; off hides those DNGs. The pictures move with the
+    /// files. Nothing is read from the disk.
+    pub fn retile(&mut self, on: bool, sort: Sort) {
+        let mut all = std::mem::take(&mut self.entries);
+        all.append(&mut self.aside);
+        let hide = if on { &self.gives_way_on } else { &self.gives_way_off };
+        let (shown, hidden): (Vec<Entry>, Vec<Entry>) =
+            all.into_iter().partition(|e| !hide.contains(&e.path));
+        self.entries = shown;
+        self.aside = hidden;
+        self.resort(sort);
+    }
+
+    /// What the listing remembers of a `.mimizan.dng`, when this folder
+    /// lists it.
+    pub fn dng_source(&self, path: &Path) -> Option<&crate::bayer::DngSource> {
+        self.sources.get(path)
+    }
+
+    /// `asked` left the strip and `opened` is the file in its place. An
+    /// X-Trans RAF is dropped. A Bayer RAW stays aside, with its DNG, so
+    /// the next flip of the checkbox needs no disk. A file put back takes
+    /// a new asking.
     pub fn show_instead(&mut self, asked: &Path, opened: &Path, sort: Sort) {
-        if self.index_of(asked).is_none() {
+        let Some(index) = self.index_of(asked) else {
+            return;
+        };
+        if crate::bayer::is_ours(opened) {
+            let raw = self.entries.remove(index);
+            self.gives_way_on.insert(raw.path.clone());
+            self.aside.push(raw);
+            self.gives_way_off.insert(opened.to_path_buf());
+            self.sources.insert(opened.to_path_buf(), crate::bayer::DngSource::One(asked.to_path_buf()));
+            if self.index_of(opened).is_none() {
+                if let Some(i) = self.aside.iter().position(|e| e.path == opened) {
+                    let entry = self.aside.remove(i);
+                    self.entries.push(entry);
+                } else {
+                    let ask = self.next_ask();
+                    if let Some(entry) = Entry::pending(opened, ask) {
+                        self.entries.push(entry);
+                    }
+                }
+                self.resort(sort);
+            }
             return;
         }
         self.entries.retain(|e| e.path != asked);
@@ -911,8 +982,12 @@ mod tests {
         let mut folder = Folder {
             path: PathBuf::from("/photos"),
             entries: vec![named("DSCF1110.RAF"), named("DSCF1110.dng"), named("DSCF1111.RAF")],
+            aside: Vec::new(),
             generation: 1,
             asks: 0,
+            gives_way_on: HashSet::new(),
+            gives_way_off: HashSet::new(),
+            sources: HashMap::new(),
             subdirs: Vec::new(),
         };
         let raf = PathBuf::from("/photos/DSCF1110.RAF");
@@ -973,6 +1048,66 @@ mod tests {
         }
         let photo = folder.entries.iter().find(|e| e.name == "photo.NEF").unwrap();
         assert_eq!(photo.size, b"raw-bytes".len() as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn marked() -> mimizan_core::thumb::Thumb {
+        mimizan_core::thumb::Thumb { width: 1, height: 1, gray: vec![7], rgb: vec![1, 2, 3] }
+    }
+
+    /// Turning the checkbox and turning it back keeps each file's picture
+    /// and the name order.
+    #[test]
+    fn retile_keeps_the_pictures_and_the_order() {
+        let dir = std::env::temp_dir().join(format!("mimizan-retile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.join("a.NEF");
+        let dng = dir.join("a.mimizan.dng");
+        std::fs::write(&raw, b"r").unwrap();
+        std::fs::write(&dng, b"d").unwrap();
+        std::fs::write(dir.join("b.NEF"), b"b").unwrap();
+        let mut folder = Folder::scan(&dir, Sort::Name, 1).unwrap();
+        for e in &mut folder.entries {
+            e.thumb = Some(marked());
+        }
+        folder.pair(|p| p == dng, |p| p == raw);
+        folder.retile(true, Sort::Name);
+        let names: Vec<&str> = folder.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.mimizan.dng", "b.NEF"]);
+        assert_eq!(folder.aside.len(), 1);
+        assert_eq!(folder.aside[0].thumb.as_ref().map(|t| t.gray.as_slice()), Some(&[7][..]));
+        folder.retile(false, Sort::Name);
+        let names: Vec<&str> = folder.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["a.NEF", "b.NEF"]);
+        assert!(folder.entries.iter().all(|e| e.thumb.as_ref().is_some_and(|t| t.gray == [7])));
+        assert_eq!(folder.aside[0].name, "a.mimizan.dng");
+        assert_eq!(folder.aside[0].thumb.as_ref().map(|t| t.gray.as_slice()), Some(&[7][..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RAW replaced by the DNG just written comes back, picture and all,
+    /// when the checkbox goes off. It is not read again.
+    #[test]
+    fn show_instead_then_retile_brings_the_raw_back() {
+        let dir = std::env::temp_dir().join(format!("mimizan-instead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.join("a.NEF");
+        let dng = dir.join("a.mimizan.dng");
+        std::fs::write(&raw, b"r").unwrap();
+        std::fs::write(&dng, b"d").unwrap();
+        let mut folder = Folder::scan(&dir, Sort::Name, 1).unwrap();
+        // The DNG was written after the listing.
+        folder.entries.retain(|e| e.path == raw);
+        folder.entries[0].thumb = Some(marked());
+        folder.show_instead(&raw, &dng, Sort::Name);
+        assert!(folder.aside.iter().any(|e| e.path == raw && e.thumb.is_some()));
+        folder.retile(false, Sort::Name);
+        let back = folder.entries.iter().find(|e| e.path == raw).unwrap();
+        assert_eq!(back.ask, 0);
+        assert_eq!(back.thumb.as_ref().map(|t| t.gray.as_slice()), Some(&[7][..]));
+        assert!(folder.aside.iter().any(|e| e.path == dng));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

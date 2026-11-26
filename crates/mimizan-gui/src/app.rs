@@ -1288,7 +1288,7 @@ impl App {
     /// or the inversion is not the one they were made for).
     fn strip_textures_drop(&mut self) {
         if let Some(f) = &mut self.folder {
-            for e in &mut f.entries {
+            for e in f.entries.iter_mut().chain(f.aside.iter_mut()) {
                 e.texture = None;
             }
         }
@@ -1323,7 +1323,7 @@ impl App {
         // Windows `\\?\` prefix is a kernel form, not a path to show.
         let path = &readable_path(path);
         match Folder::scan(path, self.sort, self.folder_generation) {
-            Ok(f) => {
+            Ok(mut f) => {
                 self.log(format!(
                     "{}: {} RAW files, {} folders",
                     f.path.display(),
@@ -1333,10 +1333,13 @@ impl App {
                 self.dir_counts = (!f.subdirs.is_empty()).then(|| {
                     browser::count_raws(f.generation, f.subdirs.iter().map(|d| d.path.clone()).collect())
                 });
+                // The checkbox decides which file is the tile. The listing
+                // already holds both, so the decision is made once here.
+                let on = self.bayer_ls;
+                let sort = self.sort;
+                f.pair(crate::bayer::dng_is_current, crate::bayer::is_bayer);
+                f.retile(on, sort);
                 self.folder = Some(f);
-                // The checkbox decides which file is the tile. A scan lists
-                // the RAW and its DNG both; this leaves the one that opens.
-                self.retile_bayer();
             }
             Err(e) => {
                 self.log(format!("folder {}: {e}", path.display()));
@@ -4504,51 +4507,43 @@ impl App {
             if !crate::bayer::is_ours(&path) {
                 self.open_anew(path);
             }
-        } else if let Some(raw) = crate::bayer::raw_of(&path) {
-            if raw != path {
-                self.open(raw);
-            }
-        } else if crate::bayer::raws_of(&path).len() > 1 {
-            // Two RAWs of the stem: opening one of them would be a guess.
-            self.log("two RAWs beside this DNG have the same name, so neither of them is opened");
         } else {
-            self.log("the RAW this DNG was written from is not beside it");
+            match self.folder.as_ref().and_then(|f| f.dng_source(&path).cloned()) {
+                Some(crate::bayer::DngSource::One(raw)) => {
+                    if raw != path {
+                        self.open(raw);
+                    }
+                }
+                Some(crate::bayer::DngSource::Several) => {
+                    self.log("two RAWs beside this DNG have the same name, so neither of them is opened");
+                }
+                Some(crate::bayer::DngSource::None) => {
+                    self.log("the RAW this DNG was written from is not beside it");
+                }
+                // This folder does not list the file, or none is open yet.
+                // One listing for this click.
+                None => {
+                    if let Some(raw) = crate::bayer::raw_of(&path) {
+                        if raw != path {
+                            self.open(raw);
+                        }
+                    } else if crate::bayer::raws_of(&path).len() > 1 {
+                        self.log("two RAWs beside this DNG have the same name, so neither of them is opened");
+                    } else {
+                        self.log("the RAW this DNG was written from is not beside it");
+                    }
+                }
+            }
         }
     }
 
-    /// The strip shows the file the checkbox opens. With it on, a RAW whose
-    /// DNG is already written gives way to that DNG, unless another RAW of
-    /// the stem is listed: the one DNG would be both, so both tiles stay.
-    /// With it off, the DNG gives way to its one RAW.
+    /// The strip shows the file the checkbox opens. The listing already
+    /// decided which files give way; this only moves them.
     fn retile_bayer(&mut self) {
         let sort = self.sort;
         let on = self.bayer_ls;
-        let Some(folder) = self.folder.as_mut() else {
-            return;
-        };
-        let entries: Vec<PathBuf> = folder.entries.iter().map(|e| e.path.clone()).collect();
-        for path in &entries {
-            if on {
-                if crate::bayer::is_ours(path) {
-                    continue;
-                }
-                let dng = crate::bayer::dng_of(path);
-                if !crate::bayer::dng_is_current(&dng) {
-                    continue;
-                }
-                // Asked only of a file whose DNG is there, and of the
-                // listing the strip already holds.
-                let shared = entries
-                    .iter()
-                    .any(|other| crate::bayer::listed_other(path, other) && crate::bayer::is_bayer(other));
-                if !shared {
-                    folder.show_instead(path, &dng, sort);
-                }
-            } else if crate::bayer::is_ours(path) {
-                if let Some(raw) = crate::bayer::raw_of(path) {
-                    folder.show_instead(path, &raw, sort);
-                }
-            }
+        if let Some(folder) = self.folder.as_mut() {
+            folder.retile(on, sort);
         }
     }
 
