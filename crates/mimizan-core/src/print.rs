@@ -1,6 +1,6 @@
 //! Negative -> print file: the one pass.
-//! Upright -> straighten -> crop window -> size -> place -> [burns ->] curve -> black edge ->
-//! white border -> [Richardson–Lucy ->] USM -> peak on the picture ->
+//! Upright -> straighten -> crop window -> size -> place -> [burns ->] curve ->
+//! [Richardson–Lucy ->] USM -> peak on the picture -> black edge -> white border ->
 //! one quantisation ->
 //! file. The mix already happened when the negative was written. Everything
 //! the pass does is in the [`Recipe`]; [`PrintParams`] adds what is not a
@@ -610,11 +610,11 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
 /// (before orientation): the live f64 planes of the stage that keeps the
 /// most, plus the 16-bit copy the writer makes. The source plane the
 /// caller already owns is not counted. When the recipe sharpens, the mask
-/// walks beside the picture through every stage and lies on a sheet of
-/// its own from the framing to the end, so those stages hold two sheets;
-/// the sheet may be far larger than the picture. A guide for refusing an
-/// export the machine cannot hold, good to about a fifth; the allocator
-/// and the order in which planes drop are what it does not see.
+/// walks beside the picture through orient, crop and resize, and stays
+/// the size of the picture: sharpening and the peak run on the picture,
+/// the mask is let go, and the sheet is laid once after. A guide for
+/// refusing an export the machine cannot hold, good to about a fifth; the
+/// allocator and the order in which planes drop are what it does not see.
 pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
     let r = &p.recipe;
     let lay = layout(w, h, orientation, p);
@@ -622,8 +622,8 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     let full = fw as f64 * fh as f64;
     let picture = lay.image_w as f64 * lay.image_h as f64;
     let sheet = lay.out_w as f64 * lay.out_h as f64;
-    // The mask walks beside the picture through orient, crop, resize and
-    // the frame, doubling those stages.
+    // The mask walks beside the picture through orient, crop and resize.
+    // It is never given a sheet.
     let m = if p.sharpens() { 2.0 } else { 1.0 };
     let (orient, resize) = if crate::straighten::turns(r.angle) {
         // The straighten reads the oriented plane and writes the picture
@@ -640,20 +640,31 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
             if (lay.image_w, lay.image_h) == (cw, ch) { m * (n + picture) } else { m * (n + mid + picture) };
         (orient, resize)
     };
-    // The picture and the sheet it is copied into; a sheet that is the
-    // picture needs no copy. The mask follows: its sheet is made while the
-    // picture's sheet is already there and the mask is still a picture.
-    let frame = if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) { m * sheet + picture } else { 0.0 };
-    // Picture cut out, blur scratch, blur, result; Richardson–Lucy keeps
-    // estimate, blurred, ratio and correction as well. The mask's sheet
-    // stays beside the picture's through both.
-    let peak = if r.peak.applies() { m * sheet + 4.0 * picture } else { 0.0 };
-    // Either of the two runs the stage, as in `apply_sharpen`: the
-    // deconvolution holds its planes whether or not the mask follows it.
+    // The picture and the one sheet it is copied into, after the filters.
+    // The mask has been let go. A sheet that is the picture needs no copy.
+    let frame = if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) { sheet + picture } else { 0.0 };
+    // The peak is an unsharp on the picture: the picture and the two
+    // planes of its blur. The sheet is not allocated yet, and the mask
+    // has been let go.
+    let peak = if r.peak.applies() { 3.0 * picture } else { 0.0 };
+    // Either of the two runs the stage, as in `apply_sharpen`.
+    // Richardson–Lucy holds the picture, the estimate, the ratio and the
+    // two planes of one blur; the mask stays beside them when a USM
+    // follows. A USM alone holds the picture, the mask and those two
+    // planes of the blur.
     let deconvolves = r.sharpen.deconv_passes() > 0;
-    let sharpen = if lay.resample_sigma_px > 0.0 && (deconvolves || r.sharpen.usm_amount() > 0.0) {
-        let planes = if deconvolves { 7.0 } else { 5.0 };
-        m * sheet + planes * picture
+    let usm = r.sharpen.usm_amount() > 0.0;
+    let sharpen = if lay.resample_sigma_px > 0.0 && (deconvolves || usm) {
+        let planes = if deconvolves {
+            if usm {
+                6.0
+            } else {
+                5.0
+            }
+        } else {
+            4.0
+        };
+        planes * picture
     } else {
         0.0
     };
@@ -905,10 +916,11 @@ pub fn burn_text(burns: &[Stroke]) -> String {
 /// the sidecar had excluded.
 pub const MASK_KERNEL: ResampleKernel = ResampleKernel::Area;
 
-/// The print pixels of one box: resize, place, tone, then the same
-/// Richardson–Lucy and USM as [`render_planes`], on a tile padded by
-/// [`sharpen_halo`]. `linear` and `mask` are the upright negative (orientation
-/// already applied) and must cover [`loupe_source_rect`].
+/// The print pixels of one box: resize, tone, then the same Richardson–Lucy,
+/// USM and peak as [`render_planes`], on the picture the box needs, padded
+/// by [`sharpen_halo`]. The paper around that picture is painted after, so
+/// the box matches the full print. `linear` and `mask` are the upright
+/// negative (orientation already applied) and must cover [`loupe_source_rect`].
 pub fn sharpen_window(
     linear: PlaneWindow<'_>,
     mask: Option<PlaneWindow<'_>>,
@@ -927,7 +939,6 @@ pub fn sharpen_window(
     if lay.black_px > 0 {
         paint_sheet_rect(&mut tile, g.tile_x, g.tile_y, black_rect(&lay), tone.eval(0.0));
     }
-    let mut mask_tile = mask.map(|_| Plane::zeros(g.tile_w, g.tile_h));
     // With a turn, the picture pixels are read back through the window
     // and the turn into the upright negative, as `render_planes` does;
     // the plane window stays in upright coordinates. Without one, the
@@ -950,33 +961,27 @@ pub fn sharpen_window(
         // The burns at the box's own print pixels, through the same map.
         let field = burn_field(&p.recipe, full_w, full_h, g.image_w, g.image_h);
         crate::tone::render_with(&mut picture, p.recipe.place, &tone, field.as_ref(), (g.pic_x, g.pic_y));
+        // Only resample the mask when a USM will read it: the crop from
+        // `loupe_source_rect` includes the mask kernel's taps only then, and
+        // resampling it anyway could read off the window. The filters run
+        // on this picture, which is the rectangle the full print sharpens,
+        // and reflect at its edge; the paper on the tile stays as painted.
+        let mask_picture = if p.recipe.sharpen.usm_amount() > 0.0 {
+            match mask {
+                Some(m) => Some(resample(m, MASK_KERNEL, pic)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        apply_sharpen(&mut picture, mask_picture.as_ref(), &p.recipe, &lay);
+        drop(mask_picture);
+        apply_peak_picture(&mut picture, &p.recipe, peak_print_radius(p.recipe.peak.radius, lay.enlargement));
         let ox = g.pic_x + g.off_x - g.tile_x;
         let oy = g.pic_y + g.off_y - g.tile_y;
         for y in 0..g.pic_h {
             tile.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(picture.row(y));
         }
-        // Only resample the mask when a USM will read it: the crop from
-        // `loupe_source_rect` includes the mask kernel's taps only then, and
-        // resampling it anyway could read off the window.
-        if p.recipe.sharpen.usm_amount() > 0.0 {
-            if let (Some(m), Some(dst)) = (mask, mask_tile.as_mut()) {
-                let resampled = resample(m, MASK_KERNEL, pic)?;
-                for y in 0..g.pic_h {
-                    dst.row_mut(oy + y)[ox..ox + g.pic_w].copy_from_slice(resampled.row(y));
-                }
-            }
-        }
-        // Sharpening and peak on the picture pixels of the tile only, the
-        // same rectangle `render_planes` sharpens, so the box matches the
-        // full print and the paper around the picture stays untouched.
-        let rect = (ox, oy, g.pic_w, g.pic_h);
-        apply_sharpen(&mut tile, mask_tile.as_ref(), &p.recipe, &lay, rect);
-        apply_peak_picture(
-            &mut tile,
-            &p.recipe,
-            rect,
-            peak_print_radius(p.recipe.peak.radius, lay.enlargement),
-        );
     }
     let mut out = Plane::zeros(g.view_w, g.view_h);
     let ox = g.view_x - g.tile_x;
@@ -1034,61 +1039,21 @@ fn on_sheet(p: &Plane, lay: &Layout, black_value: f64, white_value: f64) -> Plan
     out
 }
 
-/// `(x0, y0, width, height)` of the picture inside a sheet or tile.
-type PictureRect = (usize, usize, usize, usize);
-
-/// Run `f` on the picture rectangle of `plane` and write the result back.
-/// The paper and the black edge stay as they were, and the filters reflect
-/// inside the picture, not into the border. A rectangle that does not fit
-/// the plane is left alone. `mask` is cut to the same rectangle.
-fn on_picture(
-    plane: &mut Plane,
-    mask: Option<&Plane>,
-    rect: PictureRect,
-    f: impl FnOnce(&Plane, Option<&Plane>) -> Plane,
-) {
-    let (x0, y0, width, height) = rect;
-    if width == 0 || height == 0 {
-        return;
-    }
-    if x0.saturating_add(width) > plane.width || y0.saturating_add(height) > plane.height {
-        return;
-    }
-    let cut = |src: &Plane| {
-        let mut out = Plane::zeros(width, height);
-        for y in 0..height {
-            out.row_mut(y).copy_from_slice(&src.row(y0 + y)[x0..x0 + width]);
-        }
-        out
-    };
-    let picture = cut(plane);
-    let mask = mask.filter(|m| (m.width, m.height) == (plane.width, plane.height)).map(cut);
-    let out = f(&picture, mask.as_ref());
-    if (out.width, out.height) != (width, height) {
-        return;
-    }
-    for y in 0..height {
-        plane.row_mut(y0 + y)[x0..x0 + width].copy_from_slice(out.row(y));
-    }
-}
-
-/// Peak on the picture rectangle only.
-fn apply_peak_picture(plane: &mut Plane, recipe: &Recipe, rect: PictureRect, print_radius: f64) {
+/// Peak on the picture. The paper is laid afterwards, so the high-pass
+/// reflects at the picture's edge and the border is left as it was painted.
+fn apply_peak_picture(plane: &mut Plane, recipe: &Recipe, print_radius: f64) {
     if !recipe.peak.applies() {
         return;
     }
-    on_picture(plane, None, rect, |picture, _| unsharp(picture, print_radius, recipe.peak.amount, None));
+    let out = unsharp(plane, print_radius, recipe.peak.amount, None);
+    *plane = out;
 }
 
-/// Richardson–Lucy and USM at the enlargement σ, on the picture rectangle
-/// only. Returns the iterations run. A σ of zero leaves the plane as it is.
-fn apply_sharpen(
-    plane: &mut Plane,
-    mask: Option<&Plane>,
-    recipe: &Recipe,
-    lay: &Layout,
-    rect: PictureRect,
-) -> usize {
+/// Richardson–Lucy and USM at the enlargement σ. Returns the iterations
+/// run. A σ of zero leaves the plane as it is. The plane is the picture.
+/// A mask that is not the same size is not consulted, and the USM runs
+/// on the whole picture.
+fn apply_sharpen(plane: &mut Plane, mask: Option<&Plane>, recipe: &Recipe, lay: &Layout) -> usize {
     let detail = lay.resample_sigma_px;
     let passes = recipe.sharpen.deconv_passes() as usize;
     let amount = recipe.sharpen.usm_amount();
@@ -1096,11 +1061,13 @@ fn apply_sharpen(
         return 0;
     }
     let deconv_n = if passes > 0 { passes.min(DECONV_ITERATIONS) } else { 0 };
-    on_picture(plane, mask, rect, |picture, mask| match (deconv_n, amount > 0.0) {
-        (0, _) => unsharp(picture, detail, amount, mask),
-        (_, true) => unsharp(&richardson_lucy(picture, detail, deconv_n), detail, amount, mask),
-        (_, false) => richardson_lucy(picture, detail, deconv_n),
-    });
+    let mask = mask.filter(|m| (m.width, m.height) == (plane.width, plane.height));
+    let sharpened = match (deconv_n, amount > 0.0) {
+        (0, _) => unsharp(plane, detail, amount, mask),
+        (_, true) => unsharp(&richardson_lucy(plane, detail, deconv_n), detail, amount, mask),
+        (_, false) => richardson_lucy(plane, detail, deconv_n),
+    };
+    *plane = sharpened;
     deconv_n
 }
 
@@ -1204,28 +1171,14 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
             tone.white()
         );
     }
-    if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) {
-        // Only a white border leaves paper. With none, that strip is the black edge.
-        if lay.border_px > 0
-            && (lay.picture_x > lay.black_px + lay.border_px || lay.picture_y > lay.black_px + lay.border_px)
-        {
-            info!(
-                "sheet {}x{} px, picture at {},{}: the ratio leaves more paper than the border",
-                lay.out_w, lay.out_h, lay.picture_x, lay.picture_y
-            );
-        }
-        // The sheet in one allocation. The mask gets 0 off the picture:
-        // nothing to sharpen on paper.
-        plane = on_sheet(&plane, &lay, tone.eval(0.0), tone.white());
-        if let Some(m) = mask.take() {
-            mask = Some(on_sheet(&m, &lay, 0.0, 0.0));
-        }
-    }
-
-    let picture = (lay.picture_x, lay.picture_y, lay.image_w, lay.image_h);
-    let deconv_n = apply_sharpen(&mut plane, mask.as_ref(), r, &lay, picture);
+    // Sharpening and the peak reflect at the edge of the picture. The sheet
+    // is those rows copied into place, so it is laid after, and the mask is
+    // let go before it: nothing on the paper is filtered.
+    let masked = mask.is_some();
+    let deconv_n = apply_sharpen(&mut plane, mask.as_ref(), r, &lay);
+    drop(mask);
     let print_radius = peak_print_radius(r.peak.radius, lay.enlargement);
-    apply_peak_picture(&mut plane, r, picture, print_radius);
+    apply_peak_picture(&mut plane, r, print_radius);
     if r.peak.applies() {
         info!(
             "peak radius {:.2} px, amount {:.2}, scale {:.2}, border left as it was",
@@ -1244,8 +1197,20 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
             r.sharpen.usm_amount(),
             lay.resample_sigma_px,
             lay.enlargement,
-            mask.is_some()
+            masked
         );
+    }
+    if (lay.out_w, lay.out_h) != (lay.image_w, lay.image_h) {
+        // Only a white border leaves paper. With none, that strip is the black edge.
+        if lay.border_px > 0
+            && (lay.picture_x > lay.black_px + lay.border_px || lay.picture_y > lay.black_px + lay.border_px)
+        {
+            info!(
+                "sheet {}x{} px, picture at {},{}: the ratio leaves more paper than the border",
+                lay.out_w, lay.out_h, lay.picture_x, lay.picture_y
+            );
+        }
+        plane = on_sheet(&plane, &lay, tone.eval(0.0), tone.white());
     }
     let info = PrintInfo {
         mimizan: env!("CARGO_PKG_VERSION"),
@@ -1266,7 +1231,7 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
         usm_amount: r.sharpen.usm_amount(),
         usm_radius_px: lay.usm_radius_px,
         resample_sigma_px: lay.resample_sigma_px,
-        usm_masked: mask.is_some(),
+        usm_masked: masked,
         deconvolution_iterations: deconv_n as u32,
         ms: t.elapsed().as_millis(),
         plate: None,
@@ -1672,7 +1637,8 @@ mod tests {
 
     /// Richardson–Lucy on its own, without the unsharp mask after it,
     /// holds its planes all the same: an enlargement that deconvolves is
-    /// not estimated as one that does not sharpen.
+    /// not estimated as one that does not sharpen. The planes are the
+    /// picture's, and there are five of them.
     #[test]
     fn memory_estimate_counts_deconvolution_without_usm() {
         let enlarged = |sharpen: Sharpen| {
@@ -1688,7 +1654,7 @@ mod tests {
         let (off, picture) = enlarged(Sharpen::Off);
         let (deconv, _) = enlarged(Sharpen::Deconv { passes: 3, usm_amount: 0.0 });
         let (both, _) = enlarged(Sharpen::Deconv { passes: 3, usm_amount: 0.5 });
-        assert!(deconv >= 8.0 * 7.0 * picture, "{deconv} vs picture {picture}");
+        assert!(deconv >= 8.0 * 5.0 * picture, "{deconv} vs picture {picture}");
         assert!(deconv > 1.5 * off, "{deconv} vs {off} without sharpening");
         assert!(both >= deconv, "{both} with the mask vs {deconv}");
         // At native size nothing is deconvolved, and nothing is counted.
@@ -1702,7 +1668,8 @@ mod tests {
     #[test]
     fn memory_estimate_follows_the_sheet() {
         // 3 x 2 m at 300 dpi from a 24 MP negative, peak on: the sheet is
-        // 837 MP, and the widest stage holds it beside four picture planes.
+        // 837 MP and it is the picture. The peak runs before any sheet is
+        // laid and holds the picture beside the two planes of its blur.
         let mut recipe = Recipe::on_paper();
         recipe.size = Some(PrintSize::parse("300x200cm").unwrap());
         recipe.dpi = 300.0;
@@ -1712,9 +1679,9 @@ mod tests {
         let lay = layout(6000, 4000, 1, &p);
         let sheet = (lay.out_w * lay.out_h) as f64;
         let need = memory_estimate(6000, 4000, 1, &p) as f64;
-        assert!(need >= 8.0 * 5.0 * sheet * 0.9, "{need} vs sheet {sheet}");
-        assert!(need <= 8.0 * 5.0 * sheet * 1.2 + 2.0 * sheet, "{need} vs sheet {sheet}");
-        assert!(need > 25e9 && need < 40e9, "{}", memory_text(need as u64));
+        assert!(need >= 8.0 * 3.0 * sheet * 0.9, "{need} vs sheet {sheet}");
+        assert!(need <= 8.0 * 3.0 * sheet * 1.2 + 2.0 * sheet, "{need} vs sheet {sheet}");
+        assert!(need > 20e9 && need < 24e9, "{}", memory_text(need as u64));
         // Native size without peak: a few copies of the negative itself.
         let native = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
         let small = memory_estimate(6000, 4000, 1, &native);
@@ -1723,11 +1690,11 @@ mod tests {
         assert_eq!(memory_text(27_300_000_000), "27.3 GB");
     }
 
-    /// A small picture on a large sheet with a masked USM: the mask lies
-    /// on a sheet of its own from the framing on, so the widest stage holds
-    /// two sheets, and the estimate says so.
+    /// A small picture on a large sheet with a masked USM: the mask stays
+    /// the size of the picture and the sheet is laid once, after the
+    /// sharpening, so the estimate is that one sheet either way.
     #[test]
-    fn memory_estimate_counts_the_masks_sheet() {
+    fn memory_estimate_holds_one_sheet_for_a_masked_usm() {
         // 60x40 px enlarged to 300x200 on a 3000x2000 sheet at 100 dpi:
         // the sheet is 100 times the picture.
         let mut recipe = Recipe::on_paper();
@@ -1739,15 +1706,16 @@ mod tests {
         let lay = layout(60, 40, 1, &p);
         assert_eq!((lay.image_w, lay.image_h, lay.out_w, lay.out_h), (300, 200, 3000, 2000));
         let sheet = (lay.out_w * lay.out_h) as f64;
+        let picture = (lay.image_w * lay.image_h) as f64;
         let need = memory_estimate(60, 40, 1, &p) as f64;
-        // Two f64 sheets plus the 16-bit copy, with the pictures on top.
-        assert!(need >= 8.0 * 2.0 * sheet + 2.0 * sheet, "{need} vs sheet {sheet}");
-        assert!(need < 8.0 * 2.5 * sheet + 2.0 * sheet, "{need} vs sheet {sheet}");
-        // Without sharpening one sheet is held.
+        // One f64 sheet, the picture it was copied from, and the 16-bit copy.
+        assert!(need >= 8.0 * sheet + 2.0 * sheet, "{need} vs sheet {sheet}");
+        assert!(need < 8.0 * sheet + 2.0 * sheet + 8.0 * 2.0 * picture, "{need} vs picture {picture}");
+        // Without sharpening the same one sheet is held: the mask is not another.
         let mut quiet = p.clone();
         quiet.recipe.sharpen = Sharpen::Off;
         let one = memory_estimate(60, 40, 1, &quiet) as f64;
-        assert!(one >= 8.0 * sheet + 2.0 * sheet && one < 8.0 * 1.5 * sheet + 2.0 * sheet, "{one}");
+        assert_eq!(need, one);
     }
 
     /// A plate holds the two finished sheets and the three source frames
