@@ -836,6 +836,23 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
             return Ok(ThumbReady::Picture(thumb, Box::new(meta)));
         }
     }
+    // A header can state a frame whose 16-bit samples alone are more than
+    // half the free memory. Reading those samples is the allocation the
+    // open path refuses, and the tile is the failure mark.
+    if let Ok((w, h)) = mimizan_core::decode::stated_size(&job.path) {
+        let samples = (w as u64).saturating_mul(h as u64).saturating_mul(2);
+        let free = crate::worker::available_memory();
+        if free > 0 && samples > free / 2 {
+            let name = job
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or(std::borrow::Cow::Borrowed("the file"));
+            return Err(format!(
+                "{name} states {w}x{h}, and its 16-bit samples alone are more than half the free memory"
+            ));
+        }
+    }
     let frame = pipeline::decode(&job.path).map_err(|e| e.to_string())?;
     let wb = frame.wb_as_shot.unwrap_or([1.0; 3]);
     let weights = CameraFile::find(cameras_dir, &frame.clean_make, &frame.clean_model)

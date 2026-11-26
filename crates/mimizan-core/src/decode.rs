@@ -227,6 +227,61 @@ pub fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     }
 }
 
+/// A stated side past this, or a stated frame of more photosites than
+/// [`STATED_PIXELS_MAX`], is refused before the pixels are read. The
+/// allocation would otherwise abort the process.
+#[cfg(feature = "decode-rawler")]
+const STATED_SIDE_MAX: usize = 65_535;
+#[cfg(feature = "decode-rawler")]
+const STATED_PIXELS_MAX: u64 = 1 << 30;
+
+/// The width and height a file states, without its pixels.
+///
+/// A DNG states them in the raw IFD. That decoder's `raw_image` ignores
+/// the flag that asks for the size alone and decodes the frame
+/// (`plain_image_from_ifd` fixes the flag to false), so the IFD is read
+/// instead. It is the only decoder that returns the raw IFD. Every other
+/// one is asked for the image with the flag.
+#[cfg(feature = "decode-rawler")]
+pub fn stated_size(path: &Path) -> Result<(usize, usize)> {
+    let source = raw_source(path).map_err(|e| Error::Decode(e.to_string()))?;
+    guarded(|| stated_size_of(&source))
+}
+
+#[cfg(feature = "decode-rawler")]
+fn stated_size_of(source: &rawler::rawsource::RawSource) -> Result<(usize, usize)> {
+    use rawler::decoders::{RawDecodeParams, WellKnownIFD};
+    use rawler::tags::TiffCommonTag;
+    let decoder = rawler::get_decoder(source).map_err(|e| Error::Decode(e.to_string()))?;
+    if let Some((w, h)) =
+        decoder.ifd(WellKnownIFD::Raw).map_err(|e| Error::Decode(e.to_string()))?.and_then(|ifd| {
+            let w = ifd.get_entry(TiffCommonTag::ImageWidth)?.force_usize(0);
+            let h = ifd.get_entry(TiffCommonTag::ImageLength)?.force_usize(0);
+            (w > 0 && h > 0).then_some((w, h))
+        })
+    {
+        return Ok((w, h));
+    }
+    let img = decoder
+        .raw_image(source, &RawDecodeParams::default(), true)
+        .map_err(|e| Error::Decode(e.to_string()))?;
+    Ok((img.width, img.height))
+}
+
+/// Refuse a file whose stated frame is past [`STATED_SIDE_MAX`] on a side
+/// or past [`STATED_PIXELS_MAX`] photosites. The sentence names the size.
+#[cfg(feature = "decode-rawler")]
+pub(crate) fn refuse_stated_frame(path: &Path) -> Result<()> {
+    let (w, h) = stated_size(path)?;
+    let pixels = (w as u64).saturating_mul(h as u64);
+    if w > STATED_SIDE_MAX || h > STATED_SIDE_MAX || pixels > STATED_PIXELS_MAX {
+        let name =
+            path.file_name().map(|n| n.to_string_lossy()).unwrap_or(std::borrow::Cow::Borrowed("the file"));
+        return Err(Error::Unsupported(format!("{name} states {w}x{h} photosites")));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "decode-rawler")]
 impl RawlerDecoder {
     pub fn decode(&self, path: &Path) -> Result<RawFrame> {
@@ -544,14 +599,28 @@ mod tests {
                 }
             })
             .collect();
+        dng_file(SIDE, SIDE, float, white, cfa, pixels)
+    }
+
+    /// The same hand-written DNG with the size and the strip given.
+    /// `pixels` is the strip; it need not be `width * height` samples,
+    /// so a header can state a frame the test must not allocate.
+    fn dng_file(
+        width: u32,
+        height: u32,
+        float: bool,
+        white: Option<u32>,
+        cfa: &[u8],
+        pixels: Vec<u8>,
+    ) -> Vec<u8> {
         let short = |v: u16| v.to_le_bytes().to_vec();
         let long = |v: u32| v.to_le_bytes().to_vec();
         let text = |s: &str| [s.as_bytes(), &[0]].concat();
         // (tag, type, count, value); the strip offset is filled in below.
         let mut tags: Vec<(u16, u16, u32, Vec<u8>)> = vec![
             (254, 4, 1, long(0)),
-            (256, 4, 1, long(SIDE)),
-            (257, 4, 1, long(SIDE)),
+            (256, 4, 1, long(width)),
+            (257, 4, 1, long(height)),
             (258, 3, 1, short(if float { 32 } else { 16 })),
             (259, 3, 1, short(1)),
             (262, 3, 1, short(32803)),
@@ -559,7 +628,7 @@ mod tests {
             (272, 2, 5, text("Tiny")),
             (273, 4, 1, Vec::new()),
             (277, 3, 1, short(1)),
-            (278, 4, 1, long(SIDE)),
+            (278, 4, 1, long(height)),
             (279, 4, 1, long(pixels.len() as u32)),
             (284, 3, 1, short(1)),
             (339, 3, 1, short(if float { 3 } else { 1 })),
@@ -657,5 +726,41 @@ mod tests {
         // Cut off in the middle of its pixels.
         let whole = tiny_dng(false, Some(65535), &RGGB);
         assert!(decoded("cut", &whole[..whole.len() - 200]).is_err());
+    }
+
+    /// 60 000 × 60 000 is more than 2^30 photosites. The header says so
+    /// and the strip is a few bytes: the refusal comes back without the
+    /// frame, which would be 7 GB.
+    #[test]
+    fn a_header_of_60000_square_is_refused_before_the_frame_is_read() {
+        let bytes = dng_file(60_000, 60_000, false, Some(65535), &RGGB, vec![0; 8]);
+        let path = std::env::temp_dir().join(format!("mimizan-decode-{}-huge.dng", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(stated_size(&path).unwrap(), (60_000, 60_000));
+        let err = crate::pipeline::decode(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(&err, Error::Unsupported(text) if text.contains("60000x60000")), "{err}");
+    }
+
+    /// A side past 65 535 is refused on its own, under the pixel count.
+    #[test]
+    fn a_side_stated_above_65535_is_refused() {
+        let bytes = dng_file(70_000, 2, false, Some(65535), &RGGB, vec![0; 8]);
+        let path = std::env::temp_dir().join(format!("mimizan-decode-{}-wide.dng", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let err = crate::pipeline::decode(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(&err, Error::Unsupported(text) if text.contains("70000x2")), "{err}");
+    }
+
+    #[test]
+    fn the_stated_size_of_the_hand_written_dng_is_its_frame() {
+        let path = std::env::temp_dir().join(format!("mimizan-decode-{}-stated.dng", std::process::id()));
+        std::fs::write(&path, tiny_dng(false, Some(65535), &RGGB)).unwrap();
+        let got = stated_size(&path).unwrap();
+        let frame = crate::pipeline::decode(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, (16, 16));
+        assert_eq!((frame.width, frame.height), (16, 16));
     }
 }

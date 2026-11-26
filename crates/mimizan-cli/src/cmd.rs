@@ -4,6 +4,7 @@
 use crate::measure::{parse_list, parse_rect};
 use anyhow::{bail, Context, Result};
 use mimizan_core::calib::CameraFile;
+use mimizan_core::cfa::BayerPhase;
 use mimizan_core::decode::{RawlerDecoder, SensorKind};
 use mimizan_core::icc::GrayTrc;
 use mimizan_core::ingest::{ingest, IngestParams, WhiteBalance};
@@ -157,6 +158,23 @@ fn preview_outputs(preview: Option<&Path>, crop: bool) -> Vec<(&'static str, Pat
     outputs
 }
 
+/// Past the machine's whole memory the separation ends in the OOM
+/// killer, not in an error; below it, it is only slow.
+fn separation_fits(w: usize, h: usize, need: u64) -> Result<()> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    if sys.total_memory() > 0 && need > sys.total_memory() {
+        bail!(
+            "{}x{} would hold about {} while separating, this machine has {} in all",
+            w,
+            h,
+            mimizan_core::print::memory_text(need),
+            mimizan_core::print::memory_text(sys.total_memory())
+        );
+    }
+    Ok(())
+}
+
 /// `mimizan negative`: RAW → linear 16-bit negative TIFF plus mask sidecar.
 pub fn negative(a: &NegativeArgs) -> Result<()> {
     let mut inputs = vec![a.raw.as_path()];
@@ -170,24 +188,17 @@ pub fn negative(a: &NegativeArgs) -> Result<()> {
     never_over_an_input(&inputs, &outputs)?;
     let t_all = Instant::now();
     let t = Instant::now();
+    // The size is known before the pixels. The kind is not, so the figure
+    // is the Bayer one; the check after the decode is the file's own.
+    if let Ok((w, h)) = mimizan_core::decode::stated_size(&a.raw) {
+        let need = pipeline::develop_memory(w, h, SensorKind::Bayer(BayerPhase::RGGB));
+        separation_fits(w, h, need)?;
+    }
     let frame = pipeline::decode(&a.raw).with_context(|| format!("decoding {}", a.raw.display()))?;
     let decode_ms = t.elapsed().as_millis();
     info!("decode {} ms", decode_ms);
 
-    // Past the machine's whole memory the separation ends in the OOM
-    // killer, not in an error; below it, it is only slow.
-    let need = pipeline::develop_memory_of(&frame);
-    let mut sys = sysinfo::System::new();
-    sys.refresh_memory();
-    if sys.total_memory() > 0 && need > sys.total_memory() {
-        bail!(
-            "{}x{} would hold about {} while separating, this machine has {} in all",
-            frame.width,
-            frame.height,
-            mimizan_core::print::memory_text(need),
-            mimizan_core::print::memory_text(sys.total_memory())
-        );
-    }
+    separation_fits(frame.width, frame.height, pipeline::develop_memory_of(&frame))?;
 
     // The desktop's file beside the RAW: its development, its mix and
     // its plate, unless a flag says otherwise. The print half of it is

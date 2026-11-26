@@ -133,8 +133,12 @@ pub struct Negative {
 }
 
 /// Read a RAW file with `rawler`.
+///
+/// A frame stated with a side above 65 535, or of more than 2^30
+/// photosites, is refused before its pixels are read.
 #[cfg(feature = "decode-rawler")]
 pub fn decode(path: &Path) -> Result<RawFrame> {
+    crate::decode::refuse_stated_frame(path)?;
     RawlerDecoder.decode(path)
 }
 

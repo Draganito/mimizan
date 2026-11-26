@@ -374,7 +374,18 @@ impl std::error::Error for Refused {}
 /// go and sends the job again; the message states the figures, and the UI
 /// adds what to do when that was not enough.
 fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame, status: &dyn Fn(String)) -> Result<()> {
-    let (need, room) = (develop_memory(frame), Room::read());
+    check_hold(path, frame.width, frame.height, develop_memory(frame), status)
+}
+
+/// [`check_memory`] from the size a file states, before it is decoded.
+/// The sensor kind is not known yet, so the figure is the Bayer one,
+/// which is the larger.
+fn check_stated(path: &Path, width: usize, height: usize, status: &dyn Fn(String)) -> Result<()> {
+    check_hold(path, width, height, develop_memory_of_size(width, height), status)
+}
+
+fn check_hold(path: &Path, width: usize, height: usize, need: u64, status: &dyn Fn(String)) -> Result<()> {
+    let room = Room::read();
     if room.on_swap(need) {
         status("the swap holds the rest".into());
     }
@@ -382,7 +393,7 @@ fn check_memory(path: &Path, frame: &mimizan_core::decode::RawFrame, status: &dy
         return Ok(());
     }
     let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-    Err(anyhow::Error::new(refused(&name, "developed", frame.width, frame.height, "separating", need, room)))
+    Err(anyhow::Error::new(refused(&name, "developed", width, height, "separating", need, room)))
 }
 
 /// The log line when a file is past the free memory and the swap.
@@ -571,6 +582,12 @@ fn open(
     }
     status(format!("decoding {}", path.display()));
     let t = Instant::now();
+    // The size is known before the pixels. A file the machine cannot hold
+    // is refused before they are read. The kind is not, so this is the
+    // Bayer figure; the check after the decode is the file's own.
+    if let Ok((w, h)) = mimizan_core::decode::stated_size(path) {
+        check_stated(path, w, h, status)?;
+    }
     let frame = pipeline::decode(path).with_context(|| format!("decoding {}", path.display()))?;
     let decode_ms = t.elapsed().as_millis();
     check_memory(path, &frame, status)?;
