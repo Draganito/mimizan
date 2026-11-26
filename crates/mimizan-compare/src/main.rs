@@ -2110,7 +2110,7 @@ fn finish_demosaic(
             let cam = [samples[p], samples[p + 1], samples[p + 2]].map(|v| {
                 let x = f64::from(v) / 65535.0;
                 match transfer {
-                    Transfer::Srgb => srgb_decode(x),
+                    Transfer::Srgb => mimizan_core::kodak::srgb_decode(x),
                     Transfer::Linear => x,
                 }
             });
@@ -2175,27 +2175,8 @@ fn project(cam: [f64; 3], rows: [[f64; 3]; 3]) -> [f64; 3] {
     ]
 }
 
-/// sRGB inverse electro-optical transfer, the curve the RawTherapee file
-/// was written with.
-fn srgb_decode(v: f64) -> f64 {
-    if v <= 0.04045 {
-        v / 12.92
-    } else {
-        ((v + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// sRGB electro-optical transfer.
-fn srgb_encode(v: f64) -> f64 {
-    if v <= 0.003_130_8 {
-        v * 12.92
-    } else {
-        1.055 * v.powf(1.0 / 2.4) - 0.055
-    }
-}
-
 fn display_byte(linear: f64) -> u8 {
-    let v = srgb_encode(linear.clamp(0.0, 1.0));
+    let v = mimizan_core::kodak::srgb_encode(linear);
     (v * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
@@ -2709,9 +2690,9 @@ mod tests {
         assert_eq!(display_byte(1.0), 255);
         assert_eq!(display_byte(2.0), 255);
         assert_eq!(display_byte(-1.0), 0);
-        let mid = srgb_encode(0.5);
+        let mid = mimizan_core::kodak::srgb_encode(0.5);
         assert!((mid - 0.735356983).abs() < 1e-6);
-        assert!((srgb_decode(mid) - 0.5).abs() < 1e-9);
+        assert!((mimizan_core::kodak::srgb_decode(mid) - 0.5).abs() < 1e-9);
     }
 
     #[test]
