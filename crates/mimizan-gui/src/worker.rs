@@ -17,8 +17,8 @@
 use crate::session::{
     cover_detail, kept_negative, negative_params, next_session_id, preview_planes, render_detail_linear,
     render_preview, render_print_linear, render_sharpen_loupe, tone_tile, DetailAsk, DetailImage, DetailRect,
-    DetailTile, HistCache, LinearTile, PlateView, PreviewImage, PreviewStages, RawHistogram, Session,
-    SharpenLoupe, ToneHold, ViewParams,
+    DetailTile, HistCache, LinearTile, PlateView, PreviewHistograms, PreviewImage, PreviewStages,
+    RawHistogram, Session, SharpenLoupe, ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -958,6 +958,8 @@ pub struct PreviewResult {
     pub image: Option<PreviewImage>,
     /// New 1:1 window, when one was requested and changed.
     pub detail: Option<DetailImage>,
+    /// Full-resolution histograms of this request, sent after the picture.
+    pub histograms: Option<PreviewHistograms>,
     pub ms: u128,
     /// Set when this request panicked. The picture stays as it was.
     pub failed: Option<String>,
@@ -1101,6 +1103,7 @@ fn start_preview(
                         session,
                         image: None,
                         detail: None,
+                        histograms: None,
                         ms: started.elapsed().as_millis(),
                         failed: Some(format!("stopped: {}", panic_message(&payload))),
                     });
@@ -1144,16 +1147,33 @@ fn paint_preview(
     // view differs then, and it is rendered), the window follows the hand.
     let window_covers = req.view.burn_live && req.detail.is_some();
     if view_changed && !window_covers {
-        let image = render_preview(&req.session, &req.view, &mut hold.hists, &mut hold.stages, table);
+        let image = render_preview(&req.session, &req.view, &mut hold.stages, table);
         hold.last = Some(key);
         send(PreviewResult {
             generation: req.generation,
             session: req.session.id,
             image: Some(image),
             detail: None,
+            histograms: None,
             ms: t.elapsed().as_millis(),
             failed: None,
         });
+        // The count walks the whole negative. It follows the picture. A
+        // stroke being painted does not take it: the last count stays, and
+        // the release asks for the picture again.
+        if !req.view.burn_live && !stale() {
+            let t = Instant::now();
+            let (negative, view) = hold.hists.histograms(&req.session, &req.view, table);
+            send(PreviewResult {
+                generation: req.generation,
+                session: req.session.id,
+                image: None,
+                detail: None,
+                histograms: Some(PreviewHistograms { view, negative }),
+                ms: t.elapsed().as_millis(),
+                failed: None,
+            });
+        }
     }
     let Some(ask) = req.detail else {
         // No window asked for: what was held answers nothing now, so the
@@ -1228,6 +1248,7 @@ fn paint_preview(
         session: req.session.id,
         image: None,
         detail: Some(image),
+        histograms: None,
         ms: t.elapsed().as_millis(),
         failed: None,
     });
@@ -1670,5 +1691,74 @@ mod tests {
             assert!((light - grey.powf(2.2)).abs() < 1e-4, "{rgb} for {grey}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The picture and the histograms are the two events, and they carry
+    /// what counting both in one call used to.
+    #[test]
+    fn the_picture_arrives_before_its_histograms() {
+        let session = Arc::new(grey_session());
+        let view = ViewParams {
+            weights: Weights { r: 0.4, g: 0.4, b: 0.2 },
+            tone: Tone::paper(),
+            place: 0.3,
+            rotation: 0,
+            angle: 0.0,
+            crop: None,
+            burns: Vec::new(),
+            burn_live: false,
+            plate: None,
+        };
+        let (picture, counted) = crate::session::render_preview_and_histograms(
+            &session,
+            &view,
+            &mut HistCache::default(),
+            &mut PreviewStages::default(),
+        );
+        let sent = std::cell::RefCell::new(Vec::new());
+        paint_preview(
+            &mut PreviewHold::default(),
+            PreviewRequest {
+                session: Arc::clone(&session),
+                view: view.clone(),
+                detail: None,
+                inspect: None,
+                generation: 1,
+            },
+            &|| false,
+            &|r| sent.borrow_mut().push(r),
+        );
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 2, "the picture, then the histograms");
+        let image = sent[0].image.as_ref().expect("the picture is first");
+        assert!(sent[0].histograms.is_none());
+        assert!(sent[0].detail.is_none());
+        assert_eq!(image.gray, picture.gray);
+        assert_eq!(image.rgb, picture.rgb);
+        assert_eq!(image.hist_rgb, picture.hist_rgb);
+        assert!(sent[1].image.is_none());
+        let h = sent[1].histograms.as_ref().expect("the histograms follow");
+        assert_eq!(h.view, counted.view);
+        assert_eq!(h.negative, counted.negative);
+
+        // A stroke being painted sends the picture and does not count.
+        let live = ViewParams { burn_live: true, ..view };
+        let sent = std::cell::RefCell::new(Vec::new());
+        paint_preview(
+            &mut PreviewHold::default(),
+            PreviewRequest {
+                session: Arc::clone(&session),
+                view: live,
+                detail: None,
+                inspect: None,
+                generation: 2,
+            },
+            &|| false,
+            &|r| sent.borrow_mut().push(r),
+        );
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].image.is_some());
+        assert!(sent[0].histograms.is_none());
     }
 }

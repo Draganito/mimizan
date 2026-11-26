@@ -1812,43 +1812,46 @@ fn neg_lut() -> &'static [u8; 65536] {
 /// (`pipeline::scene_range`), so a code times the range over 65535 is the
 /// scene value. Rebuilt when the weights change, then every exposure is a
 /// lookup.
-fn mix_codes(sep: &Separation, w: &Weights) -> (Vec<u16>, f64) {
+fn mix_codes(sep: &Separation, w: &Weights, codes: &mut Vec<u16>) -> f64 {
     let width = sep.lum.width;
     if w.is_native() {
-        return codes_of(width, sep.lum.height, |y| {
+        return codes_of(width, sep.lum.height, codes, |y| {
             let l = sep.lum.row(y);
             move |x| l[x]
         });
     }
     let k1 = w.g - w.r - w.b;
     let k2 = 2.0 * (w.r - w.b);
-    codes_of(width, sep.lum.height, |y| {
+    codes_of(width, sep.lum.height, codes, |y| {
         let (l, c1, c2) = (sep.lum.row(y), sep.c1.row(y), sep.c2.row(y));
         move |x| l[x] + k1 * c1[x] + k2 * c2[x]
     })
 }
 
 /// [`mix_codes`] of a plane as it stands: a monochrome negative.
-fn plane_codes(plane: &Plane) -> (Vec<u16>, f64) {
-    codes_of(plane.width, plane.height, |y| {
+fn plane_codes(plane: &Plane, codes: &mut Vec<u16>) -> f64 {
+    codes_of(plane.width, plane.height, codes, |y| {
         let row = plane.row(y);
         move |x| row[x]
     })
 }
 
-/// The codes of `row(y)(x)` and their range. One pass when nothing stands
-/// above 1, which is every file but the ones with burnt highlights; a
-/// second one, by the range, when something does.
+/// The codes of `row(y)(x)` and their range, written into `codes`. The
+/// cache holds that buffer, so a new mix fills it instead of allocating
+/// another. One pass when nothing stands above 1, which is every file but
+/// the ones with burnt highlights; a second one, by the range, when
+/// something does.
 fn codes_of<R: Fn(usize) -> f64>(
     width: usize,
     height: usize,
+    codes: &mut Vec<u16>,
     row: impl Fn(usize) -> R + Sync,
-) -> (Vec<u16>, f64) {
-    let mut out = vec![0u16; width * height];
+) -> f64 {
+    codes.resize(width * height, 0);
     if width == 0 {
-        return (out, 1.0);
+        return 1.0;
     }
-    let top = out
+    let top = codes
         .par_chunks_mut(width)
         .enumerate()
         .map(|(y, codes)| {
@@ -1865,14 +1868,14 @@ fn codes_of<R: Fn(usize) -> f64>(
         })
         .reduce(|| 1.0, f64::max);
     if top > 1.0 {
-        out.par_chunks_mut(width).enumerate().for_each(|(y, codes)| {
+        codes.par_chunks_mut(width).enumerate().for_each(|(y, codes)| {
             let at = row(y);
             for (x, o) in codes.iter_mut().enumerate() {
                 *o = q16(at(x) / top) as u16;
             }
         });
     }
-    (out, top)
+    top
 }
 
 /// 8-bit face of the print without burns, for the tests' expectations.
@@ -2287,9 +2290,9 @@ impl Histogram {
     }
 }
 
-/// What the preview worker hands back: the 8-bit view, plus two histograms of
-/// the full-resolution negative: after the curve (the TIFF) and the linear mix
-/// before it (binned on a gamma-2.2 axis so the shadows are readable).
+/// What the preview worker hands back first: the 8-bit view. The
+/// full-resolution histograms follow as their own event; counting them
+/// walks the whole negative, and the picture does not wait.
 pub struct PreviewImage {
     pub width: usize,
     pub height: usize,
@@ -2298,12 +2301,19 @@ pub struct PreviewImage {
     pub gray: Vec<u8>,
     /// The plate in colour, interleaved R, G, B, when the view asked for one.
     pub rgb: Option<Vec<u8>>,
-    pub hist_view: Histogram,
-    pub hist_negative: Histogram,
     /// The three channels of the plate, counted on the preview's pixels
     /// by their print values: outlines over the print histogram, which
-    /// stays the mix's.
+    /// stays the mix's. The preview is a few hundred pixels on a side,
+    /// so the count goes with the picture.
     pub hist_rgb: Option<[[u32; 256]; 3]>,
+}
+
+/// The full-resolution histograms, sent once the picture is on its way:
+/// after the curve (the TIFF) and the linear mix before it (binned on a
+/// gamma-2.2 axis so the shadows are readable).
+pub struct PreviewHistograms {
+    pub view: Histogram,
+    pub negative: Histogram,
 }
 
 /// Per-channel histograms of interleaved R G B bytes.
@@ -2496,7 +2506,7 @@ impl HistCache {
                 return;
             }
             self.width = s.width;
-            (self.codes, self.range) = plane_codes(&s.negative.plane);
+            self.range = plane_codes(&s.negative.plane, &mut self.codes);
             self.session = Some(ptr);
             self.weights = None;
             self.tally = None;
@@ -2507,7 +2517,7 @@ impl HistCache {
             return;
         }
         self.width = sep.lum.width;
-        (self.codes, self.range) = mix_codes(sep, w);
+        self.range = mix_codes(sep, w, &mut self.codes);
         self.session = Some(ptr);
         self.weights = Some(*w);
         self.tally = None;
@@ -2521,7 +2531,12 @@ impl HistCache {
         &self.codes
     }
 
-    fn histograms(&mut self, s: &Session, v: &ViewParams, table: &ToneTable) -> (Histogram, Histogram) {
+    pub(crate) fn histograms(
+        &mut self,
+        s: &Session,
+        v: &ViewParams,
+        table: &ToneTable,
+    ) -> (Histogram, Histogram) {
         let ptr = s.id;
         let key = v.hist_key();
         // Under a dragged card the last count stands; the release counts.
@@ -2677,16 +2692,14 @@ impl PreviewStages {
 
 /// 8-bit grey preview of the whole negative: the downscaled mix, then the
 /// tone table, in the picture's final orientation. The
-/// stages that stand are taken from `stages`.
+/// stages that stand are taken from `stages`. The full-resolution
+/// histograms are not counted here: the worker sends them after the picture.
 pub fn render_preview(
     s: &Session,
     v: &ViewParams,
-    cache: &mut HistCache,
     stages: &mut PreviewStages,
     table: &ToneTable,
 ) -> PreviewImage {
-    // Histograms from the full-resolution separation, not the preview copy.
-    let (hist_negative, hist_view) = cache.histograms(s, v, table);
     let g = Geometry::of(s, v);
     let (fw, fh) = (g.fw, g.fh);
     let (small, window) = {
@@ -2727,7 +2740,24 @@ pub fn render_preview(
         }
         None => (None, None),
     };
-    PreviewImage { width, height, rotation: v.rotation, gray, rgb, hist_view, hist_negative, hist_rgb }
+    PreviewImage { width, height, rotation: v.rotation, gray, rgb, hist_rgb }
+}
+
+/// The picture and then its full-resolution histograms, the order the
+/// worker used to do both in one call. The two events it sends now carry
+/// the same pixels and the same counts.
+#[cfg(test)]
+pub fn render_preview_and_histograms(
+    s: &Session,
+    v: &ViewParams,
+    cache: &mut HistCache,
+    stages: &mut PreviewStages,
+) -> (PreviewImage, PreviewHistograms) {
+    let mut tones = ToneHold::default();
+    let table = tones.get(&v.tone, v.screen(s));
+    let image = render_preview(s, v, stages, table);
+    let (negative, view) = cache.histograms(s, v, table);
+    (image, PreviewHistograms { view, negative })
 }
 
 #[cfg(test)]
@@ -3073,7 +3103,8 @@ mod histogram_tests {
         let tone = Tone::paper().compile();
         let table = ToneTable::build(&tone);
         let (n1, v1) = Histogram::of_separation(&sep, &wts, 1.0, &table, 0.0, None, None);
-        let (codes, range) = mix_codes(&sep, &wts);
+        let mut codes = Vec::new();
+        let range = mix_codes(&sep, &wts, &mut codes);
         assert_eq!(range, 1.0);
         let (n2, v2) = Histogram::of_codes(&codes, range, sep.lum.width, &table, 0.0, None, None);
         assert_eq!(n1, n2);
@@ -3279,11 +3310,12 @@ mod histogram_tests {
         let expected = straighten::straighten(&session.negative.plane, angle, STRAIGHTEN_KERNEL);
         assert_eq!((expected.width, expected.height), (fw, fh));
         assert_eq!(detail.gray, display_bytes(&expected, 0.0, &table));
-        let preview = render_preview(&session, &turned, &mut cache, &mut stages, &table);
+        let preview = render_preview(&session, &turned, &mut stages, &table);
         assert_eq!((preview.width, preview.height), straighten::frame_size(w, h, angle));
         // The histogram counts only the frame's pixels.
-        assert!(preview.hist_view.total <= fw * fh);
-        assert!(preview.hist_view.total > 0);
+        let (_, hist_view) = cache.histograms(&session, &turned, &table);
+        assert!(hist_view.total <= fw * fh);
+        assert!(hist_view.total > 0);
         // And the whole frame turned 90° is the frame of the turned negative.
         let quarter = ViewParams { rotation: 1, ..turned.clone() };
         let d = render_detail(
@@ -3487,13 +3519,15 @@ mod histogram_tests {
         // histogram does not.
         let mut cache = HistCache::default();
         let mut stages = PreviewStages::default();
-        let p0 = render_preview(&session, &plain, &mut cache, &mut stages, &table);
-        let p1 = render_preview(&session, &burned, &mut cache, &mut stages, &table);
+        let p0 = render_preview(&session, &plain, &mut stages, &table);
+        let (n0, v0) = cache.histograms(&session, &plain, &table);
+        let p1 = render_preview(&session, &burned, &mut stages, &table);
+        let (n1, v1) = cache.histograms(&session, &burned, &table);
         assert_eq!((p1.width, p1.height), (p0.width, p0.height));
         assert_ne!(p1.gray, p0.gray);
-        assert_ne!(p1.hist_view, p0.hist_view);
-        assert_eq!(p1.hist_negative, p0.hist_negative);
-        assert_eq!(p1.hist_view.total, p0.hist_view.total);
+        assert_ne!(v1, v0);
+        assert_eq!(n1, n0);
+        assert_eq!(v1.total, v0.total);
         // With the preview at full size, its bytes are the tile's.
         if (p1.width, p1.height) == (w, h) {
             assert_eq!(p1.gray, after);
@@ -3507,13 +3541,15 @@ mod histogram_tests {
             points: vec![[0.0, 0.0]],
         };
         let live = ViewParams { burns: vec![moved], burn_live: true, ..plain.clone() };
-        let p2 = render_preview(&session, &live, &mut cache, &mut stages, &table);
+        let p2 = render_preview(&session, &live, &mut stages, &table);
+        let (_, v2) = cache.histograms(&session, &live, &table);
         assert_ne!(p2.gray, p1.gray);
-        assert_eq!(p2.hist_view, p1.hist_view);
+        assert_eq!(v2, v1);
         let settled = ViewParams { burn_live: false, ..live };
-        let p3 = render_preview(&session, &settled, &mut cache, &mut stages, &table);
+        let p3 = render_preview(&session, &settled, &mut stages, &table);
+        let (_, v3) = cache.histograms(&session, &settled, &table);
         assert_eq!(p3.gray, p2.gray);
-        assert_ne!(p3.hist_view, p1.hist_view);
+        assert_ne!(v3, v1);
     }
 
     /// The tally rebinned is the walk: to the pixel at place 0, with a
@@ -3526,7 +3562,8 @@ mod histogram_tests {
         let sep = sweep(64, 40);
         let wts = Weights { r: 0.3, g: 0.5, b: 0.2 };
         let table = ToneTable::build(&Tone::paper().compile());
-        let (codes, range) = mix_codes(&sep, &wts);
+        let mut codes = Vec::new();
+        let range = mix_codes(&sep, &wts, &mut codes);
         assert_eq!(range, 1.0);
         let (w, h) = (sep.lum.width, sep.lum.height);
         let to_frame = Affine { a: 0.98, b: 0.2, c: -0.2, d: 0.98, tx: 3.0, ty: -2.0 };
@@ -3700,14 +3737,16 @@ mod histogram_tests {
         let mut cache = HistCache::default();
         for v in &views {
             let table = ToneTable::build(&v.tone.compile());
-            let staged = render_preview(&session, v, &mut cache, &mut stages, &table);
-            let fresh =
-                render_preview(&session, v, &mut HistCache::default(), &mut PreviewStages::default(), &table);
+            let staged = render_preview(&session, v, &mut stages, &table);
+            let (staged_n, staged_v) = cache.histograms(&session, v, &table);
+            let mut fresh_cache = HistCache::default();
+            let fresh = render_preview(&session, v, &mut PreviewStages::default(), &table);
+            let (fresh_n, fresh_v) = fresh_cache.histograms(&session, v, &table);
             assert_eq!((staged.width, staged.height), (fresh.width, fresh.height), "{v:?}");
             assert_eq!(staged.gray, fresh.gray, "{v:?}");
             assert_eq!(staged.rgb, fresh.rgb, "{v:?}");
-            assert_eq!(staged.hist_view, fresh.hist_view, "{v:?}");
-            assert_eq!(staged.hist_negative, fresh.hist_negative, "{v:?}");
+            assert_eq!(staged_v, fresh_v, "{v:?}");
+            assert_eq!(staged_n, fresh_n, "{v:?}");
         }
         // The linear tile re-toned is the fresh tile, for the file and the print.
         use mimizan_core::burn::{Light, Stroke, Tip};
@@ -3839,9 +3878,8 @@ mod histogram_tests {
             }
         };
 
-        let mut cache = HistCache::default();
         let mut stages = PreviewStages::default();
-        let pv = render_preview(&session, &view, &mut cache, &mut stages, &table);
+        let pv = render_preview(&session, &view, &mut stages, &table);
         grey_in_colour(&pv.gray, pv.rgb.as_ref().unwrap());
         assert_eq!(pv.gray.len(), pv.width * pv.height);
 
@@ -4502,15 +4540,17 @@ mod histogram_tests {
             // The whole picture and its histograms.
             let fresh = || (HistCache::default(), PreviewStages::default());
             let (mut c, mut st) = fresh();
-            let a = render_preview(&session, &adobe, &mut c, &mut st, &print_table);
+            let a = render_preview(&session, &adobe, &mut st, &print_table);
+            let (na, va) = c.histograms(&session, &adobe, &print_table);
             let (mut c, mut st) = fresh();
-            let b = render_preview(&session, &srgb, &mut c, &mut st, &file_table);
+            let b = render_preview(&session, &srgb, &mut st, &file_table);
+            let (nb, vb) = c.histograms(&session, &srgb, &file_table);
             same_picture("preview", a.rgb.as_ref().unwrap(), b.rgb.as_ref().unwrap());
             same_picture("preview grey", &a.gray, &b.gray);
             assert_eq!(a.hist_rgb, b.hist_rgb, "the channels are counted on the print's values");
             assert_eq!(a.hist_rgb.unwrap(), rgb_histograms(a.rgb.as_ref().unwrap()));
-            assert_eq!(a.hist_view, b.hist_view);
-            assert_eq!(a.hist_negative, b.hist_negative);
+            assert_eq!(va, vb);
+            assert_eq!(na, nb);
             // The three channels differ, or the test says nothing of colour.
             let px = a.rgb.as_ref().unwrap().as_chunks::<3>().0;
             assert!(px.iter().filter(|p| p[0] != p[1] && p[1] != p[2]).count() * 2 > px.len());

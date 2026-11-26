@@ -727,6 +727,13 @@ fn tile_must_wait(tile_has_picture: bool, tile_matches_shown: bool) -> bool {
 /// The dress to hold while another file takes the edit: the one on the
 /// stage now, if a picture is there. A dress already held stays held: the
 /// stage still shows the file it was taken from.
+/// The capture waits until the histograms are the picture's. Nothing is
+/// open, or a stroke is being painted and the last count stands: there is
+/// nothing to wait for.
+fn histograms_of_the_picture(open: bool, picture: u64, histograms: u64, burn_live: bool) -> bool {
+    !open || burn_live || picture == histograms
+}
+
 fn dress_to_hold(
     held: Option<StageDress>,
     stage_has_picture: bool,
@@ -937,6 +944,10 @@ pub struct App {
     preview_ms: u128,
     /// How long the last detail window took, ms.
     detail_ms: u128,
+    /// Generation of the picture on screen, and of the histograms shown
+    /// with it. The capture waits until they are the same request.
+    preview_generation: u64,
+    hist_generation: u64,
     hist_view: Histogram,
     hist_negative: Histogram,
     /// The plate's three channels, outlines over the print histogram.
@@ -1164,6 +1175,8 @@ impl App {
             last_view: None,
             preview_ms: 0,
             detail_ms: 0,
+            preview_generation: 0,
+            hist_generation: 0,
             hist_view: Histogram::empty(),
             hist_negative: Histogram::empty(),
             hist_rgb: None,
@@ -3635,6 +3648,18 @@ impl App {
             && self.folder.as_ref().is_none_or(|f| f.entries.iter().all(|e| e.state != ThumbState::Pending))
     }
 
+    /// The histograms on screen are the picture's. A stroke being painted
+    /// does not count, and the bars already up stay.
+    fn histograms_settled(&self) -> bool {
+        let burn_live = matches!(self.burn_drag, Some(BrushDrag::Paint { .. } | BrushDrag::Push { .. }));
+        histograms_of_the_picture(
+            self.session.is_some(),
+            self.preview_generation,
+            self.hist_generation,
+            burn_live,
+        )
+    }
+
     fn screenshot_step(&mut self, ctx: &egui::Context) {
         let Some(path) = self.screenshot_to.clone() else { return };
         match self.screenshot_state {
@@ -3643,6 +3668,7 @@ impl App {
             // the empty stage instead of never happening.
             0 if self.busy.is_none()
                 && (self.texture.is_some() || self.session.is_none())
+                && self.histograms_settled()
                 && (std::env::var_os("MIMIZAN_SCREENSHOT_STRIP").is_none()
                     || self.strip_thumbs_settled()) =>
             {
@@ -3793,9 +3819,15 @@ impl App {
             } else {
                 self.log("preview was the wrong size");
             }
-            self.hist_view = im.hist_view;
-            self.hist_negative = im.hist_negative;
             self.hist_rgb = im.hist_rgb;
+            self.preview_generation = r.generation;
+        }
+        if let Some(h) = r.histograms {
+            // Kept until a later request's counts arrive, so a picture
+            // that is still being counted does not blank the bars.
+            self.hist_view = h.view;
+            self.hist_negative = h.negative;
+            self.hist_generation = r.generation;
         }
         if let Some(d) = r.detail {
             let n = d.ask.w.saturating_mul(d.ask.h);
@@ -8528,10 +8560,10 @@ mod sheet_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        baseline_after_open, dress_to_hold, hit_crop, moved_crop, must_make_room, open_step, opened_is_fresh,
-        opening_memory, peak_held_after_redevelopment, peak_rearm_after_reset, picture_terms,
-        recipe_for_window, recipe_needs_saving, released_after_failure, stage_black_px, tile_must_wait,
-        CropHit, OpenStep, PaperFormat, Released, Rings, StageDress,
+        baseline_after_open, dress_to_hold, histograms_of_the_picture, hit_crop, moved_crop, must_make_room,
+        open_step, opened_is_fresh, opening_memory, peak_held_after_redevelopment, peak_rearm_after_reset,
+        picture_terms, recipe_for_window, recipe_needs_saving, released_after_failure, stage_black_px,
+        tile_must_wait, CropHit, OpenStep, PaperFormat, Released, Rings, StageDress,
     };
     use crate::edit::Edit;
     use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
@@ -8857,6 +8889,17 @@ mod crop_drag_tests {
         assert!(tile_must_wait(true, false));
         assert!(!tile_must_wait(true, true));
         assert!(!tile_must_wait(false, false));
+    }
+
+    /// The capture waits until the histograms belong to the picture it
+    /// shows. Nothing open, and a stroke being painted, do not wait.
+    #[test]
+    fn the_capture_waits_for_the_histograms_of_the_picture() {
+        assert!(histograms_of_the_picture(false, 0, 0, false));
+        assert!(histograms_of_the_picture(true, 0, 0, false));
+        assert!(!histograms_of_the_picture(true, 3, 2, false));
+        assert!(histograms_of_the_picture(true, 3, 3, false));
+        assert!(histograms_of_the_picture(true, 4, 3, true));
     }
 }
 
