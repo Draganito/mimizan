@@ -6794,6 +6794,9 @@ impl App {
         // need a thumbnail; visible ones first, then two screens around.
         let mut wanted: Vec<(f32, usize)> = Vec::new();
         let ctx = ui.ctx().clone();
+        // Askings are handed out while the tiles are borrowed, and written
+        // back when the strip is done with them.
+        let mut asks = folder.asks;
         // Frame geometry follows the panel height: whatever is left under
         // the bar (minus the scrollbar) is one film frame.
         let tile_h = (ui.available_height() - ui.spacing().scroll.allocated_width()).max(60.0);
@@ -6884,7 +6887,8 @@ impl App {
                         if e.state == ThumbState::Ready && dist > clip.width() * THUMB_KEEP_SCREENS {
                             e.thumb = None;
                             e.state = ThumbState::Pending;
-                            e.let_go += 1;
+                            asks = asks.wrapping_add(1);
+                            e.ask = asks;
                         }
                         continue;
                     }
@@ -7027,6 +7031,7 @@ impl App {
                 }
             });
         });
+        folder.asks = asks;
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         // Compared without allocating; the list is rebuilt only when it changed.
         let same = wanted.len() == self.last_wanted.len()
@@ -7041,7 +7046,7 @@ impl App {
                         path: e.path.clone(),
                         size: e.size,
                         modified: e.modified,
-                        let_go: e.let_go,
+                        ask: e.ask,
                         bayer_ls: self.bayer_ls,
                     }
                 })

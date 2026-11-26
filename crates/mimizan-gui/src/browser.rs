@@ -100,15 +100,16 @@ pub struct Entry {
     pub state: ThumbState,
     /// Created when the tile is visible, dropped when it scrolls away.
     pub texture: Option<egui::TextureHandle>,
-    /// How often the strip let the pixels go to save memory. The thumbnail
-    /// thread makes a file once for each count, so a tile that was let go
-    /// is made again when it is wanted again.
-    pub let_go: u32,
+    /// Which asking this tile is. The thumbnail thread makes a file once
+    /// for each asking of one folder scan, so a tile whose pixels were let
+    /// go, and a file put back after it had left, is pictured again.
+    pub ask: u32,
 }
 
 impl Entry {
-    /// A file the strip has not pictured yet.
-    fn pending(path: &Path) -> Option<Self> {
+    /// A file the strip has not pictured yet. `ask` is this asking's
+    /// number ([`Folder::next_ask`]).
+    fn pending(path: &Path, ask: u32) -> Option<Self> {
         let md = std::fs::metadata(path).ok()?;
         if !md.is_file() {
             return None;
@@ -122,7 +123,7 @@ impl Entry {
             meta: None,
             state: ThumbState::Pending,
             texture: None,
-            let_go: 0,
+            ask,
         })
     }
 }
@@ -134,6 +135,10 @@ pub struct Folder {
     pub entries: Vec<Entry>,
     /// Bumped on every scan so thumbnails of an old listing are ignored.
     pub generation: u64,
+    /// The last asking handed out in this scan. A let-go and a file put
+    /// back both take the next value, so two askings of one path never
+    /// share a number.
+    pub asks: u32,
     /// Visible subfolders (not hidden ones), natural order: the strip shows
     /// them as tiles before the frames.
     pub subdirs: Vec<SubDir>,
@@ -178,13 +183,13 @@ impl Folder {
                 meta: None,
                 state: ThumbState::Pending,
                 texture: None,
-                let_go: 0,
+                ask: 0,
             });
         }
         subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
         let subdirs =
             subdirs.into_iter().map(|p| SubDir { name: dir_name(&p), path: p, raws: None }).collect();
-        let mut f = Self { path: path.to_path_buf(), entries, generation, subdirs };
+        let mut f = Self { path: path.to_path_buf(), entries, generation, asks: 0, subdirs };
         f.resort(sort);
         Ok(f)
     }
@@ -204,16 +209,24 @@ impl Folder {
         self.entries.iter().position(|e| e.path == path)
     }
 
+    /// The next asking in this scan. Two askings of one path never carry
+    /// the same number, so the thumbnail thread makes the later one.
+    pub fn next_ask(&mut self) -> u32 {
+        self.asks = self.asks.wrapping_add(1);
+        self.asks
+    }
+
     /// `asked` was an X-Trans RAF and `opened` is the DNG beside it. The
     /// RAF leaves the strip. The DNG stays, or is added when the listing
-    /// did not have it yet.
+    /// did not have it yet. A file put back takes a new asking.
     pub fn show_instead(&mut self, asked: &Path, opened: &Path, sort: Sort) {
         if self.index_of(asked).is_none() {
             return;
         }
         self.entries.retain(|e| e.path != asked);
         if self.index_of(opened).is_none() {
-            if let Some(entry) = Entry::pending(opened) {
+            let ask = self.next_ask();
+            if let Some(entry) = Entry::pending(opened, ask) {
                 self.entries.push(entry);
                 self.resort(sort);
             }
@@ -386,8 +399,8 @@ pub struct ThumbJob {
     pub path: PathBuf,
     pub size: u64,
     pub modified: SystemTime,
-    /// [`Entry::let_go`] of the tile when it asked.
-    pub let_go: u32,
+    /// [`Entry::ask`] of the tile when it asked.
+    pub ask: u32,
     /// The Negative window's least-squares demosaic. A RAW whose DNG is
     /// written is then the DNG, and with it off that DNG is not a tile.
     pub bayer_ls: bool,
@@ -396,9 +409,9 @@ pub struct ThumbJob {
 /// What the thumbnail thread has made in the folder scan it is on. The
 /// strip sends its whole list again whenever the list changes, and a list
 /// may still name a file whose result is on its way back: that one is not
-/// made twice. A tile the strip has let go since asks under a higher
-/// count and is made again; without the count it stayed "…" until the
-/// folder was read anew.
+/// made twice. A tile the strip has let go, and a file put back into the
+/// strip, ask under a new number and are made again; without it the tile
+/// stayed "…" until the folder was read anew.
 #[derive(Default)]
 struct Made(HashSet<(u64, PathBuf, u32)>);
 
@@ -411,7 +424,7 @@ impl Made {
 
     /// `true` the first time `job` is seen: it is to be made.
     fn first(&mut self, job: &ThumbJob) -> bool {
-        self.0.insert((job.generation, job.path.clone(), job.let_go))
+        self.0.insert((job.generation, job.path.clone(), job.ask))
     }
 }
 
@@ -847,7 +860,7 @@ mod tests {
             meta: None,
             state: ThumbState::Pending,
             texture: None,
-            let_go: 0,
+            ask: 0,
         }
     }
 
@@ -857,6 +870,7 @@ mod tests {
             path: PathBuf::from("/photos"),
             entries: vec![named("DSCF1110.RAF"), named("DSCF1110.dng"), named("DSCF1111.RAF")],
             generation: 1,
+            asks: 0,
             subdirs: Vec::new(),
         };
         let raf = PathBuf::from("/photos/DSCF1110.RAF");
@@ -964,12 +978,12 @@ mod tests {
     /// strip let go is one, and so is the same file in a new scan.
     #[test]
     fn a_thumbnail_is_made_once_and_again_when_it_was_let_go() {
-        let job = |generation, name: &str, let_go| ThumbJob {
+        let job = |generation, name: &str, ask| ThumbJob {
             generation,
             path: PathBuf::from(name),
             size: 1,
             modified: SystemTime::UNIX_EPOCH,
-            let_go,
+            ask,
             bayer_ls: false,
         };
         let mut made = Made::default();
@@ -988,5 +1002,38 @@ mod tests {
         made.scan(2);
         assert!(made.first(&job(2, "a.nef", 0)));
         assert!(made.first(&job(2, "b.nef", 0)));
+    }
+
+    /// A file pictured, taken out of the strip and put back in the same
+    /// scan asks again: the first picture is not the one to show.
+    #[test]
+    fn a_file_put_back_asks_under_a_key_the_worker_has_not_seen() {
+        let dir = std::env::temp_dir().join(format!("mimizan-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.join("a.NEF");
+        let dng = dir.join("a.dng");
+        std::fs::write(&raw, b"raw").unwrap();
+        std::fs::write(&dng, b"dng").unwrap();
+        let mut folder = Folder::scan(&dir, Sort::Name, 1).unwrap();
+        let generation = folder.generation;
+        let mut made = Made::default();
+        made.scan(generation);
+        let job = |e: &Entry| ThumbJob {
+            generation,
+            path: e.path.clone(),
+            size: e.size,
+            modified: e.modified,
+            ask: e.ask,
+            bayer_ls: false,
+        };
+        let pictured = folder.entries.iter().find(|e| e.path == raw).unwrap();
+        assert!(made.first(&job(pictured)));
+        // The DNG takes the tile, then the file comes back.
+        folder.show_instead(&raw, &dng, Sort::Name);
+        folder.show_instead(&dng, &raw, Sort::Name);
+        let back = folder.entries.iter().find(|e| e.path == raw).unwrap();
+        assert!(made.first(&job(back)), "a file put back asks again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
