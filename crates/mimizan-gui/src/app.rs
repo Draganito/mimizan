@@ -6389,18 +6389,13 @@ enum ExportTarget {
 /// has asked about that very path and is written as it is.
 fn export_target(picked: PathBuf, granted: bool, allowed: &[&str], source: &Path) -> ExportTarget {
     let path = if granted { picked.clone() } else { with_ext(picked.clone(), allowed) };
-    if same_file(&path, source) {
+    if mimizan_core::outfile::same_file(&path, source) {
         ExportTarget::Source(path)
     } else if path != picked && path.exists() {
         ExportTarget::Ask(path)
     } else {
         ExportTarget::Write(path)
     }
-}
-
-/// Both paths name one file that is there, whatever the spelling.
-fn same_file(a: &Path, b: &Path) -> bool {
-    matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 /// The linear export's name beside the RAW: `<stem>.dng` for the plate,

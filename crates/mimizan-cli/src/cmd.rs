@@ -135,8 +135,39 @@ pub fn warn_inert_flags(p: &SeparateParams, cutoff: f64, rounds: usize) {
     }
 }
 
+/// No file a command writes may be one it reads: the input is in memory
+/// by the time the output is written, and the RAW would be gone under the
+/// picture made from it. Asked before any work is done.
+fn never_over_an_input(inputs: &[&Path], outputs: &[(&str, PathBuf)]) -> Result<()> {
+    for (flag, out) in outputs {
+        if let Some(input) = inputs.iter().find(|input| mimizan_core::outfile::same_file(input, out)) {
+            bail!("{flag} {} is the input {}: it would be written over", out.display(), input.display());
+        }
+    }
+    Ok(())
+}
+
+/// The files beside `--preview` that a command writes.
+fn preview_outputs(preview: Option<&Path>, crop: bool) -> Vec<(&'static str, PathBuf)> {
+    let Some(p) = preview else { return Vec::new() };
+    let mut outputs = vec![("--preview", p.to_path_buf())];
+    if crop {
+        outputs.push(("the crop beside --preview", p.with_extension("crop.png")));
+    }
+    outputs
+}
+
 /// `mimizan negative`: RAW → linear 16-bit negative TIFF plus mask sidecar.
 pub fn negative(a: &NegativeArgs) -> Result<()> {
+    let mut inputs = vec![a.raw.as_path()];
+    inputs.extend(a.recipe.as_deref());
+    inputs.extend(a.camera.as_deref());
+    let mut outputs = vec![("-o", a.out.clone())];
+    if !a.dng {
+        outputs.push(("the mask beside -o", sidecar_path(&a.out)));
+    }
+    outputs.extend(preview_outputs(a.preview.as_deref(), a.crop.is_some()));
+    never_over_an_input(&inputs, &outputs)?;
     let t_all = Instant::now();
     let t = Instant::now();
     let frame = pipeline::decode(&a.raw).with_context(|| format!("decoding {}", a.raw.display()))?;
@@ -474,6 +505,16 @@ pub fn print(a: &PrintArgs) -> Result<()> {
     if a.distance_mm.is_some_and(|d| !(d.is_finite() && d > 0.0)) {
         bail!("--distance-mm must be positive");
     }
+    let mask = sidecar_path(&a.negative);
+    let mut inputs = vec![a.negative.as_path(), mask.as_path()];
+    inputs.extend(a.recipe.as_deref());
+    inputs.extend(a.look.as_deref());
+    let mut outputs = vec![("-o", a.out.clone())];
+    outputs.extend(a.write_recipe.clone().map(|p| ("--write-recipe", p)));
+    never_over_an_input(&inputs, &outputs)?;
+    if a.write_recipe.as_deref().is_some_and(|p| mimizan_core::outfile::same_file(p, &a.out) || p == a.out) {
+        bail!("--write-recipe and -o name one file: {}", a.out.display());
+    }
     let recipe = print_recipe(a)?;
     if let Some(p) = &a.write_recipe {
         recipe.save(p).with_context(|| format!("writing recipe {}", p.display()))?;
@@ -608,6 +649,9 @@ pub fn dump(
     preview: Option<&Path>,
     preview_scale: usize,
 ) -> Result<()> {
+    let mut outputs = vec![("-o", out.to_path_buf())];
+    outputs.extend(preview_outputs(preview, false));
+    never_over_an_input(&[raw], &outputs)?;
     let t = Instant::now();
     let frame = RawlerDecoder.decode(raw).with_context(|| format!("decoding {}", raw.display()))?;
     info!("decoded in {} ms", t.elapsed().as_millis());
@@ -640,4 +684,44 @@ pub fn dump(
         info!("preview {}", p.display());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_output_that_is_an_input_is_refused_under_any_spelling() {
+        let dir = std::env::temp_dir().join(format!("mimizan-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("shot.dng");
+        std::fs::write(&raw, b"the photograph").unwrap();
+        let out = |p: PathBuf| vec![("-o", p)];
+
+        let refused = never_over_an_input(&[&raw], &out(dir.join(".").join("shot.dng"))).unwrap_err();
+        let text = refused.to_string();
+        assert!(text.starts_with("-o ") && text.contains("would be written over"), "{text}");
+        // Another file, and one that is not there yet, are written.
+        never_over_an_input(&[&raw], &out(dir.join("shot.tif"))).unwrap();
+        std::fs::write(dir.join("other.dng"), b"the photograph").unwrap();
+        never_over_an_input(&[&raw], &out(dir.join("other.dng"))).unwrap();
+        // The mask beside a negative is an output as well.
+        let mask = dir.join("neg.mask.tif");
+        std::fs::write(&mask, b"mask").unwrap();
+        assert!(never_over_an_input(&[&mask], &[("the mask beside -o", sidecar_path(&dir.join("neg.tif")))])
+            .is_err());
+        // The RAW stands as it was.
+        assert_eq!(std::fs::read(&raw).unwrap(), b"the photograph");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_files_beside_a_preview_are_named() {
+        assert!(preview_outputs(None, true).is_empty());
+        let named = preview_outputs(Some(Path::new("p.png")), true);
+        assert_eq!(named[0].1, PathBuf::from("p.png"));
+        assert_eq!(named[1].1, PathBuf::from("p.crop.png"));
+        assert_eq!(preview_outputs(Some(Path::new("p.png")), false).len(), 1);
+    }
 }
