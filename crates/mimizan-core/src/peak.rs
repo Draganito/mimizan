@@ -205,8 +205,7 @@ fn sharp_esf(picture: &[f32], width: usize, height: usize) -> Option<Vec<f64>> {
     if width < 48 || height < 48 {
         return None;
     }
-    let (gx, gy, mag) = gradients(picture, width, height);
-    let ridges = spread_ridges(&mag, &gx, &gy, width, height);
+    let ridges = spread_ridges(picture, width, height);
     if ridges.is_empty() {
         return None;
     }
@@ -216,8 +215,8 @@ fn sharp_esf(picture: &[f32], width: usize, height: usize) -> Option<Vec<f64>> {
             if kept.len() == MAX_EDGES {
                 break;
             }
-            let i = y * width + x;
-            if let Some((rms, profile)) = profile(picture, width, height, x, y, gx[i], gy[i], gate) {
+            let (dx, dy, _) = grad(picture, width, height, x, y);
+            if let Some((rms, profile)) = profile(picture, width, height, x, y, dx, dy, gate) {
                 kept.push((rms, profile));
             }
         }
@@ -251,7 +250,7 @@ fn pool(kept: &[(f64, Vec<f64>)]) -> Vec<f64> {
 
 /// A few of the strongest ridges in every block, so one bright lash cannot
 /// crowd out the rest of the picture.
-fn spread_ridges(mag: &[f32], gx: &[f32], gy: &[f32], width: usize, height: usize) -> Vec<(usize, usize)> {
+fn spread_ridges(picture: &[f32], width: usize, height: usize) -> Vec<(usize, usize)> {
     let cw = width.div_ceil(CELL);
     let ch = height.div_ceil(CELL);
     let mut cells: Vec<Vec<(f32, usize, usize)>> = vec![Vec::new(); cw * ch];
@@ -259,9 +258,8 @@ fn spread_ridges(mag: &[f32], gx: &[f32], gy: &[f32], width: usize, height: usiz
     while y + MARGIN < height {
         let mut x = MARGIN;
         while x + MARGIN < width {
-            let i = y * width + x;
-            let m = mag[i];
-            if m >= MAG_MIN && is_ridge(mag, width, height, x, y, gx[i], gy[i]) {
+            let (dx, dy, m) = grad(picture, width, height, x, y);
+            if m >= MAG_MIN && is_ridge(picture, width, height, x, y, dx, dy) {
                 let cell = &mut cells[(y / CELL) * cw + (x / CELL)];
                 if cell.len() < PER_CELL {
                     cell.push((m, x, y));
@@ -282,47 +280,60 @@ fn spread_ridges(mag: &[f32], gx: &[f32], gy: &[f32], width: usize, height: usiz
     ridges
 }
 
-fn gradients(picture: &[f32], width: usize, height: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    let n = width * height;
-    let mut gx = vec![0.0f32; n];
-    let mut gy = vec![0.0f32; n];
-    let mut mag = vec![0.0f32; n];
-    for y in 1..height - 1 {
-        for x in 1..width - 1 {
-            let i = y * width + x;
-            let dx = 0.5 * (picture[i + 1] - picture[i - 1]);
-            let dy = 0.5 * (picture[i + width] - picture[i - width]);
-            gx[i] = dx;
-            gy[i] = dy;
-            mag[i] = dx.hypot(dy);
-        }
+/// Central difference at one pixel, and its length. A pixel on the border
+/// row or column has no neighbour on one side, and is zero.
+fn grad(picture: &[f32], width: usize, height: usize, x: usize, y: usize) -> (f32, f32, f32) {
+    if x < 1 || y < 1 || x + 1 >= width || y + 1 >= height {
+        return (0.0, 0.0, 0.0);
     }
-    (gx, gy, mag)
+    let i = y * width + x;
+    let dx = 0.5 * (picture[i + 1] - picture[i - 1]);
+    let dy = 0.5 * (picture[i + width] - picture[i - width]);
+    (dx, dy, dx.hypot(dy))
 }
 
-fn is_ridge(mag: &[f32], width: usize, height: usize, x: usize, y: usize, dx: f32, dy: f32) -> bool {
-    let m = mag[y * width + x];
+fn is_ridge(picture: &[f32], width: usize, height: usize, x: usize, y: usize, dx: f32, dy: f32) -> bool {
+    let (_, _, m) = grad(picture, width, height, x, y);
     let norm = m.max(1e-8);
     let sx = (dx / norm).round() as isize;
     let sy = (dy / norm).round() as isize;
     if sx == 0 && sy == 0 {
         return false;
     }
-    let ahead = shifted(width, height, x, y, sx, sy);
-    let behind = shifted(width, height, x, y, -sx, -sy);
+    // The grid starts `MARGIN` inside, so the pixel and the neighbour one
+    // step along the gradient are interior. A step that leaves the picture
+    // is no ridge; one that lands on the border row or column reads zero.
+    let ahead = mag_at(picture, width, height, x, y, sx, sy);
+    let behind = mag_at(picture, width, height, x, y, -sx, -sy);
     let (Some(a), Some(b)) = (ahead, behind) else {
         return false;
     };
-    m >= mag[a] && m >= mag[b]
+    m >= a && m >= b
 }
 
-fn shifted(width: usize, height: usize, x: usize, y: usize, dx: isize, dy: isize) -> Option<usize> {
+/// Length of the gradient one step from `(x, y)`. `None` when that step
+/// leaves the picture. The search grid is `MARGIN` inside and a step is
+/// one pixel, so the neighbour is not on the border row or column; a step
+/// that lands there is zero, as that pixel's own gradient is.
+fn mag_at(
+    picture: &[f32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    dx: isize,
+    dy: isize,
+) -> Option<f32> {
     let xx = x as isize + dx;
     let yy = y as isize + dy;
     if xx < 0 || yy < 0 || xx >= width as isize || yy >= height as isize {
         return None;
     }
-    Some(yy as usize * width + xx as usize)
+    let (xx, yy) = (xx as usize, yy as usize);
+    if xx < 1 || yy < 1 || xx + 1 >= width || yy + 1 >= height {
+        return Some(0.0);
+    }
+    Some(grad(picture, width, height, xx, yy).2)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -515,5 +526,23 @@ mod tests {
         assert!((gain - 1.0).abs() < 1e-9, "gain {gain}");
         assert!((sigma - SIGMA_PX).abs() < 1e-9, "sigma {sigma}");
         assert!((after - before).abs() < 1e-9, "after {after}");
+    }
+
+    /// Radius and amount, to the bit. `sheet` puts its edge on the search
+    /// grid at these heights: a sharp edge, and the soft one the test
+    /// above builds. Both are past 400×300 and well under the cap on edges.
+    #[test]
+    fn a_sharp_sheet_and_a_soft_one_measure_to_the_same_bits() {
+        let sharp = sheet(400, 302, 0.45);
+        let tuned = tune(&sharp, 400, 302);
+        assert!(tuned.found);
+        assert_eq!(tuned.radius.to_bits(), 4_604_480_259_023_595_110);
+        assert_eq!(tuned.amount.to_bits(), 4_595_743_956_601_516_420);
+
+        let soft = sheet(400, 304, 1.3);
+        let tuned = tune(&soft, 400, 304);
+        assert!(tuned.found);
+        assert_eq!(tuned.radius.to_bits(), 4_608_983_858_650_965_606);
+        assert_eq!(tuned.amount.to_bits(), 4_607_633_123_438_910_799);
     }
 }
