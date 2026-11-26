@@ -3282,6 +3282,13 @@ impl App {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
                     let opened = s.path.clone();
+                    // Before the strip drops a file the DNG stands in for:
+                    // that file is still listed, and it may share the recipe.
+                    let listed: Vec<PathBuf> = self
+                        .folder
+                        .as_ref()
+                        .map(|f| f.entries.iter().map(|e| e.path.clone()).collect())
+                        .unwrap_or_default();
                     if self.current_path.as_deref() != Some(opened.as_path()) {
                         if let Some(asked) = self.current_path.clone() {
                             if let Some(folder) = self.folder.as_mut() {
@@ -3309,6 +3316,11 @@ impl App {
                     let t = &s.negative.info.timing;
                     let name =
                         s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+                    if fresh {
+                        for line in shared_recipe_lines(&s.path, &listed) {
+                            self.log(line);
+                        }
+                    }
                     if let Some(note) = &s.note {
                         self.log(format!("{name}: {note}"));
                     }
@@ -5645,7 +5657,7 @@ impl App {
         if self.linear_is_dng() {
             format!(
                 "Writes the separation for another program, no print{rot}{crop}:\n\
-                 <name>.dng  {w} x {h} px, linear DNG, three 16-bit channels a pixel (no demosaicing left to \
+                 <name>.linear.dng  {w} x {h} px, linear DNG, three 16-bit channels a pixel (no demosaicing left to \
                  do), the camera's colour matrix and as-shot white balance in the tags. A RAW converter opens \
                  it as a RAW of this camera; the colour is band-limited to the carriers under the full \
                  luminance."
@@ -6510,19 +6522,38 @@ fn export_target(picked: PathBuf, granted: bool, allowed: &[&str], source: &Path
     }
 }
 
-/// The linear export's name beside the RAW: `<stem>.dng` for the plate,
-/// `<stem>.negative.tif` otherwise. A RAW that is a DNG has that first
-/// name itself, so its plate is `<stem>.linear.dng`.
+/// The linear export's name beside the RAW: `<stem>.linear.dng` for the
+/// plate, `<stem>.negative.tif` otherwise. The plate carries `.linear`
+/// so the export is not another RAW of the stem, which would share the
+/// recipe.
 fn linear_export_name(source: Option<&Path>, dng: bool) -> String {
     let stem = source
         .and_then(Path::file_stem)
         .map_or_else(|| "mimizan".into(), |f| f.to_string_lossy().to_string());
-    let source_is_dng = source.and_then(Path::extension).is_some_and(|e| e.eq_ignore_ascii_case("dng"));
-    match (dng, source_is_dng) {
-        (true, true) => format!("{stem}.linear.dng"),
-        (true, false) => format!("{stem}.dng"),
-        (false, _) => format!("{stem}.negative.tif"),
+    if dng {
+        format!("{stem}.linear.dng")
+    } else {
+        format!("{stem}.negative.tif")
     }
+}
+
+/// One line for each other listed RAW of `opened`'s stem. The recipe is
+/// named by the stem, so those files share one recipe file. The listing
+/// is the strip's; nothing is read from the disk.
+fn shared_recipe_lines(opened: &Path, listed: &[PathBuf]) -> Vec<String> {
+    let Some(recipe) =
+        sidecar_of(opened).and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    else {
+        return Vec::new();
+    };
+    listed
+        .iter()
+        .filter(|other| crate::bayer::listed_other(opened, other))
+        .filter_map(|other| other.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map(|name| {
+            format!("`{name}` beside this file has the same name: the two share one recipe file, `{recipe}`.")
+        })
+        .collect()
 }
 
 /// Strip: folder bar, film tiles, horizontal scrollbar. A tile is one frame
@@ -7949,8 +7980,8 @@ mod close_tests {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        crumb_label, export_extensions, export_target, linear_export_name, set_aside_unread, with_ext,
-        without_verbatim_prefix, ExportFormat, ExportKind, ExportTarget,
+        crumb_label, export_extensions, export_target, linear_export_name, set_aside_unread,
+        shared_recipe_lines, with_ext, without_verbatim_prefix, ExportFormat, ExportKind, ExportTarget,
     };
     use std::path::{Path, PathBuf};
 
@@ -8090,14 +8121,43 @@ mod path_tests {
     }
 
     #[test]
-    fn the_plate_of_a_dng_is_not_named_like_the_dng() {
+    fn the_plate_is_named_so_it_does_not_share_the_raws_recipe() {
         let name = |p: &str, dng| linear_export_name(Some(Path::new(p)), dng);
-        assert_eq!(name("a/IMG_1.NEF", true), "IMG_1.dng");
+        assert_eq!(name("a/IMG_1.NEF", true), "IMG_1.linear.dng");
         assert_eq!(name("a/IMG_1.dng", true), "IMG_1.linear.dng");
         assert_eq!(name("a/IMG_1.DNG", true), "IMG_1.linear.dng");
         assert_eq!(name("a/IMG_1.dng", false), "IMG_1.negative.tif");
         assert_eq!(name("a/IMG_1.NEF", false), "IMG_1.negative.tif");
-        assert_eq!(linear_export_name(None, true), "mimizan.dng");
+        assert_eq!(linear_export_name(None, true), "mimizan.linear.dng");
+    }
+
+    #[test]
+    fn two_files_of_one_stem_are_told_they_share_a_recipe() {
+        let opened = PathBuf::from("/photos/DSC_1.CR2");
+        let listed = vec![
+            opened.clone(),
+            PathBuf::from("/photos/DSC_1.CR3"),
+            PathBuf::from("/photos/DSC_2.CR2"),
+            PathBuf::from("/photos/DSC_1.mimizan.dng"),
+            PathBuf::from("/photos/DSC_1.jpg"),
+        ];
+        assert_eq!(
+            shared_recipe_lines(&opened, &listed),
+            vec![
+                "`DSC_1.CR3` beside this file has the same name: the two share one recipe file, `DSC_1.recipe.json`."
+                    .to_string()
+            ]
+        );
+        assert!(shared_recipe_lines(&opened, std::slice::from_ref(&opened)).is_empty());
+        let mixed = vec![PathBuf::from("/photos/a.NEF"), PathBuf::from("/photos/A.cr2")];
+        let lines = shared_recipe_lines(&mixed[0], &mixed);
+        assert_eq!(
+            lines,
+            vec![
+                "`A.cr2` beside this file has the same name: the two share one recipe file, `a.recipe.json`."
+                    .to_string()
+            ]
+        );
     }
 }
 
