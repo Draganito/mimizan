@@ -43,8 +43,9 @@ use tracing::info;
 /// Work for the `Heavy` thread.
 #[allow(clippy::large_enum_variant)]
 pub enum Job {
-    /// Decode and develop a file.
-    Open { path: PathBuf, develop: Develop, cameras_dir: PathBuf, bayer_ls: bool },
+    /// Decode and develop a file. `own` is the file the edit belongs to
+    /// and the development the panel has for it ([`develop_for_open`]).
+    Open { path: PathBuf, own: Option<(PathBuf, Develop)>, cameras_dir: PathBuf, bayer_ls: bool },
     /// Develop the already decoded frame again with other parameters. The
     /// frame alone, not the session: the UI may let the session go while
     /// this runs, so its planes are not held beside the new ones.
@@ -231,13 +232,13 @@ fn run_heavy(job: Job, events: &Sender<Event>, ctx: &egui::Context) -> Result<Ev
         ctx.request_repaint();
     };
     match job {
-        Job::Open { path, develop, cameras_dir, bayer_ls } => {
-            match open(&path, develop, &cameras_dir, bayer_ls, &status) {
+        Job::Open { path, own, cameras_dir, bayer_ls } => {
+            match open(&path, own.as_ref(), &cameras_dir, bayer_ls, &status) {
                 Ok(s) => Ok(Event::Opened(Arc::new(s))),
                 // The decoded frame is gone with the error; the UI decodes it
                 // again once it has made room.
                 Err(e) if e.is::<Refused>() => Ok(Event::Refused {
-                    job: Box::new(Job::Open { path, develop, cameras_dir, bayer_ls }),
+                    job: Box::new(Job::Open { path, own, cameras_dir, bayer_ls }),
                     message: format!("{e:#}"),
                 }),
                 Err(e) => Err(e),
@@ -397,9 +398,42 @@ fn refused(name: &str, what: &str, w: usize, h: usize, while_: &str, need: u64, 
     ))
 }
 
+/// The recipe file next to a RAW: `<name>.recipe.json`.
+pub fn sidecar_of(raw: &Path) -> Option<PathBuf> {
+    let stem = raw.file_stem()?.to_string_lossy().to_string();
+    Some(raw.with_file_name(format!("{stem}.recipe.json")))
+}
+
+/// The development the file at `opened` is given: what the recipe beside
+/// it names, else the default. The panel still shows what the file before
+/// was developed with, and that is not this file's. Only the file the
+/// edit already belongs to (`own`: opened again after its picture was
+/// lost) comes back as the panel has it.
+///
+/// `opened` is the file that is read, which is not always the one that
+/// was asked for: an X-Trans RAF, and a Bayer file under *least-squares
+/// demosaic*, open as the DNG beside them, and that DNG has its own
+/// recipe. `beside` reads it, and is not asked for the edit's own file.
+pub fn develop_for_open(
+    own: Option<&(PathBuf, Develop)>,
+    opened: &Path,
+    beside: impl FnOnce() -> Option<Recipe>,
+) -> Develop {
+    match own {
+        Some((path, develop)) if path == opened => *develop,
+        _ => beside().and_then(|r| r.develop).unwrap_or_default(),
+    }
+}
+
+/// The recipe beside `path`, when one is there and reads. One that does
+/// not read is said when the window loads it, once the picture is there.
+fn recipe_beside(path: &Path) -> Option<Recipe> {
+    sidecar_of(path).filter(|p| p.is_file()).and_then(|p| Recipe::load(&p).ok())
+}
+
 fn open(
     path: &Path,
-    develop: Develop,
+    own: Option<&(PathBuf, Develop)>,
     cameras_dir: &Path,
     bayer_ls: bool,
     status: &dyn Fn(String),
@@ -409,7 +443,7 @@ fn open(
     match crate::fuji::place(path) {
         crate::fuji::Place::Ready(dng) => {
             status(format!("opening {}", dng.display()));
-            return open(&dng, develop, cameras_dir, false, status);
+            return open(&dng, own, cameras_dir, false, status);
         }
         crate::fuji::Place::Needs(head) => {
             // The conversion is the wide part, and it is not the DNG's
@@ -455,7 +489,7 @@ fn open(
                 }
             };
             status(format!("opening {}", head.dng.display()));
-            let mut session = open(&head.dng, develop, cameras_dir, false, status)?;
+            let mut session = open(&head.dng, own, cameras_dir, false, status)?;
             session.xtrans_note = report.map(|r| crate::fuji::written_note(&r));
             return Ok(session);
         }
@@ -467,7 +501,7 @@ fn open(
         match crate::bayer::place(path) {
             crate::bayer::Place::Ready(dng) => {
                 status(format!("opening {}", dng.display()));
-                return open(&dng, develop, cameras_dir, false, status);
+                return open(&dng, own, cameras_dir, false, status);
             }
             crate::bayer::Place::Needs(head) => {
                 let need = crate::fuji::convert_memory(head.width, head.height);
@@ -501,7 +535,7 @@ fn open(
                     }
                 };
                 status(format!("opening {}", head.dng.display()));
-                let mut session = open(&head.dng, develop, cameras_dir, false, status)?;
+                let mut session = open(&head.dng, own, cameras_dir, false, status)?;
                 session.xtrans_note = note;
                 return Ok(session);
             }
@@ -525,6 +559,7 @@ fn open(
             None
         }
     });
+    let develop = develop_for_open(own, path, || recipe_beside(path));
     develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)
 }
 
@@ -1372,6 +1407,35 @@ mod tests {
         }
     }
 
+    /// The white balance and the mask belong to the file: the panel still
+    /// shows what the file before was developed with, and the next one
+    /// must not take that. It opens as the recipe beside it says, or with
+    /// the default. Only the file the edit already belongs to, opened
+    /// again after its picture was lost, comes back as the panel has it.
+    /// The file is the one that is read: a RAW that opens as the DNG
+    /// beside it takes that DNG's recipe, not its own.
+    #[test]
+    fn a_file_opens_with_its_own_development() {
+        use mimizan_core::ingest::WhiteBalance;
+        use mimizan_core::separate::MaskMode;
+        let card = Develop { wb: WhiteBalance::Manual([2.2, 1.0, 1.4]), mask: MaskMode::Off };
+        let gray = Develop { wb: WhiteBalance::GrayWorld, mask: MaskMode::Adaptive };
+        let beside = || Some(Recipe { develop: Some(gray), ..Recipe::on_paper() });
+        let (raw, dng) = (Path::new("/f/a.nef"), Path::new("/f/a.mimizan.dng"));
+        assert_eq!(develop_for_open(None, raw, || None), Develop::default());
+        assert_eq!(develop_for_open(None, raw, beside), gray);
+        // An older recipe names none.
+        assert_eq!(develop_for_open(None, raw, || Some(Recipe::on_paper())), Develop::default());
+        // The edit's own file: the panel, and the recipe is not read.
+        let own = (raw.to_path_buf(), card);
+        assert_eq!(develop_for_open(Some(&own), raw, || panic!("not read")), card);
+        // Another file, and the RAW opened as its DNG: the file's recipe.
+        assert_eq!(develop_for_open(Some(&own), Path::new("/f/b.nef"), beside), gray);
+        assert_eq!(develop_for_open(Some(&own), dng, beside), gray);
+        assert_eq!(develop_for_open(Some(&own), dng, || None), Develop::default());
+        assert_eq!(sidecar_of(dng), Some(PathBuf::from("/f/a.mimizan.recipe.json")));
+    }
+
     /// The window waits for an export that is counted. It is counted from
     /// the moment it is sent, and no longer when its queue is gone or the
     /// work on it panicked, or the window could never close.
@@ -1385,7 +1449,7 @@ mod tests {
         assert!(!heavy.writing());
         heavy.send(Job::Open {
             path: "none.nef".into(),
-            develop: Develop::default(),
+            own: None,
             cameras_dir: PathBuf::new(),
             bayer_ls: false,
         });

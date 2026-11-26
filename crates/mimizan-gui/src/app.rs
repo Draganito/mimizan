@@ -17,8 +17,9 @@ use crate::session::{DetailAsk, Histogram, PlateView, Screen, Session, ViewParam
 use crate::toolbar::{self, Chip, Icon};
 use crate::unlock::{self, Unlock};
 use crate::worker::{
-    available_memory, develop_memory, develop_memory_of_size, memory_fits, Event, Heavy, Job, Loupe,
-    LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult, Redevelop,
+    available_memory, develop_memory, develop_memory_of_size, memory_fits, sidecar_of, Event, Heavy, Job,
+    Loupe, LoupeRequest, LoupeResult, PeakMeasure, PeakPoll, Preview, PreviewRequest, PreviewResult,
+    Redevelop,
 };
 use egui::{
     Color32, ColorImage, CursorIcon, Pos2, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2,
@@ -642,30 +643,11 @@ fn open_step(held: Option<&Path>, released: Option<&Path>, path: &Path, unsaved:
     }
 }
 
-/// The development a file is opened with: what the recipe beside it
-/// names, else the default. The panel still shows what the file before
-/// was developed with, and that is not this file's. Only the file the
-/// edit already belongs to (`own_file`: opened again after its picture
-/// was lost) comes back as the panel has it.
-fn develop_for_open(panel: Develop, own_file: bool, beside: Option<&Recipe>) -> Develop {
-    if own_file {
-        panel
-    } else {
-        beside.and_then(|r| r.develop).unwrap_or_default()
-    }
-}
-
 /// What a session was developed with, as its recipe file carries it.
 /// `None` for a monochrome sensor: the file is the measurement, there is
 /// no balance and no mask to choose.
 fn file_development(s: &Session) -> Option<Develop> {
     (!s.is_mono()).then_some(s.develop)
-}
-
-/// The recipe file next to a RAW: `<name>.recipe.json`.
-fn sidecar_of(raw: &Path) -> Option<PathBuf> {
-    let stem = raw.file_stem()?.to_string_lossy().to_string();
-    Some(raw.with_file_name(format!("{stem}.recipe.json")))
 }
 
 /// A file's name without its folder, for a message.
@@ -2842,6 +2824,19 @@ impl App {
         }
     }
 
+    /// Open `path` although it may be the file on the stage: the way it
+    /// is opened has changed (*least-squares demosaic*), so it is another
+    /// picture, with another recipe beside it. An unsaved recipe is asked
+    /// about first, as for any other file.
+    fn open_anew(&mut self, path: PathBuf) {
+        let path = readable_path(&path);
+        if self.should_ask_to_save() {
+            self.pending_leave = Some(Leave::Open(path));
+        } else {
+            self.start_open(path);
+        }
+    }
+
     fn start_open(&mut self, path: PathBuf) {
         self.busy = Some(format!("opening {}", path.display()));
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -2862,16 +2857,13 @@ impl App {
         if let Some(need) = opening_memory(target, current, self.bayer_ls) {
             self.make_room(need);
         }
-        // The file's own development, read from the recipe beside it
-        // before the frame is developed. A recipe that does not read is
-        // said when it is loaded, once the picture is there.
-        let own_file = self.developed_path() == Some(path.as_path());
-        let beside =
-            sidecar_of(&path).filter(|p| !own_file && p.is_file()).and_then(|p| Recipe::load(&p).ok());
-        let develop = develop_for_open(self.develop_params(), own_file, beside.as_ref());
+        // The worker takes the development from the recipe beside the
+        // file it reads, which may be the DNG beside this one. Only the
+        // edit's own file comes back as the panel has it.
+        let own = self.developed_path().map(|p| (p.to_path_buf(), self.develop_params()));
         self.heavy.send(Job::Open {
             path,
-            develop,
+            own,
             cameras_dir: self.cameras_dir.clone(),
             bayer_ls: self.bayer_ls,
         });
@@ -4490,8 +4482,9 @@ impl App {
         self.retile_bayer();
         let path = s.path.clone();
         if on {
+            // The RAW on the stage, under its own path: `open` would stay.
             if !crate::bayer::is_ours(&path) {
-                self.open(path);
+                self.open_anew(path);
             }
         } else if let Some(raw) = crate::bayer::raw_of(&path) {
             if raw != path {
@@ -8245,10 +8238,10 @@ mod sheet_tests {
 #[cfg(test)]
 mod crop_drag_tests {
     use super::{
-        baseline_after_open, develop_for_open, dress_to_hold, hit_crop, moved_crop, must_make_room,
-        open_step, opened_is_fresh, opening_memory, peak_held_after_redevelopment, picture_terms,
-        recipe_for_window, recipe_needs_saving, released_after_failure, stage_black_px, tile_must_wait,
-        CropHit, OpenStep, PaperFormat, Released, Rings, StageDress,
+        baseline_after_open, dress_to_hold, hit_crop, moved_crop, must_make_room, open_step, opened_is_fresh,
+        opening_memory, peak_held_after_redevelopment, picture_terms, recipe_for_window, recipe_needs_saving,
+        released_after_failure, stage_black_px, tile_must_wait, CropHit, OpenStep, PaperFormat, Released,
+        Rings, StageDress,
     };
     use crate::edit::Edit;
     use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
@@ -8353,25 +8346,6 @@ mod crop_drag_tests {
         // is nothing to ask, the recipe goes nowhere.
         assert_eq!(open_step(None, Some(a), a, true), OpenStep::Open);
         assert_eq!(open_step(None, Some(a), b, true), OpenStep::Ask);
-    }
-
-    /// The white balance and the mask belong to the file: the panel still
-    /// shows what the file before was developed with, and the next one
-    /// must not take that. It opens as the recipe beside it says, or with
-    /// the default. Only the file the edit already belongs to, opened
-    /// again after its picture was lost, comes back as the panel has it.
-    #[test]
-    fn a_file_opens_with_its_own_development() {
-        use mimizan_core::ingest::WhiteBalance;
-        use mimizan_core::separate::MaskMode;
-        let card = Develop { wb: WhiteBalance::Manual([2.2, 1.0, 1.4]), mask: MaskMode::Off };
-        assert_eq!(develop_for_open(card, false, None), Develop::default());
-        let gray = Develop { wb: WhiteBalance::GrayWorld, mask: MaskMode::Adaptive };
-        let beside = Recipe { develop: Some(gray), ..Recipe::on_paper() };
-        assert_eq!(develop_for_open(card, false, Some(&beside)), gray);
-        // An older recipe names none.
-        assert_eq!(develop_for_open(card, false, Some(&Recipe::on_paper())), Develop::default());
-        assert_eq!(develop_for_open(card, true, Some(&beside)), card);
     }
 
     /// Developed again (another white balance, another mask) the file has
