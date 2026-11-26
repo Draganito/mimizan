@@ -726,8 +726,21 @@ pub struct App {
     redevelop: Option<Develop>,
 
     // Folder strip
+    /// The window's context, so a folder thread can ask for another frame
+    /// when its listing is ready. Cloning it does not keep the window.
+    ctx: egui::Context,
     folder: Option<Folder>,
     folder_generation: u64,
+    /// The path last asked for. While the listing is on its way this is
+    /// the folder a quit remembers, and an open in it does not ask again.
+    folder_asked: Option<PathBuf>,
+    /// The listing under way. A newer ask replaces it, so the older
+    /// result is never read.
+    folder_list: Option<std::sync::mpsc::Receiver<browser::Listed>>,
+    /// The checkbox and the sort the listing under way was started with.
+    /// A change while it reads is applied when the folder arrives.
+    listing_ls: bool,
+    listing_sort: Sort,
     sort: Sort,
     show_strip: bool,
     /// Strip tiles inverted (the film), not the print: one choice per
@@ -1026,8 +1039,13 @@ impl App {
             session: None,
             released: None,
             redevelop: None,
+            ctx: cc.egui_ctx.clone(),
             folder: None,
             folder_generation: 0,
+            folder_asked: None,
+            folder_list: None,
+            listing_ls: persisted.bayer_ls.unwrap_or(false),
+            listing_sort: persisted.sort,
             sort: persisted.sort,
             show_strip: persisted.strip.unwrap_or(true),
             strip_negative: persisted.strip_negative.unwrap_or(true),
@@ -1168,7 +1186,10 @@ impl App {
 
     fn persist(&self) {
         Persisted {
-            folder: self.folder.as_ref().map(|f| f.path.clone()),
+            folder: browser::remembered_folder(
+                self.folder.as_ref().map(|f| f.path.as_path()),
+                self.folder_asked.as_deref(),
+            ),
             sort: self.sort,
             strip: Some(self.show_strip),
             strip_negative: Some(self.strip_negative),
@@ -1314,40 +1335,67 @@ impl App {
         }
     }
 
-    /// List a folder's RAW files in the strip. The thumbnails follow as the
-    /// tiles become visible.
+    /// Ask for a folder's RAW files. The strip shows the path at once and
+    /// the listing arrives on a later frame. Nothing here reads the disk:
+    /// a slow folder must not hold the window.
     fn set_folder(&mut self, path: &Path) {
         self.folder_generation += 1;
-        // Absolute, so the breadcrumb shows the whole way and a relative
-        // CLI argument survives a restart from another directory. The
-        // Windows `\\?\` prefix is a kernel form, not a path to show.
-        let path = &readable_path(path);
-        match Folder::scan(path, self.sort, self.folder_generation) {
+        self.folder = None;
+        self.folder_asked = Some(path.to_path_buf());
+        self.dir_counts = None;
+        self.last_wanted.clear();
+        self.listing_ls = self.bayer_ls;
+        self.listing_sort = self.sort;
+        self.folder_list = Some(browser::list(
+            self.folder_generation,
+            path.to_path_buf(),
+            self.sort,
+            self.bayer_ls,
+            self.ctx.clone(),
+        ));
+        self.persist();
+    }
+
+    /// Take the listing the folder thread has finished, when it is the
+    /// one this window is still waiting for.
+    fn take_listing(&mut self) {
+        let outcome = {
+            let Some(rx) = &self.folder_list else { return };
+            match rx.try_recv() {
+                Ok(listed) => Some(listed),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.folder_list = None;
+        let Some(listed) = outcome else { return };
+        if !browser::listing_is_current(
+            listed.generation,
+            self.folder_generation,
+            &listed.asked,
+            self.folder_asked.as_deref(),
+        ) {
+            return;
+        }
+        match listed.result {
             Ok(mut f) => {
-                self.log(format!(
-                    "{}: {} RAW files, {} folders",
-                    f.path.display(),
-                    f.entries.len(),
-                    f.subdirs.len()
-                ));
+                // The count is every file the scan found. The checkbox has
+                // already moved some of them aside.
+                let files = f.entries.len() + f.aside.len();
+                self.log(format!("{}: {} RAW files, {} folders", f.path.display(), files, f.subdirs.len()));
+                if self.bayer_ls != self.listing_ls || self.sort != self.listing_sort {
+                    f.retile(self.bayer_ls, self.sort);
+                }
                 self.dir_counts = (!f.subdirs.is_empty()).then(|| {
                     browser::count_raws(f.generation, f.subdirs.iter().map(|d| d.path.clone()).collect())
                 });
-                // The checkbox decides which file is the tile. The listing
-                // already holds both, so the decision is made once here.
-                let on = self.bayer_ls;
-                let sort = self.sort;
-                f.pair(crate::bayer::dng_is_current, crate::bayer::is_bayer);
-                f.retile(on, sort);
                 self.folder = Some(f);
+                self.persist();
             }
             Err(e) => {
-                self.log(format!("folder {}: {e}", path.display()));
-                self.folder = None;
+                self.log(format!("folder {}: {e}", listed.path.display()));
             }
         }
-        self.last_wanted.clear();
-        self.persist();
     }
 
     fn toggle_strip(&mut self) {
@@ -2816,7 +2864,7 @@ impl App {
 
     fn open(&mut self, path: PathBuf) {
         // Absolute like the strip's entries, so the tile lights up.
-        let path = readable_path(&path);
+        let path = browser::readable_path(&path);
         let step = open_step(
             self.session.as_ref().map(|s| s.path.as_path()),
             self.released.as_ref().map(|r| r.path.as_path()),
@@ -2835,7 +2883,7 @@ impl App {
     /// picture, with another recipe beside it. An unsaved recipe is asked
     /// about first, as for any other file.
     fn open_anew(&mut self, path: PathBuf) {
-        let path = readable_path(&path);
+        let path = browser::readable_path(&path);
         if self.should_ask_to_save() {
             self.pending_leave = Some(Leave::Open(path));
         } else {
@@ -2846,7 +2894,14 @@ impl App {
     fn start_open(&mut self, path: PathBuf) {
         self.busy = Some(format!("opening {}", path.display()));
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if self.folder.as_ref().is_none_or(|f| f.path != parent) {
+            // The folder just asked for is not on screen yet. Asking again
+            // would empty the strip for a spelling `canonicalize` differs on.
+            let same = browser::folder_is_asked(
+                self.folder.as_ref().map(|f| f.path.as_path()),
+                self.folder_asked.as_deref(),
+                parent,
+            );
+            if !same {
                 self.set_folder(parent);
             }
         }
@@ -3283,11 +3338,22 @@ impl App {
     }
 
     fn handle_events(&mut self, ctx: &egui::Context) {
+        self.take_listing();
         while let Some(ev) = self.heavy.poll() {
             match ev {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
                     let opened = s.path.clone();
+                    // The folder was still being read, or this is another
+                    // file and there is no listing to put it in. Ask again,
+                    // so a DNG written while the first read ran is listed.
+                    let reading = self.folder_list.is_some();
+                    let other = self.current_path.as_deref() != Some(opened.as_path());
+                    if reading || (other && self.folder.is_none()) {
+                        if let Some(parent) = opened.parent().filter(|p| !p.as_os_str().is_empty()) {
+                            self.set_folder(parent);
+                        }
+                    }
                     // The other files of the folder, which may share the
                     // recipe. The RAF this DNG was converted from is the
                     // same picture, and one recipe for the two is meant.
@@ -3515,7 +3581,8 @@ impl App {
     /// `MIMIZAN_SCREENSHOT_STRIP`: the capture waits for the strip's
     /// frames, so the thumbnails are in the picture.
     fn strip_thumbs_settled(&self) -> bool {
-        self.folder.as_ref().is_none_or(|f| f.entries.iter().all(|e| e.state != ThumbState::Pending))
+        self.folder_list.is_none()
+            && self.folder.as_ref().is_none_or(|f| f.entries.iter().all(|e| e.state != ThumbState::Pending))
     }
 
     fn screenshot_step(&mut self, ctx: &egui::Context) {
@@ -6346,26 +6413,6 @@ fn crop_cursor(hit: CropHit, dragging: bool) -> CursorIcon {
     }
 }
 
-/// Absolute, and without the Windows `\\?\` prefix `canonicalize` adds.
-fn readable_path(path: &Path) -> PathBuf {
-    let absolute = std::fs::canonicalize(path)
-        .or_else(|_| std::path::absolute(path))
-        .unwrap_or_else(|_| path.to_path_buf());
-    without_verbatim_prefix(&absolute)
-}
-
-/// `\\?\C:\Users` is `C:\Users`. `\\?\UNC\server\share` is `\\server\share`.
-fn without_verbatim_prefix(path: &Path) -> PathBuf {
-    let text = path.as_os_str().to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest.to_string())
-    } else {
-        path.to_path_buf()
-    }
-}
-
 /// `APP_SANDBOX_CONTAINER_ID` is set only inside an App Sandbox. The
 /// unsigned Mac zip does not set it, so that build keeps the old folders.
 fn sandboxed() -> bool {
@@ -6638,59 +6685,82 @@ impl App {
             if ui.small_button("Open").on_hover_text("Choose a folder of negatives").clicked() {
                 choose = true;
             }
-            match &self.folder {
-                None => {
-                    let text = if sandboxed() {
-                        "No folder. Open a folder, or drop one on the window."
-                    } else {
-                        "No folder. Drop a folder or a RAW file on the window."
-                    };
-                    ui.label(RichText::new(text).weak());
-                }
-                Some(f) => {
-                    // Breadcrumb: every ancestor is a button. The root is `/`
-                    // on Unix and the drive (`C:`) on Windows. Above a sandbox
-                    // grant the steps stay visible and are not buttons.
-                    let comps: Vec<PathBuf> = f.path.ancestors().map(Path::to_path_buf).collect();
+            if self.folder_list.is_some() {
+                // The path that was asked for, in the breadcrumb's place,
+                // until the listing arrives. The controls on the right stay.
+                if let Some(path) = self.folder_asked.clone() {
+                    let comps: Vec<PathBuf> = path.ancestors().map(Path::to_path_buf).collect();
                     for anc in comps.iter().rev() {
                         let name = crumb_label(anc);
                         if name.is_empty() {
                             continue;
                         }
-                        let last = anc == &f.path;
-                        let allowed = crumb_is_open(sandboxed(), grant_root.as_deref(), anc, last);
-                        if !allowed {
-                            ui.label(RichText::new(name).weak());
-                        } else {
-                            let text = if last { RichText::new(name).strong() } else { RichText::new(name) };
-                            if ui.add(egui::Button::new(text).frame(false)).clicked() && !last {
-                                go_to = Some(anc.clone());
-                            }
-                        }
+                        let last = anc == &path;
+                        let text =
+                            if last { RichText::new(name).strong() } else { RichText::new(name).weak() };
+                        ui.label(text);
                         if !last {
                             ui.label(RichText::new("›").weak());
                         }
                     }
-                    // Going down: the subfolders of the current one as a menu.
-                    if !f.subdirs.is_empty() {
-                        let n = f.subdirs.len();
-                        ui.menu_button(RichText::new(format!("› {n} ⏷")).weak(), |ui| {
-                            ui.set_min_width(160.0);
-                            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                                for d in &f.subdirs {
-                                    if ui.button(&d.name).clicked() {
-                                        go_to = Some(d.path.clone());
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        })
-                        .response
-                        .on_hover_text(format!("{n} subfolder{}", if n == 1 { "" } else { "s" }));
+                    ui.label(RichText::new("reading…").weak());
+                }
+            } else {
+                match &self.folder {
+                    None => {
+                        let text = if sandboxed() {
+                            "No folder. Open a folder, or drop one on the window."
+                        } else {
+                            "No folder. Drop a folder or a RAW file on the window."
+                        };
+                        ui.label(RichText::new(text).weak());
                     }
-                    ui.label(RichText::new(format!("{} RAW", f.entries.len())).weak());
-                    if ui.small_button("↻").on_hover_text("Read the folder again").clicked() {
-                        rescan = true;
+                    Some(f) => {
+                        // Breadcrumb: every ancestor is a button. The root is `/`
+                        // on Unix and the drive (`C:`) on Windows. Above a sandbox
+                        // grant the steps stay visible and are not buttons.
+                        let comps: Vec<PathBuf> = f.path.ancestors().map(Path::to_path_buf).collect();
+                        for anc in comps.iter().rev() {
+                            let name = crumb_label(anc);
+                            if name.is_empty() {
+                                continue;
+                            }
+                            let last = anc == &f.path;
+                            let allowed = crumb_is_open(sandboxed(), grant_root.as_deref(), anc, last);
+                            if !allowed {
+                                ui.label(RichText::new(name).weak());
+                            } else {
+                                let text =
+                                    if last { RichText::new(name).strong() } else { RichText::new(name) };
+                                if ui.add(egui::Button::new(text).frame(false)).clicked() && !last {
+                                    go_to = Some(anc.clone());
+                                }
+                            }
+                            if !last {
+                                ui.label(RichText::new("›").weak());
+                            }
+                        }
+                        // Going down: the subfolders of the current one as a menu.
+                        if !f.subdirs.is_empty() {
+                            let n = f.subdirs.len();
+                            ui.menu_button(RichText::new(format!("› {n} ⏷")).weak(), |ui| {
+                                ui.set_min_width(160.0);
+                                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                                    for d in &f.subdirs {
+                                        if ui.button(&d.name).clicked() {
+                                            go_to = Some(d.path.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            })
+                            .response
+                            .on_hover_text(format!("{n} subfolder{}", if n == 1 { "" } else { "s" }));
+                        }
+                        ui.label(RichText::new(format!("{} RAW", f.entries.len())).weak());
+                        if ui.small_button("↻").on_hover_text("Read the folder again").clicked() {
+                            rescan = true;
+                        }
                     }
                 }
             }
@@ -7991,7 +8061,7 @@ mod close_tests {
 mod path_tests {
     use super::{
         crumb_label, export_extensions, export_target, linear_export_name, set_aside_unread,
-        shared_recipe_lines, with_ext, without_verbatim_prefix, ExportFormat, ExportKind, ExportTarget,
+        shared_recipe_lines, with_ext, ExportFormat, ExportKind, ExportTarget,
     };
     use std::path::{Path, PathBuf};
 
@@ -8016,13 +8086,6 @@ mod path_tests {
         assert_eq!(std::fs::read_to_string(dir.join("a.recipe.json.unread")).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "second");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_verbatim_windows_path_is_a_drive_path() {
-        assert_eq!(without_verbatim_prefix(Path::new(r"\\?\C:\Users")), PathBuf::from(r"C:\Users"));
-        assert_eq!(without_verbatim_prefix(Path::new(r"\\?\UNC\nas\photos")), PathBuf::from(r"\\nas\photos"));
-        assert_eq!(without_verbatim_prefix(Path::new("/home/dragan")), PathBuf::from("/home/dragan"));
     }
 
     #[test]

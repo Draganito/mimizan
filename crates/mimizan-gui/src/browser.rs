@@ -1,8 +1,10 @@
 //! Folder browser: the RAW files of one folder as a strip of grey
-//! thumbnails. Scanning is synchronous (a directory listing); the
-//! thumbnails come from their own worker thread that always works on the
-//! newest priority list the strip sent, so the visible tiles fill first
-//! and scrolling re-orders the queue instead of growing it.
+//! thumbnails. The listing runs on its own thread ([`list`]); the frame
+//! takes the finished folder from a channel, so a slow disk never holds
+//! the window. The thumbnails come from their own worker thread that
+//! always works on the newest priority list the strip sent, so the
+//! visible tiles fill first and scrolling re-orders the queue instead
+//! of growing it.
 //!
 //! Every thumbnail is the mosaic binned to grey with the file's balance
 //! and the camera file's weights (`mimizan_core::thumb`), cached on disk
@@ -319,6 +321,104 @@ impl Folder {
                 self.resort(sort);
             }
         }
+    }
+}
+
+/// One folder read by [`list`].
+pub struct Listed {
+    pub generation: u64,
+    /// The path that was asked for, before it was made readable.
+    pub asked: PathBuf,
+    /// The path that was read.
+    pub path: PathBuf,
+    pub result: std::io::Result<Folder>,
+}
+
+/// The folder a listing sends: the scan, which files give way, and the
+/// checkbox's choice. `current` and `bayer` are the questions that read
+/// a file.
+fn listed_folder(
+    path: &Path,
+    sort: Sort,
+    generation: u64,
+    bayer_ls: bool,
+    current: impl Fn(&Path) -> bool,
+    bayer: impl Fn(&Path) -> bool,
+) -> std::io::Result<Folder> {
+    let mut folder = Folder::scan(path, sort, generation)?;
+    folder.pair(current, bayer);
+    folder.retile(bayer_ls, sort);
+    Ok(folder)
+}
+
+/// Read `path` on a thread named `mimizan-folder` and send the folder.
+/// The thread makes the path readable, lists it, and pairs a RAW with
+/// the DNG beside it. Dropping the receiver ends the thread quietly: the
+/// send finds nobody waiting and the thread returns.
+pub fn list(
+    generation: u64,
+    path: PathBuf,
+    sort: Sort,
+    bayer_ls: bool,
+    ctx: egui::Context,
+) -> Receiver<Listed> {
+    let (tx, rx) = channel();
+    thread::Builder::new()
+        .name("mimizan-folder".into())
+        .spawn(move || {
+            let asked = path.clone();
+            let path = readable_path(&path);
+            let result = listed_folder(
+                &path,
+                sort,
+                generation,
+                bayer_ls,
+                crate::bayer::dng_is_current,
+                crate::bayer::is_bayer,
+            );
+            let _ = tx.send(Listed { generation, asked, path, result });
+            ctx.request_repaint();
+        })
+        .ok();
+    rx
+}
+
+/// A result belongs to the folder the window asked for last. An older
+/// generation, or a path the window is no longer asking for, is a folder
+/// it has already left.
+pub(crate) fn listing_is_current(listed: u64, now: u64, listed_path: &Path, asked: Option<&Path>) -> bool {
+    listed == now && asked.is_some_and(|p| p == listed_path)
+}
+
+/// The folder a quit remembers: the one open, or the one still being read.
+pub(crate) fn remembered_folder(open: Option<&Path>, asked: Option<&Path>) -> Option<PathBuf> {
+    open.map(Path::to_path_buf).or_else(|| asked.map(Path::to_path_buf))
+}
+
+/// The file's folder is the one on screen, or the one the strip is reading.
+/// A parent spelled the way `canonicalize` spells it and the path that was
+/// asked for are the same folder either way.
+pub(crate) fn folder_is_asked(open: Option<&Path>, asked: Option<&Path>, parent: &Path) -> bool {
+    open.is_some_and(|p| p == parent) || asked.is_some_and(|p| p == parent)
+}
+
+/// Absolute, and without the Windows `\\?\` prefix `canonicalize` adds.
+pub(crate) fn readable_path(path: &Path) -> PathBuf {
+    let absolute = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf());
+    without_verbatim_prefix(&absolute)
+}
+
+/// `\\?\C:\Users` is `C:\Users`. `\\?\UNC\server\share` is `\\server\share`.
+fn without_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest.to_string())
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -1267,5 +1367,90 @@ mod tests {
         let back = folder.entries.iter().find(|e| e.path == raw).unwrap();
         assert!(made.first(&job(back)), "a file put back asks again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_verbatim_windows_path_is_a_drive_path() {
+        assert_eq!(without_verbatim_prefix(Path::new(r"\\?\C:\Users")), PathBuf::from(r"C:\Users"));
+        assert_eq!(without_verbatim_prefix(Path::new(r"\\?\UNC\nas\photos")), PathBuf::from(r"\\nas\photos"));
+        assert_eq!(without_verbatim_prefix(Path::new("/home/dragan")), PathBuf::from("/home/dragan"));
+    }
+
+    /// The thread lists the folder it was asked for. An empty DNG is not
+    /// one this build wrote, so the RAW stays when least squares is on.
+    /// The DNG gives way when it is off, because its one RAW is listed.
+    #[test]
+    fn a_listing_thread_sends_the_folder_it_was_asked_for() {
+        let dir = std::env::temp_dir().join(format!("mimizan-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.NEF"), b"raw").unwrap();
+        std::fs::write(dir.join("a.mimizan.dng"), b"dng").unwrap();
+        std::fs::write(dir.join("note.jpg"), b"jpeg").unwrap();
+        for (on, shown) in [(false, vec!["a.NEF"]), (true, vec!["a.mimizan.dng", "a.NEF"])] {
+            let rx = list(7, dir.clone(), Sort::Name, on, egui::Context::default());
+            let listed = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(listing_is_current(listed.generation, 7, &listed.asked, Some(&dir)));
+            assert_eq!(listed.asked, dir);
+            let folder = listed.result.unwrap();
+            let names: Vec<&str> = folder.entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, shown);
+            let hidden: Vec<&str> = folder.aside.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(hidden, if on { Vec::new() } else { vec!["a.mimizan.dng"] });
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same listing hides the RAW when least squares is on and the
+    /// DNG when it is off. The questions are answered here, not from the
+    /// disk: the files are empty.
+    #[test]
+    fn a_listing_hides_the_file_the_checkbox_does_not_open() {
+        let dir = std::env::temp_dir().join(format!("mimizan-listed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.join("a.NEF");
+        let dng = dir.join("a.mimizan.dng");
+        std::fs::write(&raw, b"raw").unwrap();
+        std::fs::write(&dng, b"dng").unwrap();
+        let on = listed_folder(&dir, Sort::Name, 1, true, |p| p == dng, |p| p == raw).unwrap();
+        assert_eq!(on.entries.len(), 1);
+        assert_eq!(on.entries[0].path, dng);
+        assert_eq!(on.aside.len(), 1);
+        assert_eq!(on.aside[0].path, raw);
+        let off = listed_folder(&dir, Sort::Name, 1, false, |p| p == dng, |p| p == raw).unwrap();
+        assert_eq!(off.entries.len(), 1);
+        assert_eq!(off.entries[0].path, raw);
+        assert_eq!(off.aside[0].path, dng);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_older_listing_is_not_the_folder_now() {
+        let photos = Path::new("/photos");
+        let other = Path::new("/other");
+        assert!(!listing_is_current(1, 2, photos, Some(photos)));
+        assert!(listing_is_current(2, 2, photos, Some(photos)));
+        assert!(!listing_is_current(2, 2, photos, Some(other)));
+        assert!(!listing_is_current(2, 2, photos, None));
+    }
+
+    #[test]
+    fn a_folder_being_read_is_the_one_a_quit_remembers() {
+        let open = Path::new("/photos/canon");
+        let asked = Path::new("/photos");
+        assert_eq!(remembered_folder(Some(open), Some(asked)).as_deref(), Some(open));
+        assert_eq!(remembered_folder(None, Some(asked)).as_deref(), Some(asked));
+        assert_eq!(remembered_folder(None, None), None);
+    }
+
+    #[test]
+    fn a_file_in_the_folder_being_read_does_not_ask_for_it_again() {
+        let canon = Path::new("/photos/canon");
+        let asked = Path::new("/photos");
+        assert!(folder_is_asked(Some(canon), Some(asked), canon));
+        assert!(folder_is_asked(None, Some(asked), asked));
+        assert!(!folder_is_asked(None, Some(asked), canon));
+        assert!(!folder_is_asked(None, None, asked));
     }
 }
