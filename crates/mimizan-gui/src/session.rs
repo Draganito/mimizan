@@ -52,6 +52,18 @@ pub fn negative_params(develop: &Develop, cam: Option<CameraFile>) -> NegativePa
     p
 }
 
+/// Sensor width and height, and the negative a session keeps. With a
+/// separation the full-resolution mix is let go: every view mixes from the
+/// separation and every export mixes again, and only the size was read. A
+/// monochrome negative is the picture, and its plane stays.
+pub(crate) fn kept_negative(mut negative: Negative) -> (Negative, usize, usize) {
+    let (width, height) = (negative.plane.width, negative.plane.height);
+    if negative.separation.is_some() {
+        negative.plane = Plane::zeros(0, 0);
+    }
+    (negative, width, height)
+}
+
 /// The upright, downscaled separation the interactive view draws.
 pub struct PreviewPlanes {
     pub sep: Separation,
@@ -69,6 +81,10 @@ pub struct Session {
     pub path: PathBuf,
     pub frame: Arc<RawFrame>,
     pub negative: Negative,
+    /// The sensor's width and height. A colour session lets the
+    /// full-resolution mix go; the size stays here.
+    pub width: usize,
+    pub height: usize,
     pub camera_file: Option<CameraFile>,
     pub camera_file_path: Option<PathBuf>,
     pub develop: Develop,
@@ -200,6 +216,11 @@ impl Session {
         self.negative.separation.is_none()
     }
 
+    /// The sensor's width and height.
+    pub fn size(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
     /// A file that came with its three channels (a linear DNG): there was
     /// no mosaic to separate. In every other respect a colour file.
     pub fn is_channels(&self) -> bool {
@@ -214,12 +235,13 @@ impl Session {
 
     /// Full-resolution sharpening mask (the sidecar bytes as a plane).
     pub fn mask_plane(&self) -> mimizan_core::Result<Plane> {
-        mask_plane_of(&self.negative)
+        let (w, h) = self.size();
+        mask_plane_of(&self.negative, w, h)
     }
 
     /// Upright size of the full negative.
     pub fn upright_size(&self) -> (usize, usize) {
-        let (w, h) = (self.negative.plane.width, self.negative.plane.height);
+        let (w, h) = self.size();
         if matches!(self.negative.orientation, 5..=8) {
             (h, w)
         } else {
@@ -459,7 +481,7 @@ struct Geometry {
 
 impl Geometry {
     fn of(s: &Session, v: &ViewParams) -> Self {
-        let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
+        let (sw, sh) = s.size();
         let orientation = rotated(s.negative.orientation, v.rotation);
         let (uw, uh) = if matches!(orientation, 5..=8) { (sh, sw) } else { (sw, sh) };
         let (fw, fh) = straighten::frame_size(uw, uh, v.angle);
@@ -1163,7 +1185,7 @@ pub fn render_print_linear(
     recipe: &Recipe,
     rect: DetailRect,
 ) -> Option<LinearTile> {
-    let (sensor_w, sensor_h) = (s.negative.plane.width, s.negative.plane.height);
+    let (sensor_w, sensor_h) = s.size();
     let orientation = rotated(s.negative.orientation, v.rotation);
     let (full_w, full_h) =
         if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
@@ -1389,7 +1411,7 @@ pub fn render_sharpen_loupe(
 ) -> SharpenLoupe {
     let view = view.clamp(1, 4096);
     let params = PrintParams { recipe: recipe.clone(), ..PrintParams::default() };
-    let (sensor_w, sensor_h) = (s.negative.plane.width, s.negative.plane.height);
+    let (sensor_w, sensor_h) = s.size();
     let (full_w, full_h) =
         if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
     let (sx, sy, ex, ey) = loupe_source_rect(full_w, full_h, &params, nx, ny, view);
@@ -1412,8 +1434,10 @@ pub fn render_sharpen_loupe(
             }
             None => None,
         };
-        let mask =
-            want_mask.then(|| mask_window(&s.negative, sensor)).flatten().map(|m| orient(&m, orientation));
+        let mask = want_mask
+            .then(|| mask_window(&s.negative, sensor_w, sensor_h, sensor))
+            .flatten()
+            .map(|m| orient(&m, orientation));
         (mixed, plates, mask)
     } else {
         (Plane::zeros(1, 1), None, None)
@@ -1464,28 +1488,24 @@ pub fn render_sharpen_loupe(
 }
 
 /// The whole sidecar as a plane in [0, 1]; an error when its length does
-/// not match the negative.
-fn mask_plane_of(n: &Negative) -> mimizan_core::Result<Plane> {
-    Plane::try_from_vec(
-        n.plane.width,
-        n.plane.height,
-        n.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect(),
-    )
+/// not match the sensor.
+fn mask_plane_of(n: &Negative, width: usize, height: usize) -> mimizan_core::Result<Plane> {
+    Plane::try_from_vec(width, height, n.mask8.par_iter().map(|&v| f64::from(v) / 255.0).collect())
 }
 
 /// A window of the sidecar (sensor frame) as a plane in [0, 1]. `None`
-/// when the sidecar does not fit the negative or the window lies outside.
-fn mask_window(n: &Negative, r: DetailRect) -> Option<Plane> {
-    let samples = n.plane.width.checked_mul(n.plane.height)?;
+/// when the sidecar does not fit the sensor or the window lies outside.
+fn mask_window(n: &Negative, width: usize, height: usize, r: DetailRect) -> Option<Plane> {
+    let samples = width.checked_mul(height)?;
     if n.mask8.len() != samples || r.w == 0 || r.h == 0 {
         return None;
     }
-    if r.x.saturating_add(r.w) > n.plane.width || r.y.saturating_add(r.h) > n.plane.height {
+    if r.x.saturating_add(r.w) > width || r.y.saturating_add(r.h) > height {
         return None;
     }
     let mut out = Plane::zeros(r.w, r.h);
     out.data.par_chunks_mut(r.w).enumerate().for_each(|(y, row)| {
-        let base = (r.y + y) * n.plane.width + r.x;
+        let base = (r.y + y) * width + r.x;
         for (x, o) in row.iter_mut().enumerate() {
             *o = f64::from(n.mask8[base + x]) / 255.0;
         }
@@ -2430,7 +2450,7 @@ impl HistWindow {
 fn hist_window(s: &Session, v: &ViewParams) -> Option<HistWindow> {
     let (uw, uh) = s.upright_size();
     let (fw, fh) = s.frame_size(v.angle);
-    let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
+    let (sw, sh) = s.size();
     let o = s.negative.orientation;
     let c = match v.crop {
         Some(c) => c.sanitized(fw as u32, fh as u32),
@@ -2461,7 +2481,7 @@ fn hist_window(s: &Session, v: &ViewParams) -> Option<HistWindow> {
 /// stored file-upright, so no turn enters.
 fn hist_field(s: &Session, v: &ViewParams) -> Option<Field> {
     let (uw, uh) = s.upright_size();
-    let (sw, sh) = (s.negative.plane.width, s.negative.plane.height);
+    let (sw, sh) = s.size();
     let to_upright = straighten::orient_map(s.negative.orientation, sw, sh);
     Field::new(&v.burns, burn::normalize(uw, uh).after(&to_upright))
 }
@@ -2472,10 +2492,10 @@ impl HistCache {
         // A monochrome sensor has no mix: the measured plane, whatever the
         // weights say.
         let Some(sep) = s.separation() else {
-            if self.session == Some(ptr) && self.width == s.negative.plane.width && !self.codes.is_empty() {
+            if self.session == Some(ptr) && self.width == s.width && !self.codes.is_empty() {
                 return;
             }
-            self.width = s.negative.plane.width;
+            self.width = s.width;
             (self.codes, self.range) = plane_codes(&s.negative.plane);
             self.session = Some(ptr);
             self.weights = None;
@@ -3196,11 +3216,14 @@ mod histogram_tests {
         assert!(preview.sep.c1.data.iter().all(|&v| v == 0.0));
         assert!(preview.sep.c2.data.iter().all(|&v| v == 0.0));
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "mono.dng".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -3315,11 +3338,14 @@ mod histogram_tests {
         assert_eq!(neg.info.phase, None);
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "fuji.dng".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -3396,11 +3422,14 @@ mod histogram_tests {
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "mono.dng".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -3628,11 +3657,14 @@ mod histogram_tests {
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "bayer.dng".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -3766,11 +3798,14 @@ mod histogram_tests {
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "grey.nef".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -3913,11 +3948,14 @@ mod histogram_tests {
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "bayer.dng".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -4086,11 +4124,14 @@ mod histogram_tests {
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         let session = Session {
             id: next_session_id(),
             path: "burnt.dng".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -4253,11 +4294,14 @@ mod histogram_tests {
         let neg = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&neg).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(neg);
         Session {
             id: next_session_id(),
             path: "colour.nef".into(),
             frame: Arc::new(frame),
-            negative: neg,
+            negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
@@ -4265,6 +4309,16 @@ mod histogram_tests {
             raw_hist,
             note: None,
         }
+    }
+
+    #[test]
+    fn a_colour_session_lets_the_full_resolution_mix_go() {
+        let session = colour_session();
+        assert!(session.negative.separation.is_some());
+        assert_eq!(session.negative.plane.width, 0);
+        assert_eq!(session.negative.plane.height, 0);
+        assert!(session.negative.plane.data.is_empty());
+        assert!(session.width > 0 && session.height > 0);
     }
 
     /// The screen of a print is the sample its file holds. The grey sheet
@@ -4516,7 +4570,7 @@ mod histogram_tests {
         use mimizan_core::print::{render_plate, write_as, FileOptions, PrintSize, PrintSource};
         use mimizan_core::tiffin::read_rgb16;
         let session = colour_session();
-        let (w, h) = (session.negative.plane.width, session.negative.plane.height);
+        let (w, h) = session.size();
         let sep = session.separation().unwrap();
         let dir = std::env::temp_dir().join(format!("mimizan-gui-screen-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

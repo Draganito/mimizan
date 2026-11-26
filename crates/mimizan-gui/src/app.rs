@@ -1732,14 +1732,10 @@ impl App {
         let ux = ox + ((nx * pw as f64) as usize).min(pw - 1);
         let uy = oy + ((ny * ph as f64) as usize).min(ph - 1);
         // Frame point through the straighten to the upright negative, then
-        // to the negative plane, then to the frame.
-        let plane = &s.negative.plane;
+        // to the sensor, then to the frame.
+        let (sensor_w, sensor_h) = s.size();
         let orientation = self.export_orientation();
-        let (tw, th) = if matches!(orientation, 5..=8) {
-            (plane.height, plane.width)
-        } else {
-            (plane.width, plane.height)
-        };
+        let (tw, th) = if matches!(orientation, 5..=8) { (sensor_h, sensor_w) } else { (sensor_w, sensor_h) };
         let angle = self.view_angle();
         let (ux, uy) = if straighten::turns(angle) {
             let (u, v) = straighten::frame_to_upright(tw, th, angle).apply(ux as f64 + 0.5, uy as f64 + 0.5);
@@ -1752,8 +1748,8 @@ impl App {
         };
         let spot = crate::session::source_rect(
             orientation,
-            plane.width,
-            plane.height,
+            sensor_w,
+            sensor_h,
             crate::session::DetailRect { x: ux, y: uy, w: 1, h: 1 },
         );
         let crop = s.negative.info.report.crop;
@@ -3481,20 +3477,13 @@ impl App {
                     if let Some(note) = &s.note {
                         self.log(format!("{name}: {note}"));
                     }
+                    let (sw, sh) = s.size();
                     self.log(if s.is_mono() {
-                        format!(
-                            "{name}: decode {} ms, ingest {} ms, {}x{}",
-                            t.decode_ms, t.ingest_ms, s.negative.plane.width, s.negative.plane.height
-                        )
+                        format!("{name}: decode {} ms, ingest {} ms, {}x{}", t.decode_ms, t.ingest_ms, sw, sh)
                     } else {
                         format!(
                             "{name}: decode {} ms, ingest {} ms, separate {} ms ({} rounds), {}x{}",
-                            t.decode_ms,
-                            t.ingest_ms,
-                            t.separate_ms,
-                            s.negative.info.rounds,
-                            s.negative.plane.width,
-                            s.negative.plane.height
+                            t.decode_ms, t.ingest_ms, t.separate_ms, s.negative.info.rounds, sw, sh
                         )
                     });
                     let developed_with = s.develop;
@@ -4397,8 +4386,9 @@ impl App {
                 val(ui, lens.trim());
                 ui.end_row();
             }
+            let (sensor_w, sensor_h) = s.size();
             ui.label("sensor");
-            val(ui, format!("{} x {} @ {} bit", n.plane.width, n.plane.height, info.camera.bits));
+            val(ui, format!("{} x {} @ {} bit", sensor_w, sensor_h, info.camera.bits));
             ui.end_row();
             ui.label("pattern");
             val(
@@ -4432,7 +4422,7 @@ impl App {
             ui.label("process");
             val(ui, self.process_label(&s)).on_hover_text(self.process_hover(&s));
             ui.end_row();
-            let px = n.plane.data.len() as f64;
+            let px = (sensor_w * sensor_h) as f64;
             ui.label("saturated");
             val(
                 ui,

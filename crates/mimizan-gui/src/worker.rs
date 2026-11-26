@@ -15,10 +15,10 @@
 //! The thumbnail thread and the folder counter live in `browser`.
 
 use crate::session::{
-    cover_detail, negative_params, next_session_id, preview_planes, render_detail_linear, render_preview,
-    render_print_linear, render_sharpen_loupe, tone_tile, DetailAsk, DetailImage, DetailRect, DetailTile,
-    HistCache, LinearTile, PlateView, PreviewImage, PreviewStages, RawHistogram, Session, SharpenLoupe,
-    ToneHold, ViewParams,
+    cover_detail, kept_negative, negative_params, next_session_id, preview_planes, render_detail_linear,
+    render_preview, render_print_linear, render_sharpen_loupe, tone_tile, DetailAsk, DetailImage, DetailRect,
+    DetailTile, HistCache, LinearTile, PlateView, PreviewImage, PreviewStages, RawHistogram, Session,
+    SharpenLoupe, ToneHold, ViewParams,
 };
 use anyhow::{Context, Result};
 use mimizan_core::calib::CameraFile;
@@ -637,11 +637,14 @@ fn develop_frame(
     let preview = preview_planes(&negative)?;
     let raw_hist = RawHistogram::of_frame(&frame);
     info!("preview planes + raw histogram {} ms", t.elapsed().as_millis());
+    let (negative, width, height) = kept_negative(negative);
     Ok(Session {
         id: next_session_id(),
         path,
         frame,
         negative,
+        width,
+        height,
         camera_file,
         camera_file_path,
         develop,
@@ -661,6 +664,18 @@ fn mixed_plane(s: &Session, weights: &Weights) -> Result<Option<Plane>> {
         return Err(anyhow::anyhow!("this negative has no separation"));
     };
     Ok(Some(mix(sep, weights)))
+}
+
+/// The plane a print is made from. Colour is mixed for this print. A
+/// monochrome file is the plane the session kept.
+fn picture_plane<'a>(s: &'a Session, mixed: &'a Option<Plane>) -> &'a Plane {
+    match mixed {
+        Some(p) => p,
+        None => {
+            debug_assert!(s.is_mono());
+            &s.negative.plane
+        }
+    }
 }
 
 /// Radius and amount on the negative's own pixels. The size step and the
@@ -691,7 +706,7 @@ fn measure_peak(
         return Ok(None);
     }
     let mixed = mixed?;
-    let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
+    let plane = picture_plane(s, &mixed);
     let src =
         PrintSource { plane, mask: None, orientation, name: s.path.display().to_string(), description: None };
     let out = pr::render_planes(&src, &PrintParams { recipe, ..PrintParams::default() });
@@ -793,7 +808,7 @@ fn export(
     recipe.validate()?;
     status(if s.is_mono() { "placing".into() } else { "mixing".into() });
     let mixed = mixed_plane(s, &weights)?;
-    let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
+    let plane = picture_plane(s, &mixed);
     let params = PrintParams { recipe, ..Default::default() };
     // The mask (a full f64 plane) is only read by the sharpening step.
     let mask = if params.sharpens() { Some(s.mask_plane()?) } else { None };
@@ -906,7 +921,7 @@ fn export_linear(
     } else {
         status(if s.is_mono() { "framing".into() } else { "mixing".into() });
         let mixed = mixed_plane(s, &weights)?;
-        let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
+        let plane = picture_plane(s, &mixed);
         let mask = s.mask_plane()?;
         // The range of the plane that is written: another mix than the
         // development's has another.
@@ -1423,11 +1438,14 @@ mod tests {
         let negative = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
         let preview = preview_planes(&negative).unwrap();
         let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(negative);
         Session {
             id: next_session_id(),
             path: "grey.nef".into(),
             frame: Arc::new(frame),
             negative,
+            width,
+            height,
             camera_file: None,
             camera_file_path: None,
             develop: Develop::default(),
