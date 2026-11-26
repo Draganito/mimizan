@@ -47,7 +47,8 @@ impl Drop for FolderGrant {
     }
 }
 
-/// The user picks one folder. Cancel returns nothing.
+/// The user picks one folder. Cancel returns nothing. The panel blocks
+/// until it closes, and the window does not draw behind it.
 pub fn pick_folder() -> Option<FolderGrant> {
     let mtm = MainThreadMarker::new()?;
     let panel = NSOpenPanel::openPanel(mtm);
@@ -73,7 +74,8 @@ pub fn pick_folder() -> Option<FolderGrant> {
 /// handed back is the path that is written: the sandbox grants that one
 /// file, and a name changed afterwards would be another. The returned path
 /// stays writable for this launch; the save panel's grant is kept by not
-/// releasing the URL.
+/// releasing the URL. The panel blocks until it closes, and the window
+/// does not draw behind it.
 // `setAllowedFileTypes` is the deprecated spelling of `allowedContentTypes`.
 // It takes the extensions as strings, which is all that is needed here,
 // and it is the one of the two whose binding is verified against the
