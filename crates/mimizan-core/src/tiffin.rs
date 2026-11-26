@@ -55,15 +55,24 @@ fn read_description(dec: &mut Decoder<BufReader<File>>) -> Result<Option<String>
     }
 }
 
-/// 8- or 16-bit single-channel TIFF to a Plane in [0,1]. A description
-/// that is absent is `None`. One that is present and cannot be read is
-/// an error of this read.
+/// 8- or 16-bit single-channel TIFF to a Plane in [0,1]. A file stored
+/// in separate planes reports one sample, so its first plane has the
+/// length of a grey picture; the colour type is what says it is grey.
+/// A description that is absent is `None`. One that is present and
+/// cannot be read is an error of this read.
 pub fn read_gray(path: &Path) -> Result<GrayTiff> {
     let mut dec = open(path)?;
     let (w, h) = dec.dimensions()?;
     let description = read_description(&mut dec)?;
     let orientation =
         dec.get_tag_u32(Tag::Orientation).ok().filter(|o| (1..=8).contains(o)).unwrap_or(1) as u16;
+    match dec.colortype() {
+        Ok(tiff::ColorType::Gray(8) | tiff::ColorType::Gray(16)) => {}
+        Ok(tiff::ColorType::Gray(_)) => {
+            return Err(Error::Invalid("only 8/16-bit grey TIFF is readable".into()));
+        }
+        _ => return Err(Error::Invalid("TIFF is not single-channel".into())),
+    }
     let img = dec.read_image()?;
     let (data, bits): (Vec<f64>, u16) = match img {
         DecodingResult::U16(v) => (v.par_iter().map(|&x| f64::from(x) / 65535.0).collect(), 16),
@@ -137,11 +146,15 @@ pub fn read_gray_header(path: &Path) -> Result<Option<String>> {
 }
 
 /// Mask sidecar as raw u8 values, `(width, height, samples)`, exactly one
-/// sample per pixel.
+/// 8-bit grey sample per pixel. A file stored in separate planes reports
+/// one sample, so the colour type is what says it is that grey.
 pub fn read_mask8(path: &Path) -> Result<(usize, usize, Vec<u8>)> {
     let mut dec = open(path)?;
     let (w, h) = dec.dimensions()?;
     let (w, h) = (w as usize, h as usize);
+    if !matches!(dec.colortype(), Ok(tiff::ColorType::Gray(8))) {
+        return Err(Error::Invalid("mask sidecar must be 8-bit single-channel".into()));
+    }
     match dec.read_image()? {
         DecodingResult::U8(v) if v.len() == w.saturating_mul(h) => Ok((w, h, v)),
         _ => Err(Error::Invalid("mask sidecar must be 8-bit single-channel".into())),
@@ -253,5 +266,142 @@ mod tests {
         names_the_description(read_gray(&bad));
         names_the_description(read_gray_header(&bad));
         names_the_description(read_negative(&bad));
+    }
+
+    fn push_entry(bytes: &mut Vec<u8>, tag: tiff::tags::Tag, kind: tiff::tags::Type, count: u32, value: u32) {
+        bytes.extend_from_slice(&tag.to_u16().to_le_bytes());
+        bytes.extend_from_slice(&kind.to_u16().to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Classic little-endian TIFF of one pixel, one strip per sample,
+    /// planar. `photometric` is the interpretation (RGB, or black is
+    /// zero). Each byte of `samples` is its own strip, in order. Two
+    /// bits-per-sample shorts fit in the entry; a longer list is stored
+    /// after the strips.
+    fn write_planar(path: &Path, photometric: tiff::tags::PhotometricInterpretation, samples: &[u8]) {
+        use tiff::tags::{CompressionMethod, PlanarConfiguration, Tag, Type};
+
+        let n = u32::try_from(samples.len()).unwrap();
+        assert!(n >= 2, "separate planes means a plane besides the first");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut strips = Vec::with_capacity(samples.len());
+        for &sample in samples {
+            strips.push(u32::try_from(bytes.len()).unwrap());
+            bytes.push(sample);
+        }
+        if bytes.len() % 2 == 1 {
+            bytes.push(0);
+        }
+
+        let bits_field = if n.saturating_mul(2) <= 4 {
+            let mut packed = 0u32;
+            for i in 0..n {
+                packed |= 8u32 << (16 * i);
+            }
+            packed
+        } else {
+            let at = u32::try_from(bytes.len()).unwrap();
+            for _ in 0..n {
+                bytes.extend_from_slice(&8u16.to_le_bytes());
+            }
+            at
+        };
+        let offsets_at = u32::try_from(bytes.len()).unwrap();
+        for off in &strips {
+            bytes.extend_from_slice(&off.to_le_bytes());
+        }
+        let counts_at = u32::try_from(bytes.len()).unwrap();
+        for _ in 0..n {
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+        }
+
+        let ifd_at = u32::try_from(bytes.len()).unwrap();
+        bytes[4..8].copy_from_slice(&ifd_at.to_le_bytes());
+        bytes.extend_from_slice(&10u16.to_le_bytes());
+        push_entry(&mut bytes, Tag::ImageWidth, Type::SHORT, 1, 1);
+        push_entry(&mut bytes, Tag::ImageLength, Type::SHORT, 1, 1);
+        push_entry(&mut bytes, Tag::BitsPerSample, Type::SHORT, n, bits_field);
+        push_entry(&mut bytes, Tag::Compression, Type::SHORT, 1, u32::from(CompressionMethod::None.to_u16()));
+        push_entry(
+            &mut bytes,
+            Tag::PhotometricInterpretation,
+            Type::SHORT,
+            1,
+            u32::from(photometric.to_u16()),
+        );
+        push_entry(&mut bytes, Tag::StripOffsets, Type::LONG, n, offsets_at);
+        push_entry(&mut bytes, Tag::SamplesPerPixel, Type::SHORT, 1, n);
+        push_entry(&mut bytes, Tag::RowsPerStrip, Type::SHORT, 1, 1);
+        push_entry(&mut bytes, Tag::StripByteCounts, Type::LONG, n, counts_at);
+        push_entry(
+            &mut bytes,
+            Tag::PlanarConfiguration,
+            Type::SHORT,
+            1,
+            u32::from(PlanarConfiguration::Planar.to_u16()),
+        );
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let ifd_bytes = bytes.len() - usize::try_from(ifd_at).unwrap();
+        assert_eq!(ifd_bytes, 2 + 10 * 12 + 4, "ten tags, then the next pointer");
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// What `read_image` returns for a file this test built.
+    fn read_image_u8(path: &Path) -> Vec<u8> {
+        let file = std::io::BufReader::new(std::fs::File::open(path).unwrap());
+        let mut dec = tiff::decoder::Decoder::new(file).unwrap();
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::U8(samples) => samples,
+            other => panic!("read_image did not return bytes: {other:?}"),
+        }
+    }
+
+    fn is_invalid<T>(result: Result<T>, text: &str) {
+        match result {
+            Err(crate::Error::Invalid(msg)) => assert_eq!(msg, text),
+            Err(err) => panic!("expected {text:?}, got {err}"),
+            Ok(_) => panic!("expected {text:?}, got a value"),
+        }
+    }
+
+    /// Separate planes are not a grey picture. The decoder returns one
+    /// sample for a planar file, so the first plane has the length of a
+    /// grey pixel; the colour type is what says the other planes are
+    /// there. An 8-bit grey pixel and a 16-bit grey pixel still read.
+    #[test]
+    fn separate_planes_are_not_a_grey_picture() {
+        let rgb = tmp("planar-rgb.tif");
+        write_planar(&rgb, tiff::tags::PhotometricInterpretation::RGB, &[10, 20, 30]);
+        assert_eq!(read_image_u8(&rgb), vec![10]);
+        is_invalid(read_gray(&rgb), "TIFF is not single-channel");
+        is_invalid(read_negative(&rgb), "TIFF is not single-channel");
+        is_invalid(read_mask8(&rgb), "mask sidecar must be 8-bit single-channel");
+
+        let with_alpha = tmp("planar-grey.tif");
+        write_planar(&with_alpha, tiff::tags::PhotometricInterpretation::BlackIsZero, &[10, 20]);
+        assert_eq!(read_image_u8(&with_alpha), vec![10]);
+        is_invalid(read_gray(&with_alpha), "TIFF is not single-channel");
+        is_invalid(read_mask8(&with_alpha), "mask sidecar must be 8-bit single-channel");
+
+        let grey8 = tmp("grey8.tif");
+        write_gray8(&grey8, 1, 1, &[40], "grey").unwrap();
+        let read = read_gray(&grey8).unwrap();
+        assert_eq!((read.plane.width, read.plane.height, read.bits), (1, 1, 8));
+        assert_eq!(read.plane.data, vec![40.0 / 255.0]);
+        assert_eq!(read_mask8(&grey8).unwrap(), (1, 1, vec![40]));
+
+        let grey16 = tmp("grey16.tif");
+        let file = std::fs::File::create(&grey16).unwrap();
+        let mut enc = tiff::encoder::TiffEncoder::new(file).unwrap();
+        enc.write_image::<tiff::encoder::colortype::Gray16>(1, 1, &[400u16]).unwrap();
+        let read = read_gray(&grey16).unwrap();
+        assert_eq!((read.plane.width, read.plane.height, read.bits), (1, 1, 16));
+        assert_eq!(read.plane.data, vec![f64::from(400u16) / 65535.0]);
     }
 }
