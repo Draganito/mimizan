@@ -1407,6 +1407,10 @@ impl App {
     }
 
     fn set_weights(&mut self, w: Weights) {
+        // Weights that are no numbers are no mix: the edit keeps its own.
+        if !(w.r.is_finite() && w.g.is_finite() && w.b.is_finite()) {
+            return;
+        }
         let r = w.r.clamp(0.0, 1.0);
         let b = w.b.clamp(0.0, 1.0 - r);
         self.edit.weights = Weights { r, g: 1.0 - r - b, b };
@@ -4775,6 +4779,14 @@ impl App {
         for f in ColorFilter::ALL.into_iter().filter(|f| *f != ColorFilter::None) {
             let w = base.filtered(f);
             let hover = format!("Wratten {}, {}: {}.", f.wratten().unwrap_or(0), f.colour(), f.effect());
+            // A response with nothing behind this glass (all its weight on
+            // a channel the filter stops) has no mix to offer.
+            if w.validate().is_err() {
+                let hover = format!("{hover} This sensor's response passes nothing through it.");
+                fields.push(Field::new(filter_short(f), filter_ink(f), hover).dimmed(true));
+                targets.push(None);
+                continue;
+            }
             fields.push(Field::new(filter_short(f), filter_ink(f), hover));
             targets.push(Some(w));
             if same(&current, &w) {
