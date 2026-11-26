@@ -6839,7 +6839,19 @@ impl App {
             self.strip_look = (plate, negative);
             self.strip_textures_drop();
         }
-        let Some(folder) = &mut self.folder else { return };
+        let Some(folder) = &mut self.folder else {
+            // The panel keeps the height it was given. While a folder is
+            // being read the line is one short sentence, and that would
+            // otherwise become the strip's height: the picture above is
+            // then fitted into a taller stage.
+            if self.folder_list.is_some() {
+                let rest = ui.available_height();
+                if rest > 0.0 {
+                    ui.add_space(rest);
+                }
+            }
+            return;
+        };
         if folder.entries.is_empty() && folder.subdirs.is_empty() {
             ui.label(RichText::new("No RAW files and no folders here.").weak());
             return;
