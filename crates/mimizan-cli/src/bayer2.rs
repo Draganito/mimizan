@@ -687,9 +687,11 @@ pub fn separate_bank(m: &Plane, priors: &[Spectrum], sel: &Weighing, done: &dyn 
         let fact = Factored::build(&lat, prior);
         let head = if k == 0 { sel.bias } else { 0.0 };
         let pass = Pass { m, lat: &lat, fact: &fact, fr: &fr, head, weighing: sel };
-        let kept: Vec<Kept> =
-            specs.par_iter().zip(&at).map(|(spec, &(x0, y0))| window_of(&pass, spec, x0, y0)).collect();
-        for (run, got) in running.iter_mut().zip(&kept) {
+        // A running sum belongs to one window, and a prior is weighed only
+        // after every prior before it. The windows of one prior share
+        // nothing, so each is solved and folded in together.
+        running.par_iter_mut().zip(&specs).zip(&at).for_each(|((run, spec), &(x0, y0))| {
+            let got = window_of(&pass, spec, x0, y0);
             for i in 0..run.nx * run.ny {
                 let s = got.score[i];
                 if s < run.best[i] {
@@ -713,7 +715,7 @@ pub fn separate_bank(m: &Plane, priors: &[Spectrum], sel: &Weighing, done: &dyn 
                 run.a2[i] += wt * got.c2[i];
                 run.total[i] += wt;
             }
-        }
+        });
         done((k + 1) as f64 / priors.len() as f64);
     }
     let mut c1 = Plane::zeros(w, h);
