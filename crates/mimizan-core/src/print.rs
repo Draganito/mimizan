@@ -118,9 +118,19 @@ pub const LAMP_LIMIT: f64 = 2.0;
 
 impl PrintParams {
     /// USM consults the mask. Deconvolution does not: it runs on the whole
-    /// picture, and USM may follow it.
+    /// picture, and USM may follow it. This is what the recipe asks for;
+    /// whether a USM actually runs depends on the layout
+    /// ([`Self::usm_runs`]).
     pub fn sharpens(&self) -> bool {
         self.recipe.sharpen.uses_mask()
+    }
+
+    /// The USM runs for this layout: the amount is above zero and the
+    /// enlargement left a blur. Native size, a reduction and the Area
+    /// kernel have none, so the mask is not read and the description does
+    /// not say a USM was masked.
+    pub fn usm_runs(&self, lay: &Layout) -> bool {
+        self.recipe.sharpen.usm_amount() > 0.0 && lay.resample_sigma_px > 0.0
     }
 }
 
@@ -381,7 +391,10 @@ pub fn render_within(neg_path: &Path, p: &PrintParams, budget: Option<u64>) -> R
     }
 
     let mut mask: Option<Plane> = None;
-    if p.use_mask && p.sharpens() {
+    // The same question `render_planes` asks: a USM that will not run
+    // does not read the sidecar, and does not warn that it is missing.
+    let lay = layout(fw, fh, turned, &on_turned);
+    if p.use_mask && on_turned.usm_runs(&lay) {
         let sp = sidecar_path(neg_path);
         match read_mask8(&sp) {
             Ok((mw, mh, data)) if mw == fw && mh == fh => {
@@ -609,10 +622,10 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
 /// Bytes `render_planes` holds at its widest point for a negative of `w×h`
 /// (before orientation): the live f64 planes of the stage that keeps the
 /// most, plus the 16-bit copy the writer makes. The source plane the
-/// caller already owns is not counted. When the recipe sharpens, the mask
-/// walks beside the picture through orient, crop and resize, and stays
-/// the size of the picture: sharpening and the peak run on the picture,
-/// the mask is let go, and the sheet is laid once after. A guide for
+/// caller already owns is not counted. When a USM runs, the mask walks
+/// beside the picture through orient, crop and resize, and stays the
+/// size of the picture: sharpening and the peak run on the picture, the
+/// mask is let go, and the sheet is laid once after. A guide for
 /// refusing an export the machine cannot hold, good to about a fifth; the
 /// allocator and the order in which planes drop are what it does not see.
 pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
@@ -622,9 +635,9 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     let full = fw as f64 * fh as f64;
     let picture = lay.image_w as f64 * lay.image_h as f64;
     let sheet = lay.out_w as f64 * lay.out_h as f64;
-    // The mask walks beside the picture through orient, crop and resize.
-    // It is never given a sheet.
-    let m = if p.sharpens() { 2.0 } else { 1.0 };
+    // The mask walks beside the picture through orient, crop and resize
+    // only when a USM will read it. It is never given a sheet.
+    let m = if p.usm_runs(&lay) { 2.0 } else { 1.0 };
     let (orient, resize) = if crate::straighten::turns(r.angle) {
         // The straighten reads the oriented plane and writes the picture
         // in one pass: no crop window, no intermediate.
@@ -1091,15 +1104,17 @@ pub fn render_planes(src: &PrintSource<'_>, p: &PrintParams) -> PrintOutput {
     }
     let t = Instant::now();
     let r = &p.recipe;
-    let mut mask: Option<Plane> = None;
     // Upright first, so the fit uses the displayed aspect ratio.
     let mut plane = orient(src.plane, src.orientation);
-    if p.sharpens() {
+    let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
+    // The mask is taken only when a USM will read it. A native-size print
+    // with an amount in the recipe leaves it, and says so.
+    let mut mask: Option<Plane> = None;
+    if p.usm_runs(&lay) {
         if let Some(m) = src.mask {
             mask = Some(orient(m, src.orientation));
         }
     }
-    let lay = layout(src.plane.width, src.plane.height, src.orientation, p);
     let (tw, th) = (lay.image_w, lay.image_h);
     let (uw, uh) = (plane.width, plane.height);
     if crate::straighten::turns(r.angle) {
@@ -1901,6 +1916,56 @@ mod tests {
         );
         let masked = render_planes(&src, &enlarge(Sharpen::Usm { amount: 1.0 }));
         assert_eq!(masked.plane.data, base.plane.data);
+    }
+
+    /// A USM amount at native size does not use the mask: the description
+    /// says it was not masked, and the pixels are the print without one.
+    /// An enlargement whose kernel blurs does mask, as it always has.
+    #[test]
+    fn a_usm_at_native_size_does_not_use_the_mask() {
+        let (w, h) = (48, 32);
+        let mut plane = Plane::zeros(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                plane.set(x, y, if x < w / 2 { 0.2 } else { 0.8 });
+            }
+        }
+        // Black everywhere: if a USM did consult it, the edge would stay put.
+        let mask = Plane::from_vec(w, h, vec![0.0; w * h]);
+        fn source<'a>(plane: &'a Plane, mask: Option<&'a Plane>) -> PrintSource<'a> {
+            PrintSource { plane, mask, orientation: 1, name: "step".into(), description: None }
+        }
+        let native = PrintParams {
+            recipe: Recipe { sharpen: Sharpen::Usm { amount: 1.0 }, ..Recipe::on_paper() },
+            ..Default::default()
+        };
+        let held = source(&plane, Some(&mask));
+        let open = source(&plane, None);
+        let with = render_planes(&held, &native);
+        let without = render_planes(&open, &native);
+        assert_eq!(with.info.resample_sigma_px, 0.0);
+        assert!(!with.info.usm_masked);
+        assert_eq!(with.plane.data, without.plane.data);
+        let off = PrintParams {
+            recipe: Recipe { sharpen: Sharpen::Off, ..native.recipe.clone() },
+            ..native.clone()
+        };
+        assert_eq!(memory_estimate(w, h, 1, &native), memory_estimate(w, h, 1, &off));
+
+        let enlarge = PrintParams {
+            recipe: Recipe {
+                sharpen: Sharpen::Usm { amount: 1.0 },
+                dpi: 100.0,
+                size: Some(PrintSize::Physical { width_in: 2.0, height_in: 1.0 }),
+                ..Recipe::on_paper()
+            },
+            ..Default::default()
+        };
+        let big = render_planes(&held, &enlarge);
+        assert!(big.info.resample_sigma_px > 0.0, "sigma {}", big.info.resample_sigma_px);
+        assert!(big.info.usm_masked);
+        let bare = render_planes(&open, &enlarge);
+        assert_ne!(big.plane.data, bare.plane.data);
     }
 
     fn sized(size: PrintSize) -> PrintParams {
