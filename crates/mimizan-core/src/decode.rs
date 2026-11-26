@@ -192,6 +192,19 @@ pub fn raw_source(path: &Path) -> std::io::Result<rawler::rawsource::RawSource> 
     Ok(rawler::rawsource::RawSource::new_from_shared_vec(std::sync::Arc::new(bytes)).with_path(path))
 }
 
+/// The orientation the darkroom keeps. Rawler's own value stands, and
+/// the EXIF one is used when rawler reports the frame unturned (`Normal`
+/// or `Unknown`). `exif` outside 1..=8 is ignored.
+#[cfg(feature = "decode-rawler")]
+pub fn settled_orientation(own: rawler::Orientation, exif: Option<u16>) -> u16 {
+    use rawler::Orientation as O;
+    let exif = exif.filter(|o| (1..=8).contains(o));
+    match own {
+        O::Normal | O::Unknown => exif.unwrap_or(if own == O::Normal { 1 } else { 0 }),
+        other => other.to_u16(),
+    }
+}
+
 /// `work`, with a panic inside it turned into an error.
 ///
 /// rawler's decoders stop on some file contents with a panic (`todo!()`
@@ -332,21 +345,7 @@ impl RawlerDecoder {
         // rawler's own orientation comes from the raw IFD; some cameras (the
         // Z f among them) write it only into EXIF, so that is the fallback
         // when rawler reports nothing turned.
-        let orientation = {
-            use rawler::Orientation as O;
-            match img.orientation {
-                O::Normal | O::Unknown => {
-                    exif_orientation.unwrap_or(if img.orientation == O::Normal { 1 } else { 0 })
-                }
-                O::HorizontalFlip => 2,
-                O::Rotate180 => 3,
-                O::VerticalFlip => 4,
-                O::Transpose => 5,
-                O::Rotate90 => 6,
-                O::Transverse => 7,
-                O::Rotate270 => 8,
-            }
-        };
+        let orientation = settled_orientation(img.orientation, exif_orientation);
 
         // The camera's XYZ → camera matrix: rawler's per-illuminant table
         // first (D65, the daylight matrix the plate wants; else the other
@@ -516,6 +515,19 @@ impl RawFrame {
 #[cfg(all(test, feature = "decode-rawler"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settled_orientation_is_rawlers_own_else_the_exif_one() {
+        use rawler::Orientation as O;
+        assert_eq!(settled_orientation(O::Rotate90, Some(1)), 6);
+        assert_eq!(settled_orientation(O::Rotate270, None), 8);
+        assert_eq!(settled_orientation(O::Normal, Some(6)), 6);
+        assert_eq!(settled_orientation(O::Unknown, Some(3)), 3);
+        assert_eq!(settled_orientation(O::Normal, None), 1);
+        assert_eq!(settled_orientation(O::Unknown, None), 0);
+        assert_eq!(settled_orientation(O::Normal, Some(0)), 1);
+        assert_eq!(settled_orientation(O::Unknown, Some(9)), 0);
+    }
 
     /// A DNG of 16 x 16 photosites, written by hand: one uncompressed
     /// strip, 32-bit floating point or 16-bit integer samples, with or

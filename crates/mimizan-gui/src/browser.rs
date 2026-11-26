@@ -326,6 +326,8 @@ fn cache_key(path: &Path, size: u64, modified: SystemTime) -> String {
     feed(&secs.to_le_bytes());
     // A larger thumbnail size must not pick up the old, smaller pictures.
     feed(&(THUMB_LONG_EDGE as u64).to_le_bytes());
+    // A DNG preview was cached as the sensor stored it, on its side when the picture was taken upright.
+    feed(b"upright");
     format!("{h:016x}")
 }
 
@@ -650,8 +652,21 @@ fn dng_preview(path: &Path) -> Option<(Thumb, Meta)> {
         .ok()
         .flatten()
         .or_else(|| decoder.thumbnail_image(&source, &params).ok().flatten())?;
-    let thumb = thumb_from_image(image, THUMB_LONG_EDGE);
     let md = decoder.raw_metadata(&source, &params).ok();
+    // The same orientation the darkroom settles for this file. The preview
+    // is stored as the sensor held it; the tile is the picture upright.
+    let own = decoder
+        .ifd(WellKnownIFD::Root)
+        .ok()
+        .flatten()
+        .and_then(|ifd| {
+            ifd.get_entry(TiffCommonTag::Orientation)
+                .map(|entry| rawler::Orientation::from_u16(entry.force_usize(0) as u16))
+        })
+        .unwrap_or(rawler::Orientation::Unknown);
+    let exif = md.as_ref().and_then(|m| m.exif.orientation);
+    let image = turn_preview(image, mimizan_core::decode::settled_orientation(own, exif));
+    let thumb = thumb_from_image(image, THUMB_LONG_EDGE);
     let (width, height) = decoder
         .ifd(WellKnownIFD::Raw)
         .ok()
@@ -673,6 +688,16 @@ fn dng_preview(path: &Path) -> Option<(Thumb, Meta)> {
             xtrans: false,
         },
     ))
+}
+
+/// `picture` turned upright by a TIFF orientation (1..=8). An unknown
+/// value leaves the stored pixels, which is how an untagged preview is shown.
+fn turn_preview(mut picture: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+    let Some(turn) = u8::try_from(orientation).ok().and_then(image::metadata::Orientation::from_exif) else {
+        return picture;
+    };
+    picture.apply_orientation(turn);
+    picture
 }
 
 /// `picture` fitted so its long side is at most `long_edge`, as grey and
@@ -950,6 +975,23 @@ mod tests {
         assert_eq!((older.tiff_eight_bit, older.grey_as_rgb, older.sheet_free), (None, None, None));
         assert_eq!(Persisted::from_json(b"not json"), Persisted::default());
         assert_eq!(Persisted::from_json(b"[1, 2]"), Persisted::default());
+    }
+
+    /// Orientation 6 turns the stored preview a quarter clockwise: a 2×3
+    /// picture becomes 3×2, and the top-left pixel is the top-right one.
+    #[test]
+    fn a_portrait_preview_stands_up() {
+        let picture = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(2, 3, |x, y| {
+            image::Rgb([if (x, y) == (0, 0) { 200 } else { 10 }, 0, 0])
+        }));
+        let turned = turn_preview(picture, 6);
+        assert_eq!((turned.width(), turned.height()), (3, 2));
+        assert_eq!(turned.to_rgb8().get_pixel(2, 0).0, [200, 0, 0]);
+        assert_eq!(turned.to_rgb8().get_pixel(0, 0).0, [10, 0, 0]);
+        let flat =
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(2, 3, |_, _| image::Rgb([1, 2, 3])));
+        let stayed = turn_preview(flat, 1);
+        assert_eq!((stayed.width(), stayed.height()), (2, 3));
     }
 
     #[test]
