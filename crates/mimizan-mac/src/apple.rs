@@ -13,6 +13,8 @@ use objc2_foundation::{
 };
 use std::path::{Path, PathBuf};
 
+/// A folder the sandbox has been allowed to read, and the bookmark that
+/// opens it again next launch.
 pub struct FolderGrant {
     path: PathBuf,
     bookmark: Vec<u8>,
@@ -25,6 +27,7 @@ impl FolderGrant {
         &self.path
     }
 
+    /// Empty when the system did not hand back a bookmark.
     pub fn bookmark(&self) -> Option<&[u8]> {
         if self.bookmark.is_empty() {
             None
