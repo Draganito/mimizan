@@ -515,6 +515,8 @@ impl eframe::App for App {
             self.gesture(ui, left, &left_hit);
             self.gesture(ui, right, &right_hit);
             let n = self.rivals().len().max(1);
+        // A digit or an arrow typed into the path field is text.
+        let typing = ctx.egui_wants_keyboard_input();
             if right_hit.clicked() && !right_hit.double_clicked() {
                 self.which = (self.which + 1) % n;
             }
@@ -522,6 +524,9 @@ impl eframe::App for App {
             let label = self.rivals().get(self.which).map(|r| r.label).unwrap_or("");
             let right_tex = self.textures.get(self.which + 1).and_then(|t| t.as_ref());
             paint(ui, right, label, right_tex, &self.view);
+            if typing {
+                return;
+            }
         });
     }
 }
