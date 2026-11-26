@@ -474,12 +474,12 @@ impl eframe::App for App {
                     self.fitted = false;
                 }
                 if ui.button("1:1").clicked() {
-                    self.view.mag = 1.0;
+                    self.view.mag = 1.0 / dense;
                     self.view.pan = egui::Vec2::ZERO;
                     self.fitted = true;
                 }
-                if let Some(pic) = &self.pictures[0] {
-                    let pct = self.view.mag * 100.0;
+                if let Some(pic) = &self.textures[0] {
+                    let pct = self.view.mag * dense * 100.0;
                     ui.label(format!("{pct:.0}%  {}×{}", pic.width, pic.height));
                 }
             });
@@ -620,6 +620,9 @@ impl Tiled {
             })
             .collect();
         Self { width: picture.width, height: picture.height, tiles }
+                // One pixel of the picture on one pixel of the screen: a
+                // point is two or three of those on a dense display.
+                let dense = ctx.pixels_per_point();
     }
 }
 
