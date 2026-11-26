@@ -1096,12 +1096,10 @@ fn apply_sharpen(
         return 0;
     }
     let deconv_n = if passes > 0 { passes.min(DECONV_ITERATIONS) } else { 0 };
-    on_picture(plane, mask, rect, |picture, mask| {
-        let mut out = if deconv_n > 0 { richardson_lucy(picture, detail, deconv_n) } else { picture.clone() };
-        if amount > 0.0 {
-            out = unsharp(&out, detail, amount, mask);
-        }
-        out
+    on_picture(plane, mask, rect, |picture, mask| match (deconv_n, amount > 0.0) {
+        (0, _) => unsharp(picture, detail, amount, mask),
+        (_, true) => unsharp(&richardson_lucy(picture, detail, deconv_n), detail, amount, mask),
+        (_, false) => richardson_lucy(picture, detail, deconv_n),
     });
     deconv_n
 }
