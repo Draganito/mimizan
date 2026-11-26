@@ -1,7 +1,7 @@
 //! `mimizan calibrate`: look curve from a grey wedge, mix weights from a
 //! colour chart, star MTF into the camera file.
 
-use crate::measure::{parse_list, parse_rect, print_star, read_gray_image, star_report};
+use crate::measure::{on_picture, parse_list, parse_rect, print_star, read_gray_image, star_report};
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use mimizan_core::calib::{CameraFile, LookEncoding, StarCalib};
@@ -210,6 +210,12 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                 .ok()
                 .filter(|(mw, mh, _)| (*mw, *mh) == (neg.plane.width, neg.plane.height));
             let refp = read_gray_image(ref_path).context("reference")?;
+            for r in &rects {
+                on_picture(*r, &neg.plane)?;
+            }
+            for q in &ref_rects {
+                on_picture(*q, &refp)?;
+            }
             let mut pairs = Vec::with_capacity(rects.len());
             let mut n_sat = 0;
             for (r, q) in rects.iter().zip(&ref_rects) {
@@ -321,6 +327,9 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
                     let ref_rects = rects_from(ref_patches.as_deref(), ref_grid.as_deref(), *inset)?
                         .unwrap_or_else(|| rects.clone());
                     let p = read_gray_image(rp).context("reference")?;
+                    for q in &ref_rects {
+                        on_picture(*q, &p)?;
+                    }
                     ref_rects.iter().map(|q| renc.to_linear(patch_mean(&p, *q))).collect()
                 }
                 (None, None) => bail!("--reference or --ref-values required"),
@@ -335,6 +344,9 @@ pub fn calibrate(cmd: &CalibrateCmd) -> Result<()> {
             let params = IngestParams { wb: crate::cmd::parse_wb(wb)?, ..IngestParams::default() };
             let mosaic = ingest(&frame, &params)?;
             info!("balance {} R {:.4} B {:.4}", mosaic.report.wb_source, mosaic.wb[0], mosaic.wb[2]);
+            for r in &rects {
+                on_picture(*r, &mosaic.plane)?;
+            }
             let mut samples = Vec::with_capacity(rects.len());
             let mut dropped = 0;
             for (r, v) in rects.iter().zip(&refs) {

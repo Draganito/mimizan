@@ -101,7 +101,8 @@ pub fn carrier_energy(plane: &Plane, noise: &NoiseModel, region: Option<Rect>, r
     CarrierReport { ratio: [acc[0] * inv, acc[1] * inv, acc[2] * inv], blocks, radius }
 }
 
-/// Mean and std of a rectangle.
+/// Mean and standard deviation of the pixels of `r` that lie on the
+/// plane. A rectangle that holds no pixel is undefined (NaN, NaN).
 pub fn region_stats(plane: &Plane, r: Rect) -> (f64, f64) {
     let mut s = 0.0;
     let mut s2 = 0.0;
@@ -114,8 +115,11 @@ pub fn region_stats(plane: &Plane, r: Rect) -> (f64, f64) {
             n += 1;
         }
     }
-    let mean = s / n.max(1) as f64;
-    let var = (s2 / n.max(1) as f64 - mean * mean).max(0.0);
+    if n == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+    let mean = s / n as f64;
+    let var = (s2 / n as f64 - mean * mean).max(0.0);
     (mean, var.sqrt())
 }
 
@@ -296,7 +300,7 @@ mod tests {
 
     /// A rectangle that reaches past the picture is measured where it
     /// lies on it, and one that lies beside it has no block: neither
-    /// reads pixels that are not there.
+    /// reads pixels that are not there. A mean of no pixel is undefined.
     #[test]
     fn a_rectangle_past_the_picture_is_measured_on_the_picture() {
         let mut plane = Plane::zeros(200, 160);
@@ -323,6 +327,17 @@ mod tests {
         // rectangle is said to go.
         let to_the_edge = region_stats(&plane, Rect { x: 10, y: 8, w: 190, h: 152 });
         assert_eq!(region_stats(&plane, Rect { x: 10, y: 8, w: usize::MAX, h: usize::MAX }), to_the_edge);
+        // No pixel to average: past the picture, a side of 0, or an
+        // origin whose side does not fit in usize.
+        for none in [
+            Rect { x: 5000, y: 0, w: 8, h: 8 },
+            Rect { x: 10, y: 8, w: 0, h: 8 },
+            Rect { x: usize::MAX, y: 0, w: 8, h: 8 },
+        ] {
+            let (mean, sd) = region_stats(&plane, none);
+            assert!(mean.is_nan(), "{none:?} mean {mean}");
+            assert!(sd.is_nan(), "{none:?} sd {sd}");
+        }
     }
 
     #[test]

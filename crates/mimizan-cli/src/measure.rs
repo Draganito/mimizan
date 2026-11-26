@@ -180,7 +180,7 @@ pub fn parse_rect(s: &str) -> Result<Rect> {
 /// `r` when all of it lies on `plane`. A measurement of a rectangle that
 /// reaches past the picture would be one of another rectangle, and of
 /// nothing when it lies beside it.
-fn on_picture(r: Rect, plane: &Plane) -> Result<Rect> {
+pub(crate) fn on_picture(r: Rect, plane: &Plane) -> Result<Rect> {
     let inside =
         |at: usize, len: usize, side: usize| len > 0 && at.checked_add(len).is_some_and(|end| end <= side);
     if !inside(r.x, r.w, plane.width) || !inside(r.y, r.h, plane.height) {
@@ -468,5 +468,24 @@ pub fn measure(cmd: &MeasureCmd) -> Result<()> {
             );
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rectangle that lies on the picture is returned. An empty one, or
+    /// one that crosses the edge, is refused: the measurement would be of
+    /// another rectangle.
+    #[test]
+    fn a_rectangle_on_the_picture_is_returned_and_an_empty_or_crossing_one_is_an_error() {
+        let plane = Plane::zeros(40, 30);
+        let on = Rect { x: 4, y: 6, w: 10, h: 8 };
+        assert_eq!(on_picture(on, &plane).unwrap(), on);
+        let empty = on_picture(Rect { x: 4, y: 6, w: 0, h: 8 }, &plane).unwrap_err().to_string();
+        assert_eq!(empty, "the rectangle 4,6,0,8 is empty or reaches past the picture, which is 40x30");
+        let crossing = on_picture(Rect { x: 30, y: 6, w: 20, h: 8 }, &plane).unwrap_err().to_string();
+        assert_eq!(crossing, "the rectangle 30,6,20,8 is empty or reaches past the picture, which is 40x30");
     }
 }
