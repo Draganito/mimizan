@@ -187,7 +187,7 @@ fn installed_dir(name: &std::ffi::OsStr) -> Option<PathBuf> {
 
 /// `name` as a directory where a program in `bin` has its resources:
 /// next to it, in `../Resources`, in `../share/mimizan` or two levels up.
-fn beside_program(bin: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+pub fn beside_program(bin: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
     [bin.to_path_buf(), bin.join("../Resources"), bin.join("../share/mimizan"), bin.join("../..")]
         .into_iter()
         .map(|base| base.join(name))

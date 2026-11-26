@@ -20,7 +20,13 @@
 //! darkroom's settings, in `mimizan/compare.tools`.
 //!
 //! The developed TIFFs land in `photo.mimizan-compare/` beside the RAW and
-//! are kept. A second open reads them. *Develop again* writes them over.
+//! are kept. A second open reads them, as long as the RAW is the file they
+//! were developed from. *Develop again* writes them over.
+//!
+//! The Bayer plate is developed by the `mimizan` command: the one beside
+//! this program, the one inside `Mimizan Lab.app` beside it, or the name
+//! on the path. `MIMIZAN` names another, `MIMIZAN_CAMERAS` another folder
+//! of camera files.
 //!
 //! Both panes are the demosaic only, then one camera matrix and the sRGB
 //! curve. Nothing else: no paper, no lamps, no sharpening, no noise
@@ -934,7 +940,7 @@ fn show_mimizan(raw: &Path, work: &Path, out: &Path, again: bool) -> Result<Plat
 fn develop_mimizan(raw: &Path, work: &Path, out: &Path) -> Result<PlateMeta> {
     let bin = find_mimizan();
     let negative = work.join("negative.tif");
-    let cameras = find_cameras();
+    let cameras = find_cameras(&bin);
     let mut cmd = Command::new(&bin);
     cmd.arg("--log")
         .arg("warn")
@@ -1571,21 +1577,19 @@ fn find_mimizan() -> PathBuf {
     if let Some(p) = std::env::var_os("MIMIZAN") {
         return PathBuf::from(p);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = named(dir, "mimizan");
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
-    }
-    for candidate in ["target/release", "target/debug"] {
-        let path = named(Path::new(candidate), "mimizan");
-        if path.is_file() {
-            return path;
-        }
-    }
-    PathBuf::from("mimizan")
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| mimizan_beside(exe.parent()?))
+        .unwrap_or_else(|| PathBuf::from("mimizan"))
+}
+
+/// The command that came with a loupe in `dir`: next to it, or inside the
+/// app the Mac download puts next to it.
+fn mimizan_beside(dir: &Path) -> Option<PathBuf> {
+    [dir.to_path_buf(), dir.join("Mimizan Lab.app").join("Contents").join("MacOS")]
+        .into_iter()
+        .map(|dir| named(&dir, "mimizan"))
+        .find(|p| p.is_file())
 }
 
 /// `stem` in `dir`, or `stem.exe` where the program is built that way.
@@ -1601,34 +1605,17 @@ fn named(dir: &Path, stem: &str) -> PathBuf {
     path
 }
 
-fn find_cameras() -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(p) = std::env::var_os("MIMIZAN_CAMERAS") {
-        let path = PathBuf::from(p);
-        if path.is_dir() {
-            return Some(path);
-        }
+/// The camera files for the command at `bin`: `MIMIZAN_CAMERAS`, or the
+/// folder installed with that command. A `cameras` folder of the user's,
+/// in whatever folder the loupe was started from, is not the program's;
+/// with it the same RAW would come out another picture. A command found
+/// on the path looks for its own.
+fn find_cameras(bin: &Path) -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MIMIZAN_CAMERAS").map(PathBuf::from).filter(|p| p.is_dir()) {
+        return Some(dir);
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            roots.push(dir.to_path_buf());
-        }
-    }
-    for mut dir in roots {
-        for _ in 0..6 {
-            let cameras = dir.join("cameras");
-            if cameras.is_dir() {
-                return Some(cameras);
-            }
-            if !dir.pop() {
-                break;
-            }
-        }
-    }
-    None
+    let dir = bin.parent().filter(|dir| dir.is_absolute())?;
+    mimizan_core::calib::beside_program(dir, std::ffi::OsStr::new("cameras"))
 }
 
 /// Neutral RawTherapee profile: the named demosaicer, camera white balance,
@@ -1818,6 +1805,8 @@ fn srgb_decode(v: f64) -> f64 {
         ((v + 0.055) / 1.055).powf(2.4)
     }
 }
+/// The command that develops the plate: `MIMIZAN`, the one that came
+/// with this program, or the name on the path.
 
 /// sRGB electro-optical transfer.
 fn srgb_encode(v: f64) -> f64 {
