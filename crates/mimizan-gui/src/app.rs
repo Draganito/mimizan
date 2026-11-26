@@ -979,9 +979,9 @@ pub struct App {
     /// The settings `persist` last marked, in the form the file holds.
     /// A later mark replaces this one, and the file is written once.
     pending_settings: Option<Persisted>,
-    /// `gui.json` was there and was not a JSON object. This run uses the
-    /// defaults and does not write the file, so the unread bytes are not
-    /// replaced.
+    /// `gui.json` was there and was not a JSON object, or it could not be
+    /// read. This run uses the defaults and does not write the file, so
+    /// those bytes are not replaced.
     settings_unread: bool,
     /// Docked windows open: 0 Negative (left), 1 Print (right), 2 Enlarger (bottom).
     panels: [bool; 3],
