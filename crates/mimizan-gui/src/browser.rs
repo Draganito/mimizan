@@ -575,9 +575,11 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
     // checkbox is on, and that DNG is not a tile while it is off. Two
     // RAWs of one stem both keep their tiles: the DNG would be one file.
     if job.bayer_ls {
+        // The folder is read for another file of the stem only when the
+        // DNG is there.
         if !crate::bayer::is_ours(&job.path)
-            && crate::bayer::other_raw(&job.path).is_none()
             && crate::bayer::dng_is_current(&crate::bayer::dng_of(&job.path))
+            && crate::bayer::other_raw(&job.path).is_none()
         {
             return Ok(ThumbReady::Covered);
         }

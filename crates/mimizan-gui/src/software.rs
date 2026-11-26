@@ -79,38 +79,39 @@ fn u32_at(b: &[u8], le: bool) -> u32 {
     }
 }
 
+/// A one-entry TIFF whose Software tag is `text`, the value inline
+/// when it fits in four bytes and after the directory otherwise.
+#[cfg(test)]
+pub(crate) fn tiff_with_software(text: &str) -> Vec<u8> {
+    let bytes = format!("{text}\0").into_bytes();
+    let inline = bytes.len() <= 4;
+    let mut out = Vec::new();
+    out.extend_from_slice(b"II");
+    out.extend_from_slice(&42u16.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&305u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    if inline {
+        let mut value = [0u8; 4];
+        value[..bytes.len()].copy_from_slice(&bytes);
+        out.extend_from_slice(&value);
+    } else {
+        // The directory is 2 + 12 bytes, then the next-IFD word.
+        let at = 8 + 2 + 12 + 4;
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+    }
+    out.extend_from_slice(&0u32.to_le_bytes());
+    if !inline {
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A one-entry TIFF whose Software tag is `text`, the value inline
-    /// when it fits in four bytes and after the directory otherwise.
-    fn tiff_with_software(text: &str) -> Vec<u8> {
-        let bytes = format!("{text}\0").into_bytes();
-        let inline = bytes.len() <= 4;
-        let mut out = Vec::new();
-        out.extend_from_slice(b"II");
-        out.extend_from_slice(&42u16.to_le_bytes());
-        out.extend_from_slice(&8u32.to_le_bytes());
-        out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&305u16.to_le_bytes());
-        out.extend_from_slice(&2u16.to_le_bytes());
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        if inline {
-            let mut value = [0u8; 4];
-            value[..bytes.len()].copy_from_slice(&bytes);
-            out.extend_from_slice(&value);
-        } else {
-            // The directory is 2 + 12 bytes, then the next-IFD word.
-            let at = 8 + 2 + 12 + 4;
-            out.extend_from_slice(&(at as u32).to_le_bytes());
-        }
-        out.extend_from_slice(&0u32.to_le_bytes());
-        if !inline {
-            out.extend_from_slice(&bytes);
-        }
-        out
-    }
 
     #[test]
     fn the_software_tag_is_read_and_a_file_without_one_is_not() {

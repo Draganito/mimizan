@@ -133,6 +133,12 @@ pub fn dng_is_ours(path: &Path) -> bool {
     matches!(dng_beside(name_is_there(path), crate::software::software_of(path).as_deref()), Beside::Ours)
 }
 
+/// `dng` is the conversion of `raf`: the name the converter gives it,
+/// and written by this program.
+pub fn stands_in(dng: &Path, raf: &Path) -> bool {
+    is_raf(raf) && file::beside(raf) == dng && dng_is_ours(dng)
+}
+
 /// The name the conversion is written under before it is linked onto
 /// `<stem>.dng`. The name is the program's own, so a stale one may be
 /// removed: the conversion renames onto whatever its target is at the end.
@@ -319,6 +325,22 @@ mod tests {
         assert_eq!(dng_beside(true, Some("Adobe DNG Converter")), Beside::Taken);
         assert_eq!(dng_beside(true, Some("")), Beside::Taken);
         assert_eq!(dng_beside(true, None), Beside::Taken);
+    }
+
+    #[test]
+    fn a_conversion_stands_in_for_its_raf_and_another_dng_does_not() {
+        let dir = std::env::temp_dir().join(format!("mimizan-fuji-stands-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raf = dir.join("DSCF1.RAF");
+        let dng = dir.join("DSCF1.dng");
+        std::fs::write(&dng, crate::software::tiff_with_software(file::SOFTWARE)).unwrap();
+        assert!(stands_in(&dng, &raf));
+        assert!(!stands_in(&dng, &dir.join("DSCF1.NEF")), "only a RAF is converted");
+        assert!(!stands_in(&dng, &dir.join("DSCF2.RAF")), "another picture");
+        std::fs::write(&dng, crate::software::tiff_with_software("Adobe DNG Converter")).unwrap();
+        assert!(!stands_in(&dng, &raf), "another program's DNG is its own file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -82,22 +82,43 @@ pub fn raw_of(path: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The RAWs a DNG written here could have come from: every file of its
+/// The RAWs a DNG written here could have come from: the files of its
 /// stem in the folder, apart from the DNG itself.
 pub(crate) fn raws_of(path: &Path) -> Vec<PathBuf> {
     let Some(stem) = stem_of_ours(path) else {
         return Vec::new();
     };
-    raws_named(path, &stem)
+    sources_among(raws_named(path, &stem), is_bayer)
 }
 
-/// Another RAW in the folder with the same stem as `path`, compared
-/// without regard to case. The `.mimizan.dng` is not one: that is the
-/// file the two would share. `None` when `path` is the only RAW of its
-/// stem, or the folder cannot be read.
+/// One file of the name is the RAW, whatever it is. Of several, only a
+/// Bayer file can have been written out as this DNG: a linear DNG of the
+/// same name, an export for instance, is not a second source.
+fn sources_among(named: Vec<PathBuf>, bayer: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    if named.len() < 2 {
+        named
+    } else {
+        named.into_iter().filter(|p| bayer(p)).collect()
+    }
+}
+
+/// Another Bayer file in the folder with the same stem as `path`,
+/// compared without regard to case: the two would be written out as one
+/// DNG. A file that is not a Bayer mosaic never is, so it does not count,
+/// and neither does the `.mimizan.dng` itself. `None` when there is no
+/// such file, or the folder cannot be read.
 pub fn other_raw(path: &Path) -> Option<PathBuf> {
     let stem = path.file_stem().and_then(|s| s.to_str())?;
-    raws_named(path, stem).into_iter().next()
+    other_among(raws_named(path, stem), is_bayer)
+}
+
+fn other_among(named: Vec<PathBuf>, bayer: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    named.into_iter().find(|p| bayer(p))
+}
+
+/// A Bayer mosaic this path writes out. The head is read, not the picture.
+pub(crate) fn is_bayer(path: &Path) -> bool {
+    head_of(path).is_some()
 }
 
 fn stem_of_ours(path: &Path) -> Option<String> {
@@ -161,12 +182,12 @@ pub fn place(path: &Path) -> Place {
     } else {
         path.to_path_buf()
     };
-    if let Some(other) = other_raw(&raw) {
-        return Place::Shared(other);
-    }
     let Some(head) = head_of(&raw) else {
         return Place::NotBayer;
     };
+    if let Some(other) = other_raw(&raw) {
+        return Place::Shared(other);
+    }
     if dng_is_current(&head.dng) {
         return Place::Ready(head.dng);
     }
@@ -267,11 +288,29 @@ mod tests {
         fs::write(&lone_dng, b"d").unwrap();
         fs::write(dir.join("c.NEF"), b"x").unwrap();
         fs::write(dir.join("c.mimizan.dng"), b"d").unwrap();
-        assert_eq!(other_raw(&nef).unwrap(), cr2);
-        assert_eq!(other_raw(&cr2).unwrap(), nef);
-        assert!(other_raw(&lone).is_none(), "a lone RAW has no other");
-        assert!(other_raw(&dir.join("c.NEF")).is_none(), "the program's DNG is not another RAW");
-        assert!(raw_of(&dng).is_none(), "two RAWs are not a choice");
+        // The files here are not pictures, so the question "is it a Bayer
+        // mosaic" is answered by the test.
+        let any = |_: &Path| true;
+        let none = |_: &Path| false;
+        assert_eq!(other_among(raws_named(&nef, "a"), any).unwrap(), cr2);
+        assert_eq!(other_among(raws_named(&cr2, "A"), any).unwrap(), nef);
+        assert!(
+            other_among(raws_named(&nef, "a"), none).is_none(),
+            "a file that is no mosaic is not another"
+        );
+        assert!(other_among(raws_named(&lone, "b"), any).is_none(), "a lone RAW has no other");
+        assert!(
+            other_among(raws_named(&dir.join("c.NEF"), "c"), any).is_none(),
+            "the program's DNG is not another RAW"
+        );
+        assert!(sources_among(raws_named(&dng, "a"), any).len() == 2, "two RAWs are not a choice");
+        let only_nef = |p: &Path| p == nef;
+        assert_eq!(
+            sources_among(raws_named(&dng, "a"), only_nef),
+            std::slice::from_ref(&nef),
+            "an export is not a source"
+        );
+        assert!(raw_of(&dng).is_none(), "of two files that are no mosaic neither is the source");
         assert_eq!(raw_of(&lone_dng).unwrap(), lone);
         assert!(listed_other(&nef, &cr2));
         assert!(!listed_other(&nef, &dng));

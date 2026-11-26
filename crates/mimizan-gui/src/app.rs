@@ -3282,13 +3282,16 @@ impl App {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
                     let opened = s.path.clone();
-                    // Before the strip drops a file the DNG stands in for:
-                    // that file is still listed, and it may share the recipe.
+                    // The other files of the folder, which may share the
+                    // recipe. The RAF this DNG was converted from is the
+                    // same picture, and one recipe for the two is meant.
                     let listed: Vec<PathBuf> = self
                         .folder
                         .as_ref()
                         .map(|f| f.entries.iter().map(|e| e.path.clone()).collect())
                         .unwrap_or_default();
+                    let listed: Vec<PathBuf> =
+                        listed.into_iter().filter(|other| !crate::fuji::stands_in(&opened, other)).collect();
                     if self.current_path.as_deref() != Some(opened.as_path()) {
                         if let Some(asked) = self.current_path.clone() {
                             if let Some(folder) = self.folder.as_mut() {
@@ -4526,12 +4529,16 @@ impl App {
                 if crate::bayer::is_ours(path) {
                     continue;
                 }
-                // The listing the strip already holds.
-                if entries.iter().any(|other| crate::bayer::listed_other(path, other)) {
+                let dng = crate::bayer::dng_of(path);
+                if !crate::bayer::dng_is_current(&dng) {
                     continue;
                 }
-                let dng = crate::bayer::dng_of(path);
-                if crate::bayer::dng_is_current(&dng) {
+                // Asked only of a file whose DNG is there, and of the
+                // listing the strip already holds.
+                let shared = entries
+                    .iter()
+                    .any(|other| crate::bayer::listed_other(path, other) && crate::bayer::is_bayer(other));
+                if !shared {
                     folder.show_instead(path, &dng, sort);
                 }
             } else if crate::bayer::is_ours(path) {
