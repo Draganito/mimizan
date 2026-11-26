@@ -741,6 +741,9 @@ pub struct App {
     /// A change while it reads is applied when the folder arrives.
     listing_ls: bool,
     listing_sort: Sort,
+    /// A file opened while its folder was still being read: the lines
+    /// about files that share its recipe are logged when the listing comes.
+    shared_recipe_owed: bool,
     sort: Sort,
     show_strip: bool,
     /// Strip tiles inverted (the film), not the print: one choice per
@@ -1046,6 +1049,7 @@ impl App {
             folder_list: None,
             listing_ls: persisted.bayer_ls.unwrap_or(false),
             listing_sort: persisted.sort,
+            shared_recipe_owed: false,
             sort: persisted.sort,
             show_strip: persisted.strip.unwrap_or(true),
             strip_negative: persisted.strip_negative.unwrap_or(true),
@@ -1368,7 +1372,14 @@ impl App {
             }
         };
         self.folder_list = None;
-        let Some(listed) = outcome else { return };
+        let Some(listed) = outcome else {
+            // The thread ended without an answer, or was never started.
+            if let Some(path) = self.folder_asked.take() {
+                self.log(format!("folder {}: could not be read", path.display()));
+                self.persist();
+            }
+            return;
+        };
         if !browser::listing_is_current(
             listed.generation,
             self.folder_generation,
@@ -1391,10 +1402,39 @@ impl App {
                 });
                 self.folder = Some(f);
                 self.persist();
+                if std::mem::take(&mut self.shared_recipe_owed) {
+                    self.log_shared_recipe();
+                }
             }
             Err(e) => {
                 self.log(format!("folder {}: {e}", listed.path.display()));
+                // Not the folder a quit remembers, and an open in it asks
+                // again: the folder may be readable by then.
+                self.folder_asked = None;
+                self.persist();
             }
+        }
+    }
+
+    /// The file on the stage opened before its folder was listed, so
+    /// nothing could say which other files share its recipe. The listing
+    /// is here now.
+    fn log_shared_recipe(&mut self) {
+        let (Some(opened), Some(folder)) = (self.session.as_ref().map(|s| s.path.clone()), &self.folder)
+        else {
+            return;
+        };
+        if opened.parent() != Some(folder.path.as_path()) {
+            return;
+        }
+        let listed: Vec<PathBuf> = folder
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .filter(|other| !crate::fuji::stands_in(&opened, other))
+            .collect();
+        for line in shared_recipe_lines(&opened, &listed) {
+            self.log(line);
         }
     }
 
@@ -3344,12 +3384,12 @@ impl App {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
                     let opened = s.path.clone();
-                    // The folder was still being read, or this is another
-                    // file and there is no listing to put it in. Ask again,
-                    // so a DNG written while the first read ran is listed.
-                    let reading = self.folder_list.is_some();
+                    // Another file than the one asked for, the DNG written
+                    // for it, and no listing to put it in: the folder is
+                    // still being read, or could not be. Ask again, so the
+                    // DNG written meanwhile is listed.
                     let other = self.current_path.as_deref() != Some(opened.as_path());
-                    if reading || (other && self.folder.is_none()) {
+                    if other && self.folder.is_none() {
                         if let Some(parent) = opened.parent().filter(|p| !p.as_os_str().is_empty()) {
                             self.set_folder(parent);
                         }
@@ -3392,6 +3432,8 @@ impl App {
                     let name =
                         s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
                     if fresh {
+                        // Without a listing nothing can be said yet.
+                        self.shared_recipe_owed = self.folder.is_none();
                         for line in shared_recipe_lines(&s.path, &listed) {
                             self.log(line);
                         }
@@ -3525,29 +3567,8 @@ impl App {
         }
         self.poll_peak();
         for r in self.thumbs.poll() {
-            let Some(f) = &mut self.folder else { continue };
-            if r.generation != f.generation {
-                continue;
-            }
-            match r.result {
-                Ok(browser::ThumbReady::Covered) => {
-                    f.entries.retain(|e| e.path != r.path);
-                }
-                Ok(browser::ThumbReady::Picture(thumb, meta)) => {
-                    if let Some(e) = f.entries.iter_mut().find(|e| e.path == r.path) {
-                        tracing::debug!("thumbnail {} in {} ms", e.name, r.ms);
-                        e.thumb = Some(thumb);
-                        e.meta = Some(*meta);
-                        e.state = ThumbState::Ready;
-                        e.texture = None;
-                    }
-                }
-                Err(msg) => {
-                    if let Some(e) = f.entries.iter_mut().find(|e| e.path == r.path) {
-                        tracing::warn!("thumbnail {}: {msg}", e.name);
-                        e.state = ThumbState::Failed;
-                    }
-                }
+            if let Some(f) = &mut self.folder {
+                f.take_thumb(r);
             }
         }
         for r in self.preview.poll() {

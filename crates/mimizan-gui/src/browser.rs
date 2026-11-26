@@ -279,6 +279,37 @@ impl Folder {
         self.resort(sort);
     }
 
+    /// A finished thumbnail goes to its file, shown or aside: a file the
+    /// checkbox moved aside while its picture was being made has asked
+    /// under this number already, and would stay "…" when it came back.
+    /// An older scan's result is ignored.
+    pub fn take_thumb(&mut self, r: ThumbResult) {
+        if r.generation != self.generation {
+            return;
+        }
+        let entry = self.entries.iter_mut().chain(self.aside.iter_mut()).find(|e| e.path == r.path);
+        match r.result {
+            Ok(ThumbReady::Covered) => {
+                self.entries.retain(|e| e.path != r.path);
+            }
+            Ok(ThumbReady::Picture(thumb, meta)) => {
+                if let Some(e) = entry {
+                    tracing::debug!("thumbnail {} in {} ms", e.name, r.ms);
+                    e.thumb = Some(thumb);
+                    e.meta = Some(*meta);
+                    e.state = ThumbState::Ready;
+                    e.texture = None;
+                }
+            }
+            Err(msg) => {
+                if let Some(e) = entry {
+                    tracing::warn!("thumbnail {}: {msg}", e.name);
+                    e.state = ThumbState::Failed;
+                }
+            }
+        }
+    }
+
     /// What the listing remembers of a `.mimizan.dng`, when this folder
     /// lists it.
     pub fn dng_source(&self, path: &Path) -> Option<&crate::bayer::DngSource> {
@@ -1183,6 +1214,52 @@ mod tests {
         assert!(folder.entries.iter().all(|e| e.thumb.as_ref().is_some_and(|t| t.gray == [7])));
         assert_eq!(folder.aside[0].name, "a.mimizan.dng");
         assert_eq!(folder.aside[0].thumb.as_ref().map(|t| t.gray.as_slice()), Some(&[7][..]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A picture that arrives after the checkbox moved its file aside is
+    /// kept with the file, and is there when the file comes back.
+    #[test]
+    fn a_thumbnail_reaches_a_file_the_checkbox_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("mimizan-aside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.join("a.NEF");
+        let dng = dir.join("a.mimizan.dng");
+        std::fs::write(&raw, b"r").unwrap();
+        std::fs::write(&dng, b"d").unwrap();
+        let mut folder = listed_folder(&dir, Sort::Name, 3, false, |p| p == dng, |p| p == raw).unwrap();
+        assert_eq!(folder.entries[0].path, raw);
+        // The RAW's picture is asked for, then the checkbox goes on.
+        folder.retile(true, Sort::Name);
+        assert_eq!(folder.aside[0].path, raw);
+        let picture = |generation, path: &Path| ThumbResult {
+            generation,
+            path: path.to_path_buf(),
+            result: Ok(ThumbReady::Picture(
+                marked(),
+                Box::new(Meta {
+                    make: String::new(),
+                    model: String::new(),
+                    width: 1,
+                    height: 1,
+                    exposure: Exposure::default(),
+                    xtrans: false,
+                }),
+            )),
+            ms: 0,
+        };
+        folder.take_thumb(picture(2, &raw));
+        assert!(folder.aside[0].thumb.is_none(), "an older scan's picture is not this file's");
+        folder.take_thumb(picture(3, &raw));
+        assert_eq!(folder.aside[0].state, ThumbState::Ready);
+        folder.retile(false, Sort::Name);
+        let back = folder.entries.iter().find(|e| e.path == raw).unwrap();
+        assert_eq!(back.thumb.as_ref().map(|t| t.gray.as_slice()), Some(&[7][..]));
+        // A failure is kept too, so the tile says "?" and does not wait.
+        folder.retile(true, Sort::Name);
+        folder.take_thumb(ThumbResult { generation: 3, path: raw.clone(), result: Err("no".into()), ms: 0 });
+        assert_eq!(folder.aside[0].state, ThumbState::Failed);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
