@@ -11,6 +11,7 @@
 //! treated as burnt out.
 
 use crate::bayer2::{self, Spectrum, Weighing};
+use mimizan_core::cfa::{BayerPhase, Color};
 use mimizan_lab_xtrans::convert::{Developed, Frame, WHITE};
 use mimizan_lab_xtrans::plane::{Plane, Rgb};
 use mimizan_lab_xtrans::xtrans::{self, Curve, Prior, Refine, XTile};
@@ -424,8 +425,7 @@ fn from_luma(lum: &[f64], c1: &[f64], c2: &[f64], width: usize, height: usize) -
 /// photosite, so the tile is the RGGB one the bench measured. `tell` hears
 /// each step.
 pub fn develop(img: &RawImage, tell: &dyn Fn(String)) -> Result<Developed, String> {
-    let name = bayer_pattern(img).ok_or("the file holds no Bayer mosaic")?;
-    let (rx, ry) = red_site(&name).ok_or("the mosaic has no red photosite")?;
+    let (rx, ry) = red_site(bayer_phase(img).ok_or("the file holds no Bayer mosaic")?);
     let (cx, cy, cw, ch) = crop_of(img)?;
     let x0 = cx + usize::from(cx % 2 != rx);
     let y0 = cy + usize::from(cy % 2 != ry);
@@ -530,20 +530,27 @@ pub fn develop(img: &RawImage, tell: &dyn Fn(String)) -> Result<Developed, Strin
     })
 }
 
-fn bayer_pattern(img: &RawImage) -> Option<String> {
+/// The phase of a 2×2 Bayer mosaic, `None` for anything else.
+///
+/// Four letters over 2×2 are not yet Bayer: rawler names an emerald
+/// photosite so (`ERBG`, `RGEB`), and it hands a Fuji Super CCD over under
+/// a Bayer name on a grid turned by 45 degrees. Both would be developed
+/// into a wrong picture without a word; the names the core reads are the
+/// ones read here.
+pub fn bayer_phase(img: &RawImage) -> Option<BayerPhase> {
     let RawPhotometricInterpretation::Cfa(config) = &img.photometric else {
         return None;
     };
-    if config.cfa.width != 2 || config.cfa.height != 2 || config.cfa.name.len() != 4 {
+    if config.cfa.width != 2 || config.cfa.height != 2 || img.fuji_rotation_width.is_some() {
         return None;
     }
-    Some(config.cfa.name.clone())
+    BayerPhase::from_name(&config.cfa.name).ok()
 }
 
 /// Column and row, inside the 2×2, of the red photosite.
-fn red_site(name: &str) -> Option<(usize, usize)> {
-    let b = name.as_bytes();
-    (0..4).find(|i| b[*i].eq_ignore_ascii_case(&b'R')).map(|i| (i % 2, i / 2))
+fn red_site(phase: BayerPhase) -> (usize, usize) {
+    let i = phase.tile().iter().position(|c| *c == Color::R).unwrap_or(0);
+    (i % 2, i / 2)
 }
 
 fn crop_of(img: &RawImage) -> Result<(usize, usize, usize, usize), String> {
@@ -570,7 +577,7 @@ fn channel_at(x: usize, y: usize) -> usize {
 mod tests {
     use super::{
         bayer2, bayer_priors, channel_at, demosaic, from_luma, luma, red_site, tone_scores,
-        without_line_checker, Knobs, Plane, Prior, Spectrum, Tone, Weighing, BLACK_SLOPE,
+        without_line_checker, BayerPhase, Knobs, Plane, Prior, Spectrum, Tone, Weighing, BLACK_SLOPE,
     };
     use std::f64::consts::PI;
 
@@ -668,10 +675,10 @@ mod tests {
 
     #[test]
     fn the_red_photosite_names_the_tile() {
-        assert_eq!(red_site("RGGB"), Some((0, 0)));
-        assert_eq!(red_site("BGGR"), Some((1, 1)));
-        assert_eq!(red_site("GRBG"), Some((1, 0)));
-        assert_eq!(red_site("GBRG"), Some((0, 1)));
+        assert_eq!(red_site(BayerPhase::RGGB), (0, 0));
+        assert_eq!(red_site(BayerPhase::BGGR), (1, 1));
+        assert_eq!(red_site(BayerPhase::GRBG), (1, 0));
+        assert_eq!(red_site(BayerPhase::GBRG), (0, 1));
         assert_eq!(channel_at(0, 0), 0);
         assert_eq!(channel_at(1, 0), 1);
         assert_eq!(channel_at(0, 1), 1);
