@@ -8,7 +8,8 @@
 //! and the camera file's weights (`mimizan_core::thumb`), cached on disk
 //! as an 8-bit PNG keyed by path, size and modification time. An X-Trans
 //! RAF that has no DNG beside it is the camera's JPEG instead
-//! (`fuji`); once that DNG is there the RAF leaves the strip. A Bayer
+//! (`fuji`); once a DNG this program wrote is there the RAF leaves the
+//! strip. A DNG from another program leaves the RAF where it is. A Bayer
 //! least-squares DNG is the preview it already carries, not a second
 //! decode of its three full-size channels.
 
@@ -542,28 +543,33 @@ fn start_thumbs(ctx: &egui::Context, cameras_dir: &Path) -> (Sender<Vec<ThumbJob
 /// X-Trans RAF is the camera's JPEG until its DNG is written, and then
 /// it is not a tile of its own.
 fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Result<ThumbReady, String> {
-    match crate::fuji::place(&job.path) {
+    // Ready is the program's own DNG: the RAF is not a tile. Anything
+    // else of that name leaves the RAF, with the camera's JPEG, as while
+    // the DNG is still unwritten. The foreign DNG is its own file.
+    let xtrans_head = match crate::fuji::place(&job.path) {
         crate::fuji::Place::Ready(_) => return Ok(ThumbReady::Covered),
-        crate::fuji::Place::Needs(head) => {
-            let key = cache_key(&job.path, job.size, job.modified);
-            if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
-                return Ok(ThumbReady::Picture(hit.0, Box::new(hit.1)));
-            }
-            let thumb = crate::fuji::camera_jpeg(&job.path, THUMB_LONG_EDGE)?;
-            let meta = Meta {
-                make: head.make,
-                model: head.model,
-                exposure: head.exposure,
-                width: head.width,
-                height: head.height,
-                xtrans: true,
-            };
-            if let Some(d) = cache {
-                cache_store(d, &key, &thumb, &meta);
-            }
-            return Ok(ThumbReady::Picture(thumb, Box::new(meta)));
+        crate::fuji::Place::Needs(head) => Some(head),
+        crate::fuji::Place::Taken(_) => crate::fuji::head(&job.path),
+        crate::fuji::Place::NotXtrans => None,
+    };
+    if let Some(head) = xtrans_head {
+        let key = cache_key(&job.path, job.size, job.modified);
+        if let Some(hit) = cache.and_then(|d| cache_load(d, &key)) {
+            return Ok(ThumbReady::Picture(hit.0, Box::new(hit.1)));
         }
-        crate::fuji::Place::NotXtrans => {}
+        let thumb = crate::fuji::camera_jpeg(&job.path, THUMB_LONG_EDGE)?;
+        let meta = Meta {
+            make: head.make,
+            model: head.model,
+            exposure: head.exposure,
+            width: head.width,
+            height: head.height,
+            xtrans: true,
+        };
+        if let Some(d) = cache {
+            cache_store(d, &key, &thumb, &meta);
+        }
+        return Ok(ThumbReady::Picture(thumb, Box::new(meta)));
     }
     // The least-squares path: the RAW gives way to its DNG while the
     // checkbox is on, and that DNG is not a tile while it is off.

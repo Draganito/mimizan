@@ -12,8 +12,7 @@ use mimizan_lab_xtrans::convert::Developed;
 use mimizan_lab_xtrans::dng;
 use rawler::decoders::RawDecodeParams;
 use rawler::RawImage;
-use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -64,78 +63,7 @@ pub fn dng_is_ready(path: &Path) -> bool {
 /// the separation has changed, and opening the old file would show the
 /// picture the previous version left there.
 pub fn dng_is_current(path: &Path) -> bool {
-    dng_is_ready(path) && software_of(path).as_deref() == Some(SOFTWARE)
-}
-
-/// TIFF tag 305, the `Software` string, from the first directories.
-fn software_of(path: &Path) -> Option<String> {
-    let mut f = BufReader::new(File::open(path).ok()?);
-    let mut hdr = [0u8; 8];
-    f.read_exact(&mut hdr).ok()?;
-    let le = match &hdr[..2] {
-        b"II" => true,
-        b"MM" => false,
-        _ => return None,
-    };
-    if u16_at(&hdr[2..4], le) != 42 {
-        return None;
-    }
-    let mut offset = u64::from(u32_at(&hdr[4..8], le));
-    for _ in 0..8 {
-        if offset == 0 {
-            break;
-        }
-        f.seek(SeekFrom::Start(offset)).ok()?;
-        let mut nbuf = [0u8; 2];
-        f.read_exact(&mut nbuf).ok()?;
-        let count = usize::from(u16_at(&nbuf, le));
-        if count > 4096 {
-            return None;
-        }
-        for _ in 0..count {
-            let mut ent = [0u8; 12];
-            f.read_exact(&mut ent).ok()?;
-            let tag = u16_at(&ent[..2], le);
-            let kind = u16_at(&ent[2..4], le);
-            let n = u32_at(&ent[4..8], le) as usize;
-            // 305 is Software, 2 is ASCII.
-            if tag == 305 && kind == 2 && (1..512).contains(&n) {
-                let bytes = if n <= 4 {
-                    ent[8..8 + n].to_vec()
-                } else {
-                    let at = u64::from(u32_at(&ent[8..12], le));
-                    let back = f.stream_position().ok()?;
-                    f.seek(SeekFrom::Start(at)).ok()?;
-                    let mut buf = vec![0u8; n];
-                    f.read_exact(&mut buf).ok()?;
-                    f.seek(SeekFrom::Start(back)).ok()?;
-                    buf
-                };
-                let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-                return String::from_utf8(bytes[..end].to_vec()).ok();
-            }
-        }
-        let mut next = [0u8; 4];
-        f.read_exact(&mut next).ok()?;
-        offset = u64::from(u32_at(&next, le));
-    }
-    None
-}
-
-fn u16_at(b: &[u8], le: bool) -> u16 {
-    if le {
-        u16::from_le_bytes([b[0], b[1]])
-    } else {
-        u16::from_be_bytes([b[0], b[1]])
-    }
-}
-
-fn u32_at(b: &[u8], le: bool) -> u32 {
-    if le {
-        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-    } else {
-        u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-    }
+    dng_is_ready(path) && crate::software::software_of(path).as_deref() == Some(SOFTWARE)
 }
 
 /// The RAW a DNG written here came from, when that RAW is still beside it.

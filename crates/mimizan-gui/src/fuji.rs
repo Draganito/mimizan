@@ -5,7 +5,8 @@
 //! with the highlights left as recorded, and the file that then opens is
 //! the DNG: three channels, the same preview as any other linear DNG. A
 //! Bayer RAF is not this and is left to the ordinary path. A later open
-//! reads the DNG and does not look at the RAF again.
+//! reads the DNG and does not look at the RAF again. A file of that name
+//! which this program did not write does not stand in for the RAF.
 
 use mimizan_core::decode::Exposure;
 use mimizan_core::thumb::Thumb;
@@ -23,6 +24,19 @@ pub enum Place {
     Ready(PathBuf),
     /// The RAF still has to be written out.
     Needs(Head),
+    /// `<stem>.dng` is there, and this program did not write it.
+    Taken(PathBuf),
+}
+
+/// What the file named `<stem>.dng` means, before any RAF is read.
+#[derive(Debug, PartialEq, Eq)]
+enum Beside {
+    /// No file of that name.
+    Absent,
+    /// This program wrote it. An older version of the converter still counts.
+    Ours,
+    /// A file is there, and it is not one this program wrote.
+    Taken,
 }
 
 /// What the head of an X-Trans RAF says, and where its DNG will be.
@@ -89,39 +103,82 @@ fn is_raf(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("raf"))
 }
 
-/// The head only: `true` asks rawler not to decode the mosaic.
-pub fn place(path: &Path) -> Place {
+/// The start of [`file::SOFTWARE`], through the space after the program
+/// name. An older converter wrote that same start.
+fn software_prefix() -> &'static str {
+    let software = file::SOFTWARE;
+    match software.find(' ') {
+        Some(i) => &software[..=i],
+        None => software,
+    }
+}
+
+/// What [`place`] decides from whether a file of the DNG's name is there
+/// and what its Software tag says. No RAF is opened.
+fn dng_beside(present: bool, software: Option<&str>) -> Beside {
+    if !present {
+        Beside::Absent
+    } else if software.is_some_and(|s| s.starts_with(software_prefix())) {
+        Beside::Ours
+    } else {
+        Beside::Taken
+    }
+}
+
+/// A name that is taken, or that cannot be ruled out. Only a name that
+/// is not there may be written.
+fn name_is_there(path: &Path) -> bool {
+    !matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// The sentence an open shows for a `<stem>.dng` this program did not write.
+pub fn taken_sentence(dng: &Path) -> String {
+    let name = dng
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dng.display().to_string());
+    format!("`{name}` beside this RAF was not written by Mimizan. Move or rename it, and the RAF opens.")
+}
+
+/// The head of an X-Trans RAF, or `None` when `path` is not one. The
+/// mosaic itself is not decoded.
+pub(crate) fn head(path: &Path) -> Option<Head> {
     if !is_raf(path) {
-        return Place::NotXtrans;
+        return None;
     }
-    let Ok(source) = mimizan_core::decode::raw_source(path) else {
-        return Place::NotXtrans;
-    };
-    let Ok(decoder) = rawler::get_decoder(&source) else {
-        return Place::NotXtrans;
-    };
-    let Ok(img) = decoder.raw_image(&source, &RawDecodeParams::default(), true) else {
-        return Place::NotXtrans;
-    };
-    let Ok(frame) = frame_of(&img) else {
-        return Place::NotXtrans;
-    };
-    let dng = file::beside(path);
-    if dng_is_ready(&dng) {
-        return Place::Ready(dng);
-    }
+    let source = mimizan_core::decode::raw_source(path).ok()?;
+    let decoder = rawler::get_decoder(&source).ok()?;
+    let img = decoder.raw_image(&source, &RawDecodeParams::default(), true).ok()?;
+    let frame = frame_of(&img).ok()?;
     let exposure = decoder
         .raw_metadata(&source, &RawDecodeParams::default())
         .map(|md| mimizan_core::decode::exposure_from(&md))
         .unwrap_or_default();
-    Place::Needs(Head {
-        dng,
+    Some(Head {
+        dng: file::beside(path),
         width: frame.width,
         height: frame.height,
         make: img.clean_make,
         model: img.clean_model,
         exposure,
     })
+}
+
+/// The head only. A `<stem>.dng` stands in for the RAF only when its
+/// Software tag starts as this program's converter writes it.
+pub fn place(path: &Path) -> Place {
+    let Some(head) = head(path) else {
+        return Place::NotXtrans;
+    };
+    let dng = head.dng.clone();
+    match dng_beside(name_is_there(&dng), crate::software::software_of(&dng).as_deref()) {
+        Beside::Ours => Place::Ready(dng),
+        Beside::Taken => Place::Taken(dng),
+        Beside::Absent => Place::Needs(head),
+    }
 }
 
 /// The camera's JPEG in `raf`, shrunk so the long side is at most
@@ -197,6 +254,30 @@ mod tests {
     fn a_bayer_name_is_not_an_xtrans_raf() {
         assert!(matches!(place(Path::new("DSC.NEF")), Place::NotXtrans));
         assert!(matches!(place(Path::new("no-such-file.RAF")), Place::NotXtrans));
+    }
+
+    #[test]
+    fn a_dng_stands_in_for_the_raf_only_when_this_program_wrote_it() {
+        let ours = file::SOFTWARE;
+        let prefix = software_prefix();
+        assert!(ours.starts_with(prefix) && prefix.ends_with(' ') && ours.len() > prefix.len());
+        let older = format!("{prefix}0.1.0 (older)");
+        assert_eq!(dng_beside(false, None), Beside::Absent);
+        assert_eq!(dng_beside(false, Some(ours)), Beside::Absent);
+        assert_eq!(dng_beside(true, Some(ours)), Beside::Ours);
+        assert_eq!(dng_beside(true, Some(&older)), Beside::Ours);
+        assert_eq!(dng_beside(true, Some("Adobe DNG Converter")), Beside::Taken);
+        assert_eq!(dng_beside(true, Some("")), Beside::Taken);
+        assert_eq!(dng_beside(true, None), Beside::Taken);
+    }
+
+    #[test]
+    fn a_foreign_dng_is_named_and_left_for_the_user_to_move() {
+        let text = taken_sentence(Path::new("/photos/DSCF1234.dng"));
+        assert_eq!(
+            text,
+            "`DSCF1234.dng` beside this RAF was not written by Mimizan. Move or rename it, and the RAF opens."
+        );
     }
 
     #[test]

@@ -445,6 +445,9 @@ fn open(
             status(format!("opening {}", dng.display()));
             return open(&dng, own, cameras_dir, false, status);
         }
+        crate::fuji::Place::Taken(dng) => {
+            return Err(anyhow::Error::msg(crate::fuji::taken_sentence(&dng)));
+        }
         crate::fuji::Place::Needs(head) => {
             // The conversion is the wide part, and it is not the DNG's
             // development. Refusing here leaves the RAF unwritten; the

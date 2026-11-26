@@ -22,6 +22,7 @@ mod histogram;
 mod lamp_bar;
 mod paper_strip;
 mod session;
+mod software;
 mod toolbar;
 mod unlock;
 mod worker;
