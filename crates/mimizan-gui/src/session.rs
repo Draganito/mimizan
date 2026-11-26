@@ -880,7 +880,8 @@ fn mixed_linear(
     Some(sampled(g, rect, step, |sx, sy| mix_at(sep, weights, sx, sy)))
 }
 
-/// The three plates over `rect`, as [`mixed_linear`].
+/// The three plates over `rect`, as [`mixed_linear`]: on a coarser grid
+/// the plates of the nearest sensor pixel of each sample.
 fn plate_linear(
     sep: &Separation,
     w: &PlateWeights,
@@ -895,8 +896,18 @@ fn plate_linear(
         let sensor = source_rect(g.orientation, g.sw, g.sh, rect);
         return plate_upright(sep, w, sensor, g.orientation);
     }
-    let weights = w.weights();
-    Some(weights.map(|wc| sampled(g, rect, step, |sx, sy| mix_at(sep, &wc, sx, sy))))
+    // The separation read on the grid, then the core's plate: its three
+    // mixes and the settling of a plate the weights drive below no light,
+    // as at 1:1, in the fit copy and in the file.
+    let small = Separation {
+        lum: sampled(g, rect, step, |sx, sy| sep.lum.at(sx, sy)),
+        c1: sampled(g, rect, step, |sx, sy| sep.c1.at(sx, sy)),
+        c2: sampled(g, rect, step, |sx, sy| sep.c2.at(sx, sy)),
+        mask_max: Plane::zeros(1, 1),
+        rounds: sep.rounds,
+        phase: sep.phase,
+    };
+    Some(mix_plate(&small, w))
 }
 
 /// The measured plane of a monochrome negative over `rect`, as
@@ -2767,6 +2778,65 @@ mod tests {
             for x in 0..w {
                 let got = mix_at(&sep, &wts, x, y);
                 assert!((got - mixed.at(x, y)).abs() < 1e-12, "at {x},{y}");
+            }
+        }
+    }
+
+    /// The plate on a coarser grid is the plate at 1:1, every `step`-th
+    /// pixel of it: also where the weights drive a plate below no light
+    /// and the core brings it back, the other two giving up the same
+    /// share. Unsettled, such a pixel had another colour below 1:1 than at
+    /// 1:1 and in the file.
+    #[test]
+    fn a_plate_below_one_to_one_is_the_plate_at_one_to_one() {
+        let (w, h) = (12usize, 8usize);
+        let mut lum = Plane::zeros(w, h);
+        let mut c1 = Plane::zeros(w, h);
+        let mut c2 = Plane::zeros(w, h);
+        for (i, ((l, a), b)) in
+            lum.data.iter_mut().zip(c1.data.iter_mut()).zip(c2.data.iter_mut()).enumerate()
+        {
+            *l = 0.05 + 0.01 * (i % 7) as f64;
+            *a = 0.04 * ((i % 5) as f64 - 2.0);
+            *b = 0.05 * ((i % 3) as f64 - 1.0);
+        }
+        let sep = Separation {
+            lum,
+            c1,
+            c2,
+            mask_max: Plane::zeros(1, 1),
+            rounds: 1,
+            phase: mimizan_core::cfa::BayerPhase::RGGB,
+        };
+        // A set with negative terms, as a camera matrix has.
+        let weights = PlateWeights {
+            rows: [[1.8, -0.6, -0.2], [-0.3, 1.6, -0.3], [0.0, -0.7, 1.7]],
+            ..PlateWeights::channels()
+        };
+        let unsettled = weights.weights().map(|wc| mix(&sep, &wc));
+        let whole = mix_plate(&sep, &weights);
+        assert!(
+            (0..3).any(|c| unsettled[c].data != whole[c].data),
+            "the patch has a plate below no light, or the test sees nothing"
+        );
+        for orientation in [1u16, 3, 6] {
+            let (uw, uh) = if matches!(orientation, 5..=8) { (h, w) } else { (w, h) };
+            let g = Geometry { sw: w, sh: h, orientation, uw, uh, fw: uw, fh: uh, map: None };
+            let full = DetailRect { x: 0, y: 0, w: uw, h: uh };
+            let fine = plate_linear(&sep, &weights, &g, full, 1).unwrap();
+            let step = 2;
+            let grid = DetailRect { x: 0, y: 0, w: uw / step, h: uh / step };
+            let coarse = plate_linear(&sep, &weights, &g, grid, step).unwrap();
+            for c in 0..3 {
+                for j in 0..grid.h {
+                    for i in 0..grid.w {
+                        assert_eq!(
+                            coarse[c].at(i, j),
+                            fine[c].at(i * step, j * step),
+                            "plate {c} at {i},{j}, orientation {orientation}"
+                        );
+                    }
+                }
             }
         }
     }
