@@ -6,8 +6,8 @@
 //! * `Preview`: re-mix and tone the downscaled separation plus the zoomed
 //!   detail window (milliseconds). Coalesces: only the newest request is
 //!   rendered, older ones are dropped unseen. Told to forget, it drops
-//!   what it kept once the picture it is painting has been sent, and
-//!   before it takes the next one.
+//!   what it kept. A picture already being painted finishes first. One
+//!   that has not been started is not started.
 //! * `Loupe`: one print box rendered exactly as the TIFF would be
 //!   (resize, sharpen, peak). Coalesces like `Preview`.
 //! * `PeakMeasure`: one-shot thread per measurement of the high-pass
@@ -1005,9 +1005,9 @@ impl Preview {
         }
     }
 
-    /// The session was let go. The thread drops what it kept of that
-    /// picture once the one it is already painting has been sent, and
-    /// before it takes the next picture.
+    /// The session was let go. The thread drops what it kept. A picture
+    /// it is already painting finishes first. One that has not been
+    /// started is not started, and the next picture is taken after that.
     pub fn forget(&mut self) {
         if self.tx.send(PreviewMsg::Forget).is_err() {
             // The thread is gone, and the new one keeps nothing.
@@ -1097,11 +1097,12 @@ impl LinearKey {
 
 /// What has arrived for the preview thread, in order.
 ///
-/// A forget drops what the thread kept. A picture asked for before it is
-/// painted first and is not cancelled: the forget applies to what that
-/// paint kept, and the result already handed on is left where it was
-/// sent. A picture asked for after the forget is taken once the hold is
-/// empty. A picture already being painted is not in this queue.
+/// A forget drops what the thread kept, and a picture that has not been
+/// started is not started: it is the session being let go, and painting
+/// it would hold those planes while the next development allocates. A
+/// picture already being painted is not in this queue, so it finishes and
+/// the forget applies to what that paint kept. A picture asked for after
+/// the forget is taken once the hold is empty.
 fn deliver_preview(
     hold: &mut PreviewHold,
     first: PreviewMsg,
@@ -1114,9 +1115,7 @@ fn deliver_preview(
         match msg {
             PreviewMsg::Request(r) => pending = Some(r),
             PreviewMsg::Forget => {
-                if let Some(req) = pending.take() {
-                    paint(hold, req);
-                }
+                pending = None;
                 *hold = PreviewHold::default();
             }
         }
@@ -1820,9 +1819,9 @@ mod tests {
 
     /// The thread is told to forget. What it kept — the codes, the linear
     /// tile, the detail tile and the stages — is empty afterwards. A
-    /// picture already sent stays sent. One asked for before the forget is
-    /// painted and then dropped from the hold; one asked for after is
-    /// painted on an empty hold, so a poisoned tile is not reused.
+    /// picture already sent stays sent. One asked for and not yet started
+    /// is not started. One asked for after the forget is painted on an
+    /// empty hold, so a poisoned tile is not reused.
     #[test]
     fn a_forget_empties_the_hold_and_leaves_the_picture_already_sent() {
         let session = Arc::new(grey_session());
@@ -1877,7 +1876,8 @@ mod tests {
         assert_eq!(sent.borrow()[0].image.as_ref().unwrap().gray, picture);
         assert!(empty(&hold));
 
-        // Asked for before the forget: painted, then the hold is emptied.
+        // Asked for, and not yet started, when the forget arrives: not
+        // painted. The hold is empty, and the picture already sent stays.
         paint(&mut hold, request(view.clone(), 2), &sent);
         assert!(!empty(&hold));
         let shifted = ViewParams { place: 0.4, ..view.clone() };
@@ -1887,7 +1887,7 @@ mod tests {
         deliver_preview(&mut hold, PreviewMsg::Request(request(shifted, 3)), &rx, |hold, req| {
             paint(hold, req, &sent)
         });
-        assert!(sent.borrow().len() > before, "the picture asked for before the forget is sent");
+        assert_eq!(sent.borrow().len(), before, "a picture that had not started was started");
         assert!(empty(&hold));
 
         // Asked for after the forget: the poisoned tile is gone before the paint.

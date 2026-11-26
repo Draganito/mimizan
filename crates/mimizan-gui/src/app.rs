@@ -3217,8 +3217,9 @@ impl App {
     /// completes "<file> let go ". The measurement of this picture is
     /// dropped first: its thread ends at the next check, and the result
     /// is not applied to the picture that follows. A new file arms its
-    /// own. The preview thread is told to forget what it kept, once the
-    /// picture it is painting has been sent.
+    /// own. The preview thread is told to forget what it kept. A picture
+    /// it is already painting finishes; one that has not been started
+    /// is not started, so those planes are free for the development.
     fn release_session(&mut self, why: String) {
         let Some(s) = self.session.as_ref() else { return };
         let (path, develop) = (s.path.clone(), file_development(s));
