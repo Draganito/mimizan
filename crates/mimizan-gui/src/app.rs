@@ -2732,6 +2732,12 @@ impl App {
         self.question_open() || self.typing || text_edit_focused(ctx)
     }
 
+    /// The save dialog is up now. `dialog_up` is what it was when the
+    /// frame began, and is a frame late in the frame the dialog opens.
+    fn dialog_is_open(&self) -> bool {
+        matches!(self.dialog.state(), DialogState::Open)
+    }
+
     fn question_open(&self) -> bool {
         self.pending_leave.is_some() || self.pending_replace.is_some() || self.dialog_up || self.unlock.open()
     }
@@ -3478,7 +3484,10 @@ impl App {
                 self.hold_grant(&p);
                 self.set_folder(&p);
                 self.show_strip = true;
-            } else if self.busy.is_none() {
+            } else if self.busy.is_none() && !self.question_open() && !self.dialog_is_open() {
+                // Not behind a question or the save dialog: the answer
+                // would then be about this file, and the export under the
+                // name offered for the one before.
                 self.open(p);
             }
         }
