@@ -153,7 +153,7 @@ impl CameraFile {
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut json = serde_json::to_string_pretty(self)?;
         json.push('\n');
-        std::fs::write(path, json)?;
+        crate::outfile::write_bytes(path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -265,7 +265,7 @@ impl LookFile {
     pub fn save(&self, path: &Path) -> Result<()> {
         let mut json = serde_json::to_string_pretty(self)?;
         json.push('\n');
-        std::fs::write(path, json)?;
+        crate::outfile::write_bytes(path, json.as_bytes())?;
         Ok(())
     }
 }

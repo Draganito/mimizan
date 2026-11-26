@@ -6,8 +6,7 @@ use crate::icc::{gray_profile, GrayTrc};
 use crate::plane::Plane;
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::{BufWriter, Seek, Write};
+use std::io::{Seek, Write};
 use std::path::Path;
 use tiff::encoder::{colortype, Rational, TiffEncoder, TiffKind, TiffKindBig, TiffKindStandard, TiffValue};
 use tiff::tags::{ResolutionUnit, Tag};
@@ -224,17 +223,18 @@ where
     let sample_bytes = std::mem::size_of_val(image.data) as u64;
     let strips = (image.height as u64).div_ceil(u64::from(image.rows_per_strip.max(1)));
     let tag_bytes = (description.len() + tags.icc.map_or(0, <[u8]>::len)) as u64;
-    let file = BufWriter::new(File::create(path)?);
-    if fits_classic(sample_bytes, strips, tag_bytes) {
-        encode::<_, TiffKindStandard, C>(TiffEncoder::new(file)?, image, &description, tags)
-    } else {
-        tracing::info!(
-            "{}: {:.1} GiB is past a classic TIFF, written as BigTIFF",
-            path.display(),
-            sample_bytes as f64 / (1u64 << 30) as f64
-        );
-        encode::<_, TiffKindBig, C>(TiffEncoder::new_big(file)?, image, &description, tags)
-    }
+    crate::outfile::write_whole(path, |file| {
+        if fits_classic(sample_bytes, strips, tag_bytes) {
+            encode::<_, TiffKindStandard, C>(TiffEncoder::new(file)?, image, &description, tags)
+        } else {
+            tracing::info!(
+                "{}: {:.1} GiB is past a classic TIFF, written as BigTIFF",
+                path.display(),
+                sample_bytes as f64 / (1u64 << 30) as f64
+            );
+            encode::<_, TiffKindBig, C>(TiffEncoder::new_big(file)?, image, &description, tags)
+        }
+    })
 }
 
 fn encode<W, K, C>(
@@ -263,9 +263,13 @@ where
         if tags.orientation >= 1 && tags.orientation <= 8 {
             d.write_tag(Tag::Orientation, tags.orientation)?;
         }
-    }
-    if let Some(dpi) = tags.dpi {
-        img.resolution(ResolutionUnit::Inch, Rational { n: (dpi * 1000.0).round() as u32, d: 1000 });
+        // Tag by tag: the crate's `resolution` unwraps its three writes.
+        if let Some(dpi) = tags.dpi {
+            let per_inch = || Rational { n: (dpi * 1000.0).round() as u32, d: 1000 };
+            d.write_tag(Tag::ResolutionUnit, ResolutionUnit::Inch.to_u16())?;
+            d.write_tag(Tag::XResolution, per_inch())?;
+            d.write_tag(Tag::YResolution, per_inch())?;
+        }
     }
     img.write_data(image.data)?;
     Ok(())
@@ -354,13 +358,14 @@ mod tests {
         let classic = tmp("classic.tif");
         write_gray16_u16(&classic, w, h, &data, &meta).unwrap();
         let big = tmp("big.tif");
-        let file = BufWriter::new(File::create(&big).unwrap());
-        encode::<_, TiffKindBig, colortype::Gray16>(
-            TiffEncoder::new_big(file).unwrap(),
-            &image,
-            &ascii_description(DESCRIPTION),
-            &meta.tags(&icc),
-        )
+        crate::outfile::write_whole(&big, |file| {
+            encode::<_, TiffKindBig, colortype::Gray16>(
+                TiffEncoder::new_big(file)?,
+                &image,
+                &ascii_description(DESCRIPTION),
+                &meta.tags(&icc),
+            )
+        })
         .unwrap();
 
         // The two differ in the header: 42 for the classic, 43 for the big.
@@ -373,7 +378,7 @@ mod tests {
         assert_eq!(a.orientation, b.orientation);
         same_json(b.description);
         let tag = |p: &Path, t: Tag| {
-            let mut dec = tiff::decoder::Decoder::new(File::open(p).unwrap()).unwrap();
+            let mut dec = tiff::decoder::Decoder::new(std::fs::File::open(p).unwrap()).unwrap();
             dec.get_tag_u8_vec(t).ok()
         };
         assert_eq!(tag(&big, Tag::IccProfile), Some(icc.clone()));

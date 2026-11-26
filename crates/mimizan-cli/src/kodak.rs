@@ -420,9 +420,12 @@ pub fn kodak(a: &KodakArgs) -> Result<()> {
         tools,
         images,
     };
-    std::fs::write(a.out.join("kodak.json"), serde_json::to_string_pretty(&report)?)?;
+    mimizan_core::outfile::write_bytes(
+        &a.out.join("kodak.json"),
+        serde_json::to_string_pretty(&report)?.as_bytes(),
+    )?;
     let strips_rel = pathdiff(&a.strips, a.report.parent().unwrap_or(Path::new(".")));
-    std::fs::write(&a.report, markdown(&report, &strips_rel))?;
+    mimizan_core::outfile::write_bytes(&a.report, markdown(&report, &strips_rel).as_bytes())?;
     println!("wrote {} and {} strips in {}", a.report.display(), report.images.len(), a.strips.display());
     Ok(())
 }

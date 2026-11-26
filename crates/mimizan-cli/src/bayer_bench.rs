@@ -251,9 +251,12 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
         methods: METHODS.iter().map(|m| m.name).collect(),
         images,
     };
-    std::fs::write(a.out.join("bayer.json"), serde_json::to_string_pretty(&report)?)?;
+    mimizan_core::outfile::write_bytes(
+        &a.out.join("bayer.json"),
+        serde_json::to_string_pretty(&report)?.as_bytes(),
+    )?;
     let md = markdown(&report);
-    std::fs::write(a.out.join("report.md"), &md)?;
+    mimizan_core::outfile::write_bytes(&a.out.join("report.md"), md.as_bytes())?;
     print!("{md}");
     Ok(())
 }

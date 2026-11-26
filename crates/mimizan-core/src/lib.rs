@@ -22,6 +22,7 @@ pub mod linear;
 pub mod mask;
 pub mod metrics;
 pub mod mix;
+pub mod outfile;
 pub mod paper;
 pub mod peak;
 pub mod pipeline;

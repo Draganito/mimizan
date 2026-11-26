@@ -314,8 +314,9 @@ fn rotate_gray8_cw(w: usize, h: usize, g: &[u8], quarter_turns: u8) -> (usize, u
 /// `<negative stem>.mask.tif` next to the negative: where the mask is
 /// written and where the print looks for it.
 pub fn sidecar_path(neg: &Path) -> PathBuf {
-    let stem = neg.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    neg.with_file_name(format!("{stem}.mask.tif"))
+    let mut name = neg.file_stem().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".mask.tif");
+    neg.with_file_name(name)
 }
 
 /// The rendered sheet and its description.
@@ -1431,6 +1432,11 @@ pub fn write_as(out: &PrintOutput, path: &Path, p: &PrintParams, file: FileOptio
     if planes.iter().any(|p| (p.width, p.height) != (w, h)) {
         return Err(Error::Invalid("the three print planes differ in size".into()));
     }
+    if is_jpeg_path(path) && !jpeg_holds(w, h) {
+        return Err(Error::Invalid(format!(
+            "a JPEG holds at most {JPEG_SIDE_MAX} pixels a side, and this print is {w} x {h}: write it as a TIFF"
+        )));
+    }
     let channels = if space.is_some() { 3 } else { 1 };
     let dpi = Some(p.recipe.dpi);
     let q8 = |v: f64| (file_value(v, trc) * 255.0).round() as u8;
@@ -1462,6 +1468,14 @@ fn jpeg_density(dpi: Option<f64>) -> image::codecs::jpeg::PixelDensity {
     }
 }
 
+/// The longest side a JPEG can state: its header has two bytes for each.
+pub const JPEG_SIDE_MAX: usize = 65535;
+
+/// Whether a picture of this size can be written as a JPEG.
+pub fn jpeg_holds(width: usize, height: usize) -> bool {
+    (1..=JPEG_SIDE_MAX).contains(&width) && (1..=JPEG_SIDE_MAX).contains(&height)
+}
+
 /// `.jpg` or `.jpeg`, any case.
 pub fn is_jpeg_path(path: &Path) -> bool {
     matches!(
@@ -1484,12 +1498,13 @@ fn write_jpeg_samples(
 ) -> Result<()> {
     use image::ImageEncoder;
     let colour = if channels == 3 { image::ExtendedColorType::Rgb8 } else { image::ExtendedColorType::L8 };
-    let file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
-    enc.set_pixel_density(jpeg_density(dpi));
-    enc.set_icc_profile(icc).map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
-    enc.write_image(samples, width as u32, height as u32, colour)?;
-    Ok(())
+    crate::outfile::write_whole(path, |file| {
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 100);
+        enc.set_pixel_density(jpeg_density(dpi));
+        enc.set_icc_profile(icc).map_err(|e| Error::Invalid(format!("jpeg icc: {e}")))?;
+        enc.write_image(samples, width as u32, height as u32, colour)?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -3359,6 +3374,26 @@ mod tests {
                 assert!((back.samples[3 * i + c] - plane.data[i]).abs() <= 0.5 / 255.0 + 1e-12);
             }
         }
+    }
+
+    /// A JPEG states a side in two bytes. A sheet past that is refused
+    /// before the name is touched: the print that stood there stays.
+    #[test]
+    fn a_sheet_too_long_for_a_jpeg_is_refused_and_the_earlier_file_stays() {
+        let (out, p, dir) = ringed_print("jpeg-side");
+        let path = dir.join("print.jpg");
+        write(&out, &path, &p).unwrap();
+        let earlier = std::fs::read(&path).unwrap();
+        assert!(jpeg_holds(JPEG_SIDE_MAX, 1) && !jpeg_holds(JPEG_SIDE_MAX + 1, 1) && !jpeg_holds(0, 1));
+
+        let long =
+            PrintOutput { plane: Plane::zeros(JPEG_SIDE_MAX + 1, 1), info: out.info.clone(), plate: None };
+        let refused = write(&long, &path, &p).unwrap_err().to_string();
+        assert!(refused.contains("65535") && refused.contains("65536 x 1"), "{refused}");
+        assert_eq!(std::fs::read(&path).unwrap(), earlier);
+        // The same sheet is a TIFF without a word.
+        write(&long, &dir.join("print.tif"), &p).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The JPEG follows the same choice: grey with the grey profile, or

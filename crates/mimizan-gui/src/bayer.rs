@@ -15,7 +15,7 @@ use rawler::rawimage::RawPhotometricInterpretation;
 use rawler::rawsource::RawSource;
 use rawler::RawImage;
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -216,23 +216,12 @@ pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
     let (alpha, alpha_c) = (dev.prior.alpha, dev.prior.alpha_c);
 
     tell("writing the DNG".into());
-    let part = PathBuf::from(format!("{}.part", head.dng.display()));
-    let written = File::create(&part).map_err(|e| format!("{}: {e}", part.display())).and_then(|file| {
-        let mut out = BufWriter::new(file);
-        dng::write(&mut out, &source, decoder.as_ref(), img, dev, true, SOFTWARE)?;
-        let file = out.into_inner().map_err(|e| format!("{}: {e}", part.display()))?;
-        file.sync_all().map_err(|e| format!("{}: {e}", part.display()))
-    });
-    let renamed = written.and_then(|()| {
-        if head.dng.exists() {
-            fs::remove_file(&head.dng).map_err(|e| format!("{}: {e}", head.dng.display()))?;
-        }
-        fs::rename(&part, &head.dng).map_err(|e| format!("{}: {e}", head.dng.display()))
-    });
-    if let Err(e) = renamed {
-        let _ = fs::remove_file(&part);
-        return Err(e);
-    }
+    // Whole under its name or not there: a DNG cut off half way would be
+    // taken for the finished one at the next open.
+    mimizan_core::outfile::write_whole(&head.dng, |out| {
+        dng::write(out, &source, decoder.as_ref(), img, dev, true, SOFTWARE).map_err(std::io::Error::other)
+    })
+    .map_err(|e| e.to_string())?;
     Ok(format!(
         "DNG written in {:.0} s, prior f^{alpha:.2} and f^{alpha_c:.2}, {:.3}% burnt out and kept",
         started.elapsed().as_secs_f64(),

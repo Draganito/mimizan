@@ -39,8 +39,6 @@ use crate::straighten::STRAIGHTEN_KERNEL;
 use crate::tiffout::{write_gray16_range, write_gray8, TiffMeta};
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::BufWriter;
 use std::path::Path;
 use tiff::encoder::colortype::RGB16;
 use tiff::encoder::{Rational, SRational, TiffEncoder, TiffValue};
@@ -209,6 +207,10 @@ pub fn write_negative(
     range: f64,
     description: &str,
 ) -> Result<Written> {
+    // Before either file is touched.
+    if mask.is_some_and(|m| (m.width, m.height) != (plane.width, plane.height)) {
+        return Err(Error::Invalid("the mask and the negative differ in size".into()));
+    }
     let out = framed(plane, framing, STRAIGHTEN_KERNEL);
     write_gray16_range(
         path,
@@ -217,9 +219,6 @@ pub fn write_negative(
         &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None },
     )?;
     if let Some(m) = mask {
-        if (m.width, m.height) != (plane.width, plane.height) {
-            return Err(Error::Invalid("the mask and the negative differ in size".into()));
-        }
         let fm = framed(m, framing, MASK_KERNEL);
         let bytes: Vec<u8> = fm.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
         write_gray8(
@@ -281,42 +280,43 @@ pub fn write_dng(
         });
     }
 
-    let file = BufWriter::new(File::create(path)?);
-    let mut enc = TiffEncoder::new(file)?;
-    let mut img = enc.new_image::<RGB16>(width as u32, height as u32)?;
-    img.rows_per_strip(64)?;
-    {
-        let d = img.encoder();
-        d.write_tag(Tag::PhotometricInterpretation, LINEAR_RAW)?;
-        d.write_tag(Tag::NewSubfileType, 0u32)?;
-        d.write_tag(Tag::PlanarConfiguration, 1u16)?;
-        d.write_tag(Tag::Orientation, 1u16)?;
-        d.write_tag(Tag::Make, &*ascii_even(meta.make))?;
-        d.write_tag(Tag::Model, &*ascii_even(meta.model))?;
-        // The description is JSON: its letters outside ASCII are escaped,
-        // not replaced, so the source path in it stays the path.
-        let description = crate::tiffout::ascii_description(meta.description);
-        d.write_tag(Tag::ImageDescription, &*ascii_even(&description))?;
-        d.write_tag(Tag::Software, &*ascii_even(concat!("mimizan ", env!("CARGO_PKG_VERSION"))))?;
-        // DNGVersion, DNGBackwardVersion.
-        d.write_tag(Tag::Unknown(50706), &[1u8, 4, 0, 0][..])?;
-        d.write_tag(Tag::Unknown(50707), &[1u8, 1, 0, 0][..])?;
-        // UniqueCameraModel.
-        let unique = format!("{} {}", meta.make.trim(), meta.model.trim());
-        d.write_tag(Tag::Unknown(50708), &*ascii_even(unique.trim()))?;
-        // BlackLevel, WhiteLevel: one per sample.
-        d.write_tag(Tag::Unknown(50714), &[0u32, 0, 0][..])?;
-        d.write_tag(Tag::Unknown(50717), &[65535u32, 65535, 65535][..])?;
-        // ColorMatrix1, CalibrationIlluminant1.
-        let m: Vec<SRational> = meta.xyz_to_cam.iter().flatten().map(|&v| srational(v)).collect();
-        d.write_tag(Tag::Unknown(50721), SRationals(m))?;
-        d.write_tag(Tag::Unknown(50778), meta.illuminant.unwrap_or(0))?;
-        // AsShotNeutral: the raw value of a neutral, G = 1.
-        let n: Vec<Rational> = meta.wb.iter().map(|&k| rational(1.0 / k)).collect();
-        d.write_tag(Tag::Unknown(50728), Rationals(n))?;
-    }
-    img.write_data(&data)?;
-    Ok(Written { width, height })
+    crate::outfile::write_whole(path, |file| {
+        let mut enc = TiffEncoder::new(file)?;
+        let mut img = enc.new_image::<RGB16>(width as u32, height as u32)?;
+        img.rows_per_strip(64)?;
+        {
+            let d = img.encoder();
+            d.write_tag(Tag::PhotometricInterpretation, LINEAR_RAW)?;
+            d.write_tag(Tag::NewSubfileType, 0u32)?;
+            d.write_tag(Tag::PlanarConfiguration, 1u16)?;
+            d.write_tag(Tag::Orientation, 1u16)?;
+            d.write_tag(Tag::Make, &*ascii_even(meta.make))?;
+            d.write_tag(Tag::Model, &*ascii_even(meta.model))?;
+            // The description is JSON: its letters outside ASCII are escaped,
+            // not replaced, so the source path in it stays the path.
+            let description = crate::tiffout::ascii_description(meta.description);
+            d.write_tag(Tag::ImageDescription, &*ascii_even(&description))?;
+            d.write_tag(Tag::Software, &*ascii_even(concat!("mimizan ", env!("CARGO_PKG_VERSION"))))?;
+            // DNGVersion, DNGBackwardVersion.
+            d.write_tag(Tag::Unknown(50706), &[1u8, 4, 0, 0][..])?;
+            d.write_tag(Tag::Unknown(50707), &[1u8, 1, 0, 0][..])?;
+            // UniqueCameraModel.
+            let unique = format!("{} {}", meta.make.trim(), meta.model.trim());
+            d.write_tag(Tag::Unknown(50708), &*ascii_even(unique.trim()))?;
+            // BlackLevel, WhiteLevel: one per sample.
+            d.write_tag(Tag::Unknown(50714), &[0u32, 0, 0][..])?;
+            d.write_tag(Tag::Unknown(50717), &[65535u32, 65535, 65535][..])?;
+            // ColorMatrix1, CalibrationIlluminant1.
+            let m: Vec<SRational> = meta.xyz_to_cam.iter().flatten().map(|&v| srational(v)).collect();
+            d.write_tag(Tag::Unknown(50721), SRationals(m))?;
+            d.write_tag(Tag::Unknown(50778), meta.illuminant.unwrap_or(0))?;
+            // AsShotNeutral: the raw value of a neutral, G = 1.
+            let n: Vec<Rational> = meta.wb.iter().map(|&k| rational(1.0 / k)).collect();
+            d.write_tag(Tag::Unknown(50728), Rationals(n))?;
+        }
+        img.write_data(&data)?;
+        Ok(Written { width, height })
+    })
 }
 
 #[cfg(test)]
