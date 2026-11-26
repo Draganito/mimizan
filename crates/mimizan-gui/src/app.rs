@@ -968,6 +968,12 @@ pub struct App {
     /// config file holds, so a drag is written once, when it ends.
     strip_height: f32,
     strip_height_saved: f32,
+    /// The settings differ from the file. It stays set while the pointer
+    /// is down; the frame the pointer is up writes `pending_settings`.
+    settings_dirty: bool,
+    /// The settings `persist` last marked, in the form the file holds.
+    /// A later mark replaces this one, and the file is written once.
+    pending_settings: Option<Persisted>,
     /// Docked windows open: 0 Negative (left), 1 Print (right), 2 Enlarger (bottom).
     panels: [bool; 3],
     /// Open panels that had no rectangle last frame. The toolbar button
@@ -1281,6 +1287,8 @@ impl App {
             },
             strip_height,
             strip_height_saved: strip_height,
+            settings_dirty: false,
+            pending_settings: None,
             panels: persisted.panels.unwrap_or([true; 3]),
             waiting: [false; 3],
             enlarger_h: None,
@@ -1413,8 +1421,14 @@ impl App {
         app
     }
 
-    fn persist(&self) {
-        Persisted {
+    /// Mark the settings for the file. The file is written on a frame the
+    /// pointer is up (`settings_due`), and several marks before that frame
+    /// are one write. The file receives this mark, so a field that moves
+    /// afterwards without another mark is left as it was. A failure to
+    /// write stays silent.
+    fn persist(&mut self) {
+        self.settings_dirty = true;
+        self.pending_settings = Some(Persisted {
             folder: browser::remembered_folder(
                 self.folder.as_ref().map(|f| f.path.as_path()),
                 self.folder_asked.as_deref(),
@@ -1436,8 +1450,20 @@ impl App {
             sheet_free: Some(self.sheet_free),
             brush: self.brush_set.then_some(self.brush),
             folder_bookmark: self.saved_bookmark(),
+        });
+    }
+
+    /// Write the marked settings on a frame the pointer is up. The frames
+    /// `settle_brush` runs ask `settings_due` here. A button held down
+    /// leaves the mark until the pointer is up, so those frames are one write.
+    fn flush_settings(&mut self, pointer_down: bool) {
+        if !settings_due(self.settings_dirty, pointer_down) {
+            return;
         }
-        .save();
+        self.settings_dirty = false;
+        if let Some(settings) = self.pending_settings.take() {
+            settings.save();
+        }
     }
 
     /// The sandbox grant, when this process is inside one. A Mac build that
@@ -2636,7 +2662,9 @@ impl App {
 
     /// An open brush whose handles have left the picture is pulled back
     /// in, so they can be taken hold of again. A shape already kept is
-    /// written back then, unless a handle is still in the hand.
+    /// marked for the settings then, unless a handle is still in the
+    /// hand. The frames this runs on share that mark: the file is written
+    /// once, on the frame the pointer is up.
     fn settle_brush(&mut self, centre: (f64, f64), k: f64, rect: Rect, back: &straighten::Affine) {
         if self.burn_locked {
             return;
@@ -7706,7 +7734,15 @@ impl eframe::App for App {
         // For the keys of the next frame.
         self.typing = text_edit_focused(&ctx);
         self.list_open = egui::Popup::is_any_open(&ctx);
+        self.flush_settings(ctx.input(|i| i.pointer.any_down()));
     }
+}
+
+/// Whether this frame writes the settings. A dirty window waits while a
+/// button is down, so the frames that pull a brush back are one write,
+/// on the frame the pointer is up.
+fn settings_due(dirty: bool, pointer_down: bool) -> bool {
+    dirty && !pointer_down
 }
 
 /// The docked windows' places for one frame.
@@ -9600,5 +9636,26 @@ mod strip_tile_tests {
             let brute: Vec<usize> = (0..n).filter(|k| touches(origin, tile_w, *k, left, right)).collect();
             assert_eq!(got, brute, "origin {origin} tile {tile_w} n {n} clip {left}..{right}");
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_write_tests {
+    use super::settings_due;
+
+    /// The frames a kept brush is pulled back through, then the frame the
+    /// pointer is up. One of them writes. A window that is not dirty never does.
+    #[test]
+    fn a_dirty_window_writes_on_the_frame_the_pointer_is_up() {
+        assert!(!settings_due(false, false));
+        assert!(!settings_due(false, true));
+        let mut writes = 0;
+        for pointer_down in [true, true, true] {
+            if settings_due(true, pointer_down) {
+                writes += 1;
+            }
+        }
+        assert_eq!(writes, 0);
+        assert!(settings_due(true, false));
     }
 }
