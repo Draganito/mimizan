@@ -16,8 +16,8 @@
 //! develops at once, and a file dropped on the window does too.
 //!
 //! RawTherapee and dcraw are the names on the path, unless *RawTherapee…*
-//! or *dcraw…* has pointed at the program. The choice is kept beside this
-//! program, in `mimizan-compare.tools`.
+//! or *dcraw…* has pointed at the program. The choice is kept with the
+//! darkroom's settings, in `mimizan/compare.tools`.
 //!
 //! The developed TIFFs land in `photo.mimizan-compare/` beside the RAW and
 //! are kept. A second open reads them. *Develop again* writes them over.
@@ -1459,21 +1459,29 @@ fn tool_directory(current: &Path) -> PathBuf {
 }
 
 fn tools_file() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.with_file_name("mimizan-compare.tools"))
+    Some(mimizan_core::home::settings_dir()?.join("compare.tools"))
+}
+
+/// Where versions up to 0.20.15 kept it: beside the program.
+fn old_tools_file() -> Option<PathBuf> {
+    Some(std::env::current_exe().ok()?.with_file_name("mimizan-compare.tools"))
 }
 
 fn load_tools() -> Tools {
-    let Some(path) = tools_file() else {
-        return Tools::default();
-    };
-    std::fs::read_to_string(path).map(|text| decode_tools(&text)).unwrap_or_default()
+    [tools_file(), old_tools_file()]
+        .into_iter()
+        .flatten()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|text| decode_tools(&text))
+        .unwrap_or_default()
 }
 
 fn save_tools(tools: &Tools) -> Result<()> {
-    let path = tools_file().context("the program's own folder is not known")?;
-    std::fs::write(&path, encode_tools(&tools.rawtherapee, &tools.dcraw))
-        .with_context(|| format!("writing {}", path.display()))?;
+    let path = tools_file().context("there is no settings folder")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    mimizan_core::outfile::write_bytes(&path, encode_tools(&tools.rawtherapee, &tools.dcraw).as_bytes())?;
     Ok(())
 }
 
@@ -1525,11 +1533,8 @@ fn dialog_directory(typed: &str) -> PathBuf {
             return parent.to_path_buf();
         }
     }
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home = PathBuf::from(home);
-        if home.is_dir() {
-            return home;
-        }
+    if let Some(home) = mimizan_core::home::home_dir().filter(|home| home.is_dir()) {
+        return home;
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -1718,6 +1723,8 @@ fn read_crop(v: &serde_json::Value) -> Result<Crop> {
         v.get(key)
             .and_then(|n| n.as_u64())
             .map(|n| n as usize)
+/// Where the choice is kept: with the darkroom's settings. An installed
+/// program cannot write beside itself.
             .with_context(|| format!("the crop has no {key}"))
     };
     Ok(Crop { x: n("x")?, y: n("y")?, w: n("w")?, h: n("h")? })
