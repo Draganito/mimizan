@@ -2175,7 +2175,8 @@ impl App {
 
     fn paint_crop(&self, painter: &egui::Painter, rect: Rect) {
         let Some((shown, uw, uh)) = self.turned_window() else { return };
-        if uw == 0 || uh == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        // Written so that a rectangle that is not a number is no rectangle.
+        if uw == 0 || uh == 0 || !(rect.width() > 0.0 && rect.height() > 0.0) {
             return;
         }
         let x = rect.left() + shown.x as f32 / uw as f32 * rect.width();
@@ -5886,6 +5887,13 @@ impl App {
         // does not jump.
         let fit = (stage.width() / (tw as f32 + 2.0 * frame_tex.x))
             .min(stage.height() / (th as f32 + 2.0 * frame_tex.y));
+        // The windows have left the stage no room. Nothing is drawn, and
+        // the zoom is not worked out from a fit of zero: it would be no
+        // number from then on, with no picture until the next double
+        // click. A scale kept for a turn waits for the frame with room.
+        if !(fit > 0.0 && fit.is_finite()) {
+            return;
+        }
         if let Some(scale) = self.keep_scale.take() {
             self.zoom = (scale / fit).clamp(1.0, MAX_ZOOM);
         } else if let (Some(old_fit), Some(old_stage)) = (self.last_fit, self.last_stage) {
