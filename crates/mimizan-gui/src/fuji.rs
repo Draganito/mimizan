@@ -12,7 +12,6 @@ use mimizan_core::thumb::Thumb;
 use mimizan_lab_xtrans::convert::frame_of;
 use mimizan_lab_xtrans::file::{self, Event, Options, Report};
 use rawler::decoders::RawDecodeParams;
-use rawler::rawsource::RawSource;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
@@ -95,7 +94,7 @@ pub fn place(path: &Path) -> Place {
     if !is_raf(path) {
         return Place::NotXtrans;
     }
-    let Ok(source) = RawSource::new(path) else {
+    let Ok(source) = mimizan_core::decode::raw_source(path) else {
         return Place::NotXtrans;
     };
     let Ok(decoder) = rawler::get_decoder(&source) else {

@@ -11,8 +11,6 @@ use mimizan_cli::bayer_ls;
 use mimizan_lab_xtrans::convert::Developed;
 use mimizan_lab_xtrans::dng;
 use rawler::decoders::RawDecodeParams;
-use rawler::rawimage::RawPhotometricInterpretation;
-use rawler::rawsource::RawSource;
 use rawler::RawImage;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -190,10 +188,10 @@ pub fn place(path: &Path) -> Place {
 
 /// Width and height of a Bayer file this path writes out.
 fn head_of(raw: &Path) -> Option<Head> {
-    let source = RawSource::new(raw).ok()?;
+    let source = mimizan_core::decode::raw_source(raw).ok()?;
     let decoder = rawler::get_decoder(&source).ok()?;
     let img = decoder.raw_image(&source, &RawDecodeParams::default(), true).ok()?;
-    bayer_name(&img)?;
+    bayer_ls::bayer_phase(&img)?;
     Some(Head { raw: raw.to_path_buf(), dng: dng_of(raw), width: img.width, height: img.height })
 }
 
@@ -205,7 +203,7 @@ pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
     }
     let started = Instant::now();
     tell("reading the Bayer file".into());
-    let source = RawSource::new(&head.raw).map_err(|e| format!("cannot be read: {e}"))?;
+    let source = mimizan_core::decode::raw_source(&head.raw).map_err(|e| format!("cannot be read: {e}"))?;
     let decoder =
         rawler::get_decoder(&source).map_err(|e| format!("not a raw file this program reads: {e}"))?;
     let img = decoder
@@ -233,16 +231,6 @@ pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
 /// photosite, so the tile is the RGGB one the bench measured.
 fn develop(img: &RawImage, tell: &dyn Fn(String)) -> Result<Developed, String> {
     bayer_ls::develop(img, tell)
-}
-
-fn bayer_name(img: &RawImage) -> Option<String> {
-    let RawPhotometricInterpretation::Cfa(config) = &img.photometric else {
-        return None;
-    };
-    if config.cfa.width != 2 || config.cfa.height != 2 || config.cfa.name.len() != 4 {
-        return None;
-    }
-    Some(config.cfa.name.clone())
 }
 
 #[cfg(test)]

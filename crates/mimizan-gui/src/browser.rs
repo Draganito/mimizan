@@ -640,9 +640,8 @@ fn make_thumb(job: &ThumbJob, cache: Option<&Path>, cameras_dir: &Path) -> Resul
 /// neither a preview nor a thumbnail: the caller then bins the channels.
 fn dng_preview(path: &Path) -> Option<(Thumb, Meta)> {
     use rawler::decoders::{RawDecodeParams, WellKnownIFD};
-    use rawler::rawsource::RawSource;
     use rawler::tags::TiffCommonTag;
-    let source = RawSource::new(path).ok()?;
+    let source = mimizan_core::decode::raw_source(path).ok()?;
     let decoder = rawler::get_decoder(&source).ok()?;
     let params = RawDecodeParams::default();
     let image = decoder

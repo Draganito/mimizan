@@ -810,7 +810,7 @@ fn send_picture(tx: &mpsc::Sender<Note>, slot: usize, path: &Path, ours: bool, o
 /// EXIF orientation, the same choice the negative uses: the raw IFD, and
 /// the EXIF value when that IFD says the frame is not turned.
 fn camera_orientation(path: &Path) -> u8 {
-    let Ok(source) = rawler::rawsource::RawSource::new(path) else {
+    let Ok(source) = mimizan_core::decode::raw_source(path) else {
         return 1;
     };
     let Ok(decoder) = rawler::get_decoder(&source) else {
@@ -949,7 +949,7 @@ fn sensor_of(path: &Path) -> Result<Sensor> {
 }
 
 fn load_image(path: &Path, dummy: bool) -> Result<rawler::RawImage> {
-    let source = rawler::rawsource::RawSource::new(path).context("cannot be read")?;
+    let source = mimizan_core::decode::raw_source(path).context("cannot be read")?;
     let decoder = rawler::get_decoder(&source).context("not a raw file this program reads")?;
     decoder
         .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), dummy)
@@ -1242,7 +1242,7 @@ fn raw_preview(path: &Path) -> Option<image::DynamicImage> {
             return Some(image);
         }
     }
-    let source = rawler::rawsource::RawSource::new(path).ok()?;
+    let source = mimizan_core::decode::raw_source(path).ok()?;
     let decoder = rawler::get_decoder(&source).ok()?;
     let params = rawler::decoders::RawDecodeParams::default();
     decoder.thumbnail_image(&source, &params).ok().flatten()

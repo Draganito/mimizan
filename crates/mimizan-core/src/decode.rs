@@ -179,14 +179,61 @@ pub fn exposure_from(md: &rawler::decoders::RawMetadata) -> Exposure {
     }
 }
 
+/// The file at `path`, read whole, as rawler takes it.
+///
+/// rawler's own `RawSource::new` maps the file into memory. A card that is
+/// pulled or a file another program cuts short while a decoder reads the
+/// map ends the whole process with a bus error, which nothing can catch. A
+/// read fails with an error instead; the cost is one buffer of the file's
+/// size for the length of the decode.
+#[cfg(feature = "decode-rawler")]
+pub fn raw_source(path: &Path) -> std::io::Result<rawler::rawsource::RawSource> {
+    let bytes = std::fs::read(path)?;
+    Ok(rawler::rawsource::RawSource::new_from_shared_vec(std::sync::Arc::new(bytes)).with_path(path))
+}
+
+/// `work`, with a panic inside it turned into an error.
+///
+/// rawler's decoders stop on some file contents with a panic (`todo!()`
+/// for a layout they do not know, an index past the end of a damaged
+/// file). rawler catches those around its own entry point; the calls made
+/// here go past it, so they are caught here: a file is never a reason for
+/// the program to end.
+#[cfg(feature = "decode-rawler")]
+pub fn guarded<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let said = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_owned());
+            Err(Error::Decode(format!("the decoder stopped on this file: {said}")))
+        }
+    }
+}
+
 #[cfg(feature = "decode-rawler")]
 impl RawlerDecoder {
     pub fn decode(&self, path: &Path) -> Result<RawFrame> {
+        let source = raw_source(path).map_err(|e| Error::Decode(e.to_string()))?;
+        guarded(|| Self::decode_source(&source))
+    }
+
+    fn decode_source(source: &rawler::rawsource::RawSource) -> Result<RawFrame> {
         use rawler::rawimage::RawPhotometricInterpretation as P;
-        let source = rawler::rawsource::RawSource::new(path).map_err(|e| Error::Decode(e.to_string()))?;
-        let decoder = rawler::get_decoder(&source).map_err(|e| Error::Decode(e.to_string()))?;
+        let decoder = rawler::get_decoder(source).map_err(|e| Error::Decode(e.to_string()))?;
         let params = rawler::decoders::RawDecodeParams::default();
-        let img = decoder.raw_image(&source, &params, false).map_err(|e| Error::Decode(e.to_string()))?;
+        let img = decoder.raw_image(source, &params, false).map_err(|e| Error::Decode(e.to_string()))?;
+        // rawler hands the photosites of a Fuji Super CCD over on a grid
+        // turned by 45 degrees, under a 2x2 name: read as an upright
+        // Bayer frame it would develop into a turned picture in a square.
+        if img.fuji_rotation_width.is_some() {
+            return Err(Error::Unsupported(
+                "Fuji Super CCD: its photosites lie on a diagonal grid, not on a 2x2 Bayer one".into(),
+            ));
+        }
         // Before the metadata is asked for: a file that is neither a
         // mosaic nor a linear DNG is refused here whatever its metadata
         // is. rawler 0.8 has none for a Sigma X3F (three components per
@@ -201,7 +248,7 @@ impl RawlerDecoder {
             )));
         }
         // Metadata is informational; a file without usable EXIF still decodes.
-        let (exposure, exif_orientation) = match decoder.raw_metadata(&source, &params) {
+        let (exposure, exif_orientation) = match decoder.raw_metadata(source, &params) {
             Ok(md) => (exposure_from(&md), md.exif.orientation.filter(|o| (1..=8).contains(o))),
             Err(err) => {
                 tracing::debug!("no exif metadata: {err}");
@@ -246,8 +293,21 @@ impl RawlerDecoder {
         // rawler's white level is per component. A mosaic has one, so the
         // one-entry form is what real files give; three or four entries are
         // read as R, G, B in case a decoder lists them per colour.
+        //
+        // A DNG that states no WhiteLevel means 1.0 when its samples are
+        // floating point (DNG specification); rawler fills in 2^bits - 1
+        // whatever the sample format, which would divide such a picture
+        // down to black.
+        let float_without_white = matches!(img.data, rawler::RawImageData::Float(_))
+            && decoder.format_hint() == rawler::decoders::FormatHint::DNG
+            && decoder
+                .ifd(rawler::decoders::WellKnownIFD::Raw)
+                .ok()
+                .flatten()
+                .is_some_and(|ifd| ifd.get_entry(rawler::tags::TiffCommonTag::WhiteLevel).is_none());
         let wl = &img.whitelevel.0;
         let white_rgb: [f64; 3] = match wl.len() {
+            _ if float_without_white => [1.0; 3],
             1 => [f64::from(wl[0]); 3],
             3 | 4 => [f64::from(wl[0]), f64::from(wl[1]), f64::from(wl[2])],
             n => return Err(Error::Unsupported(format!("white level with {n} entries"))),
@@ -450,5 +510,140 @@ impl RawFrame {
                 (lo, hi)
             })
             .reduce(|| (f64::INFINITY, f64::NEG_INFINITY), |a, b| (a.0.min(b.0), a.1.max(b.1)))
+    }
+}
+
+#[cfg(all(test, feature = "decode-rawler"))]
+mod tests {
+    use super::*;
+
+    /// A DNG of 16 x 16 photosites, written by hand: one uncompressed
+    /// strip, 32-bit floating point or 16-bit integer samples, with or
+    /// without a WhiteLevel, and the CFA pattern given.
+    fn tiny_dng(float: bool, white: Option<u32>, cfa: &[u8]) -> Vec<u8> {
+        const SIDE: u32 = 16;
+        let pixels: Vec<u8> = (0..SIDE * SIDE)
+            .flat_map(|i| {
+                let step = (i % SIDE + i / SIDE) as f32 / (2 * SIDE - 2) as f32;
+                if float {
+                    (0.25 + 0.5 * step).to_le_bytes().to_vec()
+                } else {
+                    ((16384.0 + 32768.0 * step) as u16).to_le_bytes().to_vec()
+                }
+            })
+            .collect();
+        let short = |v: u16| v.to_le_bytes().to_vec();
+        let long = |v: u32| v.to_le_bytes().to_vec();
+        let text = |s: &str| [s.as_bytes(), &[0]].concat();
+        // (tag, type, count, value); the strip offset is filled in below.
+        let mut tags: Vec<(u16, u16, u32, Vec<u8>)> = vec![
+            (254, 4, 1, long(0)),
+            (256, 4, 1, long(SIDE)),
+            (257, 4, 1, long(SIDE)),
+            (258, 3, 1, short(if float { 32 } else { 16 })),
+            (259, 3, 1, short(1)),
+            (262, 3, 1, short(32803)),
+            (271, 2, 5, text("Test")),
+            (272, 2, 5, text("Tiny")),
+            (273, 4, 1, Vec::new()),
+            (277, 3, 1, short(1)),
+            (278, 4, 1, long(SIDE)),
+            (279, 4, 1, long(pixels.len() as u32)),
+            (284, 3, 1, short(1)),
+            (339, 3, 1, short(if float { 3 } else { 1 })),
+            (33421, 3, 2, [short((cfa.len() / 2) as u16), short(2)].concat()),
+            (33422, 1, cfa.len() as u32, cfa.to_vec()),
+            (50706, 1, 4, vec![1, 4, 0, 0]),
+            (50708, 2, 10, text("Test Tiny")),
+            (50721, 10, 9, {
+                let unit = [1i32, 0, 0, 0, 1, 0, 0, 0, 1];
+                unit.iter()
+                    .flat_map(|v| [(v * 10000).to_le_bytes(), 10000i32.to_le_bytes()].concat())
+                    .collect()
+            }),
+            (50728, 5, 3, [long(1), long(1)].concat().repeat(3)),
+        ];
+        if let Some(level) = white {
+            tags.push((50717, 4, 1, long(level)));
+        }
+        tags.sort_by_key(|t| t.0);
+        let values_at = 8 + 2 + 12 * tags.len() + 4;
+        let mut values = Vec::new();
+        let mut entries = Vec::new();
+        for (tag, kind, count, value) in &tags {
+            entries.extend([short(*tag), short(*kind), long(*count)].concat());
+            if *tag == 273 {
+                entries.extend([0xAA; 4]);
+            } else if value.len() <= 4 {
+                entries.extend(value.iter().copied().chain(std::iter::repeat(0)).take(4));
+            } else {
+                entries.extend(long((values_at + values.len()) as u32));
+                values.extend(value);
+                if values.len() % 2 == 1 {
+                    values.push(0);
+                }
+            }
+        }
+        let strip = long((values_at + values.len()) as u32);
+        let at = entries.windows(4).position(|w| w == [0xAA; 4]).unwrap();
+        entries[at..at + 4].copy_from_slice(&strip);
+        [b"II*\0".to_vec(), long(8), short(tags.len() as u16), entries, long(0), values, pixels].concat()
+    }
+
+    fn decoded(name: &str, bytes: &[u8]) -> Result<RawFrame> {
+        let path = std::env::temp_dir().join(format!("mimizan-decode-{}-{name}.dng", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let frame = RawlerDecoder.decode(&path);
+        let _ = std::fs::remove_file(&path);
+        frame
+    }
+
+    const RGGB: [u8; 4] = [0, 1, 1, 2];
+
+    #[test]
+    fn the_hand_written_dng_decodes() {
+        let frame = decoded("int", &tiny_dng(false, Some(65535), &RGGB)).unwrap();
+        assert_eq!((frame.width, frame.height), (16, 16));
+        assert_eq!(frame.kind, SensorKind::Bayer(BayerPhase::RGGB));
+        assert_eq!(frame.white_rgb, [65535.0; 3]);
+        assert!(matches!(frame.data, RawData::Integer(_)));
+    }
+
+    /// The DNG default for floating-point samples is 1.0, not 2^32 - 1:
+    /// the picture would otherwise be divided down to black.
+    #[test]
+    fn a_float_dng_without_a_white_level_is_white_at_one() {
+        let frame = decoded("float", &tiny_dng(true, None, &RGGB)).unwrap();
+        assert!(matches!(frame.data, RawData::Float(_)));
+        assert_eq!(frame.white_rgb, [1.0; 3]);
+        let (lo, hi) = frame.raw_range();
+        assert!((lo - 0.25).abs() < 1e-6 && (hi - 0.75).abs() < 1e-6, "{lo} {hi}");
+    }
+
+    #[test]
+    fn a_float_dng_keeps_the_white_level_it_states() {
+        let frame = decoded("float-white", &tiny_dng(true, Some(4), &RGGB)).unwrap();
+        assert_eq!(frame.white_rgb, [4.0; 3]);
+        // An integer file without the tag keeps rawler's 2^bits - 1.
+        let frame = decoded("int-default", &tiny_dng(false, None, &RGGB)).unwrap();
+        assert_eq!(frame.white_rgb, [65535.0; 3]);
+    }
+
+    /// rawler panics on a CFA pattern of eight entries. The file is
+    /// refused; the program goes on.
+    #[test]
+    fn a_file_the_decoder_panics_on_is_an_error() {
+        let err = decoded("cfa8", &tiny_dng(false, Some(65535), &[0, 1, 1, 2, 1, 2, 0, 1])).unwrap_err();
+        assert!(matches!(&err, Error::Decode(text) if text.contains("the decoder stopped")), "{err}");
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_or_not_a_raw_is_an_error() {
+        let missing = std::env::temp_dir().join("mimizan-decode-no-such-file.dng");
+        assert!(matches!(RawlerDecoder.decode(&missing), Err(Error::Decode(_))));
+        assert!(matches!(decoded("text", b"not a raw file"), Err(Error::Decode(_))));
+        // Cut off in the middle of its pixels.
+        let whole = tiny_dng(false, Some(65535), &RGGB);
+        assert!(decoded("cut", &whole[..whole.len() - 200]).is_err());
     }
 }
