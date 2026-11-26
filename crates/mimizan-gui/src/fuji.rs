@@ -75,13 +75,6 @@ pub fn written_note(r: &Report) -> String {
     )
 }
 
-/// A DNG that is there and holds something. An empty file is not one:
-/// `convert` will not write over a file that exists, and an empty one
-/// would otherwise block the RAF for good.
-pub fn dng_is_ready(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
-}
-
 /// The DNG the plate is printed from: the highlights stay in the file.
 pub fn plate_options() -> Options {
     Options { keep_highlights: true, ..Options::default() }
@@ -127,11 +120,26 @@ fn dng_beside(present: bool, software: Option<&str>) -> Beside {
 
 /// A name that is taken, or that cannot be ruled out. Only a name that
 /// is not there may be written.
-fn name_is_there(path: &Path) -> bool {
+pub(crate) fn name_is_there(path: &Path) -> bool {
     !matches!(
         std::fs::symlink_metadata(path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound
     )
+}
+
+/// This program wrote `path`. The Software tag starts as the converter
+/// writes it, and an older version of that converter still counts.
+pub fn dng_is_ours(path: &Path) -> bool {
+    matches!(dng_beside(name_is_there(path), crate::software::software_of(path).as_deref()), Beside::Ours)
+}
+
+/// The name the conversion is written under before it is linked onto
+/// `<stem>.dng`. The name is the program's own, so a stale one may be
+/// removed: the conversion renames onto whatever its target is at the end.
+pub fn staging_dng(dng: &Path) -> PathBuf {
+    let mut name = dng.as_os_str().to_owned();
+    name.push(".mimizan-new");
+    PathBuf::from(name)
 }
 
 /// The sentence an open shows for a `<stem>.dng` this program did not write.
@@ -305,20 +313,6 @@ mod tests {
         );
         assert!(writing > bayer * 3, "{writing} vs {bayer}");
         assert_eq!(convert_memory(0, 100), 0);
-    }
-
-    #[test]
-    fn an_empty_file_is_not_a_dng() {
-        let dir = std::env::temp_dir().join(format!("mimizan-fuji-dng-{}", std::process::id()));
-        let _ = std::fs::create_dir(&dir);
-        let empty = dir.join("empty.dng");
-        let held = dir.join("held.dng");
-        std::fs::write(&empty, b"").unwrap();
-        std::fs::write(&held, b"x").unwrap();
-        assert!(!dng_is_ready(&empty));
-        assert!(dng_is_ready(&held));
-        assert!(!dng_is_ready(&dir.join("missing.dng")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

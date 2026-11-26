@@ -128,6 +128,46 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_whole(path, |sink| sink.write_all(bytes).map_err(|e| named(path, e)))
 }
 
+/// Move `from` onto `to` when `to` is not there.
+///
+/// A hard link is tried first. It fails where the name is taken, and until
+/// `from` is removed the two names are the one file, so nothing is replaced.
+/// A volume that cannot make a link (a FAT or exFAT card, some shares) is
+/// checked once more and then renamed. [`io::ErrorKind::AlreadyExists`] is
+/// returned as such. On any failure `from` is removed.
+pub fn place_new(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::hard_link(from, to) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(from);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(from);
+            Err(e)
+        }
+        Err(_) => match std::fs::symlink_metadata(to) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(from);
+                Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} is there already", to.display()),
+                ))
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => match std::fs::rename(from, to) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    let _ = std::fs::remove_file(from);
+                    Err(err)
+                }
+            },
+            Err(err) => {
+                let _ = std::fs::remove_file(from);
+                Err(err)
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +289,32 @@ mod tests {
             std::os::unix::fs::symlink(&raw, &link).unwrap();
             assert!(same_file(&link, &raw));
         }
+    }
+
+    #[test]
+    fn a_new_file_is_moved_onto_a_free_name() {
+        let dir = Dir::new("place-new");
+        let from = dir.0.join("shot.dng.mimizan-new");
+        let to = dir.0.join("shot.dng");
+        std::fs::write(&from, b"the dng").unwrap();
+        place_new(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"the dng");
+        assert!(!from.exists());
+        assert_eq!(dir.names(), ["shot.dng"]);
+    }
+
+    #[test]
+    fn an_existing_file_is_refused_and_left_as_it_was() {
+        let dir = Dir::new("place-taken");
+        let from = dir.0.join("shot.dng.mimizan-new");
+        let to = dir.0.join("shot.dng");
+        std::fs::write(&from, b"the new one").unwrap();
+        std::fs::write(&to, b"already there").unwrap();
+        let err = place_new(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"already there");
+        assert!(!from.exists(), "no temporary file is left");
+        assert_eq!(dir.names(), ["shot.dng"]);
     }
 
     #[cfg(unix)]

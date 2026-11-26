@@ -469,26 +469,44 @@ fn open(
             if room.on_swap(need) {
                 status("the swap holds the rest".into());
             }
-            // convert will not replace a file that is there. An empty one
-            // is not a DNG; leaving it would block this RAF. A file that
-            // holds something, written since the head was read, stays.
-            if head.dng.is_file() && !crate::fuji::dng_is_ready(&head.dng) {
-                let _ = std::fs::remove_file(&head.dng);
+            // The conversion checks its target once and renames onto it
+            // about a minute later, which would replace a file that
+            // arrived meanwhile. It is written under a name of ours and
+            // linked onto the DNG's name, which fails where that name is
+            // taken. A stale file of the temporary name is ours.
+            let staging = crate::fuji::staging_dng(&head.dng);
+            if std::fs::symlink_metadata(&staging).is_ok() {
+                let _ = std::fs::remove_file(&staging);
             }
             status("reading the X-Trans file".into());
             let written =
-                mimizan_lab_xtrans::file::convert(path, &head.dng, &crate::fuji::plate_options(), &|event| {
+                mimizan_lab_xtrans::file::convert(path, &staging, &crate::fuji::plate_options(), &|event| {
                     status(crate::fuji::words(&event));
                 });
             let report = match written {
-                Ok(report) => Some(report),
+                Ok(report) => match mimizan_core::outfile::place_new(&staging, &head.dng) {
+                    Ok(()) => Some(report),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // A file landed on the DNG's name while the
+                        // conversion worked. One this program wrote is
+                        // the file, as a later open would find it.
+                        if crate::fuji::dng_is_ours(&head.dng) {
+                            None
+                        } else {
+                            return Err(anyhow::Error::msg(crate::fuji::taken_sentence(&head.dng)));
+                        }
+                    }
+                    Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+                },
                 Err(e) => {
-                    // A finished DNG landed between the check and the
-                    // write. It is the file, as a later open would find it.
-                    if !crate::fuji::dng_is_ready(&head.dng) {
+                    let _ = std::fs::remove_file(&staging);
+                    if crate::fuji::dng_is_ours(&head.dng) {
+                        None
+                    } else if crate::fuji::name_is_there(&head.dng) {
+                        return Err(anyhow::Error::msg(crate::fuji::taken_sentence(&head.dng)));
+                    } else {
                         return Err(anyhow::Error::msg(e));
                     }
-                    None
                 }
             };
             status(format!("opening {}", head.dng.display()));
