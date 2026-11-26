@@ -209,9 +209,16 @@ fn sharp_esf(picture: &[f32], width: usize, height: usize) -> Option<Vec<f64>> {
     if ridges.is_empty() {
         return None;
     }
+    // Every k-th ridge once the list is longer than the cap, so the
+    // candidates are spread over the picture and the number scored stays
+    // bounded. k is 1 when the list fits, and every ridge is scored.
+    let step = ridges.len().div_ceil(MAX_EDGES);
     for gate in GATES {
         let mut kept: Vec<(f64, Vec<f64>)> = Vec::new();
-        for &(x, y) in &ridges {
+        for (n, &(x, y)) in ridges.iter().enumerate() {
+            if n % step != 0 {
+                continue;
+            }
             if kept.len() == MAX_EDGES {
                 break;
             }
@@ -544,5 +551,67 @@ mod tests {
         assert!(tuned.found);
         assert_eq!(tuned.radius.to_bits(), 4_608_983_858_650_965_606);
         assert_eq!(tuned.amount.to_bits(), 4_607_633_123_438_910_799);
+    }
+
+    /// One horizontal edge to a cell row. The first `soft_rows` are soft,
+    /// the rest sharp. Edges sit on the search grid.
+    fn half_and_half(width: usize, soft_rows: usize, rows: usize, soft: f64, sharp: f64) -> Vec<f32> {
+        let height = rows * CELL;
+        let low = 0.06;
+        let high = 0.78;
+        let radius = 12i32;
+        let plateau = 28i32;
+        let mut col = vec![low; height];
+        for c in 0..rows {
+            let mid = c * CELL + 48;
+            let sigma = if c < soft_rows { soft } else { sharp };
+            let y0 = (mid as i32 - radius).max(0) as usize;
+            let y1 = ((mid as i32 + plateau + radius) as usize).min(height - 1);
+            for (y, slot) in col.iter_mut().enumerate().skip(y0).take(y1 + 1 - y0) {
+                let mut v = 0.0;
+                let mut norm = 0.0;
+                for t in -radius..=radius {
+                    let w = (-0.5 * (t as f64).powi(2) / (sigma * sigma)).exp();
+                    let rel = y as i32 + t - mid as i32;
+                    let step = if rel >= 0 && rel < plateau { high } else { low };
+                    v += w * step;
+                    norm += w;
+                }
+                *slot = v / norm;
+            }
+        }
+        let mut raw = vec![0.0f32; width * height];
+        for (y, v) in col.iter().enumerate() {
+            raw[y * width..(y + 1) * width].fill(*v as f32);
+        }
+        raw
+    }
+
+    /// The upper half is soft and, on its own, passes more edges than the
+    /// cap. The lower half is sharp, and those edges set the radius and
+    /// the amount.
+    #[test]
+    fn a_picture_sharper_in_its_lower_half_is_tuned_by_that_half() {
+        let width = 8 * CELL;
+        let soft_rows = 90;
+        let rows = soft_rows * 2;
+        let raw = half_and_half(width, soft_rows, rows, 1.3, 0.30);
+        let height = rows * CELL;
+        let ridges = spread_ridges(&raw, width, height);
+        let mut upper = 0usize;
+        for &(x, y) in &ridges {
+            if y >= height / 2 {
+                continue;
+            }
+            let (dx, dy, _) = grad(&raw, width, height, x, y);
+            if profile(&raw, width, height, x, y, dx, dy, GATES[0]).is_some() {
+                upper += 1;
+            }
+        }
+        assert!(upper > MAX_EDGES, "upper half passed {upper}, ridges {}", ridges.len());
+        let tuned = tune(&raw, width, height);
+        assert!(tuned.found);
+        assert_eq!(tuned.radius.to_bits(), 4_604_480_259_023_595_110);
+        assert_eq!(tuned.amount.to_bits(), 0);
     }
 }
