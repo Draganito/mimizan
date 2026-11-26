@@ -449,12 +449,19 @@ pub fn points_per_unit(rect: egui::Rect, back: &mimizan_core::straighten::Affine
 /// outline moves by `off` along its outward normal, and for an eccentric
 /// tip the grown ellipse misses that curve by more than a pixel at an
 /// ordinary picture size.
+///
+/// Moved inwards further than the outline is curved at its ends, the
+/// curve crosses itself there and runs on as two tails. Those are not at
+/// the distance `off` from the outline, some other part of it is nearer,
+/// and they are left out: what stays is the line where the penumbra
+/// ends. Nothing stays where the feather is more than the short
+/// half-axis, and the tip is then full nowhere.
 pub fn tip_outline(tip: &Tip, cx: f64, cy: f64, off: f64, at: &dyn Fn(f64, f64) -> Pos2) -> Vec<Pos2> {
     let (s, c) = tip.angle.to_radians().sin_cos();
     let (rx0, ry0) = (tip.rx.max(1e-9), tip.ry.max(1e-9));
     let grown = off == 0.0 || rx0 == ry0;
     (0..72)
-        .map(|i| {
+        .filter_map(|i| {
             let t = i as f64 / 72.0 * std::f64::consts::TAU;
             let (st, ct) = t.sin_cos();
             let (px, py) = if grown {
@@ -467,7 +474,9 @@ pub fn tip_outline(tip: &Tip, cx: f64, cy: f64, off: f64, at: &dyn Fn(f64, f64) 
                 let scale = off / nx.hypot(ny).max(1e-12);
                 (px + nx * scale, py + ny * scale)
             };
-            at(cx + px * c - py * s, cy + px * s + py * c)
+            let (dx, dy) = (px * c - py * s, px * s + py * c);
+            let tail = !grown && off < 0.0 && (tip.distance(dx, dy) - off).abs() > 1e-6 * off.abs();
+            (!tail).then(|| at(cx + dx, cy + dy))
         })
         .collect()
 }
@@ -739,6 +748,28 @@ mod tests {
             }
             assert!(worst < 1e-5, "{angle}: {worst}");
         }
+    }
+
+    /// Moved inwards by more than the outline is curved at its ends, the
+    /// curve has tails that are nearer to the outline than the feather.
+    /// They are not drawn, and with a feather wider than the tip is short
+    /// there is no inner line at all.
+    #[test]
+    fn the_inner_penumbra_has_no_tails() {
+        let at = |x: f64, y: f64| Pos2::new(x as f32, y as f32);
+        let tip = Tip { rx: 0.3, ry: 0.06, angle: 25.0, feather: 0.03 };
+        let ring = tip_outline(&tip, 0.0, 0.0, -tip.feather, &at);
+        assert!(ring.len() > 36 && ring.len() < 72, "{}", ring.len());
+        for p in &ring {
+            let d = tip.distance(f64::from(p.x), f64::from(p.y));
+            assert!((d + tip.feather).abs() < 1e-6, "{p:?}: {d}");
+        }
+        // Curved more gently than the feather everywhere: all of it stays.
+        let round = Tip { rx: 0.3, ry: 0.2, angle: 25.0, feather: 0.03 };
+        assert_eq!(tip_outline(&round, 0.0, 0.0, -round.feather, &at).len(), 72);
+        let flat = Tip { rx: 0.3, ry: 0.03, angle: 25.0, feather: 0.04 };
+        assert!(tip_outline(&flat, 0.0, 0.0, -flat.feather, &at).is_empty());
+        assert_eq!(tip_outline(&flat, 0.0, 0.0, flat.feather, &at).len(), 72);
     }
 
     /// A tip dragged past the picture comes back until every handle is on

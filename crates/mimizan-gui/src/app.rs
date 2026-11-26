@@ -2475,9 +2475,12 @@ impl App {
                 painter.add(egui::Shape::closed_line(brush::tip_outline(tip, cx, cy, 0.0, &at), stroke));
                 if tip.feather > 0.0 {
                     for off in [-tip.feather, tip.feather] {
+                        // Empty inside a tip that is full nowhere.
                         let mut pts = brush::tip_outline(tip, cx, cy, off, &at);
-                        pts.push(pts[0]);
-                        painter.extend(egui::Shape::dashed_line(&pts, faint, 4.0, 4.0));
+                        if let Some(&first) = pts.first() {
+                            pts.push(first);
+                            painter.extend(egui::Shape::dashed_line(&pts, faint, 4.0, 4.0));
+                        }
                     }
                 }
             }

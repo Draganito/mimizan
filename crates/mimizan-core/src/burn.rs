@@ -162,7 +162,47 @@ impl Tip {
     /// origin, takes from a point at `(dx, dy)`: 1 well inside, the
     /// penumbra at the edge, 0 beyond.
     pub fn weight(&self, dx: f64, dy: f64) -> f64 {
-        edge_weight(self.distance(dx, dy), self.feather)
+        let (s, c) = self.angle.to_radians().sin_cos();
+        self.weight_turned(dx, dy, s, c)
+    }
+
+    /// The weight is 0 from one feather outside the outline and 1 from
+    /// one feather inside, and most points of a stroke are one or the
+    /// other, so an ellipse asks two cheap bounds before it looks for the
+    /// nearest outline point. With the point `r` times as far out as the
+    /// outline on its own ray: outside, the tangent where the ray leaves
+    /// the outline lies `(r − 1) r / |g|` from the point, and the outline
+    /// is behind it; inside, the tip shrunk to `r` and the short half-axis
+    /// times `1 − r` around each of its points still fit the outline. A
+    /// hard edge needs `r` alone.
+    #[inline]
+    fn weight_turned(&self, dx: f64, dy: f64, sin: f64, cos: f64) -> f64 {
+        let (rx, ry) = self.axes();
+        if rx == ry {
+            return edge_weight(self.distance_turned(dx, dy, sin, cos), self.feather);
+        }
+        let px = dx * cos + dy * sin;
+        let py = -dx * sin + dy * cos;
+        let (ex, ey) = (px / rx, py / ry);
+        let r = (ex * ex + ey * ey).sqrt();
+        if hard_edge(self.feather) {
+            return if r < 1.0 {
+                1.0
+            } else if r > 1.0 {
+                0.0
+            } else {
+                0.5
+            };
+        }
+        if r >= 1.0 {
+            let (gx, gy) = (ex / rx, ey / ry);
+            if (r - 1.0) * r >= self.feather * (gx * gx + gy * gy).sqrt() {
+                return 0.0;
+            }
+        } else if (1.0 - r) * rx.min(ry) >= self.feather {
+            return 1.0;
+        }
+        penumbra(ellipse_distance(px, py, rx, ry) / self.feather)
     }
 
     /// Beyond this distance from the centre the weight is exactly 0. Every
@@ -213,7 +253,8 @@ impl Tip {
         if rx == ry {
             return -self.feather * penumbra_integral(-h / self.feather);
         }
-        integrated_half(self, ux, uy)
+        let (s, c) = self.angle.to_radians().sin_cos();
+        integrated_half(self, ux * c + uy * s, -ux * s + uy * c)
     }
 
     /// The tip after `quarters` clockwise quarter turns of the picture.
@@ -238,98 +279,215 @@ impl Tip {
 }
 
 /// Signed distance from `(px, py)` to the ellipse of half-axes `rx` and
-/// `ry`, negative inside. The nearest outline point is a root of the
-/// stationarity condition on the parametric angle: started from the
-/// first-order foot and stepped a fixed handful of times, with the step
-/// held small so a bad start cannot run away. On the centre and the axes
-/// that derivative vanishes, so those use the closed form.
+/// `ry`, negative inside.
 fn ellipse_distance(px: f64, py: f64, rx: f64, ry: f64) -> f64 {
-    let (ax, ay) = (px.abs(), py.abs());
-    let (ex, ey) = (ax / rx, ay / ry);
-    if ex * ex + ey * ey < 1e-24 {
-        return -rx.min(ry);
+    if rx >= ry {
+        nearest(px.abs(), py.abs(), rx, ry).0
+    } else {
+        nearest(py.abs(), px.abs(), ry, rx).0
     }
-    let scale = rx.max(ry);
-    if ay <= 1e-12 * scale {
-        return axis_distance(ax, rx, ry);
+}
+
+/// Signed distance from the point `(y0, y1)` of the first quadrant to the
+/// ellipse of half-axes `e0 ≥ e1`, negative inside, and after it the
+/// direction in which it grows fastest, of no particular length.
+///
+/// The nearest outline point is `(e0² y0 / (t + e0²), e1² y1 / (t + e1²))`
+/// for the one root `t > −e1²` of
+/// `(e0 y0 / (t + e0²))² + (e1 y1 / (t + e1²))² = 1`. That function falls
+/// and is convex there, so Newton's steps from a point left of the root
+/// never pass it: there is no other root to run to, which a search on the
+/// outline's angle has (the far vertex, for a point inside near the long
+/// axis). The unknown is `u = t / e1² + 1`, which stays exact where the
+/// point is close to the long axis.
+#[inline]
+fn nearest(y0: f64, y1: f64, e0: f64, e1: f64) -> (f64, f64, f64) {
+    let (z0, z1) = (y0 / e0, y1 / e1);
+    let r0 = (e0 / e1) * (e0 / e1);
+    // Either term alone is at most 1 at the root, which bounds it from
+    // the left twice. On the long axis the first bound is no bound, and
+    // inside the centres of curvature the second is none either: the
+    // nearest point is then off the axis, in closed form.
+    let start = z1.max(r0 * (z0 - 1.0) + 1.0);
+    if start <= 0.0 {
+        let x0 = r0 * y0 / (r0 - 1.0);
+        let x1 = e1 * (1.0 - (x0 / e0) * (x0 / e0)).max(0.0).sqrt();
+        let (out0, out1) = (x0 - y0, x1);
+        return (-(out0 * out0 + out1 * out1).sqrt(), out0, out1);
     }
-    if ax <= 1e-12 * scale {
-        return axis_distance(ay, ry, rx);
-    }
-    let r = ex.hypot(ey);
-    let (gx, gy) = (ax / (rx * rx), ay / (ry * ry));
-    let g = gx.hypot(gy);
-    let d0 = (r - 1.0) * r / g;
-    let (fx, fy) = (ax - d0 * gx / g, ay - d0 * gy / g);
-    let mut theta = (fy / ry).atan2(fx / rx);
-    for _ in 0..8 {
-        let (s, c) = theta.sin_cos();
-        let f = (ax - rx * c) * (-rx * s) + (ay - ry * s) * (ry * c);
-        let fp = -ax * rx * c - ay * ry * s + (rx * rx - ry * ry) * (c * c - s * s);
-        if fp.abs() < 1e-18 {
+    let wide = r0 - 1.0;
+    // The point's own level, read on either axis, is left of the root on
+    // one of them: a third bound, and the close one for most points.
+    let level = (z0 * z0 + z1 * z1).sqrt();
+    let left = start.max(if level >= 1.0 { level } else { r0 * (level - 1.0) + 1.0 });
+    // With the first term held as it is at `left`, the second gives a
+    // point at or right of the root, close to it on a flat ellipse, where
+    // the first term hardly moves. A step from the right may pass the
+    // root, and `left` holds it; from there on the steps only close in.
+    let first = r0 * z0 / (left + wide);
+    let mut u = if first < 1.0 { z1 / (1.0 - first * first).sqrt() } else { left };
+    for _ in 0..ELLIPSE_STEPS {
+        let (over, under) = (1.0 / (u + wide), 1.0 / u);
+        let (a, b) = (r0 * z0 * over, z1 * under);
+        let g = a * a + b * b - 1.0;
+        let step = g / (2.0 * (a * a * over + b * b * under));
+        let next = (u + step).max(left);
+        let moved = (next - u).abs();
+        u = next;
+        if moved <= 1e-15 * u {
             break;
         }
-        let step = (f / fp).clamp(-0.5, 0.5);
-        theta -= step;
-        if step.abs() < 1e-15 {
+    }
+    // The point less its nearest one is `u − 1` times this.
+    let (out0, out1) = (y0 / (u + wide), y1 / u);
+    ((u - 1.0) * (out0 * out0 + out1 * out1).sqrt(), out0, out1)
+}
+
+/// Newton's steps in [`nearest`] at most. Three or four settle
+/// an ordinary point. From the plain bound a step grows the unknown by
+/// half where the root is far, and a double holds a ratio of 10⁸ there
+/// at most, which is 46 steps, and a handful more to settle.
+const ELLIPSE_STEPS: usize = 96;
+
+/// Half the integral of the weight of an elliptical tip over the line
+/// through its centre along the unit direction `(ex, ey)` of its own
+/// axes: the integral from the centre outwards.
+///
+/// The distance to the outline is convex and does not fall along that
+/// ray, so the weight is 1 up to the point one feather inside the
+/// outline, 0 from the point one feather outside, and the penumbra
+/// between the two. Only that band is integrated. Its ends are where the
+/// penumbra's slope is singular, so the band is walked with a pace that
+/// stops at both (`3τ² − 2τ³`), which leaves a smooth integrand for the
+/// rule; it still halves where the distance bends, which it does on the
+/// long axis past the centres of curvature.
+fn integrated_half(tip: &Tip, ex: f64, ey: f64) -> f64 {
+    let (rx, ry) = tip.axes();
+    let feather = tip.feather;
+    let (a0, a1, e0, e1) = if rx >= ry { (ex.abs(), ey.abs(), rx, ry) } else { (ey.abs(), ex.abs(), ry, rx) };
+    let along = |s: f64| {
+        let (distance, out0, out1) = nearest(s * a0, s * a1, e0, e1);
+        (distance, (a0 * out0 + a1 * out1) / (out0 * out0 + out1 * out1).sqrt())
+    };
+    let (b0, b1) = (a0 / e0, a1 / e1);
+    let chord = 1.0 / (b0 * b0 + b1 * b1).sqrt().max(1e-12);
+    // How fast the distance grows where the ray leaves the outline. A
+    // convex distance lies above that line, so the line's crossings are
+    // beyond the distance's own, on the side its steps close in from.
+    let leaving = 1.0 / (chord * chord * ((b0 / e0) * (b0 / e0) + (b1 / e1) * (b1 / e1)).sqrt());
+    let run = feather / leaving;
+    // An end a millionth of the feather off leaves the integral as it is
+    // to the last digit, for the weight is flat there: what is missed or
+    // counted double goes with the power 5/2 of that.
+    let within = 1e-6 * feather;
+    let far = e0 + feather;
+    let outer = crossing(&along, feather, (chord + run).min(far), far, within);
+    let inner =
+        if e1 > feather { crossing(&along, -feather, (chord - run).max(0.0), far, within) } else { 0.0 };
+    let band = outer - inner;
+    if band <= 0.0 {
+        return inner;
+    }
+    let paced = |t: f64| {
+        let s = inner + band * t * t * (3.0 - 2.0 * t);
+        penumbra(along(s).0 / feather) * 6.0 * t * (1.0 - t)
+    };
+    // On the long axis the distance bends at the centre of curvature of
+    // the vertex, and close to that axis nearly so. With the bend at an
+    // end of its own stretch the rule is not asked to see through it.
+    let bend = ((e0 - e1 * e1 / e0) * a0 - inner) / band;
+    let area = if bend > 0.0 && bend < 1.0 {
+        let split = 0.5 - ((1.0 - 2.0 * bend).asin() / 3.0).sin();
+        kronrod(0.0, split, 0.5 * DWELL_TOLERANCE, 0, &paced)
+            + kronrod(split, 1.0, 0.5 * DWELL_TOLERANCE, 0, &paced)
+    } else {
+        kronrod(0.0, 1.0, DWELL_TOLERANCE, 0, &paced)
+    };
+    inner + band * area
+}
+
+/// What the two rules may differ by in [`integrated_half`], as a share
+/// of the band. A step of a 16-bit print is a thousand times that.
+const DWELL_TOLERANCE: f64 = 1e-8;
+
+/// Where `f`, convex and not falling, reaches `level`, to `within`; `f`
+/// gives its value and its slope. From `from`, at or beyond the place,
+/// Newton's steps come down on it and never pass it. Should rounding have
+/// put `from` short of it, the first step goes beyond, no further than
+/// `far`, and the rest is the same.
+fn crossing(f: &impl Fn(f64) -> (f64, f64), level: f64, from: f64, far: f64, within: f64) -> f64 {
+    let mut s = from;
+    for _ in 0..CROSSING_STEPS {
+        let (value, slope) = f(s);
+        let step = (value - level) / slope;
+        if !step.is_finite() {
+            break;
+        }
+        s = (s - step).clamp(0.0, far);
+        if step.abs() <= within {
             break;
         }
     }
-    let (s, c) = theta.sin_cos();
-    let dist = (ax - rx * c).hypot(ay - ry * s);
-    if (ax / rx).powi(2) + (ay / ry).powi(2) < 1.0 {
-        -dist
-    } else {
-        dist
-    }
+    s
 }
 
-/// Distance from a point on one axis to the ellipse. `along` is its
-/// distance from the centre, `a` the half-axis it lies on and `b` the
-/// other. The vertex, and the other stationary point when that falls on
-/// the outline: Newton's derivative is zero on the axis.
-fn axis_distance(along: f64, a: f64, b: f64) -> f64 {
-    let mut best = (along - a).abs();
-    let disc = a * a - b * b;
-    if disc.abs() > 1e-18 * a * a {
-        let c = (a * along) / disc;
-        if c.abs() <= 1.0 {
-            let s = (1.0 - c * c).sqrt();
-            best = best.min((along - a * c).hypot(b * s));
+/// Newton's steps in [`crossing`] at most. Four settle an ordinary
+/// place. Where a tip is hardly wider than its feather the inner end
+/// lies near the centre, where the distance is flat, and each step
+/// halves what is left.
+const CROSSING_STEPS: usize = 64;
+
+/// The integral of `f` from `a` to `b` by the 15-point rule of Kronrod,
+/// halved where it and the 7-point rule of Gauss inside it differ by more
+/// than `tol`. The difference is the error of the lesser rule, so the
+/// answer is a good deal closer than `tol`.
+fn kronrod(a: f64, b: f64, tol: f64, depth: u32, f: &impl Fn(f64) -> f64) -> f64 {
+    let (mid, half) = (0.5 * (a + b), 0.5 * (b - a));
+    let centre = f(mid);
+    let (mut fine, mut coarse) = (KRONROD_WEIGHTS[7] * centre, GAUSS_WEIGHTS[3] * centre);
+    for i in 0..7 {
+        let offset = half * KRONROD_NODES[i];
+        let pair = f(mid - offset) + f(mid + offset);
+        fine += KRONROD_WEIGHTS[i] * pair;
+        if i % 2 == 1 {
+            coarse += GAUSS_WEIGHTS[i / 2] * pair;
         }
     }
-    if (along / a).powi(2) < 1.0 {
-        -best
-    } else {
-        best
+    if depth >= 20 || ((fine - coarse) * half).abs() <= tol {
+        return fine * half;
     }
+    kronrod(a, mid, 0.5 * tol, depth + 1, f) + kronrod(mid, b, 0.5 * tol, depth + 1, f)
 }
 
-/// Half the integral of [`Tip::weight`] from the centre out along
-/// `(ux, uy)`, which is half the integral over the whole line by symmetry.
-/// Adaptive Simpson, stopped when the local error estimate is under
-/// 1e-12: the penumbra's slope is singular at the edge of the band and the
-/// distance kinks on the medial axis, so a fixed grid does not reach that.
-fn integrated_half(tip: &Tip, ux: f64, uy: f64) -> f64 {
-    let reach = tip.reach();
-    let weight = |s: f64| tip.weight(s * ux, s * uy);
-    simpson(0.0, reach, weight(0.0), weight(reach), 1e-12, 0, &weight)
-}
+/// The nodes of the 15-point rule on (0, 1], outermost first; the centre
+/// is the eighth. Every second one is a node of the 7-point rule.
+const KRONROD_NODES: [f64; 7] = [
+    0.991_455_371_120_812_6,
+    0.949_107_912_342_758_5,
+    0.864_864_423_359_769_1,
+    0.741_531_185_599_394_4,
+    0.586_087_235_467_691_1,
+    0.405_845_151_377_397_2,
+    0.207_784_955_007_898_47,
+];
 
-fn simpson(a: f64, b: f64, fa: f64, fb: f64, tol: f64, depth: u32, f: &impl Fn(f64) -> f64) -> f64 {
-    let mid = 0.5 * (a + b);
-    let fm = f(mid);
-    let whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
-    let fl = f(0.5 * (a + mid));
-    let fr = f(0.5 * (mid + b));
-    let left = (mid - a) / 6.0 * (fa + 4.0 * fl + fm);
-    let right = (b - mid) / 6.0 * (fm + 4.0 * fr + fb);
-    if depth >= 24 || (left + right - whole).abs() <= tol * 15.0 {
-        left + right
-    } else {
-        simpson(a, mid, fa, fm, tol * 0.5, depth + 1, f) + simpson(mid, b, fm, fb, tol * 0.5, depth + 1, f)
-    }
-}
+/// The weights of the 15-point rule, as its nodes; the last is the
+/// centre's.
+const KRONROD_WEIGHTS: [f64; 8] = [
+    0.022_935_322_010_529_225,
+    0.063_092_092_629_978_55,
+    0.104_790_010_322_250_18,
+    0.140_653_259_715_525_92,
+    0.169_004_726_639_267_9,
+    0.190_350_578_064_785_4,
+    0.204_432_940_075_298_9,
+    0.209_482_141_084_727_83,
+];
+
+/// The weights of the 7-point rule, outermost first; the last is the
+/// centre's.
+const GAUSS_WEIGHTS: [f64; 4] =
+    [0.129_484_966_168_869_7, 0.279_705_391_489_276_7, 0.381_830_050_505_118_9, 0.417_959_183_673_469_4];
 
 /// Whether `feather` is too narrow to be a penumbra, including one that
 /// is not a number.
@@ -800,7 +958,7 @@ impl ReadyTip {
         } else if r2 < self.inside2 {
             1.0
         } else {
-            edge_weight(self.tip.distance_turned(dx, dy, self.sin, self.cos), self.tip.feather)
+            self.tip.weight_turned(dx, dy, self.sin, self.cos)
         }
     }
 }
@@ -1918,6 +2076,139 @@ mod tests {
             for (x, y) in marks {
                 check_weight(&t, x, y);
             }
+            // Inside, just off the long axis, the nearest outline is beside
+            // the point. A search along the outline that starts at the
+            // vertex stays there, and the middle of a thin soft tip would
+            // then weigh 1.
+            let (sin, cos) = t.angle.to_radians().sin_cos();
+            for along in [0.05, 0.3, 0.6, 0.9, 0.99] {
+                for off in [1e-9, 1e-6, 1e-3, 0.1, 0.5] {
+                    let (u, v) = (along * t.rx, off * t.ry);
+                    check_weight(&t, u * cos - v * sin, u * sin + v * cos);
+                }
+            }
+        }
+    }
+
+    /// The distance does not jump beside the long axis: a hair off it, the
+    /// nearest point is the one the axis itself has, on either long axis.
+    #[test]
+    fn the_distance_to_a_thin_ellipse_is_the_same_on_its_axis_and_beside_it() {
+        let on = ellipse_distance(0.05, 0.0, 0.5, 0.0005);
+        assert!((on + 0.000_497_493).abs() < 1e-8, "{on}");
+        for off in [5e-11, 1e-9, 1e-7] {
+            let beside = ellipse_distance(0.05, off, 0.5, 0.0005);
+            assert!((beside - on).abs() <= off + 1e-12, "{beside} at {off} against {on}");
+            let turned = ellipse_distance(off, 0.05, 0.0005, 0.5);
+            assert_eq!(turned, beside, "the half-axes the other way round");
+        }
+        // Outside, past the end: the vertex, and the distance grows with it.
+        assert!((ellipse_distance(0.7, 0.0, 0.5, 0.0005) - 0.2).abs() < 1e-12);
+        assert!((ellipse_distance(0.7, 1e-9, 0.5, 0.0005) - 0.2).abs() < 1e-9);
+        assert!((ellipse_distance(0.0, 0.3, 0.5, 0.0005) - 0.2995).abs() < 1e-12);
+        assert!((ellipse_distance(0.0, 0.0, 0.5, 0.0005) + 0.0005).abs() < 1e-15);
+    }
+
+    /// The rules of Gauss and Kronrod are exact for polynomials up to the
+    /// 13th and the 22nd degree: a wrong digit in a node or a weight
+    /// shows here.
+    #[test]
+    fn the_rule_of_kronrod_is_exact_for_the_polynomials_it_should_be() {
+        for degree in 0..=22 {
+            let power = |x: f64| x.powi(degree);
+            let exact = if degree % 2 == 0 { 2.0 / (degree as f64 + 1.0) } else { 0.0 };
+            let fine = kronrod(-1.0, 1.0, f64::INFINITY, 0, &power);
+            assert!((fine - exact).abs() < 1e-14, "degree {degree}: {fine} against {exact}");
+        }
+        let gauss = |degree: i32| {
+            let mut sum = GAUSS_WEIGHTS[3] * 0f64.powi(degree);
+            for i in 0..3 {
+                let x = KRONROD_NODES[2 * i + 1];
+                sum += GAUSS_WEIGHTS[i] * (x.powi(degree) + (-x).powi(degree));
+            }
+            sum
+        };
+        for degree in (0..=12).step_by(2) {
+            let exact = 2.0 / (degree as f64 + 1.0);
+            assert!((gauss(degree) - exact).abs() < 1e-14, "degree {degree}");
+        }
+    }
+
+    fn simpson(a: f64, b: f64, fa: f64, fb: f64, tol: f64, depth: u32, f: &impl Fn(f64) -> f64) -> f64 {
+        let mid = 0.5 * (a + b);
+        let fm = f(mid);
+        let whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
+        let fl = f(0.5 * (a + mid));
+        let fr = f(0.5 * (mid + b));
+        let left = (mid - a) / 6.0 * (fa + 4.0 * fl + fm);
+        let right = (b - mid) / 6.0 * (fm + 4.0 * fr + fb);
+        if depth >= 24 || (left + right - whole).abs() <= tol * 15.0 {
+            left + right
+        } else {
+            simpson(a, mid, fa, fm, tol * 0.5, depth + 1, f)
+                + simpson(mid, b, fm, fb, tol * 0.5, depth + 1, f)
+        }
+    }
+
+    /// The two bounds an ellipse asks first give 0 and 1 only where the
+    /// distance to the outline says so too, and they do spare most points
+    /// the search.
+    #[test]
+    fn the_bounds_of_an_ellipse_agree_with_its_distance() {
+        for t in [
+            tip(0.12, 0.03, 25.0, 0.03),
+            tip(0.3, 0.1, 0.0, 0.01),
+            tip(0.02, 0.09, -70.0, 0.01),
+            tip(0.5, 0.0005, 10.0, 0.0001),
+            tip(0.2, 0.19, 0.0, 0.3),
+        ] {
+            let reach = t.reach();
+            let (mut zeros, mut ones, mut n) = (0, 0, 0);
+            for j in -60..=60 {
+                for i in -60..=60 {
+                    let (x, y) = (reach * i as f64 / 50.0, reach * j as f64 / 50.0);
+                    let slow = penumbra(t.distance(x, y) / t.feather);
+                    let fast = t.weight(x, y);
+                    assert!((fast - slow).abs() < 1e-12, "{t:?} at {x}, {y}: {fast} against {slow}");
+                    n += 1;
+                    zeros += usize::from(slow == 0.0);
+                    ones += usize::from(slow == 1.0);
+                }
+            }
+            assert!(
+                zeros > n / 3 && (ones > 0 || t.feather >= t.rx.min(t.ry)),
+                "{t:?}: {zeros} {ones} of {n}"
+            );
+        }
+    }
+
+    /// The dwell is found from the band alone, with a pace that hides its
+    /// ends. The plain way, Simpson's rule on the weight over the whole
+    /// ray, gives the same number, also along the long axis, where the
+    /// distance bends inside the band.
+    #[test]
+    fn the_dwell_of_an_ellipse_is_the_plain_integral_of_its_weight() {
+        let tips = [
+            tip(0.15, 0.05, 0.0, 0.2),
+            tip(0.15, 0.04, 20.0, 0.04),
+            tip(0.3, 0.03, 0.0, 0.03),
+            tip(0.1, 0.002, 0.0, 0.05),
+            tip(0.03, 0.3, -35.0, 0.01),
+            tip(0.2, 0.19, 0.0, 0.3),
+            tip(0.5, 0.0005, 10.0, 0.0001),
+            tip(0.3, 0.01, 0.0, 0.02),
+            tip(0.05, 0.2, 0.0, 0.3),
+            tip(0.3, 0.050_001, 0.0, 0.05),
+        ];
+        for t in tips {
+            for deg in [0.0, 1e-7, 0.01, 0.05, 0.25, 3.0, 20.0, 45.0, 89.5, 89.99, 90.0, 133.0, 179.75] {
+                let (uy, ux) = (deg + t.angle).to_radians().sin_cos();
+                let weight = |s: f64| t.weight(s * ux, s * uy);
+                let reach = t.reach();
+                let plain = simpson(0.0, reach, weight(0.0), weight(reach), 1e-13, 0, &weight);
+                let got = t.half_dwell(ux, uy);
+                assert!((got - plain).abs() <= 5e-8 * plain, "{t:?} at {deg}°: {got} against {plain}");
+            }
         }
     }
 
@@ -2251,9 +2542,31 @@ mod tests {
         assert!(!Arc::ptr_eq(&prepared(&other), &a));
     }
 
-    /// A stroke painted in several steps stays grown for the screen. The
-    /// field a file reads is that stroke built whole, the same raster a
-    /// fresh cache would prepare.
+    /// The print of a file settles the strokes itself: after it, the
+    /// stroke the screen had grown is the one built whole.
+    #[test]
+    fn a_print_settles_the_strokes_it_reads() {
+        use crate::print::{render_planes, PrintParams, PrintSource};
+        let path: Vec<[f64; 2]> =
+            (0..60).map(|i| [-0.3 + i as f64 * 0.01, 0.05 * (i as f64 * 0.3).cos()]).collect();
+        let t = tip(0.05, 0.02, -8.0, 0.015);
+        for n in (2..path.len()).step_by(5) {
+            let _screen = prepared(&hand(t, 0.7, Light::Soft, &path[..n]));
+        }
+        let stroke = hand(t, 0.7, Light::Soft, &path);
+        assert!(prepared(&stroke).is_provisional());
+        let plane = crate::plane::Plane::from_vec(48, 32, vec![0.2; 48 * 32]);
+        let src =
+            PrintSource { plane: &plane, mask: None, orientation: 1, name: "t".into(), description: None };
+        let recipe =
+            crate::recipe::Recipe { burns: vec![stroke.clone()], ..crate::recipe::Recipe::on_paper() };
+        let _ = render_planes(&src, &PrintParams { recipe, ..PrintParams::default() });
+        assert!(!prepared(&stroke).is_provisional());
+    }
+
+    /// A stroke painted in several steps stays grown for the screen. What
+    /// a file reads, once the strokes are settled for it, is that stroke
+    /// built whole, the same raster a fresh cache would prepare.
     #[test]
     fn a_file_reads_the_stroke_built_whole() {
         let path: Vec<[f64; 2]> =
@@ -2270,7 +2583,11 @@ mod tests {
         let grown_w = grown_raster.w.clone();
         let grown_x0 = grown_raster.x0.to_bits();
 
+        // The field alone is the screen's and leaves the stroke as it is.
         let recipe = crate::recipe::Recipe { burns: vec![stroke.clone()], ..Default::default() };
+        let shown = crate::print::burn_field(&recipe, 240, 160, 240, 160).unwrap();
+        assert!(shown.ready[0].is_provisional());
+        settle_for_file(&recipe.burns);
         let field = crate::print::burn_field(&recipe, 240, 160, 240, 160).unwrap();
         let Ready::Moving { raster, provisional, .. } = &*field.ready[0] else {
             panic!("the print's hand moves");
