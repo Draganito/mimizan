@@ -55,7 +55,7 @@ pub fn pick_folder() -> Option<FolderGrant> {
     panel.setCanChooseDirectories(true);
     panel.setAllowsMultipleSelection(false);
     panel.setPrompt(Some(&NSString::from_str("Open")));
-    panel.setMessage(Some(&NSString::from_str("Choose a folder of negatives")));
+    panel.setMessage(Some(&NSString::from_str("Choose a folder of RAW files")));
     if panel.runModal() != NSModalResponseOK {
         return None;
     }
@@ -155,7 +155,9 @@ pub fn adopt(path: &Path) -> Option<FolderGrant> {
     MainThreadMarker::new()?;
     let text = path.to_str()?;
     let url = NSURL::fileURLWithPath(&NSString::from_str(text));
-    hold(url, true, None).filter(|g| g.bookmark().is_some() && g.started)
+    // A grant from `hold` here has already started, so only the bookmark
+    // decides whether the drop is kept.
+    hold(url, true, None).filter(|g| g.bookmark().is_some())
 }
 
 /// Open the resource and keep it. `keep` is a bookmark already known to be
