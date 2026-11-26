@@ -343,7 +343,7 @@ impl App {
             return;
         }
         if !raw.is_file() {
-            self.status = format!("No such file: {}", raw.display());
+            self.status = not_a_file(&raw);
             return;
         }
         self.fitted = false;
@@ -361,7 +361,7 @@ impl App {
         }
         let Some(raw) = self.shown.clone() else { return };
         if !raw.is_file() {
-            self.status = format!("No such file: {}", raw.display());
+            self.status = not_a_file(&raw);
             return;
         }
         self.fitted = false;
@@ -458,11 +458,32 @@ impl App {
         }
         if !finished {
             self.job = Some(job);
-        } else if job.stop.load(Ordering::Relaxed) {
-            self.status = "Stopped.".into();
-        } else if self.status.starts_with("Developing") || self.status.ends_with('…') {
-            self.status = "Ready. Scroll zooms, drag pans, click the right pane for the next.".into();
+        } else {
+            let erred = self.errors.iter().any(|e| e.is_some());
+            self.status = settled_status(job.stop.load(Ordering::Relaxed), erred).to_string();
         }
+    }
+}
+
+/// What Develop says when the field does not name a file.
+fn not_a_file(raw: &Path) -> String {
+    if raw.as_os_str().is_empty() {
+        "Open a RAW file first.".to_string()
+    } else {
+        format!("Not a file: {}", raw.display())
+    }
+}
+
+/// The status line once a job has ended. It says ready only when every
+/// pane came through, whatever the last progress text was. A pane's error
+/// is shown under the line; the line itself does not say the work goes on.
+fn settled_status(stopped: bool, erred: bool) -> &'static str {
+    if stopped {
+        "Stopped."
+    } else if erred {
+        "A pane could not be developed."
+    } else {
+        "Ready. Scroll zooms, drag pans, click the right pane for the next."
     }
 }
 
@@ -884,7 +905,7 @@ fn clear_leftovers(work: &Path) {
 fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tools: &Tools, out: &Out) {
     let work = work_dir(raw);
     if let Err(e) = std::fs::create_dir_all(&work) {
-        out.missed(0, format!("{}: {e}", work.display()));
+        out.missed(0, cannot_make(&work, &e));
         return;
     }
     let sensor = match sensor_of(raw) {
@@ -1820,6 +1841,12 @@ fn is_raw_path(path: &Path) -> bool {
         .is_some_and(|e| RAW_EXTENSIONS.iter().any(|ext| e.eq_ignore_ascii_case(ext)))
 }
 
+/// The status for a work folder that could not be made: the folder, the
+/// system's reason, and that the pictures are kept beside the RAW.
+fn cannot_make(work: &Path, err: &std::io::Error) -> String {
+    format!("{} cannot be made: {err}. The loupe keeps its pictures beside the RAW.", work.display())
+}
+
 fn work_dir(raw: &Path) -> PathBuf {
     let stem = raw.file_stem().and_then(|s| s.to_str()).unwrap_or("picture");
     let parent = raw.parent().unwrap_or_else(|| Path::new("."));
@@ -2239,6 +2266,38 @@ mod tests {
         assert_eq!(kept(None, &stamp, false), Kept::Nothing);
         std::fs::write(&nef, b"another picture").unwrap();
         assert_eq!(kept(Some(&stamp), &stamp_of(&nef), false), Kept::Nothing, "the RAW was replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_status_line_says_ready_only_when_every_pane_came_through() {
+        let ready = "Ready. Scroll zooms, drag pans, click the right pane for the next.";
+        assert_eq!(settled_status(false, false), ready);
+        assert_eq!(settled_status(true, false), "Stopped.");
+        assert_eq!(settled_status(true, true), "Stopped.");
+        assert_eq!(settled_status(false, true), "A pane could not be developed.");
+    }
+
+    #[test]
+    fn an_empty_field_and_a_folder_are_named_as_not_a_file() {
+        assert_eq!(not_a_file(Path::new("")), "Open a RAW file first.");
+        assert_eq!(not_a_file(Path::new("/tmp/no-such-raw")), "Not a file: /tmp/no-such-raw");
+        let dir = scratch("notfile");
+        assert_eq!(not_a_file(&dir), format!("Not a file: {}", dir.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_work_folder_that_cannot_be_made_names_the_folder_and_the_reason() {
+        let dir = scratch("nowork");
+        let work = work_dir(&dir.join("photo.NEF"));
+        std::fs::write(&work, b"not a directory").unwrap();
+        let err = std::fs::create_dir_all(&work).unwrap_err();
+        let said = cannot_make(&work, &err);
+        assert_eq!(
+            said,
+            format!("{} cannot be made: {err}. The loupe keeps its pictures beside the RAW.", work.display())
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
