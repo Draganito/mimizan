@@ -870,6 +870,20 @@ fn changed_sentence(kept: &Path) -> String {
     )
 }
 
+/// Bytes a grey export holds at its widest, for the whole negative of
+/// `w` by `h` (already turned; the estimate is asked with orientation 1).
+/// The estimate leaves out the source plane. A colour file builds that
+/// plane for the print and keeps it until the file is written, so
+/// `mixes` counts it once. A monochrome sensor is already that plane.
+fn grey_export_memory(w: usize, h: usize, params: &mimizan_core::print::PrintParams, mixes: bool) -> u64 {
+    let held = memory_estimate(w, h, 1, params);
+    if !mixes {
+        return held;
+    }
+    let plane = (w as u64).saturating_mul(h as u64).saturating_mul(8);
+    held.saturating_add(plane)
+}
+
 /// Bytes the development of the file about to open will hold: from its
 /// size when the strip has read it, else the current session's own, the
 /// next file being most often from the same camera. Nothing to go by
@@ -5910,7 +5924,10 @@ impl App {
         }
         let params = mimizan_core::print::PrintParams { recipe: self.print_recipe(), ..Default::default() };
         if self.plate_view().is_none() {
-            return Some(memory_estimate(w, h, 1, &params));
+            // The mixed plane is built for this print and held to the end.
+            // A monochrome sensor already is that plane.
+            let mixes = self.session.as_ref().is_some_and(|s| !s.is_mono());
+            return Some(grey_export_memory(w, h, &params, mixes));
         }
         // A plate holds its three mixed planes while one of them is
         // printed, and the finished positives beside the third: the same
@@ -9769,5 +9786,23 @@ mod settings_write_tests {
         assert!(!settings_due(true, true, false));
         assert!(!settings_due(true, true, true));
         assert!(!settings_due(true, false, false));
+    }
+}
+
+#[cfg(test)]
+mod export_memory_tests {
+    use super::grey_export_memory;
+    use mimizan_core::print::{memory_estimate, PrintParams};
+    use mimizan_core::recipe::Recipe;
+
+    /// Native size, so the mixed plane is the whole of the difference.
+    /// Without it the figure is the estimate. With it, one plane more.
+    #[test]
+    fn a_grey_export_without_a_mix_is_the_estimate_and_a_mix_adds_one_plane() {
+        let params = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let (w, h) = (6000usize, 4000usize);
+        let bare = memory_estimate(w, h, 1, &params);
+        assert_eq!(grey_export_memory(w, h, &params, false), bare);
+        assert_eq!(grey_export_memory(w, h, &params, true), bare + (w as u64) * (h as u64) * 8);
     }
 }
