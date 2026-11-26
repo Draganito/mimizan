@@ -933,9 +933,14 @@ pub struct App {
     ctx: egui::Context,
     folder: Option<Folder>,
     folder_generation: u64,
-    /// The path last asked for. While the listing is on its way this is
-    /// the folder a quit remembers, and an open in it does not ask again.
+    /// The path last asked for. The bar names it while the listing is on
+    /// its way, and an open in it does not ask again. It is not the folder
+    /// the settings file stores: that waits until the listing is in.
     folder_asked: Option<PathBuf>,
+    /// The folder the settings file may name. The one on screen once a
+    /// listing has succeeded, and until then the folder the file already
+    /// named. An ask that has not been read does not replace it.
+    folder_stored: Option<PathBuf>,
     /// The listing under way. A newer ask replaces it, so the older
     /// result is never read.
     folder_list: Option<std::sync::mpsc::Receiver<browser::Listed>>,
@@ -1271,6 +1276,7 @@ impl App {
             folder: None,
             folder_generation: 0,
             folder_asked: None,
+            folder_stored: persisted.folder.clone(),
             folder_list: None,
             listing_ls: persisted.bayer_ls.unwrap_or(false),
             listing_sort: persisted.sort,
@@ -1429,9 +1435,9 @@ impl App {
     fn persist(&mut self) {
         self.settings_dirty = true;
         self.pending_settings = Some(Persisted {
-            folder: browser::remembered_folder(
+            folder: browser::folder_to_store(
                 self.folder.as_ref().map(|f| f.path.as_path()),
-                self.folder_asked.as_deref(),
+                self.folder_stored.as_deref(),
             ),
             sort: self.sort,
             strip: Some(self.show_strip),
@@ -1666,6 +1672,7 @@ impl App {
                 // The priority list belongs to the folder that was on
                 // screen. This folder's tiles are a new listing.
                 self.last_wanted.clear();
+                self.folder_stored = Some(f.path.clone());
                 self.folder = Some(f);
                 self.persist();
                 if std::mem::take(&mut self.shared_recipe_owed) {
@@ -1674,8 +1681,8 @@ impl App {
             }
             Err(e) => {
                 self.log(format!("folder {}: {e}", listed.path.display()));
-                // Not the folder a quit remembers, and an open in it asks
-                // again: the folder may be readable by then.
+                // The unread path is not stored. An open in it asks again:
+                // the folder may be readable by then.
                 self.keep_shown_folder();
             }
         }

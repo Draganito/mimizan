@@ -421,9 +421,11 @@ pub(crate) fn listing_is_current(listed: u64, now: u64, listed_path: &Path, aske
     listed == now && asked.is_some_and(|p| p == listed_path)
 }
 
-/// The folder a quit remembers: the one open, or the one still being read.
-pub(crate) fn remembered_folder(open: Option<&Path>, asked: Option<&Path>) -> Option<PathBuf> {
-    open.map(Path::to_path_buf).or_else(|| asked.map(Path::to_path_buf))
+/// The folder the settings file names. The one on screen, or the one the
+/// file already named while a listing is still being read. A path that was
+/// asked for and has not been read is not stored.
+pub(crate) fn folder_to_store(open: Option<&Path>, stored: Option<&Path>) -> Option<PathBuf> {
+    open.map(Path::to_path_buf).or_else(|| stored.map(Path::to_path_buf))
 }
 
 /// The file's folder is the one on screen, or the one the strip is reading.
@@ -1547,13 +1549,15 @@ mod tests {
         assert!(!listing_is_current(2, 2, photos, None));
     }
 
+    /// A quit stores the folder on screen, or the one the file already
+    /// named. A path that was asked for and has not been read is not it.
     #[test]
-    fn a_folder_being_read_is_the_one_a_quit_remembers() {
+    fn a_quit_stores_the_folder_on_screen_or_the_one_already_named() {
         let open = Path::new("/photos/canon");
-        let asked = Path::new("/photos");
-        assert_eq!(remembered_folder(Some(open), Some(asked)).as_deref(), Some(open));
-        assert_eq!(remembered_folder(None, Some(asked)).as_deref(), Some(asked));
-        assert_eq!(remembered_folder(None, None), None);
+        let stored = Path::new("/photos");
+        assert_eq!(folder_to_store(Some(open), Some(stored)).as_deref(), Some(open));
+        assert_eq!(folder_to_store(None, Some(stored)).as_deref(), Some(stored));
+        assert_eq!(folder_to_store(None, None), None);
     }
 
     /// A screen on `/photos`, asked for `/photos/lost+found`, still shows
