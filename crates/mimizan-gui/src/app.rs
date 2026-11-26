@@ -608,6 +608,34 @@ fn peak_held_after_redevelopment(held: bool, at_measured: bool) -> bool {
     held && !at_measured
 }
 
+/// What a peak measurement reads of the development. Sharpening, the peak,
+/// the size and the rings are set aside before the render, so they are not
+/// here. The tone, the crop, the angle, the burns, the place and the mix
+/// are, and the resample of a straighten.
+#[derive(Clone, PartialEq)]
+struct PeakRead {
+    weights: Weights,
+    orientation: u16,
+    place: f64,
+    curve: Tone,
+    resample: ResampleKernel,
+    angle: f64,
+    crop: Option<CropRect>,
+    burns: Vec<Stroke>,
+}
+
+/// Whether a reset drops a measurement that has not landed and arms another.
+///
+/// `running`: one is in flight for the session on the stage. `same`: that
+/// one already reads the development the reset leaves. A reset puts the
+/// tone, the crop, the angle, the burns, the place and the mix back, so a
+/// measurement of the development before it is not the reset print's. A
+/// second reset, with nothing changed since, finds the one running already
+/// reading that paper and leaves it.
+fn peak_rearm_after_reset(running: bool, same: bool) -> bool {
+    !running || !same
+}
+
 /// What a development that failed leaves of the file let go for it; `job`
 /// is the file that development was of. The picture is gone either way.
 /// When the job was the file's own (a re-development, or its open sent
@@ -830,6 +858,9 @@ pub struct App {
     peak_arm: bool,
     /// The measurement in flight. A new file or a loaded recipe drops it.
     peak_measure: Option<PeakMeasure>,
+    /// What `peak_measure` reads. A reset compares it with the development
+    /// the reset leaves, and does not start another when they agree.
+    peak_read: Option<PeakRead>,
     /// Radius and amount Peak measured on this negative, in negative pixels.
     /// The fields may have been moved; reset puts these back.
     peak_measured: Option<(f64, f64)>,
@@ -1093,6 +1124,7 @@ impl App {
             peak_held: false,
             peak_arm: false,
             peak_measure: None,
+            peak_read: None,
             peak_measured: None,
             cross_drag: false,
             loupe: Loupe::spawn(cc.egui_ctx.clone()),
@@ -3105,13 +3137,25 @@ impl App {
         // The file next to the RAW is written only when that question is saved.
         self.tex_rotation = 0;
         self.keep_scale = None;
-        // Drop a measurement that is still running. Fresh opens arm a new
-        // one after this. A reset keeps the default radius and amount, and
-        // finishes a measurement that has not landed yet so the print reset
-        // still has a target. One that already landed stays.
-        self.peak_measure = None;
-        self.peak_arm =
-            !fresh && self.peak_measured.is_none() && self.session.is_some() && self.screenshot_to.is_none();
+        // Sharpening and the peak are off in every measurement. The tone,
+        // the crop, the angle, the burns, the place and the mix are not,
+        // and a reset puts those back. A measurement of the development
+        // before that is dropped and another armed, so the reset print
+        // has a target of its own. One that already reads what the reset
+        // leaves is that measurement: a second reset does not start
+        // another. A fresh file arms its own after this. One that has
+        // landed stays.
+        let running = self.peak_measure.is_some();
+        let same = running && self.peak_read.as_ref().is_some_and(|was| was == &self.peak_inputs());
+        if fresh || peak_rearm_after_reset(running, same) {
+            self.peak_measure = None;
+            self.peak_arm = !fresh
+                && self.peak_measured.is_none()
+                && self.session.is_some()
+                && self.screenshot_to.is_none();
+        } else {
+            self.peak_arm = false;
+        }
         self.peak_held = true;
         self.zoom = 1.0;
         self.pan = Vec2::ZERO;
@@ -5801,11 +5845,29 @@ impl App {
         self.peak_arm = self.session.is_some() && self.screenshot_to.is_none();
     }
 
+    /// What a measurement started now would read. The size, the rings,
+    /// the sharpening and the peak are set aside inside the measurement.
+    fn peak_inputs(&self) -> PeakRead {
+        let recipe = self.print_recipe();
+        PeakRead {
+            weights: self.weights(),
+            orientation: self.export_orientation(),
+            place: recipe.place,
+            curve: recipe.curve,
+            resample: recipe.resample,
+            angle: recipe.angle,
+            crop: recipe.crop,
+            burns: recipe.burns,
+        }
+    }
+
     fn start_peak_tune(&mut self, ctx: &egui::Context) {
         let Some(session) = self.session.clone() else { return };
+        let inputs = self.peak_inputs();
         let mut recipe = self.print_recipe();
         recipe.sharpen = Sharpen::Off;
         recipe.peak.on = false;
+        self.peak_read = Some(inputs);
         self.peak_measure =
             Some(PeakMeasure::start(ctx.clone(), session, self.weights(), recipe, self.export_orientation()));
     }
@@ -8477,9 +8539,9 @@ mod sheet_tests {
 mod crop_drag_tests {
     use super::{
         baseline_after_open, dress_to_hold, hit_crop, moved_crop, must_make_room, open_step, opened_is_fresh,
-        opening_memory, peak_held_after_redevelopment, picture_terms, recipe_for_window, recipe_needs_saving,
-        released_after_failure, stage_black_px, tile_must_wait, CropHit, OpenStep, PaperFormat, Released,
-        Rings, StageDress,
+        opening_memory, peak_held_after_redevelopment, peak_rearm_after_reset, picture_terms,
+        recipe_for_window, recipe_needs_saving, released_after_failure, stage_black_px, tile_must_wait,
+        CropHit, OpenStep, PaperFormat, Released, Rings, StageDress,
     };
     use crate::edit::Edit;
     use crate::worker::{develop_memory_of_size, memory_fits, MEMORY_HEADROOM};
@@ -8603,6 +8665,17 @@ mod crop_drag_tests {
         // Moved, then put back with the row's reset; or a recipe that was
         // saved with the measured numbers: the measurement's again.
         assert!(!peak_held_after_redevelopment(true, true));
+    }
+
+    /// A reset puts the tone, the crop, the angle, the burns, the place
+    /// and the mix back. A measurement of the development before that is
+    /// dropped and another armed. One that already reads the paper the
+    /// reset leaves stays, so pressing reset again does not start a third.
+    #[test]
+    fn a_second_reset_does_not_start_another_measurement() {
+        assert!(peak_rearm_after_reset(false, false));
+        assert!(peak_rearm_after_reset(true, false));
+        assert!(!peak_rearm_after_reset(true, true));
     }
 
     /// A recipe the window does not print as it is written, one from the
