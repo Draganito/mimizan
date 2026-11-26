@@ -668,6 +668,31 @@ fn sidecar_of(raw: &Path) -> Option<PathBuf> {
     Some(raw.with_file_name(format!("{stem}.recipe.json")))
 }
 
+/// A file's name without its folder, for a message.
+fn file_label(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+/// A recipe file that could not be read, moved out of the way of the one
+/// about to be written under its name: `<name>.unread`, or the first of
+/// `<name>.unread-2`, `-3`, … that is free. `None` when no file is there.
+fn set_aside_unread(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let named = |n: u32| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(if n == 1 { ".unread".to_owned() } else { format!(".unread-{n}") });
+        PathBuf::from(name)
+    };
+    let aside = (1..=999)
+        .map(named)
+        .find(|p| !p.exists())
+        .ok_or_else(|| std::io::Error::other("no free name to keep the unread recipe under"))?;
+    std::fs::rename(path, &aside)?;
+    Ok(Some(aside))
+}
+
 /// Bytes the development of the file about to open will hold: from its
 /// size when the strip has read it, else the current session's own, the
 /// next file being most often from the same camera. Nothing to go by
@@ -946,6 +971,10 @@ pub struct App {
     cameras_dir: PathBuf,
     /// Recipe as opened, as reset, or as last saved next to the RAW.
     recipe_baseline: Recipe,
+    /// The recipe file beside the open RAW when it is there and could not
+    /// be read, with the reason: one a later version wrote, or one with a
+    /// slip in it. Saving sets it aside instead of writing over it.
+    unread_recipe: Option<(PathBuf, String)>,
     /// A file change or a close is waiting on the save question.
     pending_leave: Option<Leave>,
     /// An export is waiting on the question whether this file, which is
@@ -1136,6 +1165,7 @@ impl App {
             folder_grant: None,
             cameras_dir,
             recipe_baseline: Recipe::on_paper(),
+            unread_recipe: None,
             pending_leave: None,
             pending_replace: None,
             unlock: Unlock::new(&cc.egui_ctx),
@@ -3032,7 +3062,11 @@ impl App {
                 Some(read)
             }
             Err(e) => {
-                self.log(format!("recipe not loaded: {e}"));
+                self.log(format!(
+                    "recipe not loaded: {e}. The file stays as it is; saving a new recipe keeps it \
+                     under another name"
+                ));
+                self.unread_recipe = Some((path.to_path_buf(), e.to_string()));
                 None
             }
         }
@@ -3047,9 +3081,35 @@ impl App {
 
     fn save_recipe(&mut self, path: &Path) {
         let r = self.recipe_for_file();
+        // The file under this name was never read: it is not this
+        // recipe's earlier state, and is kept.
+        let unread = self.unread_recipe.as_ref().is_some_and(|(p, _)| p == path);
+        let kept = match r.validate() {
+            Ok(()) if unread => match set_aside_unread(path) {
+                Ok(kept) => kept,
+                Err(e) => {
+                    self.log(format!(
+                        "recipe not saved: {} could not be read and could not be moved out of the way: {e}",
+                        path.display()
+                    ));
+                    return;
+                }
+            },
+            _ => None,
+        };
         match r.validate().and_then(|_| r.save(path)) {
             Ok(()) => {
-                self.log(format!("saved recipe {}", path.display()));
+                if unread {
+                    self.unread_recipe = None;
+                }
+                match kept {
+                    Some(kept) => self.log(format!(
+                        "saved recipe {}; the one that could not be read is kept as {}",
+                        path.display(),
+                        kept.display()
+                    )),
+                    None => self.log(format!("saved recipe {}", path.display())),
+                }
                 if self.recipe_sidecar().as_deref() == Some(path) {
                     self.recipe_baseline = r;
                 }
@@ -3175,6 +3235,16 @@ impl App {
         egui::Modal::new(egui::Id::new("save_recipe")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.label(format!("Save the recipe next to the RAW {when}?"));
+            if let Some((path, why)) = &self.unread_recipe {
+                ui.set_max_width(460.0);
+                ui.add_space(6.0);
+                ui.label(format!(
+                    "{} is already there and could not be read ({why}). Save keeps it as \
+                     {}.unread and writes the new recipe.",
+                    file_label(path),
+                    file_label(path)
+                ));
+            }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
@@ -3268,6 +3338,7 @@ impl App {
                         self.loupe_size = [0, 0];
                         self.reset(true);
                         // A recipe saved next to the file comes back with it.
+                        self.unread_recipe = None;
                         let mut read = None;
                         if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
                             read = self.load_recipe(&p);
@@ -7837,10 +7908,33 @@ mod close_tests {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        crumb_label, export_extensions, export_target, linear_export_name, with_ext, without_verbatim_prefix,
-        ExportFormat, ExportKind, ExportTarget,
+        crumb_label, export_extensions, export_target, linear_export_name, set_aside_unread, with_ext,
+        without_verbatim_prefix, ExportFormat, ExportKind, ExportTarget,
     };
     use std::path::{Path, PathBuf};
+
+    /// A recipe a later version wrote, or one with a slip in it, is not
+    /// written over: it moves to a free name beside the new one.
+    #[test]
+    fn a_recipe_that_was_not_read_is_kept_under_another_name() {
+        let dir = std::env::temp_dir().join(format!("mimizan-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recipe = dir.join("a.recipe.json");
+        assert_eq!(set_aside_unread(&recipe).unwrap(), None);
+        std::fs::write(&recipe, "first").unwrap();
+        let kept = set_aside_unread(&recipe).unwrap().unwrap();
+        assert_eq!(kept, dir.join("a.recipe.json.unread"));
+        assert!(!recipe.exists());
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "first");
+        // The name is taken: the next one is kept as well.
+        std::fs::write(&recipe, "second").unwrap();
+        let kept = set_aside_unread(&recipe).unwrap().unwrap();
+        assert_eq!(kept, dir.join("a.recipe.json.unread-2"));
+        assert_eq!(std::fs::read_to_string(dir.join("a.recipe.json.unread")).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_verbatim_windows_path_is_a_drive_path() {
