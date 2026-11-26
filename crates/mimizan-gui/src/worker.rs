@@ -9,8 +9,8 @@
 //! * `Loupe`: one print box rendered exactly as the TIFF would be
 //!   (resize, sharpen, peak). Coalesces like `Preview`.
 //! * `PeakMeasure`: one-shot thread per measurement of the high-pass
-//!   radius; a newer measurement drops the receiver and the old result is
-//!   ignored.
+//!   radius. Dropping it asks the thread to stop; a result sent after
+//!   that has nowhere to land.
 //!
 //! The thumbnail thread and the folder counter live in `browser`.
 
@@ -33,7 +33,7 @@ use mimizan_core::print::{self as pr, FileOptions, PrintParams, PrintSource};
 use mimizan_core::recipe::{CropRect, Develop, Recipe, Sharpen};
 use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
@@ -655,22 +655,39 @@ fn measure_peak(
     weights: &Weights,
     mut recipe: Recipe,
     orientation: u16,
-) -> Result<(f64, f64, bool)> {
+    stop: &AtomicBool,
+) -> Result<Option<(f64, f64, bool)>> {
     use rayon::prelude::*;
+    // `stop` is set when the measurement is no longer wanted. Checked
+    // before the mix, after it, after the render and before the search,
+    // so a full-resolution plane is not carried into the next stage.
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     recipe.sharpen = Sharpen::Off;
     recipe.peak.on = false;
     recipe.size = None;
     recipe.border_mm = 0.0;
     recipe.black_mm = 0.0;
-    let mixed = mixed_plane(s, weights)?;
+    let mixed = mixed_plane(s, weights);
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let mixed = mixed?;
     let plane = mixed.as_ref().unwrap_or(&s.negative.plane);
     let src =
         PrintSource { plane, mask: None, orientation, name: s.path.display().to_string(), description: None };
     let out = pr::render_planes(&src, &PrintParams { recipe, ..PrintParams::default() });
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let samples: Vec<f32> = out.plane.data.par_iter().map(|&v| v as f32).collect();
+    if stop.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
     let tuned = mimizan_core::peak::tune(&samples, out.plane.width, out.plane.height);
     let (radius, amount) = mimizan_core::recipe::Peak::clamp_measured(tuned.radius, tuned.amount);
-    Ok((radius, amount, tuned.found))
+    Ok(Some((radius, amount, tuned.found)))
 }
 
 /// Result of one peak measurement.
@@ -688,10 +705,18 @@ pub enum PeakPoll {
     Lost,
 }
 
-/// One measurement of the open print. The app drops it with the picture
-/// it was started on, so a result that arrives is that picture's.
+/// One measurement of the open print. Dropping it asks the thread to
+/// stop, so a picture let go does not keep its planes for the rest of
+/// the pass, and a result is not applied to the picture that follows.
 pub struct PeakMeasure {
     rx: Receiver<PeakMeasured>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for PeakMeasure {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 impl PeakMeasure {
@@ -704,23 +729,29 @@ impl PeakMeasure {
         orientation: u16,
     ) -> Self {
         let (tx, rx) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
         thread::Builder::new()
             .name("mimizan-peak".into())
             .spawn(move || {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    measure_peak(&session, &weights, recipe, orientation)
+                    measure_peak(&session, &weights, recipe, orientation, &stop_for_thread)
                 }));
+                // The session's planes are the memory a let-go was waiting
+                // on. They go before the window is asked to paint.
+                drop(session);
                 match outcome {
-                    Ok(Ok((radius, amount, found))) => {
+                    Ok(Ok(Some((radius, amount, found)))) => {
                         let _ = tx.send(PeakMeasured { radius, amount, found });
                     }
+                    Ok(Ok(None)) => {}
                     Ok(Err(e)) => tracing::error!("peak measure failed: {e:#}"),
                     Err(_) => tracing::error!("peak measure stopped"),
                 }
                 ctx.request_repaint();
             })
             .expect("spawn peak measure");
-        Self { rx }
+        Self { rx, stop }
     }
 
     /// Has the measurement arrived?
@@ -1331,6 +1362,20 @@ mod tests {
         assert!(held_tile_stale(false, true, false));
         // A pan of the same print reuses what is rendered.
         assert!(!held_tile_stale(false, false, false));
+    }
+
+    /// Asked to stop, the measurement returns before the mix and has no
+    /// result. Left running, the small negative still has one.
+    #[test]
+    fn a_measurement_asked_to_end_returns_without_a_result() {
+        let session = grey_session();
+        let weights = Weights::default();
+        let stop = AtomicBool::new(true);
+        let ended = measure_peak(&session, &weights, Recipe::on_paper(), 1, &stop).unwrap();
+        assert!(ended.is_none());
+        let stop = AtomicBool::new(false);
+        let ran = measure_peak(&session, &weights, Recipe::on_paper(), 1, &stop).unwrap();
+        assert!(ran.is_some());
     }
 
     /// A small Bayer session of a grey ramp, top to bottom.

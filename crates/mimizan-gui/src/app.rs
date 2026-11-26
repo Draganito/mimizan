@@ -2993,20 +2993,16 @@ impl App {
 
     /// Drop the session so its planes are freed, keeping its picture on
     /// the stage with the rings and the crosshair it has now. `why`
-    /// completes "<file> let go ". A peak measurement still running holds
-    /// a clone of the session until it ends, so the memory is not back
-    /// before that; the log says so instead of claiming it.
+    /// completes "<file> let go ". The measurement of this picture is
+    /// dropped first: its thread ends at the next check, and the result
+    /// is not applied to the picture that follows. A new file arms its
+    /// own.
     fn release_session(&mut self, why: String) {
         let Some(s) = self.session.as_ref() else { return };
         let (path, develop) = (s.path.clone(), file_development(s));
         let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-        if self.peak_measure.is_some() {
-            self.log(format!(
-                "{name} let go {why}; the sharpening measurement still holds it until it finishes"
-            ));
-        } else {
-            self.log(format!("{name} let go {why}"));
-        }
+        self.peak_measure = None;
+        self.log(format!("{name} let go {why}"));
         // The dress first, while the session can still measure the rings.
         self.hold_dress();
         self.released = Some(Released { path, develop });
