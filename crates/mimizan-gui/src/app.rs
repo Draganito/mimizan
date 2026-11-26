@@ -3,9 +3,7 @@
 //! Enlarger below). Nothing here changes pixels; it only chooses
 //! parameters and hands them to the workers.
 
-use crate::browser::{
-    self, home_dir, ExportFormat, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs,
-};
+use crate::browser::{self, ExportFormat, Folder, Persisted, Ruler, Sort, ThumbJob, ThumbState, Thumbs};
 use crate::brush::{self, Brush, Hit, Tool};
 use crate::cpu::{CpuMeter, CpuView};
 use crate::edit::{Edit, History};
@@ -6422,7 +6420,7 @@ const COMMAND_KEY: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }
 /// Where the strip starts when nothing is remembered: the pictures folder
 /// if there is one, else home.
 fn start_folder() -> Option<PathBuf> {
-    let home = home_dir()?;
+    let home = mimizan_core::home::home_dir()?;
     ["Pictures", "Bilder", "Images", "Photos"]
         .iter()
         .map(|d| home.join(d))

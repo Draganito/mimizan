@@ -290,33 +290,10 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 // ---------------------------------------------------------------------------
 // Disk cache
 
-/// Login directory. `$HOME` on Linux. On Windows, `$USERPROFILE` when a
-/// Unix shell has not set `$HOME`.
-pub(crate) fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()).map(PathBuf::from))
-}
-
-/// `$XDG_*` when it is absolute, otherwise the Windows known folder, otherwise
-/// `$HOME/<fallback>`.
-fn xdg_or_home(xdg: &str, windows: &str, fallback: &str) -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os(xdg).map(PathBuf::from).filter(|p| p.is_absolute()) {
-        return Some(path);
-    }
-    if cfg!(windows) {
-        if let Some(path) = std::env::var_os(windows).filter(|h| !h.is_empty()) {
-            return Some(PathBuf::from(path));
-        }
-    }
-    Some(home_dir()?.join(fallback))
-}
-
 /// `$XDG_CACHE_HOME/mimizan/thumbs`, `%LOCALAPPDATA%/mimizan/thumbs`, or
 /// `~/.cache/mimizan/thumbs`.
 fn cache_dir() -> Option<PathBuf> {
-    Some(xdg_or_home("XDG_CACHE_HOME", "LOCALAPPDATA", ".cache")?.join("mimizan").join("thumbs"))
+    Some(mimizan_core::home::cache_dir()?.join("thumbs"))
 }
 
 /// FNV-1a over path, size and modification time: a renamed or re-saved
@@ -807,7 +784,7 @@ pub struct Persisted {
 /// `$XDG_CONFIG_HOME/mimizan/gui.json`, `%APPDATA%/mimizan/gui.json`, or
 /// `~/.config/mimizan/gui.json`.
 fn config_path() -> Option<PathBuf> {
-    Some(xdg_or_home("XDG_CONFIG_HOME", "APPDATA", ".config")?.join("mimizan").join("gui.json"))
+    Some(mimizan_core::home::settings_dir()?.join("gui.json"))
 }
 
 impl Persisted {

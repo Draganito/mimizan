@@ -15,6 +15,7 @@ pub mod deconv;
 pub mod dubois;
 pub mod error;
 pub mod filter;
+pub mod home;
 pub mod icc;
 pub mod ingest;
 pub mod kodak;
