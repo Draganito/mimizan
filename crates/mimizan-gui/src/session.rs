@@ -1791,6 +1791,11 @@ impl ToneHold {
         }
         &self.held.as_ref().unwrap().2
     }
+
+    #[cfg(test)]
+    pub(crate) fn holds_a_table(&self) -> bool {
+        self.held.is_some()
+    }
 }
 
 /// Gamma-2.2 bins of a 16-bit linear code. The negative histogram's axis;
@@ -2505,6 +2510,7 @@ impl HistCache {
             if self.session == Some(ptr) && self.width == s.width && !self.codes.is_empty() {
                 return;
             }
+            self.release_other_codes(ptr);
             self.width = s.width;
             self.range = plane_codes(&s.negative.plane, &mut self.codes);
             self.session = Some(ptr);
@@ -2516,12 +2522,28 @@ impl HistCache {
         if self.session == Some(ptr) && self.weights.as_ref() == Some(w) {
             return;
         }
+        self.release_other_codes(ptr);
         self.width = sep.lum.width;
         self.range = mix_codes(sep, w, &mut self.codes);
         self.session = Some(ptr);
         self.weights = Some(*w);
         self.tally = None;
         self.hist_key = None;
+    }
+
+    /// The codes belong to one session. Another session's buffer is
+    /// dropped before this one's is built, so the new one is not allocated
+    /// beside the old and the old capacity is not kept. The same session
+    /// keeps its buffer, and a new mix fills it.
+    fn release_other_codes(&mut self, session: u64) {
+        if self.session != Some(session) {
+            self.codes = Vec::new();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn codes_capacity(&self) -> usize {
+        self.codes.capacity()
     }
 
     /// Cached mix codes for this session and these weights. Sensor order.
@@ -2687,6 +2709,11 @@ impl PreviewStages {
             self.plate = Some((key, planes));
         }
         &self.plate.as_ref().unwrap().1
+    }
+
+    #[cfg(test)]
+    pub(crate) fn holds_a_plane(&self) -> bool {
+        self.shown.is_some() || self.mixed.is_some() || self.plate.is_some()
     }
 }
 
@@ -4730,5 +4757,96 @@ mod histogram_tests {
         // The comparison reached the deep shadows, where the two curves part.
         assert!(shadows > 2000, "only {shadows} shadow samples compared");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A developed frame of `w` by `h`. Monochrome keeps the measured plane;
+    /// a Bayer frame keeps a separation and lets the full mix go.
+    fn sized_session(w: usize, h: usize, mono: bool) -> Session {
+        use mimizan_core::cfa::BayerPhase;
+        use mimizan_core::decode::{RawData, Rect, SensorKind};
+        use mimizan_core::pipeline;
+        use std::sync::Arc;
+        let raw: Vec<u16> =
+            (0..w * h).map(|i| (150.0 + 700.0 * ((i / w) as f64 / h as f64)) as u16).collect();
+        let frame = RawFrame {
+            make: "Test".into(),
+            model: if mono { "Mono".into() } else { "Bayer".into() },
+            clean_make: String::new(),
+            clean_model: String::new(),
+            width: w,
+            height: h,
+            bits: 10,
+            kind: if mono { SensorKind::Mono } else { SensorKind::Bayer(BayerPhase::RGGB) },
+            black_tile: [0.0; 4],
+            white_rgb: [1000.0; 3],
+            crop: Rect { x: 0, y: 0, w, h },
+            orientation: 1,
+            xyz_to_cam: None,
+            illuminant: None,
+            wb_as_shot: Some([1.0, 1.0, 1.0]),
+            exposure: Default::default(),
+            data: RawData::Integer(raw),
+        };
+        let params = NegativeParams { keep_separation: true, ..NegativeParams::default() };
+        let negative = pipeline::negative_from_frame(&frame, &params, 0).unwrap();
+        let preview = preview_planes(&negative).unwrap();
+        let raw_hist = RawHistogram::of_frame(&frame);
+        let (negative, width, height) = kept_negative(negative);
+        Session {
+            id: next_session_id(),
+            path: "sized.nef".into(),
+            frame: Arc::new(frame),
+            negative,
+            width,
+            height,
+            camera_file: None,
+            camera_file_path: None,
+            develop: Develop::default(),
+            preview,
+            raw_hist,
+            note: None,
+        }
+    }
+
+    /// Another session's codes replace the buffer. The old capacity is not
+    /// kept, and the new codes match a cache that never held the previous
+    /// session. The same session keeps a buffer it already has room in.
+    #[test]
+    fn a_different_session_does_not_keep_the_previous_codes_buffer() {
+        let big = sized_session(80, 48, false);
+        let small = sized_session(40, 24, false);
+        let mono = sized_session(16, 12, true);
+        let mut cache = HistCache::default();
+        let native = Weights::default();
+        cache.ensure(&big, &native);
+        let big_len = cache.codes.len();
+        assert!(big_len > 1000);
+        cache.codes.reserve(big_len);
+        let kept = cache.codes.capacity();
+        assert!(kept >= big_len * 2);
+
+        let shifted = Weights { r: 0.2, g: 0.3, b: 0.5 };
+        cache.ensure(&big, &shifted);
+        assert_eq!(cache.codes.capacity(), kept, "the same session fills the buffer it has");
+        assert_eq!(cache.codes.len(), big_len);
+
+        cache.ensure(&small, &native);
+        assert!(cache.codes.len() < big_len);
+        assert!(
+            cache.codes.capacity() < kept,
+            "the old buffer's capacity is still held: {} after {}",
+            cache.codes.capacity(),
+            kept
+        );
+        let mut fresh = HistCache::default();
+        let expected = fresh.codes_for(&small, &native).to_vec();
+        assert_eq!(cache.codes_for(&small, &native), expected.as_slice());
+
+        let small_cap = cache.codes.capacity();
+        cache.ensure(&mono, &native);
+        assert!(cache.codes.capacity() < small_cap);
+        assert_eq!(cache.codes.len(), mono.width * mono.height);
+        let mut fresh = HistCache::default();
+        assert_eq!(cache.codes_for(&mono, &shifted), fresh.codes_for(&mono, &native));
     }
 }

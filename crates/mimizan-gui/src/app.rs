@@ -3217,7 +3217,8 @@ impl App {
     /// completes "<file> let go ". The measurement of this picture is
     /// dropped first: its thread ends at the next check, and the result
     /// is not applied to the picture that follows. A new file arms its
-    /// own.
+    /// own. The preview thread is told to forget what it kept, once the
+    /// picture it is painting has been sent.
     fn release_session(&mut self, why: String) {
         let Some(s) = self.session.as_ref() else { return };
         let (path, develop) = (s.path.clone(), file_development(s));
@@ -3228,6 +3229,7 @@ impl App {
         self.hold_dress();
         self.released = Some(Released { path, develop });
         self.session = None;
+        self.preview.forget();
     }
 
     /// The file the edit belongs to: the session's, or the one let go for

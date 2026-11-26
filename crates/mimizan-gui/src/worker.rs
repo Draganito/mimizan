@@ -5,7 +5,9 @@
 //!   order; a panic in a job is caught and reported as `Event::Failed`.
 //! * `Preview`: re-mix and tone the downscaled separation plus the zoomed
 //!   detail window (milliseconds). Coalesces: only the newest request is
-//!   rendered, older ones are dropped unseen.
+//!   rendered, older ones are dropped unseen. Told to forget, it drops
+//!   what it kept once the picture it is painting has been sent, and
+//!   before it takes the next one.
 //! * `Loupe`: one print box rendered exactly as the TIFF would be
 //!   (resize, sharpen, peak). Coalesces like `Preview`.
 //! * `PeakMeasure`: one-shot thread per measurement of the high-pass
@@ -970,8 +972,17 @@ pub struct PreviewResult {
     pub failed: Option<String>,
 }
 
+/// A forget carries nothing. The request is moved once along the channel
+/// and is not boxed: a box on every preview would allocate for a slider.
+#[allow(clippy::large_enum_variant)]
+enum PreviewMsg {
+    Request(PreviewRequest),
+    /// The session was let go. What the thread kept of it is dropped.
+    Forget,
+}
+
 pub struct Preview {
-    tx: Sender<PreviewRequest>,
+    tx: Sender<PreviewMsg>,
     rx: Receiver<PreviewResult>,
     ctx: egui::Context,
     /// The newest generation asked for. The worker reads it between its
@@ -988,9 +999,19 @@ impl Preview {
 
     pub fn request(&mut self, r: PreviewRequest) {
         self.latest.store(r.generation, Ordering::Relaxed);
-        if let Err(std::sync::mpsc::SendError(r)) = self.tx.send(r) {
+        if let Err(std::sync::mpsc::SendError(msg)) = self.tx.send(PreviewMsg::Request(r)) {
             self.restart();
-            let _ = self.tx.send(r);
+            let _ = self.tx.send(msg);
+        }
+    }
+
+    /// The session was let go. The thread drops what it kept of that
+    /// picture once the one it is already painting has been sent, and
+    /// before it takes the next picture.
+    pub fn forget(&mut self) {
+        if self.tx.send(PreviewMsg::Forget).is_err() {
+            // The thread is gone, and the new one keeps nothing.
+            self.restart();
         }
     }
 
@@ -1074,45 +1095,75 @@ impl LinearKey {
     }
 }
 
+/// What has arrived for the preview thread, in order.
+///
+/// A forget drops what the thread kept. A picture asked for before it is
+/// painted first and is not cancelled: the forget applies to what that
+/// paint kept, and the result already handed on is left where it was
+/// sent. A picture asked for after the forget is taken once the hold is
+/// empty. A picture already being painted is not in this queue.
+fn deliver_preview(
+    hold: &mut PreviewHold,
+    first: PreviewMsg,
+    more: &Receiver<PreviewMsg>,
+    mut paint: impl FnMut(&mut PreviewHold, PreviewRequest),
+) {
+    let mut pending: Option<PreviewRequest> = None;
+    let mut incoming = Some(first);
+    while let Some(msg) = incoming.take().or_else(|| more.try_recv().ok()) {
+        match msg {
+            PreviewMsg::Request(r) => pending = Some(r),
+            PreviewMsg::Forget => {
+                if let Some(req) = pending.take() {
+                    paint(hold, req);
+                }
+                *hold = PreviewHold::default();
+            }
+        }
+    }
+    if let Some(req) = pending {
+        paint(hold, req);
+    }
+}
+
 fn start_preview(
     ctx: &egui::Context,
     latest: Arc<AtomicU64>,
-) -> (Sender<PreviewRequest>, Receiver<PreviewResult>) {
-    let (tx, reqs) = channel::<PreviewRequest>();
+) -> (Sender<PreviewMsg>, Receiver<PreviewResult>) {
+    let (tx, reqs) = channel::<PreviewMsg>();
     let (results, rx) = channel::<PreviewResult>();
     let ctx = ctx.clone();
     thread::Builder::new()
         .name("mimizan-preview".into())
         .spawn(move || {
             let mut hold = PreviewHold::default();
-            while let Ok(mut req) = reqs.recv() {
-                while let Ok(newer) = reqs.try_recv() {
-                    req = newer;
-                }
-                let generation = req.generation;
-                let session = req.session.id;
-                let started = Instant::now();
-                let stale = || latest.load(Ordering::Relaxed) != generation;
+            while let Ok(first) = reqs.recv() {
                 let send = |r: PreviewResult| {
                     let _ = results.send(r);
                     ctx.request_repaint();
                 };
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    paint_preview(&mut hold, req, &stale, &send)
-                }));
-                if let Err(payload) = outcome {
-                    // The hold may be half updated. Drop it and start clean.
-                    hold = PreviewHold::default();
-                    send(PreviewResult {
-                        generation,
-                        session,
-                        image: None,
-                        detail: None,
-                        histograms: None,
-                        ms: started.elapsed().as_millis(),
-                        failed: Some(format!("stopped: {}", panic_message(&payload))),
-                    });
-                }
+                deliver_preview(&mut hold, first, &reqs, |hold, req| {
+                    let generation = req.generation;
+                    let session = req.session.id;
+                    let started = Instant::now();
+                    let stale = || latest.load(Ordering::Relaxed) != generation;
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        paint_preview(hold, req, &stale, &send)
+                    }));
+                    if let Err(payload) = outcome {
+                        // The hold may be half updated. Drop it and start clean.
+                        *hold = PreviewHold::default();
+                        send(PreviewResult {
+                            generation,
+                            session,
+                            image: None,
+                            detail: None,
+                            histograms: None,
+                            ms: started.elapsed().as_millis(),
+                            failed: Some(format!("stopped: {}", panic_message(&payload))),
+                        });
+                    }
+                });
             }
         })
         .expect("spawn preview worker");
@@ -1765,5 +1816,98 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert!(sent[0].image.is_some());
         assert!(sent[0].histograms.is_none());
+    }
+
+    /// The thread is told to forget. What it kept — the codes, the linear
+    /// tile, the detail tile and the stages — is empty afterwards. A
+    /// picture already sent stays sent. One asked for before the forget is
+    /// painted and then dropped from the hold; one asked for after is
+    /// painted on an empty hold, so a poisoned tile is not reused.
+    #[test]
+    fn a_forget_empties_the_hold_and_leaves_the_picture_already_sent() {
+        let session = Arc::new(grey_session());
+        let view = ViewParams {
+            weights: Weights::default(),
+            tone: Tone::paper(),
+            place: 0.0,
+            rotation: 0,
+            angle: 0.0,
+            crop: None,
+            burns: Vec::new(),
+            burn_live: false,
+            plate: None,
+        };
+        let ask = DetailAsk { x: 2, y: 2, w: 12, h: 8, step: 1 };
+        let request = |view: ViewParams, generation: u64| PreviewRequest {
+            session: Arc::clone(&session),
+            view,
+            detail: Some(ask),
+            inspect: None,
+            generation,
+        };
+        let paint =
+            |hold: &mut PreviewHold, req: PreviewRequest, sent: &std::cell::RefCell<Vec<PreviewResult>>| {
+                paint_preview(hold, req, &|| false, &|r| sent.borrow_mut().push(r));
+            };
+        let empty = |hold: &PreviewHold| {
+            hold.linear.is_none()
+                && hold.hists.codes_capacity() == 0
+                && !hold.stages.holds_a_plane()
+                && !hold.tones.holds_a_table()
+                && hold.held.is_none()
+                && hold.last.is_none()
+                && hold.last_detail.is_none()
+        };
+
+        let sent = std::cell::RefCell::new(Vec::new());
+        let mut hold = PreviewHold::default();
+        paint(&mut hold, request(view.clone(), 1), &sent);
+        let picture = sent.borrow()[0].image.as_ref().expect("the picture").gray.clone();
+        assert!(!picture.is_empty());
+        assert!(hold.linear.as_ref().is_some_and(|(_, tile)| !tile.gray.data.is_empty()));
+        assert!(hold.hists.codes_capacity() > 0);
+        assert!(hold.stages.holds_a_plane());
+        assert!(hold.tones.holds_a_table());
+        assert!(hold.held.is_some());
+
+        // The paint has finished and the picture is on its way. The forget
+        // the thread runs next empties the hold and does not take it back.
+        let (_tx, rx) = channel();
+        deliver_preview(&mut hold, PreviewMsg::Forget, &rx, |hold, req| paint(hold, req, &sent));
+        assert_eq!(sent.borrow()[0].image.as_ref().unwrap().gray, picture);
+        assert!(empty(&hold));
+
+        // Asked for before the forget: painted, then the hold is emptied.
+        paint(&mut hold, request(view.clone(), 2), &sent);
+        assert!(!empty(&hold));
+        let shifted = ViewParams { place: 0.4, ..view.clone() };
+        let (tx, rx) = channel();
+        tx.send(PreviewMsg::Forget).unwrap();
+        let before = sent.borrow().len();
+        deliver_preview(&mut hold, PreviewMsg::Request(request(shifted, 3)), &rx, |hold, req| {
+            paint(hold, req, &sent)
+        });
+        assert!(sent.borrow().len() > before, "the picture asked for before the forget is sent");
+        assert!(empty(&hold));
+
+        // Asked for after the forget: the poisoned tile is gone before the paint.
+        paint(&mut hold, request(view.clone(), 4), &sent);
+        hold.linear.as_mut().unwrap().1.gray.data.fill(4.0);
+        let fresh = {
+            let sent = std::cell::RefCell::new(Vec::new());
+            paint(&mut PreviewHold::default(), request(view.clone(), 5), &sent);
+            let gray = sent.borrow().iter().find_map(|r| r.detail.as_ref().map(|d| d.gray.clone())).unwrap();
+            gray
+        };
+        let (tx, rx) = channel();
+        tx.send(PreviewMsg::Request(request(view, 6))).unwrap();
+        let sent = std::cell::RefCell::new(Vec::new());
+        deliver_preview(&mut hold, PreviewMsg::Forget, &rx, |hold, req| paint(hold, req, &sent));
+        let again = sent
+            .borrow()
+            .iter()
+            .find_map(|r| r.detail.as_ref().map(|d| d.gray.clone()))
+            .expect("the next picture");
+        assert_eq!(again, fresh);
     }
 }
