@@ -879,6 +879,9 @@ pub fn burn_field(r: &Recipe, full_w: usize, full_h: usize, image_w: usize, imag
     if r.burns.is_empty() || full_w == 0 || full_h == 0 || image_w == 0 || image_h == 0 {
         return None;
     }
+    // The screen may show a stroke grown as it was painted. This field is
+    // how a file reads the burns, so that stroke is built whole first.
+    crate::burn::settle_for_file(&r.burns);
     let map = crate::straighten::print_map(full_w, full_h, r.angle, r.crop, image_w, image_h);
     Field::new(&r.burns, crate::burn::normalize(full_w, full_h).after(&map))
 }

@@ -847,6 +847,9 @@ enum Ready {
         points: Vec<[f64; 2]>,
         gain: f64,
         light: Light,
+        /// Grown from a shorter path. The screen may read it. A file
+        /// builds the stroke whole and puts that in its place.
+        provisional: bool,
     },
     Card {
         x: f64,
@@ -959,6 +962,7 @@ impl Ready {
                         points: points.clone(),
                         gain,
                         light: *light,
+                        provisional: false,
                     },
                 }
             }
@@ -981,7 +985,9 @@ impl Ready {
 
     /// `stroke` prepared from `from`, a shorter path of the same hand that
     /// this one continues: the raster is copied and the new steps added.
-    /// `None` when it does not continue it, or the steps changed.
+    /// `None` when it does not continue it, or the steps changed. The
+    /// result is provisional: the screen may read a grown raster, and a
+    /// file builds the stroke whole.
     fn grown(from: &Ready, stroke: &Stroke) -> Option<Self> {
         let Stroke::Hand { tip, light, points, .. } = stroke else { return None };
         let Ready::Moving { tip: ready, raster, full, step, points: old, light: old_light, gain, .. } = from
@@ -1009,7 +1015,13 @@ impl Ready {
             points: points.clone(),
             gain: *gain,
             light: *light,
+            provisional: true,
         })
+    }
+
+    /// Grown while a stroke was painted, so only the screen should read it.
+    fn is_provisional(&self) -> bool {
+        matches!(self, Ready::Moving { provisional: true, .. })
     }
 
     /// What this takes to keep.
@@ -1148,8 +1160,31 @@ fn prefix_key(s: &Stroke) -> Option<u64> {
     Some(h.finish())
 }
 
+/// Put `ready` under `key`, newest last, and drop the oldest while the
+/// rasters pass [`CACHE_BYTES`].
+fn store(c: &mut Cache, key: u64, prefix: Option<u64>, ready: Arc<Ready>) {
+    if let Some(old) = c.map.insert(key, Arc::clone(&ready)) {
+        c.bytes -= old.bytes();
+        if let Some(pos) = c.order.iter().position(|k| *k == key) {
+            c.order.remove(pos);
+        }
+    }
+    c.order.push_back(key);
+    c.bytes += ready.bytes();
+    if let Some(p) = prefix {
+        c.latest.insert(p, key);
+    }
+    while c.bytes > CACHE_BYTES && c.order.len() > 1 {
+        let Some(k) = c.order.pop_front() else { break };
+        if let Some(r) = c.map.remove(&k) {
+            c.bytes -= r.bytes();
+        }
+    }
+}
+
 /// The stroke prepared, from the cache when it is there, grown from its
-/// shorter self when that is, built otherwise.
+/// shorter self when that is, built otherwise. A grown entry is
+/// provisional; [`settle_for_file`] replaces it before a file reads it.
 fn prepared(stroke: &Stroke) -> Arc<Ready> {
     let key = stroke_key(stroke);
     let prefix = prefix_key(stroke);
@@ -1167,22 +1202,32 @@ fn prepared(stroke: &Stroke) -> Arc<Ready> {
     let ready =
         Arc::new(shorter.and_then(|s| Ready::grown(&s, stroke)).unwrap_or_else(|| Ready::new(stroke)));
     let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(old) = c.map.insert(key, Arc::clone(&ready)) {
-        c.bytes -= old.bytes();
-    } else {
-        c.order.push_back(key);
-    }
-    c.bytes += ready.bytes();
-    if let Some(p) = prefix {
-        c.latest.insert(p, key);
-    }
-    while c.bytes > CACHE_BYTES && c.order.len() > 1 {
-        let Some(k) = c.order.pop_front() else { break };
-        if let Some(r) = c.map.remove(&k) {
-            c.bytes -= r.bytes();
-        }
-    }
+    store(&mut c, key, prefix, Arc::clone(&ready));
     ready
+}
+
+/// A file reads each stroke built whole. One grown while it was painted
+/// is provisional, and so is a stroke whose shorter self is cached and
+/// which the next read would grow: both are built again here and put in
+/// place of the grown entry. The screen is the reader of a grown raster.
+pub(crate) fn settle_for_file(strokes: &[Stroke]) {
+    for stroke in strokes {
+        let key = stroke_key(stroke);
+        let prefix = prefix_key(stroke);
+        let rebuild = {
+            let c = cache().lock().unwrap_or_else(|e| e.into_inner());
+            match c.map.get(&key) {
+                Some(r) => r.is_provisional(),
+                None => prefix.is_some_and(|p| c.latest.contains_key(&p)),
+            }
+        };
+        if !rebuild {
+            continue;
+        }
+        let ready = Arc::new(Ready::new(stroke));
+        let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
+        store(&mut c, key, prefix, ready);
+    }
 }
 
 /// Which strokes can reach a point: the hands' bounds binned on a coarse
@@ -1967,6 +2012,46 @@ mod tests {
         let other = hand(t, 0.8, Light::Soft, &path);
         assert!(Ready::grown(&a, &other).is_none());
         assert!(!Arc::ptr_eq(&prepared(&other), &a));
+    }
+
+    /// A stroke painted in several steps stays grown for the screen. The
+    /// field a file reads is that stroke built whole, the same raster a
+    /// fresh cache would prepare.
+    #[test]
+    fn a_file_reads_the_stroke_built_whole() {
+        let path: Vec<[f64; 2]> =
+            (0..80).map(|i| [-0.35 + i as f64 * 0.008, 0.08 * (i as f64 * 0.25).sin()]).collect();
+        let t = tip(0.045, 0.028, 12.0, 0.012);
+        for n in (2..path.len()).step_by(7) {
+            let _screen = prepared(&hand(t, 0.9, Light::Soft, &path[..n]));
+        }
+        let stroke = hand(t, 0.9, Light::Soft, &path);
+        let grown = prepared(&stroke);
+        let Ready::Moving { raster: grown_raster, provisional: true, .. } = &*grown else {
+            panic!("the screen's long path is a grown hand");
+        };
+        let grown_w = grown_raster.w.clone();
+        let grown_x0 = grown_raster.x0.to_bits();
+
+        let recipe = crate::recipe::Recipe { burns: vec![stroke.clone()], ..Default::default() };
+        let field = crate::print::burn_field(&recipe, 240, 160, 240, 160).unwrap();
+        let Ready::Moving { raster, provisional, .. } = &*field.ready[0] else {
+            panic!("the print's hand moves");
+        };
+        assert!(!provisional);
+        let fresh = Ready::new(&stroke);
+        let Ready::Moving { raster: fresh_raster, provisional: false, .. } = &fresh else {
+            panic!("a fresh hand moves");
+        };
+        assert_eq!(raster.w, fresh_raster.w);
+        assert_eq!(raster.x0.to_bits(), fresh_raster.x0.to_bits());
+        assert_eq!(raster.y0.to_bits(), fresh_raster.y0.to_bits());
+        assert_eq!(raster.h.to_bits(), fresh_raster.h.to_bits());
+        assert_eq!((raster.nx, raster.ny), (fresh_raster.nx, fresh_raster.ny));
+        assert!(
+            grown_w != fresh_raster.w || grown_x0 != fresh_raster.x0.to_bits(),
+            "the screen's raster was already the fresh one"
+        );
     }
 
     /// A stamp of the tip on a growing raster visits the points of the
