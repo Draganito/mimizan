@@ -22,11 +22,26 @@ pub const PLACE_LIMIT: f64 = 5.0;
 
 /// What the recipe prints with. Untagged in JSON: a split-grade object has
 /// `paper`, a look has `points`; older recipes carry the look as before.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Tone {
     Paper(SplitGrade),
     Look(LookFile),
+}
+
+/// Read by the key that tells the two apart, so that what is wrong with
+/// the object is said in its own words ("unknown field `sof`") and not as
+/// "did not match any variant".
+impl<'de> Deserialize<'de> for Tone {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(d)?;
+        if value.get("paper").is_some() {
+            SplitGrade::deserialize(value).map(Self::Paper).map_err(D::Error::custom)
+        } else {
+            LookFile::deserialize(value).map(Self::Look).map_err(D::Error::custom)
+        }
+    }
 }
 
 impl Default for Tone {
@@ -260,6 +275,11 @@ mod tests {
         let old = r#"{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}"#;
         assert_eq!(serde_json::from_str::<Tone>(old).unwrap(), look);
         assert!(Tone::paper().as_paper().is_some() && look.as_paper().is_none());
+        // A slip in a key is named, not taken for the other kind of tone.
+        let slip = serde_json::from_str::<Tone>(r#"{"paper":"multigrade","sof":0.5}"#).unwrap_err();
+        assert!(slip.to_string().contains("unknown field `sof`"), "{slip}");
+        let neither = serde_json::from_str::<Tone>(r#"{"soft":0.5}"#).unwrap_err();
+        assert!(neither.to_string().contains("missing field"), "{neither}");
         assert!(!Tone::paper().compile().is_identity() && look.compile().is_identity());
         assert_eq!(Tone::paper().compile().white(), 1.0);
     }

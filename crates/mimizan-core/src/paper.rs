@@ -308,6 +308,7 @@ pub fn paper() -> &'static Paper {
 /// The two exposures of a split-grade print, in stops of time from the
 /// paper's base exposure. The recipe's tone when it prints on paper.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SplitGrade {
     /// Which paper; only [`PAPER_NAME`] exists.
     pub paper: String,

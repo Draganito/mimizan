@@ -41,6 +41,7 @@ fn default_peak_radius() -> f64 {
 /// `on` is the checkbox: radius and amount stay when it is off, and neither
 /// the tile nor the TIFF is sharpened.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Peak {
     #[serde(default)]
     pub on: bool,
@@ -191,6 +192,7 @@ fn no_turn(v: &u8) -> bool {
 
 /// Every decision of the print pass. See the module doc.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Recipe {
     /// [`SCHEMA`]; anything else fails validation.
     #[serde(default = "default_schema")]
@@ -280,6 +282,7 @@ pub struct Recipe {
 /// `mask` is `"dubois"`, `"adaptive"` or `"off"`, the words of the
 /// command's `--wb` and `--mask`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Develop {
     /// Channel balance before the separation.
     #[serde(default = "Develop::default_wb", with = "wb_in_file")]
@@ -381,6 +384,7 @@ mod mask_in_file {
 
 /// The plate as the recipe carries it: which process, and its two lamps.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlateRecipe {
     /// The taking filters.
     #[serde(default)]
@@ -457,6 +461,7 @@ pub enum CropCorner {
 /// A window on the upright negative, in whole pixels. The origin is the
 /// top-left. Nothing here resamples: the size step is the only resize.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CropRect {
     /// Left edge, pixels from the left of the upright negative.
     pub x: u32,
@@ -621,7 +626,15 @@ impl Recipe {
     /// a pixel is touched.
     pub fn validate(&self) -> Result<()> {
         if self.schema != SCHEMA {
-            return Err(Error::Invalid(format!("recipe schema {} not supported", self.schema)));
+            return Err(Error::Invalid(if self.schema > SCHEMA {
+                format!(
+                    "recipe schema {} is newer than this program reads ({SCHEMA}): it was written by a \
+                     later version",
+                    self.schema
+                )
+            } else {
+                format!("recipe schema {} not supported", self.schema)
+            }));
         }
         if !self.place.is_finite() || self.place.abs() > crate::tone::PLACE_LIMIT {
             return Err(Error::Invalid(format!(
@@ -873,6 +886,30 @@ mod tests {
             serde_json::from_str(r#"{"curve":{"schema":1,"name":"neutral","points":[[0,0],[1,1]],"encoding":"gamma22","fitted_against":null}}"#)
                 .unwrap();
         assert_eq!(minimal, Recipe::default());
+    }
+
+    /// A key this version does not know changes the print somewhere else:
+    /// a later version's recipe, or a slip of the hand. Read without it,
+    /// the picture would be another one without a word.
+    #[test]
+    fn a_key_the_reader_does_not_know_is_refused_by_name() {
+        let refused = |json: &str, key: &str| {
+            let err = serde_json::from_str::<Recipe>(json).unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown field `{key}`")), "{json}: {err}");
+        };
+        refused(r#"{"boarder_mm": 10}"#, "boarder_mm");
+        refused(r#"{"quarter_turn": 1}"#, "quarter_turn");
+        refused(r#"{"peak": {"on": true, "radious": 2}}"#, "radious");
+        refused(r#"{"develop": {"wb": "as-shot", "moire_net": true}}"#, "moire_net");
+        refused(r#"{"plate": {"filters": "camera", "lamp": [0, 0]}}"#, "lamp");
+        refused(r#"{"crop": {"x": 0, "y": 0, "w": 10, "h": 10, "angle": 1}}"#, "angle");
+        refused(r#"{"curve": {"paper": "multigrade", "sof": 0.5}}"#, "sof");
+        // Every key at rest is left out of the file, so what an earlier
+        // version wrote still reads.
+        let written = serde_json::to_string(&Recipe::on_paper()).unwrap();
+        assert_eq!(serde_json::from_str::<Recipe>(&written).unwrap(), Recipe::on_paper());
+        let newer = Recipe { schema: SCHEMA + 1, ..Recipe::default() };
+        assert!(newer.validate().unwrap_err().to_string().contains("newer than this program reads"));
     }
 
     #[test]
