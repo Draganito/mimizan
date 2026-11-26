@@ -182,13 +182,30 @@ impl Framing {
     }
 }
 
-/// Upright, straightened with `kernel`, then the window.
-fn framed(p: &Plane, f: &Framing, kernel: ResampleKernel) -> Plane {
-    let up = orient(p, f.orientation);
-    let up = crate::straighten::straighten(&up, f.angle, kernel);
+/// Upright, straightened with `kernel`, then the window. An orientation
+/// that is already upright and an angle that does not turn borrow `p`;
+/// only a real turn or a crop allocates.
+fn framed<'a>(p: &'a Plane, f: &Framing, kernel: ResampleKernel) -> Cow<'a, Plane> {
+    let oriented = if (2..=8).contains(&f.orientation) {
+        Cow::Owned(orient(p, f.orientation))
+    } else {
+        Cow::Borrowed(p)
+    };
+    let picture = if crate::straighten::turns(f.angle) {
+        // The straighten has read the oriented plane. Let it go before the
+        // window is cut, so the crop does not sit beside a plane it does not read.
+        let turned = crate::straighten::straighten(oriented.as_ref(), f.angle, kernel);
+        drop(oriented);
+        Cow::Owned(turned)
+    } else {
+        oriented
+    };
     match f.crop {
-        Some(c) => window_plane(&up, c.sanitized(up.width as u32, up.height as u32)),
-        None => up,
+        Some(c) => Cow::Owned(window_plane(
+            picture.as_ref(),
+            c.sanitized(picture.width as u32, picture.height as u32),
+        )),
+        None => picture,
     }
 }
 
@@ -211,13 +228,18 @@ pub fn write_negative(
     if mask.is_some_and(|m| (m.width, m.height) != (plane.width, plane.height)) {
         return Err(Error::Invalid("the mask and the negative differ in size".into()));
     }
-    let out = framed(plane, framing, STRAIGHTEN_KERNEL);
-    write_gray16_range(
-        path,
-        &out,
-        range,
-        &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None },
-    )?;
+    // The framed negative is written and let go before the mask is framed.
+    // What the mask needs of it is its size.
+    let (width, height) = {
+        let out = framed(plane, framing, STRAIGHTEN_KERNEL);
+        write_gray16_range(
+            path,
+            &out,
+            range,
+            &TiffMeta { description, trc: GrayTrc::Linear, orientation: 1, dpi: None },
+        )?;
+        (out.width, out.height)
+    };
     if let Some(m) = mask {
         let fm = framed(m, framing, MASK_KERNEL);
         let bytes: Vec<u8> = fm.data.par_iter().map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
@@ -229,7 +251,7 @@ pub fn write_negative(
             "mimizan mask: 255*max(M), 255=saturated",
         )?;
     }
-    Ok(Written { width: out.width, height: out.height })
+    Ok(Written { width, height })
 }
 
 /// The plate as a linear DNG. `balanced` are the three channel planes of
@@ -632,5 +654,19 @@ mod tests {
         let whole = Framing { crop: None, ..framing };
         let got = write_negative(&path, &plane, Some(&mask), &whole, 1.0, "{}").unwrap();
         assert_eq!(got, Written { width: fw, height: fh });
+    }
+
+    /// An upright picture with nothing to turn is the caller's plane.
+    /// A crop is a window of that plane, not a copy of the whole.
+    #[test]
+    fn an_upright_picture_with_nothing_to_turn_is_borrowed() {
+        let plane = ramp(8, 6, 1.0);
+        let out = framed(&plane, &Framing::upright(1), STRAIGHTEN_KERNEL);
+        assert!(matches!(out, Cow::Borrowed(_)));
+        assert_eq!(out.data.as_ptr(), plane.data.as_ptr());
+        let crop = CropRect { x: 1, y: 1, w: 3, h: 2 };
+        let cut = framed(&plane, &Framing { crop: Some(crop), ..Framing::upright(1) }, STRAIGHTEN_KERNEL);
+        assert!(matches!(cut, Cow::Owned(_)));
+        assert_eq!(cut.data, window_plane(&plane, crop).data);
     }
 }
