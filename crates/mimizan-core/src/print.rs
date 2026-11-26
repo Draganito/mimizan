@@ -979,7 +979,7 @@ pub fn sharpen_window(
         // resampling it anyway could read off the window. The filters run
         // on this picture, which is the rectangle the full print sharpens,
         // and reflect at its edge; the paper on the tile stays as painted.
-        let mask_picture = if p.recipe.sharpen.usm_amount() > 0.0 {
+        let mask_picture = if p.usm_runs(&lay) {
             match mask {
                 Some(m) => Some(resample(m, MASK_KERNEL, pic)?),
                 None => None,
