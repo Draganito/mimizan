@@ -321,7 +321,7 @@ impl App {
             return;
         }
         self.path = path.display().to_string();
-        self.develop_file(path, false);
+        self.develop_file(path, Again::Read);
     }
 
     /// The file the path field names: the one on screen while the field
@@ -334,11 +334,11 @@ impl App {
         }
     }
 
-    fn develop(&mut self, again: bool) {
+    fn develop(&mut self, again: Again) {
         self.develop_file(self.named_file(), again);
     }
 
-    fn develop_file(&mut self, raw: PathBuf, again: bool) {
+    fn develop_file(&mut self, raw: PathBuf, again: Again) {
         if self.working() {
             return;
         }
@@ -351,7 +351,7 @@ impl App {
         self.errors.fill(None);
         self.status = "Developing…".into();
         self.shown = Some(raw.clone());
-        self.start(raw, again, false);
+        self.start(raw, again, Panes::Both);
     }
 
     /// The other Mimizan algorithm, the rivals staying as they are.
@@ -368,10 +368,10 @@ impl App {
         self.textures[0] = None;
         self.errors[0] = None;
         self.status = format!("Developing {}…", self.algo.label());
-        self.start(raw, false, true);
+        self.start(raw, Again::Read, Panes::Left);
     }
 
-    fn start(&mut self, raw: PathBuf, again: bool, only_left: bool) {
+    fn start(&mut self, raw: PathBuf, again: Again, panes: Panes) {
         let (tx, rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let tools = Arc::new(AtomicUsize::new(0));
@@ -383,7 +383,7 @@ impl App {
             // A file is never a reason for the window to stay on
             // "Developing…": what stops the job is shown, and it ends.
             let done = catch_unwind(AssertUnwindSafe(|| {
-                develop_all(&raw, again, algo, only_left, &programs, &out);
+                develop_all(&raw, again, algo, panes, &programs, &out);
             }));
             if let Err(payload) = done {
                 out.missed(0, format!("stopped: {}", panic_text(payload.as_ref())));
@@ -589,13 +589,13 @@ impl eframe::App for App {
                     egui::TextEdit::singleline(&mut self.path).desired_width(420.0).hint_text("RAW file"),
                 );
                 if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.working() {
-                    self.develop(false);
+                    self.develop(Again::Read);
                 }
                 if ui.add_enabled(!self.working(), egui::Button::new("Develop")).clicked() {
-                    self.develop(false);
+                    self.develop(Again::Read);
                 }
                 if ui.add_enabled(!self.working(), egui::Button::new("Develop again")).clicked() {
-                    self.develop(true);
+                    self.develop(Again::Over);
                 }
                 if ui
                     .add_enabled(self.working(), egui::Button::new("Stop"))
@@ -880,9 +880,26 @@ enum Kept {
     All,
 }
 
-fn kept(marker: Option<&str>, stamp: &str, again: bool) -> Kept {
+/// Whether Develop writes the folder over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Again {
+    /// A second open reads what is already there.
+    Read,
+    /// *Develop again* writes the pictures over.
+    Over,
+}
+
+/// Which panes a job develops.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Panes {
+    Both,
+    /// The left pane. The rivals stay.
+    Left,
+}
+
+fn kept(marker: Option<&str>, stamp: &str, again: Again) -> Kept {
     match marker {
-        _ if again => Kept::Nothing,
+        _ if again == Again::Over => Kept::Nothing,
         Some(text) if text == stamp => Kept::All,
         Some(text) if text.strip_suffix(UNFINISHED) == Some(stamp) => Kept::Plate,
         _ => Kept::Nothing,
@@ -908,7 +925,7 @@ fn clear_leftovers(work: &Path) {
     }
 }
 
-fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tools: &Tools, out: &Out) {
+fn develop_all(raw: &Path, again: Again, mut algo: Algo, panes: Panes, tools: &Tools, out: &Out) {
     let work = work_dir(raw);
     if let Err(e) = std::fs::create_dir_all(&work) {
         out.missed(0, cannot_make(&work, &e));
@@ -932,7 +949,7 @@ fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tools: 
     let kept = kept(std::fs::read_to_string(&marker).ok().as_deref(), &stamp, again);
     // Rivals of a file that is no longer the one in the folder would stand
     // beside the new left pane.
-    let only_left = only_left && kept != Kept::Nothing;
+    let only_left = panes == Panes::Left && kept != Kept::Nothing;
     clear_leftovers(&work);
     if !only_left && kept != Kept::All {
         let _ = std::fs::write(&marker, format!("{stamp}{UNFINISHED}"));
@@ -1063,7 +1080,11 @@ fn develop_rival(
     }
     .and_then(|()| {
         let meta = wait_plate(shared)?;
-        finish_demosaic(&linear, &meta, &file, !matches!(rival.kind, Kind::Dht), orientation)
+        let transfer = match rival.kind {
+            Kind::Dht => Transfer::Linear,
+            Kind::Bayer(_) | Kind::Xtrans(_) => Transfer::Srgb,
+        };
+        finish_demosaic(&linear, &meta, &file, transfer, orientation)
     });
     let _ = std::fs::remove_file(&linear);
     made.map(|()| file)
@@ -1248,7 +1269,7 @@ fn ensure_plate(raw: &Path, work: &Path, anew: bool, out: &Out) -> Result<PlateM
 }
 
 fn sensor_of(path: &Path) -> Result<Sensor> {
-    let img = load_image(path, true)?;
+    let img = load_image(path, Depth::Header)?;
     match &img.photometric {
         rawler::rawimage::RawPhotometricInterpretation::Cfa(cfg)
             if cfg.cfa.width == 6
@@ -1266,11 +1287,19 @@ fn sensor_of(path: &Path) -> Result<Sensor> {
     }
 }
 
-fn load_image(path: &Path, dummy: bool) -> Result<rawler::RawImage> {
+/// Whether the photosites are read. The mosaic and the matrix are there
+/// either way; the photosites are the slow part, and a demosaic needs them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Depth {
+    Header,
+    Pixels,
+}
+
+fn load_image(path: &Path, depth: Depth) -> Result<rawler::RawImage> {
     let source = mimizan_core::decode::raw_source(path).context("cannot be read")?;
     let decoder = rawler::get_decoder(&source).context("not a raw file this program reads")?;
     decoder
-        .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), dummy)
+        .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), depth == Depth::Header)
         .context("cannot be decoded")
 }
 
@@ -1308,10 +1337,10 @@ fn camera_rows(img: &rawler::RawImage) -> Result<[[f64; 3]; 3]> {
 }
 
 fn xtrans_meta(raw: &Path) -> Result<PlateMeta> {
-    let head = load_image(raw, true)?;
+    let head = load_image(raw, Depth::Header)?;
     match meta_of_xtrans(&head) {
         Ok(meta) => Ok(meta),
-        Err(_) => meta_of_xtrans(&load_image(raw, false)?),
+        Err(_) => meta_of_xtrans(&load_image(raw, Depth::Pixels)?),
     }
 }
 
@@ -1328,7 +1357,7 @@ fn meta_of_xtrans(img: &rawler::RawImage) -> Result<PlateMeta> {
 
 fn develop_least_squares(raw: &Path, meta: &PlateMeta, file: &Path, out: &Out) -> Result<()> {
     out.status("Developing the least-squares demosaic…");
-    let img = load_image(raw, false)?;
+    let img = load_image(raw, Depth::Pixels)?;
     let dev = mimizan_cli::bayer_ls::develop(&img, &|s| out.status(s)).map_err(anyhow::Error::msg)?;
     let rgb = encode_balanced(&dev.data, dev.frame.width, dev.frame.height, dev.balance, meta.rows);
     write_display(file, dev.frame.width, dev.frame.height, &rgb)
@@ -1336,7 +1365,7 @@ fn develop_least_squares(raw: &Path, meta: &PlateMeta, file: &Path, out: &Out) -
 
 fn develop_xtrans(raw: &Path, meta: &PlateMeta, file: &Path, out: &Out) -> Result<()> {
     out.status("Developing the X-Trans demosaic…");
-    let img = load_image(raw, false)?;
+    let img = load_image(raw, Depth::Pixels)?;
     let dev = mimizan_lab_xtrans::convert::develop_watched(
         &img,
         &mimizan_lab_xtrans::convert::Settings { keep_highlights: true },
@@ -2054,13 +2083,22 @@ fn encode_plate(gray: &[u16], meta: &PlateMeta) -> Vec<u8> {
     rgb
 }
 
+/// How a rival's file stores a sample.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Transfer {
+    /// Linear, as dcraw writes it.
+    Linear,
+    /// The sRGB curve RawTherapee writes, undone before the matrix.
+    Srgb,
+}
+
 /// A rival's linear camera channels through the plate matrix and the sRGB
 /// curve, cropped to the active area the negative kept.
 fn finish_demosaic(
     linear: &Path,
     meta: &PlateMeta,
     out: &Path,
-    encoded: bool,
+    transfer: Transfer,
     orientation: u8,
 ) -> Result<()> {
     let (width, height, samples, _) = read_tiff_u16(linear, 3)?;
@@ -2071,10 +2109,9 @@ fn finish_demosaic(
             let p = ((crop.y + y) * width + crop.x + x) * 3;
             let cam = [samples[p], samples[p + 1], samples[p + 2]].map(|v| {
                 let x = f64::from(v) / 65535.0;
-                if encoded {
-                    srgb_decode(x)
-                } else {
-                    x
+                match transfer {
+                    Transfer::Srgb => srgb_decode(x),
+                    Transfer::Linear => x,
                 }
             });
             let lin = project(cam, meta.rows);
@@ -2321,14 +2358,14 @@ mod tests {
         assert_eq!(work_dir(&nef).file_name().and_then(|n| n.to_str()), Some("photo.mimizan-compare"));
         let stamp = stamp_of(&nef);
         assert_ne!(stamp, stamp_of(&dng));
-        assert_eq!(kept(Some(&stamp), &stamp, false), Kept::All);
-        assert_eq!(kept(Some(&stamp), &stamp, true), Kept::Nothing, "Develop again");
-        assert_eq!(kept(Some(&format!("{stamp}{UNFINISHED}")), &stamp, false), Kept::Plate);
-        assert_eq!(kept(Some(&stamp_of(&dng)), &stamp, false), Kept::Nothing);
-        assert_eq!(kept(Some(VIEW), &stamp, false), Kept::Nothing, "a folder of 0.20.15");
-        assert_eq!(kept(None, &stamp, false), Kept::Nothing);
+        assert_eq!(kept(Some(&stamp), &stamp, Again::Read), Kept::All);
+        assert_eq!(kept(Some(&stamp), &stamp, Again::Over), Kept::Nothing, "Develop again");
+        assert_eq!(kept(Some(&format!("{stamp}{UNFINISHED}")), &stamp, Again::Read), Kept::Plate);
+        assert_eq!(kept(Some(&stamp_of(&dng)), &stamp, Again::Read), Kept::Nothing);
+        assert_eq!(kept(Some(VIEW), &stamp, Again::Read), Kept::Nothing, "a folder of 0.20.15");
+        assert_eq!(kept(None, &stamp, Again::Read), Kept::Nothing);
         std::fs::write(&nef, b"another picture").unwrap();
-        assert_eq!(kept(Some(&stamp), &stamp_of(&nef), false), Kept::Nothing, "the RAW was replaced");
+        assert_eq!(kept(Some(&stamp), &stamp_of(&nef), Again::Read), Kept::Nothing, "the RAW was replaced");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
