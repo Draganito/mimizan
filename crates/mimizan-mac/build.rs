@@ -35,16 +35,21 @@ fn main() {
     };
     let (major, minor) = deployment_target();
     let library = out.join("libmimizan_store.a");
-    let status = Command::new("xcrun")
+    let output = Command::new("xcrun")
         .args(["swiftc", "-parse-as-library", "-emit-library", "-static", "-O", "-swift-version", "5"])
         .args(["-module-name", "MimizanStore"])
         .args(["-target", &format!("{arch}-apple-macos{major}.{minor}")])
         .arg("-o")
         .arg(&library)
         .arg(&source)
-        .status()
-        .expect("xcrun swiftc: the Xcode command line tools are needed for the store build");
-    assert!(status.success(), "swiftc failed on {}", source.display());
+        .output()
+        .expect("xcrun swiftc could not be started");
+    assert!(
+        output.status.success(),
+        "swiftc failed on {}: the Xcode command line tools are needed for the store build\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=mimizan_store");
@@ -75,7 +80,7 @@ fn deployment_target() -> (u32, u32) {
 }
 
 fn xcrun(args: &[&str]) -> String {
-    let output = Command::new("xcrun").args(args).output().expect("xcrun");
-    assert!(output.status.success(), "xcrun {args:?} failed");
+    let output = Command::new("xcrun").args(args).output().expect("xcrun could not be started");
+    assert!(output.status.success(), "xcrun {args:?} failed: {}", String::from_utf8_lossy(&output.stderr));
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }

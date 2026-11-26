@@ -171,7 +171,12 @@ private final class Store: @unchecked Sendable {
                 case let .verified(transaction):
                     await transaction.finish()
                     await refresh()
-                    say("Unlocked. Thank you.")
+                    let owns: Bool = locked { owned }
+                    say(
+                        owns
+                            ? "Unlocked. Thank you."
+                            : "The purchase is made. It will unlock in a moment."
+                    )
                 case .unverified:
                     say("The purchase could not be verified.")
                 }
