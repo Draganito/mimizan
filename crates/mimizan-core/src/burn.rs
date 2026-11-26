@@ -198,17 +198,22 @@ impl Tip {
     }
 
     /// Half the light a point takes over a straight pass of the tip
-    /// through it along `(ux, uy)`: the integral of the weight along the
-    /// line, halved. The half-chord when the feather fits inside the tip
-    /// (the penumbra is symmetric about the edge); more when the tip is
-    /// softer than it is wide, its tail reaching past the chord.
+    /// through it along the unit direction `(ux, uy)`: half the integral
+    /// of the weight along that line. A circle, and a hard edge, are the
+    /// closed form (the half-chord when the feather fits inside the tip,
+    /// the penumbra being symmetric about the edge, and more when the tip
+    /// is softer than it is wide). An ellipse integrates the penumbra of
+    /// the true distance along the line, once per path segment.
     pub fn half_dwell(&self, ux: f64, uy: f64) -> f64 {
         let h = self.half_chord(ux, uy);
-        if !hard_edge(self.feather) {
-            -self.feather * penumbra_integral(-h / self.feather)
-        } else {
-            h
+        if hard_edge(self.feather) {
+            return h;
         }
+        let (rx, ry) = self.axes();
+        if rx == ry {
+            return -self.feather * penumbra_integral(-h / self.feather);
+        }
+        integrated_half(self, ux, uy)
     }
 
     /// The tip after `quarters` clockwise quarter turns of the picture.
@@ -297,6 +302,32 @@ fn axis_distance(along: f64, a: f64, b: f64) -> f64 {
         -best
     } else {
         best
+    }
+}
+
+/// Half the integral of [`Tip::weight`] from the centre out along
+/// `(ux, uy)`, which is half the integral over the whole line by symmetry.
+/// Adaptive Simpson, stopped when the local error estimate is under
+/// 1e-12: the penumbra's slope is singular at the edge of the band and the
+/// distance kinks on the medial axis, so a fixed grid does not reach that.
+fn integrated_half(tip: &Tip, ux: f64, uy: f64) -> f64 {
+    let reach = tip.reach();
+    let weight = |s: f64| tip.weight(s * ux, s * uy);
+    simpson(0.0, reach, weight(0.0), weight(reach), 1e-12, 0, &weight)
+}
+
+fn simpson(a: f64, b: f64, fa: f64, fb: f64, tol: f64, depth: u32, f: &impl Fn(f64) -> f64) -> f64 {
+    let mid = 0.5 * (a + b);
+    let fm = f(mid);
+    let whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
+    let fl = f(0.5 * (a + mid));
+    let fr = f(0.5 * (mid + b));
+    let left = (mid - a) / 6.0 * (fa + 4.0 * fl + fm);
+    let right = (b - mid) / 6.0 * (fm + 4.0 * fr + fb);
+    if depth >= 24 || (left + right - whole).abs() <= tol * 15.0 {
+        left + right
+    } else {
+        simpson(a, mid, fa, fm, tol * 0.5, depth + 1, f) + simpson(mid, b, fm, fb, tol * 0.5, depth + 1, f)
     }
 }
 
@@ -1782,6 +1813,37 @@ mod tests {
         let numeric: f64 =
             (0..n).map(|i| fuzzy.weight((i as f64 + 0.5) / n as f64 - 0.5, 0.0)).sum::<f64>() / n as f64;
         assert!((numeric - 2.0 * fuzzy.half_dwell(1.0, 0.0)).abs() < 1e-5, "{numeric}");
+    }
+
+    /// The dwell along a pass is the integral of the weight. The circle
+    /// above is checked along x; an ellipse is checked in each direction,
+    /// turned tips included.
+    #[test]
+    fn the_dwell_along_a_pass_is_the_integral_of_the_weight() {
+        let tips = [
+            tip(0.15, 0.05, 0.0, 0.2),
+            tip(0.3, 0.03, 0.0, 0.03),
+            tip(0.2, 0.08, 35.0, 0.05),
+            tip(0.12, 0.04, -20.0, 0.01),
+            tip(0.25, 0.25, 15.0, 0.04),
+        ];
+        for t in tips {
+            for deg in [0.0f64, 30.0, 45.0, 90.0] {
+                let (uy, ux) = deg.to_radians().sin_cos();
+                let reach = t.rx.max(t.ry) + t.feather;
+                let n = 20_000;
+                let h = 2.0 * reach / n as f64;
+                let mut sum = t.weight(-reach * ux, -reach * uy) + t.weight(reach * ux, reach * uy);
+                for i in 1..n {
+                    let s = -reach + i as f64 * h;
+                    let w = if i % 2 == 0 { 2.0 } else { 4.0 };
+                    sum += w * t.weight(s * ux, s * uy);
+                }
+                let numeric = sum * h / 3.0;
+                let got = 2.0 * t.half_dwell(ux, uy);
+                assert!((numeric - got).abs() < 1e-6, "{t:?} along {deg}°: {numeric} vs {got}");
+            }
+        }
     }
 
     /// Signed distance from `(x, y)` to the tip's outline, negative inside.
