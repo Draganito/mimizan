@@ -968,7 +968,7 @@ fn develop_all(raw: &Path, again: bool, mut algo: Algo, only_left: bool, tools: 
                     break;
                 }
                 let made = guarded(|| {
-                    let file = develop_rival(raw, &work, rival, kept, tools, &shared, out)?;
+                    let file = develop_rival(raw, &work, rival, kept, tools, &shared, out, orientation)?;
                     show(out, n + 1, rival.key, &file, 1)
                 });
                 if let Err(e) = made {
@@ -1036,6 +1036,7 @@ fn develop_ours(
 }
 
 /// A rival's file, developed by its tool or found.
+#[allow(clippy::too_many_arguments)]
 fn develop_rival(
     raw: &Path,
     work: &Path,
@@ -1044,6 +1045,7 @@ fn develop_rival(
     tools: &Tools,
     shared: &Shared,
     out: &Out,
+    orientation: u8,
 ) -> Result<PathBuf> {
     let file = work.join(format!("{}.tif", rival.key));
     if kept == Kept::All && file.is_file() {
@@ -1061,7 +1063,7 @@ fn develop_rival(
     }
     .and_then(|()| {
         let meta = wait_plate(shared)?;
-        finish_demosaic(&linear, &meta, &file, !matches!(rival.kind, Kind::Dht))
+        finish_demosaic(&linear, &meta, &file, !matches!(rival.kind, Kind::Dht), orientation)
     });
     let _ = std::fs::remove_file(&linear);
     made.map(|()| file)
@@ -2042,9 +2044,15 @@ fn encode_plate(gray: &[u16], meta: &PlateMeta) -> Vec<u8> {
 
 /// A rival's linear camera channels through the plate matrix and the sRGB
 /// curve, cropped to the active area the negative kept.
-fn finish_demosaic(linear: &Path, meta: &PlateMeta, out: &Path, encoded: bool) -> Result<()> {
+fn finish_demosaic(
+    linear: &Path,
+    meta: &PlateMeta,
+    out: &Path,
+    encoded: bool,
+    orientation: u8,
+) -> Result<()> {
     let (width, height, samples, _) = read_tiff_u16(linear, 3)?;
-    let crop = placed(width, height, meta.crop);
+    let crop = placed(width, height, turned_crop(width, height, meta.crop, orientation));
     let mut rgb = vec![0u8; crop.w * crop.h * 3];
     for y in 0..crop.h {
         for x in 0..crop.w {
@@ -2065,6 +2073,33 @@ fn finish_demosaic(linear: &Path, meta: &PlateMeta, out: &Path, encoded: bool) -
         }
     }
     write_display(out, crop.w, crop.h, &rgb)
+}
+
+/// The negative's crop, which is the sensor's, in the coordinates of a
+/// file the tool has already turned. A portrait file is the sensor on its
+/// side, so the same rectangle has to be turned with it. A file that is
+/// not that sensor is handed on as it is: [`placed`] keeps it whole when
+/// the rectangle does not lie inside.
+fn turned_crop(width: usize, height: usize, crop: Crop, orientation: u8) -> Crop {
+    let (sensor_w, sensor_h) = if matches!(orientation, 5..=8) { (height, width) } else { (width, height) };
+    let Crop { x, y, w, h } = crop;
+    let (Some(x1), Some(y1)) = (x.checked_add(w), y.checked_add(h)) else {
+        return crop;
+    };
+    if x1 > sensor_w || y1 > sensor_h || !(2..=8).contains(&orientation) {
+        return crop;
+    }
+    let (x, y, w, h) = match orientation {
+        2 => (sensor_w - x1, y, w, h),
+        3 => (sensor_w - x1, sensor_h - y1, w, h),
+        4 => (x, sensor_h - y1, w, h),
+        5 => (y, x, h, w),
+        6 => (sensor_h - y1, x, h, w),
+        7 => (sensor_h - y1, sensor_w - x1, h, w),
+        8 => (y, sensor_w - x1, h, w),
+        _ => (x, y, w, h),
+    };
+    Crop { x, y, w, h }
 }
 
 /// The crop, when it lies inside `width`×`height`. A file that is already
@@ -2594,6 +2629,37 @@ mod tests {
         assert_eq!((full.x, full.y), (0, 0));
         let crop = placed(200, 100, Crop { x: 8, y: 4, w: 100, h: 80 });
         assert_eq!((crop.x, crop.y, crop.w, crop.h), (8, 4, 100, 80));
+        let upright = turned_crop(200, 100, Crop { x: 8, y: 4, w: 100, h: 80 }, 1);
+        assert_eq!((upright.x, upright.y, upright.w, upright.h), (8, 4, 100, 80));
+    }
+
+    /// A rival's file is already turned. The crop, which is the sensor's,
+    /// has to cover the same pixels our pane turns into place. A file that
+    /// is already just that area is kept whole.
+    #[test]
+    fn a_portrait_rivals_crop_covers_the_same_pixels_as_ours() {
+        let (sw, sh) = (20usize, 12usize);
+        let crop = Crop { x: 2, y: 1, w: 16, h: 8 };
+        for orientation in 1..=8u8 {
+            let mut px = vec![0u8; sw * sh * 4];
+            for y in crop.y..crop.y + crop.h {
+                for x in crop.x..crop.x + crop.w {
+                    px[(y * sw + x) * 4] = 255;
+                }
+            }
+            let (turned, fw, fh) = turn(px, sw, sh, orientation);
+            let got = placed(fw, fh, turned_crop(fw, fh, crop, orientation));
+            for y in 0..fh {
+                for x in 0..fw {
+                    let marked = turned[(y * fw + x) * 4] == 255;
+                    let inside = x >= got.x && y >= got.y && x < got.x + got.w && y < got.y + got.h;
+                    assert_eq!(marked, inside, "orientation {orientation} at {x},{y}");
+                }
+            }
+            let (aw, ah) = if matches!(orientation, 5..=8) { (crop.h, crop.w) } else { (crop.w, crop.h) };
+            let whole = placed(aw, ah, turned_crop(aw, ah, crop, orientation));
+            assert_eq!((whole.x, whole.y, whole.w, whole.h), (0, 0, aw, ah), "{orientation}");
+        }
     }
 
     #[test]
