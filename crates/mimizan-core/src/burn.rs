@@ -1022,13 +1022,15 @@ struct Raster {
 impl Raster {
     /// Every grid point summed over the samples near it, in parallel.
     /// `h` is the spacing asked for ([`raster_step`]); a box too wide for
-    /// [`MAX_RASTER`] points of it is rastered coarser.
-    fn build(tip: &ReadyTip, samples: &[Sample], h: f64) -> Self {
+    /// `points` steps of it is rastered coarser. A stroke built whole asks
+    /// for [`MAX_RASTER`]. One the cap stopped asks for half of that, so
+    /// the next frames still have room to extend it.
+    fn build(tip: &ReadyTip, samples: &[Sample], h: f64, points: usize) -> Self {
         let reach = tip.reach();
         let bounds = reach_box(samples, reach, h);
         let grid = Grid::new(samples, bounds, tip);
         let (x0, y0, x1, y1) = bounds;
-        let h = h.max((x1 - x0) / MAX_RASTER as f64).max((y1 - y0) / MAX_RASTER as f64);
+        let h = h.max((x1 - x0) / points as f64).max((y1 - y0) / points as f64);
         let nx = ((x1 - x0) / h).ceil() as usize + 1;
         let ny = ((y1 - y0) / h).ceil() as usize + 1;
         let mut w = vec![0f32; nx * ny];
@@ -1249,7 +1251,7 @@ impl Ready {
                     ([], [one]) => Ready::Still { tip: ready, x: one.x, y: one.y, gain, light: *light },
                     (full, _) => Ready::Moving {
                         tip: ready,
-                        raster: Raster::build(&ready, full, raster_step(tip)),
+                        raster: Raster::build(&ready, full, raster_step(tip), MAX_RASTER),
                         tail: sampled.tail,
                         full: full.len(),
                         step: sampled.step,
@@ -1279,9 +1281,10 @@ impl Ready {
 
     /// `stroke` prepared from `from`, a shorter path of the same hand that
     /// this one continues: the raster is copied and the new steps added.
-    /// `None` when it does not continue it, or the steps changed. The
-    /// result is provisional: the screen may read a grown raster, and a
-    /// file builds the stroke whole.
+    /// `None` when it does not continue it, or the steps changed. When the
+    /// cap stops the growing, the stroke is built again with room to
+    /// extend, and the next frames grow that. The result is provisional:
+    /// the screen may read it, and a file builds the stroke whole.
     fn grown(from: &Ready, stroke: &Stroke) -> Option<Self> {
         let Stroke::Hand { tip, light, points, .. } = stroke else { return None };
         let Ready::Moving { tip: ready, raster, full, step, points: old, light: old_light, gain, .. } = from
@@ -1298,7 +1301,9 @@ impl Ready {
         }
         let mut raster = raster.clone();
         if !raster.extend(ready, &sampled.full[*full..]) {
-            return None;
+            // The path continues this one, and only the cap stopped it
+            // growing. Half as many points leaves room for the next frames.
+            raster = Raster::build(ready, &sampled.full, raster_step(tip), MAX_RASTER / 2);
         }
         Some(Ready::Moving {
             tip: *ready,
@@ -2894,7 +2899,7 @@ mod tests {
             let sampled = sample_path(&t, &path);
             let samples: Vec<Sample> = sampled.full.iter().chain(sampled.tail.iter()).copied().collect();
             let h = raster_step(&t);
-            let got = Raster::build(&ready, &samples, h);
+            let got = Raster::build(&ready, &samples, h, MAX_RASTER);
             let old = raster_on_square_grid(&ready, &samples, h);
             assert_eq!((got.nx, got.ny), (old.nx, old.ny), "{t:?}");
             assert_eq!(got.x0, old.x0);
@@ -2915,7 +2920,7 @@ mod tests {
         let sampled = sample_path(&t, &path);
         let samples: Vec<Sample> = sampled.full.iter().chain(sampled.tail.iter()).copied().collect();
         assert!(samples.len() > 50, "{}", samples.len());
-        let raster = Raster::build(&ready, &samples, raster_step(&t));
+        let raster = Raster::build(&ready, &samples, raster_step(&t), MAX_RASTER);
         assert!(raster.nx > 32 && raster.ny > 32, "{}x{}", raster.nx, raster.ny);
         let (nx, ny) = (raster.nx, raster.ny);
         let (fails, worst) = (0..ny)
@@ -2939,5 +2944,81 @@ mod tests {
             .reduce(|| (0, 0.0), |a, b| (a.0 + b.0, a.1.max(b.1)));
         assert_eq!(fails, 0, "worst difference {worst} over {}x{ny}", raster.nx);
         assert!(raster.w.iter().any(|v| *v > 0.0));
+    }
+
+    fn moving(ready: &Ready) -> &Raster {
+        let Ready::Moving { raster, .. } = ready else { panic!("the hand moves") };
+        raster
+    }
+
+    /// Past the cap the stroke is built once with room to grow, and the
+    /// frames after that extend it. A file then reads the stroke built
+    /// whole, the same raster a fresh preparation has.
+    #[test]
+    fn a_stroke_at_the_raster_cap_is_built_with_room_and_then_extended() {
+        let t = tip(0.006, 0.006, 0.0, 0.0);
+        let n = 48;
+        let path: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let x = -0.7 + 1.4 * i as f64 / (n - 1) as f64;
+                [x, 0.012 * (i as f64 * 0.35).sin()]
+            })
+            .collect();
+        let mut prev: Option<Ready> = None;
+        let mut coarsened = 0usize;
+        let mut extended_after = 0usize;
+        let mut seen_room = false;
+        for k in 2..=path.len() {
+            let stroke = hand(t, 1.0, Light::Both, &path[..k]);
+            let next = match &prev {
+                Some(p) => Ready::grown(p, &stroke).expect("a continuing path grows"),
+                None => Ready::new(&stroke),
+            };
+            let Ready::Moving { raster, provisional, .. } = &next else { panic!("frame {k} moves") };
+            if let Some(old) = prev.as_ref() {
+                let before = moving(old);
+                if raster.h == before.h {
+                    assert!(raster.nx >= before.nx && raster.ny >= before.ny, "frame {k} shrank");
+                    if seen_room {
+                        extended_after += 1;
+                        assert!(*provisional);
+                    }
+                } else {
+                    assert!(raster.h > before.h, "frame {k}: {} then {}", before.h, raster.h);
+                    assert!(*provisional);
+                    assert!(
+                        raster.nx <= MAX_RASTER / 2 + 2 && raster.ny <= MAX_RASTER / 2 + 2,
+                        "frame {k} filled the cap again: {}x{}",
+                        raster.nx,
+                        raster.ny
+                    );
+                    coarsened += 1;
+                    seen_room = true;
+                    extended_after = 0;
+                }
+            }
+            prev = Some(next);
+        }
+        assert!(coarsened >= 1, "the cap was never reached");
+        assert!(extended_after >= 4, "built with room {coarsened} times, then extended {extended_after}");
+
+        let stroke = hand(t, 0.55, Light::Hard, &path);
+        for k in (2..path.len()).step_by(4) {
+            let _screen = prepared(&hand(t, 0.55, Light::Hard, &path[..k]));
+        }
+        let screen = prepared(&stroke);
+        assert!(screen.is_provisional());
+        let screen_h = moving(&screen).h;
+        settle_for_file(std::slice::from_ref(&stroke));
+        let settled = prepared(&stroke);
+        let fresh = Ready::new(&stroke);
+        assert!(!settled.is_provisional());
+        let (a, b) = (moving(&settled), moving(&fresh));
+        assert_eq!(a.w, b.w);
+        assert_eq!(a.x0, b.x0);
+        assert_eq!(a.y0, b.y0);
+        assert_eq!(a.h, b.h);
+        assert_eq!((a.nx, a.ny), (b.nx, b.ny));
+        assert!(screen_h > a.h, "the screen's step {screen_h} is the file's {}", a.h);
     }
 }
