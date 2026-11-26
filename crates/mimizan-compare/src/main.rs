@@ -165,7 +165,7 @@ struct App {
     fitted: bool,
     which: usize,
     pictures: Vec<Option<Picture>>,
-    textures: Vec<Option<egui::TextureHandle>>,
+    textures: Vec<Option<Tiled>>,
     errors: Vec<Option<String>>,
     status: String,
     working: bool,
@@ -258,7 +258,7 @@ impl App {
         self.working = true;
         self.fitted = false;
         self.pictures.fill(None);
-        self.textures.fill(None);
+        self.textures.iter_mut().for_each(|t| *t = None);
         self.errors.fill(None);
         self.status = "Developing…".into();
         let (tx, rx) = mpsc::channel();
@@ -322,18 +322,7 @@ impl App {
                             .map(|r| r.key.to_string())
                             .unwrap_or_else(|| format!("slot{slot}"))
                     };
-                    self.textures[slot] = Some(ctx.load_texture(
-                        name,
-                        egui::ColorImage::from_rgba_unmultiplied(
-                            [picture.width, picture.height],
-                            &picture.rgba,
-                        ),
-                        egui::TextureOptions {
-                            magnification: egui::TextureFilter::Nearest,
-                            minification: egui::TextureFilter::Linear,
-                            ..Default::default()
-                        },
-                    ));
+                    self.textures[slot] = Some(Tiled::upload(ctx, &name, &picture));
                     self.pictures[slot] = Some(picture);
                     self.errors[slot] = None;
                 }
@@ -594,15 +583,74 @@ impl App {
     }
 }
 
-fn paint(ui: &egui::Ui, pane: egui::Rect, title: &str, texture: Option<&egui::TextureHandle>, view: &View) {
+/// A picture on the graphics card: one texture, or a grid of them where
+/// the picture is larger than the card's largest. A texture over that
+/// limit is not refused by the renderer, it ends the program, and the
+/// limit is 8192 pixels with the Windows build: under a 45-megapixel
+/// frame.
+struct Tiled {
+    width: usize,
+    height: usize,
+    /// Each tile's place in the picture, `[x, y, w, h]`, and its texture.
+    tiles: Vec<([usize; 4], egui::TextureHandle)>,
+}
+
+impl Tiled {
+    fn upload(ctx: &egui::Context, name: &str, picture: &Picture) -> Self {
+        let options = egui::TextureOptions {
+            magnification: egui::TextureFilter::Nearest,
+            minification: egui::TextureFilter::Linear,
+            ..Default::default()
+        };
+        let max_side = ctx.input(|i| i.max_texture_side);
+        let tiles = tile_grid(picture.width, picture.height, max_side)
+            .into_iter()
+            .map(|[x, y, w, h]| {
+                let image = if (w, h) == (picture.width, picture.height) {
+                    egui::ColorImage::from_rgba_unmultiplied([w, h], &picture.rgba)
+                } else {
+                    let mut rgba = Vec::with_capacity(4 * w * h);
+                    for row in y..y + h {
+                        let at = 4 * (row * picture.width + x);
+                        rgba.extend_from_slice(&picture.rgba[at..at + 4 * w]);
+                    }
+                    egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba)
+                };
+                ([x, y, w, h], ctx.load_texture(format!("{name}-{x}-{y}"), image, options))
+            })
+            .collect();
+        Self { width: picture.width, height: picture.height, tiles }
+    }
+}
+
+/// The tiles, `[x, y, w, h]`, a `width` × `height` picture is cut into so
+/// that none has a side over `max_side`: one tile when it fits.
+fn tile_grid(width: usize, height: usize, max_side: usize) -> Vec<[usize; 4]> {
+    let max_side = max_side.max(1);
+    let mut tiles = Vec::new();
+    for y in (0..height).step_by(max_side) {
+        for x in (0..width).step_by(max_side) {
+            tiles.push([x, y, max_side.min(width - x), max_side.min(height - y)]);
+        }
+    }
+    tiles
+}
+
+fn paint(ui: &egui::Ui, pane: egui::Rect, title: &str, texture: Option<&Tiled>, view: &View) {
     let painter = ui.painter_at(pane);
     painter.rect_filled(pane, 0.0, egui::Color32::from_rgb(18, 18, 18));
-    if let Some(texture) = texture {
-        let [w, h] = texture.size();
-        let shown = egui::vec2(w as f32, h as f32) * view.mag;
-        let dest = egui::Rect::from_min_size(origin(pane, shown, view.pan), shown);
+    if let Some(picture) = texture {
+        let shown = egui::vec2(picture.width as f32, picture.height as f32) * view.mag;
+        let corner = origin(pane, shown, view.pan);
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-        painter.image(texture.id(), dest, uv, egui::Color32::WHITE);
+        // Neighbours share the edge they are computed to, so no gap opens.
+        let at = |x: usize, y: usize| corner + egui::vec2(x as f32, y as f32) * view.mag;
+        for ([x, y, w, h], texture) in &picture.tiles {
+            let dest = egui::Rect::from_min_max(at(*x, *y), at(x + w, y + h));
+            if dest.intersects(pane) {
+                painter.image(texture.id(), dest, uv, egui::Color32::WHITE);
+            }
+        }
     }
     let label = egui::Rect::from_min_size(pane.min, egui::vec2(pane.width(), 22.0));
     painter.rect_filled(label, 0.0, egui::Color32::from_black_alpha(160));
@@ -1831,6 +1879,34 @@ fn pan_keeping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whatever the picture and the card, no tile is larger than the
+    /// card takes, the tiles cover every pixel once, and a picture that
+    /// fits is one texture as before.
+    #[test]
+    fn a_picture_is_cut_into_textures_the_card_takes() {
+        assert_eq!(tile_grid(6048, 4032, 8192), vec![[0, 0, 6048, 4032]]);
+        assert_eq!(tile_grid(8192, 8192, 8192), vec![[0, 0, 8192, 8192]]);
+        assert_eq!(
+            tile_grid(8256, 5504, 8192),
+            vec![[0, 0, 8192, 5504], [8192, 0, 64, 5504]],
+            "a 45 MP frame on the Windows build"
+        );
+        for (w, h, max) in [(9504, 6336, 8192), (11648, 8736, 4096), (5, 3, 2), (1, 1, 1), (7, 7, 0)] {
+            let tiles = tile_grid(w, h, max);
+            let mut seen = vec![0u8; w * h];
+            for [x, y, tw, th] in tiles {
+                assert!(tw >= 1 && th >= 1 && tw <= max.max(1) && th <= max.max(1));
+                for row in y..y + th {
+                    for col in x..x + tw {
+                        seen[row * w + col] += 1;
+                    }
+                }
+            }
+            assert!(seen.iter().all(|n| *n == 1), "{w}x{h} at {max}");
+        }
+        assert!(tile_grid(0, 10, 8192).is_empty());
+    }
 
     #[test]
     fn a_missing_file_has_no_preview() {
