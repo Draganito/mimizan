@@ -76,6 +76,10 @@ const CACHE_BYTES: usize = 256 << 20;
 const MAX_CELLS: usize = 512;
 const MAX_RASTER: usize = 2048;
 const INDEX_CELLS: usize = 48;
+/// A feather narrower than this, in the stroke's normalised unit, is a hard
+/// edge. Below it the penumbra's ratio overflows or cancels to nothing, and
+/// the width is far under a step of a 16-bit print.
+const HARD_FEATHER: f64 = 1e-12;
 
 /// Which pass of the split-grade print the time is added to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,7 +196,7 @@ impl Tip {
     /// softer than it is wide, its tail reaching past the chord.
     pub fn half_dwell(&self, ux: f64, uy: f64) -> f64 {
         let h = self.half_chord(ux, uy);
-        if self.feather > 0.0 {
+        if !hard_edge(self.feather) {
             -self.feather * penumbra_integral(-h / self.feather)
         } else {
             h
@@ -220,11 +224,19 @@ impl Tip {
     }
 }
 
+/// Whether `feather` is too narrow to be a penumbra, including one that
+/// is not a number.
+#[inline]
+fn hard_edge(feather: f64) -> bool {
+    feather < HARD_FEATHER || feather.is_nan()
+}
+
 /// The weight at signed distance `d` from an edge with a penumbra of
 /// half-width `feather`: inside (`d < 0`) towards 1, outside towards 0.
+/// A feather below [`HARD_FEATHER`] is the hard edge.
 #[inline]
 fn edge_weight(d: f64, feather: f64) -> f64 {
-    if feather > 0.0 {
+    if !hard_edge(feather) {
         penumbra(d / feather)
     } else if d < 0.0 {
         1.0
@@ -868,7 +880,7 @@ impl Profile {
     /// The card's weight over `s` in `[−feather, travel + feather]`;
     /// `None` without a feather (the hard card is two branches).
     fn new(travel: f64, feather: f64) -> Option<Self> {
-        if feather <= 0.0 || feather.is_nan() {
+        if hard_edge(feather) {
             return None;
         }
         let (s0, s1) = (-feather, travel + feather);
@@ -903,9 +915,14 @@ impl Profile {
 /// of a resting card, the mean of it over the travel of a moving one.
 #[inline]
 fn card_weight(s: f64, travel: f64, feather: f64) -> f64 {
-    if travel <= 0.0 {
-        edge_weight(-s, feather)
-    } else if feather > 0.0 {
+    // A push no longer than a billionth of the feather is the card held
+    // still. The two integrals then agree to their last digits, and
+    // scaling the difference by feather/travel is noise, nothing, or not
+    // a number.
+    if travel <= 1e-9 * feather.max(0.0) {
+        return edge_weight(-s, feather);
+    }
+    if !hard_edge(feather) {
         let f = feather;
         // Past the penumbra on either side the weight is whole. Said
         // outright: far from a very narrow edge the two integrals below
@@ -1306,7 +1323,9 @@ impl Field {
         for &i in near.iter().chain(&self.index.everywhere) {
             let r = &self.ready[i as usize];
             let w = r.weight(x, y);
-            if w <= 0.0 {
+            // A weight that is not a number is no time. Left in, it becomes
+            // no exposure and the paper stays white there.
+            if !w.is_finite() || w <= 0.0 {
                 continue;
             }
             let dt = w * r.gain();
@@ -1487,6 +1506,54 @@ mod tests {
     fn pass(cx: f64, cy: f64, deg: f64) -> [[f64; 2]; 2] {
         let (s, c) = deg.to_radians().sin_cos();
         [[cx - 0.5 * c, cy - 0.5 * s], [cx + 0.5 * c, cy + 0.5 * s]]
+    }
+
+    /// A push far shorter than the feather is the card at rest, and a
+    /// feather too narrow to be a penumbra is a hard edge: a card and a
+    /// hand both, with finite weights.
+    #[test]
+    fn a_tiny_travel_rests_and_a_feather_too_small_to_be_a_penumbra_is_hard() {
+        // (a) The two integrals cancel; the card is the one held still.
+        let (feather, s) = (0.05, 0.01);
+        let got = card_weight(s, 1e-30, feather);
+        let rest = edge_weight(-s, feather);
+        assert!(got.is_finite() && (got - rest).abs() == 0.0, "{got} vs {rest}");
+        assert!((got - penumbra(-s / feather)).abs() < 1e-12);
+        let pushed = card(0.0, 0.0, 0.0, 1e-30, feather, 1.0);
+        let still = card(0.0, 0.0, 0.0, 0.0, feather, 1.0);
+        let tp = times(std::slice::from_ref(&pushed), s, 0.0);
+        let ts = times(std::slice::from_ref(&still), s, 0.0);
+        assert!(tp.soft.is_finite() && tp.hard.is_finite() && tp.all.is_finite());
+        assert!((tp.soft - ts.soft).abs() < 1e-6, "{} vs {}", tp.soft, ts.soft);
+
+        // (b) A subnormal feather and an ordinary push: the hard card.
+        assert!(Profile::new(0.3, 5e-324).is_none());
+        for s in [-0.2, 0.0, 0.15, 0.3, 0.8] {
+            let got = card_weight(s, 0.3, 5e-324);
+            let hard = card_weight(s, 0.3, 0.0);
+            assert!(got.is_finite() && got == hard, "{s}: {got} vs {hard}");
+        }
+        let soft = card(0.1, -0.05, 25.0, 0.3, 5e-324, 1.0);
+        let edge = card(0.1, -0.05, 25.0, 0.3, 0.0, 1.0);
+        for (x, y) in [(0.0, 0.0), (0.1, -0.05), (0.4, 0.1), (-0.2, 0.2)] {
+            let a = times(std::slice::from_ref(&soft), x, y);
+            let b = times(std::slice::from_ref(&edge), x, y);
+            assert!(a.soft.is_finite() && a == b, "({x}, {y}): {a:?} vs {b:?}");
+        }
+
+        // (c) A hand with a subnormal feather: the hard tip.
+        let soft = tip(0.12, 0.04, 15.0, 5e-324);
+        let edge = tip(0.12, 0.04, 15.0, 0.0);
+        assert_eq!(soft.half_dwell(0.6, 0.8), edge.half_dwell(0.6, 0.8));
+        assert!(soft.half_dwell(1.0, 0.0).is_finite());
+        for (x, y) in [(0.0, 0.0), (0.08, 0.01), (0.2, 0.0), (0.0, 0.06)] {
+            let w = soft.weight(x, y);
+            assert!(w.is_finite() && w == edge.weight(x, y), "({x}, {y}): {w}");
+        }
+        let path = [[-0.2, 0.0], [0.25, 0.05]];
+        let a = times(std::slice::from_ref(&hand(soft, 1.0, Light::Both, &path)), 0.0, 0.0);
+        let b = times(std::slice::from_ref(&hand(edge, 1.0, Light::Both, &path)), 0.0, 0.0);
+        assert!(a.all.is_finite() && a == b, "{a:?} vs {b:?}");
     }
 
     /// The narrowest feather a recipe can carry is a number so small that
