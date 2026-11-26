@@ -3309,7 +3309,7 @@ impl App {
                     let t = &s.negative.info.timing;
                     let name =
                         s.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-                    if let Some(note) = &s.xtrans_note {
+                    if let Some(note) = &s.note {
                         self.log(format!("{name}: {note}"));
                     }
                     self.log(if s.is_mono() {
@@ -4490,14 +4490,18 @@ impl App {
             if raw != path {
                 self.open(raw);
             }
+        } else if crate::bayer::raws_of(&path).len() > 1 {
+            // Two RAWs of the stem: opening one of them would be a guess.
+            self.log("two RAWs beside this DNG have the same name, so neither of them is opened");
         } else {
             self.log("the RAW this DNG was written from is not beside it");
         }
     }
 
     /// The strip shows the file the checkbox opens. With it on, a RAW whose
-    /// DNG is already written gives way to that DNG. With it off, the DNG
-    /// gives way to the RAW.
+    /// DNG is already written gives way to that DNG, unless another RAW of
+    /// the stem is listed: the one DNG would be both, so both tiles stay.
+    /// With it off, the DNG gives way to its one RAW.
     fn retile_bayer(&mut self) {
         let sort = self.sort;
         let on = self.bayer_ls;
@@ -4505,18 +4509,22 @@ impl App {
             return;
         };
         let entries: Vec<PathBuf> = folder.entries.iter().map(|e| e.path.clone()).collect();
-        for path in entries {
+        for path in &entries {
             if on {
-                if crate::bayer::is_ours(&path) {
+                if crate::bayer::is_ours(path) {
                     continue;
                 }
-                let dng = crate::bayer::dng_of(&path);
-                if crate::bayer::dng_is_current(&dng) {
-                    folder.show_instead(&path, &dng, sort);
+                // The listing the strip already holds.
+                if entries.iter().any(|other| crate::bayer::listed_other(path, other)) {
+                    continue;
                 }
-            } else if crate::bayer::is_ours(&path) {
-                if let Some(raw) = crate::bayer::raw_of(&path) {
-                    folder.show_instead(&path, &raw, sort);
+                let dng = crate::bayer::dng_of(path);
+                if crate::bayer::dng_is_current(&dng) {
+                    folder.show_instead(path, &dng, sort);
+                }
+            } else if crate::bayer::is_ours(path) {
+                if let Some(raw) = crate::bayer::raw_of(path) {
+                    folder.show_instead(path, &raw, sort);
                 }
             }
         }

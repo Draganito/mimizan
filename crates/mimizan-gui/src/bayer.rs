@@ -30,6 +30,9 @@ pub enum Place {
     Ready(PathBuf),
     /// The RAW still has to be written out.
     Needs(Head),
+    /// Another RAW in the folder has this stem. The one DNG would be
+    /// both files, so this file stays on the measured separation.
+    Shared(PathBuf),
 }
 
 /// What the head of a Bayer file says, and where its DNG will be.
@@ -66,33 +69,86 @@ pub fn dng_is_current(path: &Path) -> bool {
     dng_is_ready(path) && crate::software::software_of(path).as_deref() == Some(SOFTWARE)
 }
 
-/// The RAW a DNG written here came from, when that RAW is still beside it.
-/// A path that is not such a DNG is returned as it stands.
+/// The RAW a DNG written here came from, when that one RAW is still
+/// beside it. Two RAWs of the stem are not a choice: the caller is not
+/// handed one of them. A path that is not such a DNG is returned as it stands.
 pub fn raw_of(path: &Path) -> Option<PathBuf> {
     if !is_ours(path) {
         return Some(path.to_path_buf());
     }
-    let name = path.file_name()?.to_str()?;
-    let stem = &name[..name.len() - MARK.len()];
-    let dir = path.parent()?;
-    for entry in fs::read_dir(dir).ok()?.flatten() {
-        let p = entry.path();
-        if p == path {
-            continue;
-        }
-        let Some(file_stem) = p.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if file_stem.eq_ignore_ascii_case(stem) && crate::browser::is_raw(&p) {
-            return Some(p);
-        }
+    match raws_of(path).as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
     }
-    None
+}
+
+/// The RAWs a DNG written here could have come from: every file of its
+/// stem in the folder, apart from the DNG itself.
+pub(crate) fn raws_of(path: &Path) -> Vec<PathBuf> {
+    let Some(stem) = stem_of_ours(path) else {
+        return Vec::new();
+    };
+    raws_named(path, &stem)
+}
+
+/// Another RAW in the folder with the same stem as `path`, compared
+/// without regard to case. The `.mimizan.dng` is not one: that is the
+/// file the two would share. `None` when `path` is the only RAW of its
+/// stem, or the folder cannot be read.
+pub fn other_raw(path: &Path) -> Option<PathBuf> {
+    let stem = path.file_stem().and_then(|s| s.to_str())?;
+    raws_named(path, stem).into_iter().next()
+}
+
+fn stem_of_ours(path: &Path) -> Option<String> {
+    if !is_ours(path) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    Some(name[..name.len() - MARK.len()].to_string())
+}
+
+/// `other` is a different RAW of `stem`. The program's own DNG is not a
+/// RAW of the stem it was written from.
+fn is_raw_of_stem(stem: &str, other: &Path) -> bool {
+    if is_ours(other) {
+        return false;
+    }
+    other.file_stem().and_then(|s| s.to_str()).is_some_and(|s| s.eq_ignore_ascii_case(stem))
+        && crate::browser::is_raw(other)
+}
+
+/// `other` is another RAW of `path`'s stem, in a listing the caller
+/// already holds.
+pub(crate) fn listed_other(path: &Path, other: &Path) -> bool {
+    path != other && path.file_stem().and_then(|s| s.to_str()).is_some_and(|stem| is_raw_of_stem(stem, other))
+}
+
+fn raws_named(path: &Path, stem: &str) -> Vec<PathBuf> {
+    let Some(dir) = path.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries.flatten().map(|entry| entry.path()).filter(|p| p != path && is_raw_of_stem(stem, p)).collect()
+}
+
+/// What the log says when least squares is not used because of `other`.
+pub fn shared_note(other: &Path) -> String {
+    let name = other
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| other.display().to_string());
+    format!(
+        "least squares is off for this file: `{name}` beside it has the same name, and the DNG would be one file for both"
+    )
 }
 
 /// The head only. A file this path does not write out is [`Place::NotBayer`].
 /// A DNG this build already wrote is that too: it opens as it stands. One
-/// an older build wrote is written again from the RAW beside it.
+/// an older build wrote is written again from the RAW beside it. Two RAWs
+/// of one stem are [`Place::Shared`]: the DNG would be one file for both.
 pub fn place(path: &Path) -> Place {
     let raw = if is_ours(path) {
         if dng_is_current(path) {
@@ -105,6 +161,9 @@ pub fn place(path: &Path) -> Place {
     } else {
         path.to_path_buf()
     };
+    if let Some(other) = other_raw(&raw) {
+        return Place::Shared(other);
+    }
     let Some(head) = head_of(&raw) else {
         return Place::NotBayer;
     };
@@ -173,6 +232,41 @@ mod tests {
         assert!(!is_ours(&raw));
         assert!(is_ours(&dng));
         assert!(is_ours(Path::new("/photos/DSC_100.MIMIZAN.DNG")));
+    }
+
+    #[test]
+    fn two_raws_of_one_stem_do_not_share_a_dng() {
+        let dir = std::env::temp_dir().join(format!("mimizan-bayer-stem-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let nef = dir.join("a.NEF");
+        let cr2 = dir.join("A.cr2");
+        let dng = dir.join("a.mimizan.dng");
+        let lone = dir.join("b.NEF");
+        let lone_dng = dir.join("b.mimizan.dng");
+        fs::write(&nef, b"x").unwrap();
+        fs::write(&cr2, b"y").unwrap();
+        fs::write(&dng, b"d").unwrap();
+        fs::write(dir.join("a.txt"), b"t").unwrap();
+        fs::write(&lone, b"z").unwrap();
+        fs::write(&lone_dng, b"d").unwrap();
+        fs::write(dir.join("c.NEF"), b"x").unwrap();
+        fs::write(dir.join("c.mimizan.dng"), b"d").unwrap();
+        assert_eq!(other_raw(&nef).unwrap(), cr2);
+        assert_eq!(other_raw(&cr2).unwrap(), nef);
+        assert!(other_raw(&lone).is_none(), "a lone RAW has no other");
+        assert!(other_raw(&dir.join("c.NEF")).is_none(), "the program's DNG is not another RAW");
+        assert!(raw_of(&dng).is_none(), "two RAWs are not a choice");
+        assert_eq!(raw_of(&lone_dng).unwrap(), lone);
+        assert!(listed_other(&nef, &cr2));
+        assert!(!listed_other(&nef, &dng));
+        assert!(!listed_other(&nef, &dir.join("a.txt")));
+        let note = shared_note(&cr2);
+        assert_eq!(
+            note,
+            "least squares is off for this file: `A.cr2` beside it has the same name, and the DNG would be one file for both"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -75,9 +75,10 @@ pub struct Session {
     pub preview: PreviewPlanes,
     /// The four CFA channels of the frame as shot; fixed for the session.
     pub raw_hist: RawHistogram,
-    /// Set when this session was opened by writing an X-Trans DNG. The
-    /// log says it once; a later open of that DNG has none.
-    pub xtrans_note: Option<String>,
+    /// One line for the log about how this file was opened: a DNG that
+    /// was written, or why least squares was not used. The log says it
+    /// once; a later open that has nothing to say has none.
+    pub note: Option<String>,
 }
 
 /// The next session id. Starts at 1 so 0 can mean "none" in a cache.
@@ -3205,7 +3206,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         assert!(session.is_mono());
         assert!(session.raw_hist.mono);
@@ -3324,7 +3325,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         assert!(session.is_channels() && !session.is_mono());
         let hist = &session.raw_hist;
@@ -3405,7 +3406,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         let tone = Tone::paper().compile();
         let table = ToneTable::build(&tone);
@@ -3637,7 +3638,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         let base = ViewParams {
             weights: Weights::default(),
@@ -3775,7 +3776,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         assert!(!session.is_mono());
         let plate_params = PlateParams::default();
@@ -3922,7 +3923,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         let burns = vec![
             Stroke::Hand {
@@ -4095,7 +4096,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         };
         let weights = Weights::default();
         let mixed = mix(session.separation().unwrap(), &weights);
@@ -4262,7 +4263,7 @@ mod histogram_tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         }
     }
 

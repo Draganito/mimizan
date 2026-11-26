@@ -511,13 +511,15 @@ fn open(
             };
             status(format!("opening {}", head.dng.display()));
             let mut session = open(&head.dng, own, cameras_dir, false, status)?;
-            session.xtrans_note = report.map(|r| crate::fuji::written_note(&r));
+            session.note = report.map(|r| crate::fuji::written_note(&r));
             return Ok(session);
         }
         crate::fuji::Place::NotXtrans => {}
     }
     // The same way, when the Negative window asks for it: a Bayer file is
-    // written once as a linear DNG and that DNG is what opens.
+    // written once as a linear DNG and that DNG is what opens. Two RAWs
+    // of one stem would share that one DNG, so neither of them uses it.
+    let mut shared = None;
     if bayer_ls {
         match crate::bayer::place(path) {
             crate::bayer::Place::Ready(dng) => {
@@ -557,9 +559,10 @@ fn open(
                 };
                 status(format!("opening {}", head.dng.display()));
                 let mut session = open(&head.dng, own, cameras_dir, false, status)?;
-                session.xtrans_note = note;
+                session.note = note;
                 return Ok(session);
             }
+            crate::bayer::Place::Shared(other) => shared = Some(crate::bayer::shared_note(&other)),
             crate::bayer::Place::NotBayer => {}
         }
     }
@@ -581,7 +584,10 @@ fn open(
         }
     });
     let develop = develop_for_open(own, path, || recipe_beside(path));
-    develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)
+    let mut session =
+        develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)?;
+    session.note = shared;
+    Ok(session)
 }
 
 /// The memory was checked by the caller, which still has the job to send
@@ -621,7 +627,7 @@ fn develop_frame(
         develop,
         preview,
         raw_hist,
-        xtrans_note: None,
+        note: None,
     })
 }
 
@@ -1362,7 +1368,7 @@ mod tests {
             develop: Develop::default(),
             preview,
             raw_hist,
-            xtrans_note: None,
+            note: None,
         }
     }
 
