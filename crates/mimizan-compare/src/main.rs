@@ -1700,7 +1700,7 @@ fn plate_meta(desc: &str, width: usize, height: usize) -> Result<PlateMeta> {
     let frame_h =
         plate.get("frame_height").and_then(|n| n.as_u64()).context("the plate states no frame height")?
             as usize;
-    if frame_h == 0 || frame_h * 3 != height {
+    if frame_h == 0 || frame_h.checked_mul(3) != Some(height) {
         bail!("the plate is {width}x{height}, not three frames of {frame_h}");
     }
     let weights = plate.get("weights").and_then(|w| w.as_array()).context("the plate states no matrix")?;
@@ -1834,11 +1834,16 @@ fn display_byte(linear: f64) -> u8 {
 }
 
 fn read_tiff_u16(path: &Path, samples: usize) -> Result<(usize, usize, Vec<u16>, String)> {
-    let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let file = std::io::BufReader::new(
+        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?,
+    );
+    let mut limits = tiff::decoder::Limits::default();
+    limits.decoding_buffer_size = SAMPLE_BYTES_MAX;
+    limits.intermediate_buffer_size = SAMPLE_BYTES_MAX;
     let mut decoder = tiff::decoder::Decoder::new(file)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .with_context(|| format!("reading {}", path.display()))?
-        .with_limits(tiff::decoder::Limits::unlimited());
+        .with_limits(limits);
     let desc = decoder.get_tag_ascii_string(tiff::tags::Tag::ImageDescription).unwrap_or_default();
     let (width, height) = decoder.dimensions().map_err(|e| anyhow::anyhow!("{e}"))?;
     let got = decoder.colortype().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1847,7 +1852,7 @@ fn read_tiff_u16(path: &Path, samples: usize) -> Result<(usize, usize, Vec<u16>,
         bail!("{} is not 16-bit", path.display());
     };
     let (width, height) = (width as usize, height as usize);
-    if data.len() != width * height * samples {
+    if Some(data.len()) != width.checked_mul(height).and_then(|n| n.checked_mul(samples)) {
         bail!(
             "{} has {} samples a pixel ({got:?}), and this view reads {samples}",
             path.display(),
@@ -2071,6 +2076,12 @@ mod tests {
         let meta = plate_meta(desc, 6, 12).unwrap();
         assert_eq!(meta.range, 1.5);
         assert_eq!((meta.crop.x, meta.crop.y, meta.crop.w, meta.crop.h), (8, 4, 6, 4));
+/// Most bytes of samples a file in the work folder can hold: the largest
+/// sheet the program writes, three 16-bit channels. A file that claims
+/// more is not one of ours or a tool's, and is refused with an error and
+/// not with an allocation the machine cannot make.
+const SAMPLE_BYTES_MAX: usize = mimizan_core::recipe::SHEET_MAX_PX.saturating_mul(3 * 2);
+
         let gray = vec![0u16; 6 * 12];
         let rgb = encode_plate(&gray, &meta);
         assert_eq!(rgb.len(), 6 * 4 * 3);
