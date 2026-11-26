@@ -625,9 +625,11 @@ pub fn layout(w: usize, h: usize, orientation: u16, p: &PrintParams) -> Layout {
 /// caller already owns is not counted. When a USM runs, the mask walks
 /// beside the picture through orient, crop and resize, and stays the
 /// size of the picture: sharpening and the peak run on the picture, the
-/// mask is let go, and the sheet is laid once after. A guide for
-/// refusing an export the machine cannot hold, good to about a fifth; the
-/// allocator and the order in which planes drop are what it does not see.
+/// mask is let go, and the sheet is laid once after. The strokes are
+/// counted once on top of that: the field is built after the resize and
+/// kept through the tone, the sharpening, the peak and the sheet. A guide
+/// for refusing an export the machine cannot hold, good to about a fifth;
+/// the allocator and the order in which planes drop are what it does not see.
 pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) -> u64 {
     let r = &p.recipe;
     let lay = layout(w, h, orientation, p);
@@ -683,7 +685,10 @@ pub fn memory_estimate(w: usize, h: usize, orientation: u16, p: &PrintParams) ->
     };
     let widest = [orient, resize, frame, peak, sharpen].into_iter().fold(0.0, f64::max);
     let bytes = 8.0 * widest + 2.0 * sheet;
-    bytes.min(u64::MAX as f64) as u64
+    let planes = bytes.min(u64::MAX as f64) as u64;
+    // The field is built after the resize and kept through the tone, the
+    // sharpening, the peak and the sheet, so its strokes are counted once.
+    planes.saturating_add(crate::burn::held_bytes(&r.burns) as u64)
 }
 
 /// Bytes a plate print holds at its widest point, for frames of `w×h`
@@ -1731,6 +1736,39 @@ mod tests {
         quiet.recipe.sharpen = Sharpen::Off;
         let one = memory_estimate(60, 40, 1, &quiet) as f64;
         assert_eq!(need, one);
+    }
+
+    /// The strokes are counted once, on top of the planes. A recipe with
+    /// none is the estimate it was; one moving hand and one soft card add
+    /// what those two keep.
+    #[test]
+    fn memory_estimate_counts_the_strokes_a_print_holds() {
+        use crate::burn::{held_bytes, Light, Tip};
+        let bare = PrintParams { recipe: Recipe::on_paper(), ..Default::default() };
+        let without = memory_estimate(400, 300, 1, &bare);
+        let hand = Stroke::Hand {
+            tip: Tip { rx: 0.12, ry: 0.05, angle: 20.0, feather: 0.02 },
+            stops: 0.5,
+            light: Light::Soft,
+            points: vec![[-0.04, 0.0], [0.05, 0.02]],
+        };
+        let card = Stroke::Card {
+            x: -0.05,
+            y: 0.0,
+            angle: 10.0,
+            travel: 0.12,
+            feather: 0.03,
+            stops: -0.5,
+            light: Light::Hard,
+        };
+        let strokes = vec![hand, card];
+        let burned = PrintParams {
+            recipe: Recipe { burns: strokes.clone(), ..Recipe::on_paper() },
+            ..Default::default()
+        };
+        assert!(held_bytes(std::slice::from_ref(&strokes[0])) > 128);
+        assert!(held_bytes(std::slice::from_ref(&strokes[1])) > 128);
+        assert_eq!(memory_estimate(400, 300, 1, &burned), without + held_bytes(&strokes) as u64);
     }
 
     /// A plate holds the two finished sheets and the three source frames

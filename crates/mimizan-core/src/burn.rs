@@ -999,6 +999,28 @@ fn reach_box(samples: &[Sample], reach: f64, step: f64) -> (f64, f64, f64, f64) 
     (x0 - m, y0 - m, x1 + m, y1 + m)
 }
 
+/// The box, the spacing and the two sizes of the grid a dwell is stored
+/// on. `h` is the spacing asked for; a box too wide for `points` steps
+/// of it is coarser. [`Raster::build`] fills this grid, and a count of
+/// its points reads these sizes, so the two cannot differ.
+struct RasterShape {
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    h: f64,
+    nx: usize,
+    ny: usize,
+}
+
+fn raster_shape(tip: &ReadyTip, samples: &[Sample], h: f64, points: usize) -> RasterShape {
+    let (x0, y0, x1, y1) = reach_box(samples, tip.reach(), h);
+    let h = h.max((x1 - x0) / points as f64).max((y1 - y0) / points as f64);
+    let nx = ((x1 - x0) / h).ceil() as usize + 1;
+    let ny = ((y1 - y0) / h).ceil() as usize + 1;
+    RasterShape { x0, y0, x1, y1, h, nx, ny }
+}
+
 /// The dwell of a moving tip, worked out once on a grid of points a
 /// [`raster_step`] apart and read between them. The tip is resolved by
 /// the step ([`STEPS_PER_UNIT`]); what a pixel reads is the bilinear
@@ -1026,13 +1048,9 @@ impl Raster {
     /// for [`MAX_RASTER`]. One the cap stopped asks for half of that, so
     /// the next frames still have room to extend it.
     fn build(tip: &ReadyTip, samples: &[Sample], h: f64, points: usize) -> Self {
-        let reach = tip.reach();
-        let bounds = reach_box(samples, reach, h);
-        let grid = Grid::new(samples, bounds, tip);
-        let (x0, y0, x1, y1) = bounds;
-        let h = h.max((x1 - x0) / points as f64).max((y1 - y0) / points as f64);
-        let nx = ((x1 - x0) / h).ceil() as usize + 1;
-        let ny = ((y1 - y0) / h).ceil() as usize + 1;
+        let shape = raster_shape(tip, samples, h, points);
+        let grid = Grid::new(samples, (shape.x0, shape.y0, shape.x1, shape.y1), tip);
+        let (x0, y0, h, nx, ny) = (shape.x0, shape.y0, shape.h, shape.nx, shape.ny);
         let mut w = vec![0f32; nx * ny];
         w.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
             let y = y0 + j as f64 * h;
@@ -1175,21 +1193,30 @@ struct Profile {
 
 const PROFILE_MAX: usize = 1 << 16;
 
+/// Where a card's profile starts, how far apart its samples lie, and how
+/// many it keeps. `None` for a hard edge, and for a feather too narrow
+/// to take a sample. [`Profile::new`] fills those samples; a count of
+/// them reads the length.
+fn profile_shape(travel: f64, feather: f64) -> Option<(f64, f64, usize)> {
+    if hard_edge(feather) {
+        return None;
+    }
+    let (s0, s1) = (-feather, travel + feather);
+    let step = (feather / 256.0).max((s1 - s0) / (PROFILE_MAX - 1) as f64);
+    // A feather so narrow that a 256th of it is nothing has no samples
+    // to take: the card is read as it is, like the hard one.
+    if step.is_nan() || step <= 0.0 {
+        return None;
+    }
+    let n = ((s1 - s0) / step).ceil() as usize + 1;
+    Some((s0, step, n))
+}
+
 impl Profile {
     /// The card's weight over `s` in `[−feather, travel + feather]`;
     /// `None` without a feather (the hard card is two branches).
     fn new(travel: f64, feather: f64) -> Option<Self> {
-        if hard_edge(feather) {
-            return None;
-        }
-        let (s0, s1) = (-feather, travel + feather);
-        let step = (feather / 256.0).max((s1 - s0) / (PROFILE_MAX - 1) as f64);
-        // A feather so narrow that a 256th of it is nothing has no
-        // samples to take: the card is read as it is, like the hard one.
-        if step.is_nan() || step <= 0.0 {
-            return None;
-        }
-        let n = ((s1 - s0) / step).ceil() as usize + 1;
+        let (s0, step, n) = profile_shape(travel, feather)?;
         let w = (0..n).map(|i| card_weight(s0 + i as f64 * step, travel, feather) as f32).collect();
         Some(Self { s0, inv_step: 1.0 / step, w })
     }
@@ -1388,6 +1415,37 @@ impl Ready {
                 }
             }
         }
+    }
+}
+
+/// What `strokes` keep once each is built whole: a moving hand its dwell
+/// raster, its path and its tail, a soft card its profile, and every
+/// stroke a small fixed part. That is [`Ready::bytes`] after [`Ready::new`].
+/// Nothing, for no strokes. The sample list a path needs for its box is
+/// built; the raster and the profile are not.
+pub(crate) fn held_bytes(strokes: &[Stroke]) -> usize {
+    strokes.iter().map(stroke_bytes).sum()
+}
+
+/// What one stroke keeps, counted as [`Ready::bytes`] counts [`Ready::new`]
+/// of the whole stroke, from the grid's sizes and the profile's length.
+fn stroke_bytes(stroke: &Stroke) -> usize {
+    match stroke {
+        Stroke::Hand { tip, points, .. } => {
+            let sampled = sample_path(tip, points);
+            match (sampled.full.as_slice(), sampled.tail.as_slice()) {
+                ([], []) | ([], [_]) => 128,
+                (full, _) => {
+                    let ready = ReadyTip::new(*tip);
+                    let shape = raster_shape(&ready, full, raster_step(tip), MAX_RASTER);
+                    shape.nx * shape.ny * 4 + points.len() * 16 + sampled.tail.len() * 24 + 128
+                }
+            }
+        }
+        Stroke::Card { travel, feather, .. } => match profile_shape(*travel, *feather) {
+            Some((_, _, n)) => n * 4 + 128,
+            None => 128,
+        },
     }
 }
 
@@ -2696,6 +2754,28 @@ mod tests {
         }
         // A hard card keeps nothing but itself.
         assert_eq!(Ready::new(&card(0.0, 0.0, 0.0, 0.25, 0.0, 1.0)).bytes(), 128);
+    }
+
+    /// What a list keeps is what each stroke keeps once it is built whole.
+    /// A list with nothing keeps nothing.
+    #[test]
+    fn the_bytes_a_list_keeps_are_what_each_ready_stroke_keeps() {
+        let still = hand(tip(0.08, 0.08, 0.0, 0.0), 1.0, Light::Both, &[[0.1, -0.05]]);
+        let moving = hand(tip(0.12, 0.05, 20.0, 0.02), 0.5, Light::Soft, &[[-0.04, 0.0], [0.05, 0.02]]);
+        let hard = card(0.0, 0.1, 30.0, 0.2, 0.0, -1.0);
+        let soft = card(-0.05, 0.0, 10.0, 0.12, 0.03, 1.0);
+        let lists = [
+            Vec::new(),
+            vec![still.clone()],
+            vec![moving.clone()],
+            vec![hard.clone()],
+            vec![soft.clone()],
+            vec![still, moving, hard, soft],
+        ];
+        for strokes in &lists {
+            let kept: usize = strokes.iter().map(|s| Ready::new(s).bytes()).sum();
+            assert_eq!(held_bytes(strokes), kept);
+        }
     }
 
     #[test]
