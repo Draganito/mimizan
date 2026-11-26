@@ -415,16 +415,33 @@ pub struct PrintArgs {
     pub lamp: Option<String>,
 }
 
-/// USM default: the camera file of the camera named in the negative's description.
-fn usm_default_from_negative(negative: &Path, cameras: &Path) -> Option<f64> {
-    let g = mimizan_core::tiffin::read_gray_header(negative).ok()?;
-    let v: serde_json::Value = serde_json::from_str(g.as_deref()?).ok()?;
-    let cam = v.get("camera")?;
-    let (make, model) = (cam.get("clean_make")?.as_str()?, cam.get("clean_model")?.as_str()?);
-    let p = CameraFile::find(cameras, make, model)?;
-    let c = CameraFile::load(&p).ok()?;
+/// USM amount from the camera file of the camera the negative's description
+/// names. `Ok(None)` when that description is absent, is not JSON, names no
+/// camera, or the camera has no file. A description that is present and
+/// cannot be read is that read's error. A camera file that is there and does
+/// not load is an error naming the file, as `negative` names it.
+fn usm_default_from_negative(negative: &Path, cameras: &Path) -> Result<Option<f64>> {
+    let Some(text) = mimizan_core::tiffin::read_gray_header(negative)? else {
+        return Ok(None);
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Ok(None);
+    };
+    let Some(cam) = v.get("camera") else {
+        return Ok(None);
+    };
+    let (Some(make), Some(model)) = (
+        cam.get("clean_make").and_then(serde_json::Value::as_str),
+        cam.get("clean_model").and_then(serde_json::Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let Some(p) = CameraFile::find(cameras, make, model) else {
+        return Ok(None);
+    };
+    let c = CameraFile::load(&p).with_context(|| format!("camera file {}", p.display()))?;
     info!("usm amount {} from {}", c.usm_amount, p.display());
-    Some(c.usm_amount)
+    Ok(Some(c.usm_amount))
 }
 
 /// The recipe of a `print` run: the file, then every explicit flag on top.
@@ -490,7 +507,7 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
     if explicit {
         let usm_amount = match a.usm_amount {
             Some(v) => v,
-            None => usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0),
+            None => usm_default_from_negative(&a.negative, &a.cameras)?.unwrap_or(0.0),
         };
         r.sharpen = match a.deconv {
             Some(passes) => Sharpen::Deconv { passes, usm_amount },
@@ -498,7 +515,7 @@ pub fn print_recipe(a: &PrintArgs) -> Result<mimizan_core::recipe::Recipe> {
             None => Sharpen::Off,
         };
     } else if a.recipe.is_none() {
-        let usm_amount = usm_default_from_negative(&a.negative, &a.cameras).unwrap_or(0.0);
+        let usm_amount = usm_default_from_negative(&a.negative, &a.cameras)?.unwrap_or(0.0);
         if usm_amount > 0.0 {
             r.sharpen = Sharpen::Usm { amount: usm_amount };
         }
@@ -734,5 +751,199 @@ mod tests {
         assert_eq!(named[0].1, PathBuf::from("p.png"));
         assert_eq!(named[1].1, PathBuf::from("p.crop.png"));
         assert_eq!(preview_outputs(Some(Path::new("p.png")), false).len(), 1);
+    }
+
+    /// One grey pixel and no `ImageDescription`.
+    fn write_bare(path: &Path) {
+        fn entry(bytes: &mut Vec<u8>, tag: u16, kind: u16, count: u32, value: u32) {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&10u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&9u16.to_le_bytes());
+        let short = 3u16;
+        let long = 4u16;
+        entry(&mut bytes, 256, short, 1, 1);
+        entry(&mut bytes, 257, short, 1, 1);
+        entry(&mut bytes, 258, short, 1, 8);
+        entry(&mut bytes, 259, short, 1, 1);
+        entry(&mut bytes, 262, short, 1, 1);
+        entry(&mut bytes, 273, long, 1, 8);
+        entry(&mut bytes, 277, short, 1, 1);
+        entry(&mut bytes, 278, short, 1, 1);
+        entry(&mut bytes, 279, long, 1, 1);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_described(path: &Path, description: &str) {
+        write_gray8(path, 1, 1, &[0], description).unwrap();
+    }
+
+    /// The encoder wrote this description as ASCII. Make that tag BYTE, so
+    /// the tag is present and is not text.
+    fn description_type_to_byte(path: &Path) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let at = image_description_type_byte(&bytes);
+        assert_eq!(bytes[at], 2, "the encoder writes ASCII");
+        bytes[at] = 1;
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Index of the byte that holds ASCII (2) on the description tag.
+    fn image_description_type_byte(bytes: &[u8]) -> usize {
+        assert!(bytes.len() > 8, "not a TIFF");
+        let be = match &bytes[..2] {
+            b"II" => false,
+            b"MM" => true,
+            other => panic!("not a TIFF: {other:?}"),
+        };
+        let u16_at = |i: usize| {
+            let raw = [bytes[i], bytes[i + 1]];
+            if be {
+                u16::from_be_bytes(raw)
+            } else {
+                u16::from_le_bytes(raw)
+            }
+        };
+        let u32_at = |i: usize| {
+            let raw = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
+            if be {
+                u32::from_be_bytes(raw)
+            } else {
+                u32::from_le_bytes(raw)
+            }
+        };
+        assert_eq!(u16_at(2), 42, "a one-pixel file is a classic TIFF");
+        let mut at = u32_at(4) as usize;
+        let count = usize::from(u16_at(at));
+        at += 2;
+        for _ in 0..count {
+            if u16_at(at) == 270 {
+                assert_eq!(u16_at(at + 2), 2, "the encoder writes text");
+                return if be { at + 3 } else { at + 2 };
+            }
+            at += 12;
+        }
+        panic!("the file has no ImageDescription");
+    }
+
+    fn camera_text(make: &str, model: &str) -> String {
+        json!({"camera": {"clean_make": make, "clean_model": model}}).to_string()
+    }
+
+    /// `deconv` set and unset are the two places a print asks for this default.
+    fn print_args(negative: &Path, cameras: &Path, deconv: Option<u32>) -> PrintArgs {
+        PrintArgs {
+            negative: negative.to_path_buf(),
+            out: PathBuf::from("out.tif"),
+            file: mimizan_core::print::FileOptions::default(),
+            recipe: None,
+            write_recipe: None,
+            look: None,
+            paper: None,
+            place: None,
+            size: None,
+            resample: None,
+            border_mm: None,
+            black_mm: None,
+            angle: None,
+            quarter_turns: None,
+            dpi: None,
+            usm_amount: None,
+            usm_k: 1.0,
+            distance_mm: None,
+            use_mask: false,
+            deconv,
+            cameras: cameras.to_path_buf(),
+            lamp: None,
+        }
+    }
+
+    fn takes_zero(negative: &Path, cameras: &Path) {
+        let off = print_recipe(&print_args(negative, cameras, None)).unwrap();
+        assert_eq!(off.sharpen, mimizan_core::recipe::Sharpen::Off);
+        let deconv = print_recipe(&print_args(negative, cameras, Some(1))).unwrap();
+        assert_eq!(deconv.sharpen, mimizan_core::recipe::Sharpen::Deconv { passes: 1, usm_amount: 0.0 });
+    }
+
+    /// A missing description, text that is not JSON, no camera name and no
+    /// camera file are `Ok(None)`, and both places a print asks still take
+    /// 0. A file that is there and is not a camera file is an error naming
+    /// that file. A description whose tag is present and is not text is the
+    /// error of that read. The recipe is decided here; no print is rendered.
+    #[test]
+    fn a_camera_file_that_does_not_load_stops_the_usm_default() {
+        let dir = std::env::temp_dir().join(format!("mimizan-cmd-usm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cameras = dir.join("cameras");
+        std::fs::create_dir_all(&cameras).unwrap();
+
+        let bare = dir.join("bare.tif");
+        write_bare(&bare);
+        assert_eq!(usm_default_from_negative(&bare, &cameras).unwrap(), None);
+        takes_zero(&bare, &cameras);
+
+        let text = dir.join("text.tif");
+        write_described(&text, "not json");
+        assert_eq!(usm_default_from_negative(&text, &cameras).unwrap(), None);
+        takes_zero(&text, &cameras);
+
+        let unnamed = dir.join("unnamed.tif");
+        write_described(&unnamed, r#"{"stage":"negative"}"#);
+        assert_eq!(usm_default_from_negative(&unnamed, &cameras).unwrap(), None);
+        let half = dir.join("half.tif");
+        write_described(&half, r#"{"camera":{"clean_make":"Proof"}}"#);
+        assert_eq!(usm_default_from_negative(&half, &cameras).unwrap(), None);
+        takes_zero(&unnamed, &cameras);
+        takes_zero(&half, &cameras);
+
+        let missing = dir.join("missing.tif");
+        write_described(&missing, &camera_text("Absent", "Body"));
+        assert_eq!(usm_default_from_negative(&missing, &cameras).unwrap(), None);
+        takes_zero(&missing, &cameras);
+
+        let mut cam = CameraFile::defaults("Proof", "Body", BayerPhase::RGGB);
+        cam.usm_amount = 0.5;
+        cam.save(&cameras.join(CameraFile::file_name("Proof", "Body"))).unwrap();
+        let named = dir.join("named.tif");
+        write_described(&named, &camera_text("Proof", "Body"));
+        assert_eq!(usm_default_from_negative(&named, &cameras).unwrap(), Some(0.5));
+        let sharpened = print_recipe(&print_args(&named, &cameras, None)).unwrap();
+        assert_eq!(sharpened.sharpen, mimizan_core::recipe::Sharpen::Usm { amount: 0.5 });
+        let sharpened = print_recipe(&print_args(&named, &cameras, Some(1))).unwrap();
+        assert_eq!(sharpened.sharpen, mimizan_core::recipe::Sharpen::Deconv { passes: 1, usm_amount: 0.5 });
+
+        let broken_path = cameras.join(CameraFile::file_name("Broken", "Body"));
+        std::fs::write(&broken_path, b"not a camera file").unwrap();
+        let broken = dir.join("broken.tif");
+        write_described(&broken, &camera_text("Broken", "Body"));
+        let context = format!("camera file {}", broken_path.display());
+        let err = usm_default_from_negative(&broken, &cameras).unwrap_err().to_string();
+        assert!(err.contains(&context), "{err}");
+        for deconv in [None, Some(1)] {
+            let got = print_recipe(&print_args(&broken, &cameras, deconv)).unwrap_err().to_string();
+            assert!(got.contains(&context), "{got}");
+        }
+
+        let bad = dir.join("byte.tif");
+        write_described(&bad, "not json");
+        description_type_to_byte(&bad);
+        let read = mimizan_core::tiffin::read_gray_header(&bad).unwrap_err().to_string();
+        assert!(read.contains("the description could not be read"), "{read}");
+        let got = usm_default_from_negative(&bad, &cameras).unwrap_err().to_string();
+        assert_eq!(got, read);
+        for deconv in [None, Some(1)] {
+            let got = print_recipe(&print_args(&bad, &cameras, deconv)).unwrap_err().to_string();
+            assert_eq!(got, read);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
