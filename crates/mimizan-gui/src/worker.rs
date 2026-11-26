@@ -496,7 +496,9 @@ fn open(
                             return Err(anyhow::Error::msg(crate::fuji::taken_sentence(&head.dng)));
                         }
                     }
-                    Err(e) => return Err(anyhow::Error::msg(e.to_string())),
+                    Err(e) => {
+                        return Err(anyhow::Error::msg(crate::fuji::write_error(e.kind(), &e.to_string())))
+                    }
                 },
                 Err(e) => {
                     let _ = std::fs::remove_file(&staging);
@@ -505,7 +507,7 @@ fn open(
                     } else if crate::fuji::name_is_there(&head.dng) {
                         return Err(anyhow::Error::msg(crate::fuji::taken_sentence(&head.dng)));
                     } else {
-                        return Err(anyhow::Error::msg(e));
+                        return Err(anyhow::Error::msg(crate::fuji::write_error_text(&e)));
                     }
                 }
             };
@@ -519,7 +521,7 @@ fn open(
     // The same way, when the Negative window asks for it: a Bayer file is
     // written once as a linear DNG and that DNG is what opens. Two RAWs
     // of one stem would share that one DNG, so neither of them uses it.
-    let mut shared = None;
+    let mut open_note = None;
     if bayer_ls {
         match crate::bayer::place(path) {
             crate::bayer::Place::Ready(dng) => {
@@ -547,22 +549,23 @@ fn open(
                 if head.dng.is_file() && !crate::bayer::dng_is_ready(&head.dng) {
                     let _ = std::fs::remove_file(&head.dng);
                 }
-                let written = crate::bayer::write(&head, status);
-                let note = match written {
-                    Ok(note) => Some(note),
-                    Err(e) => {
-                        if !crate::bayer::dng_is_ready(&head.dng) {
-                            return Err(anyhow::Error::msg(e));
-                        }
-                        None
+                match crate::bayer::write(&head, status) {
+                    Ok(note) => {
+                        status(format!("opening {}", head.dng.display()));
+                        let mut session = open(&head.dng, own, cameras_dir, false, status)?;
+                        session.note = Some(note);
+                        return Ok(session);
                     }
-                };
-                status(format!("opening {}", head.dng.display()));
-                let mut session = open(&head.dng, own, cameras_dir, false, status)?;
-                session.note = note;
-                return Ok(session);
+                    // Another window finished this build's DNG between the
+                    // check and the write. An older build's file is not it.
+                    Err(_) if crate::bayer::dng_is_current(&head.dng) => {
+                        status(format!("opening {}", head.dng.display()));
+                        return open(&head.dng, own, cameras_dir, false, status);
+                    }
+                    Err(e) => open_note = Some(crate::bayer::unwritten_note(&e)),
+                }
             }
-            crate::bayer::Place::Shared(other) => shared = Some(crate::bayer::shared_note(&other)),
+            crate::bayer::Place::Shared(other) => open_note = Some(crate::bayer::shared_note(&other)),
             crate::bayer::Place::NotBayer => {}
         }
     }
@@ -586,7 +589,7 @@ fn open(
     let develop = develop_for_open(own, path, || recipe_beside(path));
     let mut session =
         develop_frame(path.to_path_buf(), frame, decode_ms, camera_file, camera_file_path, develop, status)?;
-    session.note = shared;
+    session.note = open_note;
     Ok(session)
 }
 

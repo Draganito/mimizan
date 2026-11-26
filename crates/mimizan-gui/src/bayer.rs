@@ -184,19 +184,22 @@ fn head_of(raw: &Path) -> Option<Head> {
 
 /// Write the DNG of `head`. The highlights stay in the file, as they do for
 /// an X-Trans plate. `tell` hears each step, and the share of the separation.
-pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
+/// An I/O error keeps its kind, so a folder that cannot be written is told
+/// apart from a file the separation refused.
+pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, std::io::Error> {
     if dng_is_current(&head.dng) {
-        return Err(format!("{} is there already", head.dng.display()));
+        return Err(std::io::Error::other(format!("{} is there already", head.dng.display())));
     }
     let started = Instant::now();
     tell("reading the Bayer file".into());
-    let source = mimizan_core::decode::raw_source(&head.raw).map_err(|e| format!("cannot be read: {e}"))?;
-    let decoder =
-        rawler::get_decoder(&source).map_err(|e| format!("not a raw file this program reads: {e}"))?;
+    let source = mimizan_core::decode::raw_source(&head.raw)
+        .map_err(|e| std::io::Error::other(format!("cannot be read: {e}")))?;
+    let decoder = rawler::get_decoder(&source)
+        .map_err(|e| std::io::Error::other(format!("not a raw file this program reads: {e}")))?;
     let img = decoder
         .raw_image(&source, &RawDecodeParams::default(), false)
-        .map_err(|e| format!("cannot be decoded: {e}"))?;
-    let dev = develop(&img, tell)?;
+        .map_err(|e| std::io::Error::other(format!("cannot be decoded: {e}")))?;
+    let dev = develop(&img, tell).map_err(std::io::Error::other)?;
     let burnt = dev.burnt as f64 / (dev.frame.width * dev.frame.height) as f64;
     let (alpha, alpha_c) = (dev.prior.alpha, dev.prior.alpha_c);
 
@@ -205,13 +208,25 @@ pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, String> {
     // taken for the finished one at the next open.
     mimizan_core::outfile::write_whole(&head.dng, |out| {
         dng::write(out, &source, decoder.as_ref(), img, dev, true, SOFTWARE).map_err(std::io::Error::other)
-    })
-    .map_err(|e| e.to_string())?;
+    })?;
     Ok(format!(
         "DNG written in {:.0} s, prior f^{alpha:.2} and f^{alpha_c:.2}, {:.3}% burnt out and kept",
         started.elapsed().as_secs_f64(),
         100.0 * burnt
     ))
+}
+
+/// What the log says when the least-squares DNG was not written. A folder
+/// that will not take the file is named as that, and any other failure
+/// keeps its own text. A refusal for memory is not this: that stays an error.
+pub fn unwritten_note(err: &std::io::Error) -> String {
+    let reason = match err.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+            "this folder cannot be written to".to_owned()
+        }
+        _ => err.to_string(),
+    };
+    format!("the least-squares DNG was not written ({reason}); this file is on the measured separation")
 }
 
 /// The picture, in the camera's own channels. The frame's corner is a red
@@ -311,6 +326,20 @@ mod tests {
         fs::write(&path, tiff_with_software(SOFTWARE)).unwrap();
         assert!(dng_is_current(&path));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_written_is_said_in_plain_words() {
+        let plain = "the least-squares DNG was not written (this folder cannot be written to); this file is on the measured separation";
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let readonly = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        assert_eq!(unwritten_note(&denied), plain);
+        assert_eq!(unwritten_note(&readonly), plain);
+        let full = std::io::Error::other("no space left on the device");
+        assert_eq!(
+            unwritten_note(&full),
+            "the least-squares DNG was not written (no space left on the device); this file is on the measured separation"
+        );
     }
 
     #[test]

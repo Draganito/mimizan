@@ -142,6 +142,48 @@ pub fn staging_dng(dng: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// What an open says when the folder will not take the DNG. An X-Trans
+/// file has no measured separation to open instead.
+pub const UNWRITABLE_FOLDER: &str = "The DNG of an X-Trans file is written beside it, and this folder cannot be written to. Copy the RAF to a folder that can.";
+
+/// A folder that refused the write, from the error's kind.
+pub(crate) fn folder_denied(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem)
+}
+
+/// The error an X-Trans open shows. A folder that cannot be written to
+/// says where to put the RAF; any other failure keeps its own text.
+pub fn write_error(kind: std::io::ErrorKind, text: &str) -> String {
+    if folder_denied(kind) {
+        UNWRITABLE_FOLDER.to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+/// [`write_error`] for an error that has already been made into text, as
+/// the converter returns. The operating system's wording is recognised.
+pub fn write_error_text(text: &str) -> String {
+    if text_is_unwritable(text) {
+        UNWRITABLE_FOLDER.to_owned()
+    } else {
+        text.to_owned()
+    }
+}
+
+fn text_is_unwritable(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "permission denied",
+        "operation not permitted",
+        "read-only file system",
+        "read-only filesystem",
+        "access is denied",
+    ]
+    .into_iter()
+    .any(|mark| lower.contains(mark))
+}
+
 /// The sentence an open shows for a `<stem>.dng` this program did not write.
 pub fn taken_sentence(dng: &Path) -> String {
     let name = dng
@@ -277,6 +319,28 @@ mod tests {
         assert_eq!(dng_beside(true, Some("Adobe DNG Converter")), Beside::Taken);
         assert_eq!(dng_beside(true, Some("")), Beside::Taken);
         assert_eq!(dng_beside(true, None), Beside::Taken);
+    }
+
+    #[test]
+    fn an_unwritable_folder_says_to_copy_the_raf() {
+        let sentence = UNWRITABLE_FOLDER;
+        assert!(sentence.contains("Copy the RAF"));
+        for kind in [std::io::ErrorKind::PermissionDenied, std::io::ErrorKind::ReadOnlyFilesystem] {
+            let err = std::io::Error::from(kind);
+            assert_eq!(write_error(kind, &err.to_string()), sentence);
+            assert_eq!(write_error_text(&err.to_string()), sentence);
+        }
+        // The wording the operating system puts on the error the converter
+        // returns as text. Codes differ by system; the kind does not.
+        for code in 1..96 {
+            let err = std::io::Error::from_raw_os_error(code);
+            if folder_denied(err.kind()) {
+                assert_eq!(write_error_text(&err.to_string()), sentence, "{code}: {err}");
+            }
+        }
+        let other = "no space left on the device";
+        assert_eq!(write_error(std::io::ErrorKind::StorageFull, other), other);
+        assert_eq!(write_error_text(other), other);
     }
 
     #[test]
