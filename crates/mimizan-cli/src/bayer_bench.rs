@@ -14,7 +14,7 @@ use mimizan_core::kodak::{self, colour_quality, ColourQuality};
 use mimizan_core::plane::Plane;
 use mimizan_core::synth::Rgb;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Args)]
 pub struct BayerBenchArgs {
@@ -195,9 +195,7 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
         }
         let fb = kodak::mosaic_rgb(&rgb, phase, kodak::quantisation_noise(), &stem);
         let dng = a.out.join(format!("{stem}.dng"));
-        if !dng.is_file() {
-            kodak::write_dng(&dng, w, h, &fb.samples, phase, &stem)?;
-        }
+        kodak::write_dng(&dng, w, h, &fb.samples, phase, &stem)?;
 
         let mut demosaic = Vec::new();
         for m in METHODS {
@@ -205,8 +203,21 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
                 demosaic.push(None);
                 continue;
             }
-            match cached_external(m.tool, &dng, &a.out) {
-                Ok(Some(est)) => demosaic.push(Some(colour_quality(&est, &rgb, a.border))),
+            match run_external(m.tool, &dng, &a.out) {
+                Ok(Some(est)) => {
+                    if (est.width(), est.height()) != (w, h) {
+                        bail!(
+                            "{}: {} returned {}x{}, expected {}x{}",
+                            stem,
+                            m.name,
+                            est.width(),
+                            est.height(),
+                            w,
+                            h
+                        );
+                    }
+                    demosaic.push(Some(colour_quality(&est, &rgb, a.border)));
+                }
                 Ok(None) => demosaic.push(None),
                 Err(e) => {
                     eprintln!("{stem}: {} failed: {e}", m.name);
@@ -259,28 +270,6 @@ pub fn bayer_bench(a: &BayerBenchArgs) -> Result<()> {
     mimizan_core::outfile::write_bytes(&a.out.join("report.md"), md.as_bytes())?;
     print!("{md}");
     Ok(())
-}
-
-/// The converter's picture, read back when it is already written.
-fn cached_external(tool: Tool, dng: &Path, out_dir: &Path) -> Result<Option<Rgb>> {
-    let stem = stem_of(dng)?;
-    match tool {
-        Tool::Bilinear => Ok(None),
-        Tool::Libraw(q) => {
-            let out = out_dir.join(format!("{stem}.dng.q{q}.ppm"));
-            if out.is_file() {
-                return Ok(Some(kodak::read_ppm16(&out)?));
-            }
-            run_external(tool, dng, out_dir)
-        }
-        Tool::RawTherapee(m) => {
-            let out = out_dir.join(format!("{stem}.{m}.png"));
-            if out.is_file() {
-                return Ok(Some(kodak::read_rgb_png(&out, true)?));
-            }
-            run_external(tool, dng, out_dir)
-        }
-    }
 }
 
 fn markdown(r: &Report) -> String {
