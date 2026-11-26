@@ -209,29 +209,43 @@ fn sharp_esf(picture: &[f32], width: usize, height: usize) -> Option<Vec<f64>> {
     if ridges.is_empty() {
         return None;
     }
-    // Every k-th ridge once the list is longer than the cap, so the
-    // candidates are spread over the picture and the number scored stays
-    // bounded. k is 1 when the list fits, and every ridge is scored.
-    let step = ridges.len().div_ceil(MAX_EDGES);
     for gate in GATES {
-        let mut kept: Vec<(f64, Vec<f64>)> = Vec::new();
-        for (n, &(x, y)) in ridges.iter().enumerate() {
-            if n % step != 0 {
-                continue;
-            }
-            if kept.len() == MAX_EDGES {
-                break;
-            }
+        let mut kept = spread_kept(ridges.len(), MAX_EDGES, |n| {
+            let (x, y) = ridges[n];
             let (dx, dy, _) = grad(picture, width, height, x, y);
-            if let Some((rms, profile)) = profile(picture, width, height, x, y, dx, dy, gate) {
-                kept.push((rms, profile));
-            }
-        }
+            profile(picture, width, height, x, y, dx, dy, gate)
+        });
         if kept.len() >= MIN_EDGES {
             return Some(pool_sharp(&mut kept));
         }
     }
     None
+}
+
+/// What `score` gives for the entries `0..len` of a list, at most `cap`
+/// of them, in the list's order.
+///
+/// Every entry is asked while fewer than `cap` have passed, so a list
+/// with no more than `cap` passing entries gives all of them, as a plain
+/// walk does. With more, the walk goes in strides: every k-th entry
+/// first, `k = ceil(len / cap)`, then the ones after those. The entries
+/// kept when the cap is reached then lie along the whole list, and not
+/// at its start.
+fn spread_kept<T>(len: usize, cap: usize, mut score: impl FnMut(usize) -> Option<T>) -> Vec<T> {
+    let stride = len.div_ceil(cap.max(1)).max(1);
+    let mut kept: Vec<(usize, T)> = Vec::new();
+    'walk: for offset in 0..stride {
+        for n in (offset..len).step_by(stride) {
+            if kept.len() >= cap {
+                break 'walk;
+            }
+            if let Some(v) = score(n) {
+                kept.push((n, v));
+            }
+        }
+    }
+    kept.sort_by_key(|(n, _)| *n);
+    kept.into_iter().map(|(_, v)| v).collect()
 }
 
 fn pool_sharp(kept: &mut [(f64, Vec<f64>)]) -> Vec<f64> {
@@ -551,6 +565,31 @@ mod tests {
         assert!(tuned.found);
         assert_eq!(tuned.radius.to_bits(), 4_608_983_858_650_965_606);
         assert_eq!(tuned.amount.to_bits(), 4_607_633_123_438_910_799);
+    }
+
+    /// A list with no more passing entries than the cap is walked whole,
+    /// in its order, however long it is. One with more gives the cap,
+    /// taken along the whole list.
+    #[test]
+    fn the_cap_takes_from_the_whole_list_and_only_when_it_is_reached() {
+        let passing = |n: usize| n.is_multiple_of(3).then_some(n);
+        let plain: Vec<usize> = (0..5000).filter_map(passing).collect();
+        assert_eq!(spread_kept(5000, 2000, passing), plain);
+        assert_eq!(spread_kept(1500, 2000, Some), (0..1500).collect::<Vec<_>>());
+        // The first 2000 in order, when the list is no longer than the cap.
+        assert_eq!(spread_kept(2000, 2000, Some), (0..2000).collect::<Vec<_>>());
+
+        let kept = spread_kept(6000, 2000, Some);
+        assert_eq!(kept, (0..6000).step_by(3).collect::<Vec<_>>());
+        // 4320 entries: the first stride gives 1440, the second fills up.
+        let kept = spread_kept(4320, 2000, Some);
+        assert_eq!(kept.len(), 2000);
+        assert!(kept.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(kept.iter().filter(|n| **n >= 2160).count(), 720);
+        assert_eq!(*kept.last().unwrap(), 4317);
+
+        assert!(spread_kept(0, 2000, Some).is_empty());
+        assert!(spread_kept(10, 0, Some).is_empty());
     }
 
     /// One horizontal edge to a cell row. The first `soft_rows` are soft,
