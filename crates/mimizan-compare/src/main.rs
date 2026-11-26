@@ -2609,4 +2609,55 @@ mod tests {
         let bare = r#"{"report":{"crop":{"x":8,"y":4,"w":6,"h":4}},"plate":{"frames":["blue","green","red"],"frame_height":4,"weights":[[1,0,0],[0,1,0],[0,0,1]]}}"#;
         assert_eq!(plate_meta(bare, 6, 12).unwrap().range, 1.0);
     }
+
+    /// A frame height that does not make three frames of the file, including
+    /// one whose triple does not fit in a `usize`, is not a plate we can read.
+    #[test]
+    fn a_plate_whose_frame_height_does_not_triple_is_refused() {
+        let plate = |height: u128| {
+            format!(
+                r#"{{"plate":{{"frames":["blue","green","red"],"frame_height":{height},"weights":[[1,0,0],[0,1,0],[0,0,1]]}}}}"#
+            )
+        };
+        let short = plate_meta(&plate(5), 6, 12).err().unwrap().to_string();
+        assert!(short.contains("not three frames of 5"), "{short}");
+        let huge = (usize::MAX / 3) as u128 + 1;
+        let overflow = plate_meta(&plate(huge), 6, 12).err().unwrap().to_string();
+        assert!(overflow.contains("not three frames"), "{overflow}");
+    }
+
+    #[test]
+    fn a_tiff_with_the_wrong_number_of_samples_is_refused() {
+        let dir = scratch("tiff");
+        let rgb = dir.join("rgb.tif");
+        let gray = dir.join("gray.tif");
+        write_u16::<tiff::encoder::colortype::RGB16>(&rgb, &[1, 2, 3]);
+        write_u16::<tiff::encoder::colortype::Gray16>(&gray, &[7]);
+        let rgb_err = read_tiff_u16(&rgb, 1).unwrap_err().to_string();
+        assert!(rgb_err.contains("reads 1"), "{rgb_err}");
+        let gray_err = read_tiff_u16(&gray, 3).unwrap_err().to_string();
+        assert!(gray_err.contains("reads 3"), "{gray_err}");
+        let (w, h, samples, _) = read_tiff_u16(&gray, 1).unwrap();
+        assert_eq!((w, h, samples.as_slice()), (1, 1, [7].as_slice()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn write_u16<C>(path: &Path, data: &[C::Inner])
+    where
+        C: tiff::encoder::colortype::ColorType,
+        [C::Inner]: tiff::encoder::TiffValue,
+    {
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file)).unwrap();
+        enc.write_image::<C>(1, 1, data).unwrap();
+    }
+
+    #[test]
+    fn a_program_path_may_contain_an_equals_sign() {
+        let rt = Path::new("/opt/RawTherapee=5.11/rawtherapee-cli");
+        let dcraw = Path::new("D:/libraw/bin=emu/dcraw_emu.exe");
+        let tools = decode_tools(&encode_tools(rt, dcraw));
+        assert_eq!(tools.rawtherapee(), rt);
+        assert_eq!(tools.dcraw(), dcraw);
+    }
 }
