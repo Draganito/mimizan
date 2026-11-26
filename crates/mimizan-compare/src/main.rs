@@ -1579,17 +1579,28 @@ fn load_preview(path: &Path) -> Option<Picture> {
     };
     let rgba = image.into_rgba8();
     let (width, height) = rgba.dimensions();
-    let (mut rgba, mut width, mut height) = (rgba.into_raw(), width as usize, height as usize);
-    if matches!(orientation, 5..=8) && width > height {
-        (rgba, width, height) = turn(rgba, width, height, orientation);
-    }
+    let (rgba, width, height) = orient_preview(rgba.into_raw(), width as usize, height as usize, orientation);
     Some(fit_preview(rgba, width, height, 480))
+}
+
+/// The preview turned the way the camera asked. A frame whose sides were
+/// already swapped is left as stored, so a portrait preview is not turned
+/// a second time. A flip or a half turn does not swap the sides, and the
+/// stored frame is the one to turn: an upside-down shot would stay so.
+fn orient_preview(rgba: Vec<u8>, width: usize, height: usize, orientation: u8) -> (Vec<u8>, usize, usize) {
+    let swaps = matches!(orientation, 5..=8);
+    if matches!(orientation, 2..=4) || (swaps && width > height) {
+        turn(rgba, width, height, orientation)
+    } else {
+        (rgba, width, height)
+    }
 }
 
 fn raw_preview(source: &rawler::rawsource::RawSource) -> Option<image::DynamicImage> {
     // The largest embedded JPEG is often the full frame. The dialog wants
-    // the small one, which a camera keeps beside the raw.
-    if let Some(bytes) = embedded_jpeg(source.buf()) {
+    // a preview, so the candidates are the small ones, largest first. One
+    // that does not decode gives way to the next.
+    for bytes in embedded_jpegs(source.buf()) {
         if let Ok(image) = image::load_from_memory(bytes) {
             return Some(image);
         }
@@ -1599,17 +1610,17 @@ fn raw_preview(source: &rawler::rawsource::RawSource) -> Option<image::DynamicIm
     decoder.thumbnail_image(source, &params).ok().flatten()
 }
 
-/// The largest JPEG in the file that is still a preview: at least 8 KB,
-/// at most 512 KB. Bigger than that is the full frame.
-fn embedded_jpeg(bytes: &[u8]) -> Option<&[u8]> {
-    let mut best: Option<std::ops::Range<usize>> = None;
+/// The JPEGs in the file that are still a preview: at least 8 KB, at most
+/// 512 KB, largest first. Bigger than that is the full frame.
+fn embedded_jpegs(bytes: &[u8]) -> Vec<&[u8]> {
+    let mut found = Vec::new();
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] == 0xFF && bytes[i + 1] == 0xD8 {
             if let Some(end) = jpeg_end(bytes, i) {
                 let len = end - i;
-                if (8 * 1024..=512 * 1024).contains(&len) && best.as_ref().is_none_or(|r| len > r.len()) {
-                    best = Some(i..end);
+                if (8 * 1024..=512 * 1024).contains(&len) {
+                    found.push(i..end);
                 }
                 i = end;
                 continue;
@@ -1617,12 +1628,13 @@ fn embedded_jpeg(bytes: &[u8]) -> Option<&[u8]> {
         }
         i += 1;
     }
-    best.map(|range| &bytes[range])
+    found.sort_by_key(|range| std::cmp::Reverse(range.len()));
+    found.into_iter().map(|range| &bytes[range]).collect()
 }
 
 /// The byte after a JPEG that starts at `start` (the FF D8), if the markers
-/// parse. Entropy data uses FF 00 for a literal FF, so a real end marker is
-/// not hidden in it.
+/// parse. Entropy data uses FF 00 for a literal FF and FF D0–D7 to restart
+/// a scan, so a real end marker is not hidden in it.
 fn jpeg_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut j = start + 2;
     while j + 1 < bytes.len() {
@@ -1653,7 +1665,7 @@ fn jpeg_end(bytes: &[u8], start: usize) -> Option<usize> {
                     continue;
                 }
                 let next = bytes[j + 1];
-                if next == 0x00 {
+                if next == 0x00 || (0xD0..=0xD7).contains(&next) {
                     j += 2;
                     continue;
                 }
@@ -2513,6 +2525,50 @@ mod tests {
         let (same, w, h) = turn(px.to_vec(), 2, 1, 1);
         assert_eq!((w, h), (2, 1));
         assert_eq!(same, px);
+    }
+
+    /// Orientation 3 is stored upside down and does not swap the sides, so
+    /// the preview is turned. A portrait frame tagged as turned is already
+    /// the right way up and is left.
+    #[test]
+    fn a_preview_stored_upside_down_is_turned_and_a_portrait_one_is_not() {
+        let px = vec![255, 0, 0, 255, 0, 255, 0, 255];
+        let (out, w, h) = orient_preview(px.clone(), 2, 1, 3);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(&out[..4], &[0, 255, 0, 255]);
+        let (flipped, _, _) = orient_preview(px.clone(), 2, 1, 2);
+        assert_eq!(&flipped[..4], &[0, 255, 0, 255]);
+        let (_, w, h) = orient_preview(px, 2, 1, 6);
+        assert_eq!((w, h), (1, 2));
+        let tall = vec![9u8; 2 * 4];
+        let (out, w, h) = orient_preview(tall.clone(), 1, 2, 8);
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(out, tall);
+    }
+
+    #[test]
+    fn a_restart_marker_does_not_hide_the_end_of_a_jpeg() {
+        let bytes = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x04, 0x00, 0x00, 0x12, 0xFF, 0xD0, 0x34, 0xFF, 0xD9];
+        assert_eq!(jpeg_end(&bytes, 0), Some(bytes.len()));
+    }
+
+    #[test]
+    fn the_largest_preview_jpeg_is_tried_first() {
+        let jpeg = |n: usize, mark: u8| {
+            let mut bytes = vec![0u8; n];
+            bytes[0] = 0xFF;
+            bytes[1] = 0xD8;
+            bytes[2] = mark;
+            bytes[n - 2] = 0xFF;
+            bytes[n - 1] = 0xD9;
+            bytes
+        };
+        let mut bytes = jpeg(8 * 1024, 1);
+        bytes.extend(jpeg(9 * 1024, 2));
+        let found = embedded_jpegs(&bytes);
+        assert_eq!(found.len(), 2);
+        assert_eq!((found[0].len(), found[0][2]), (9 * 1024, 2));
+        assert_eq!((found[1].len(), found[1][2]), (8 * 1024, 1));
     }
 
     #[test]
