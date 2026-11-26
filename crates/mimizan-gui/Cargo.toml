@@ -26,15 +26,15 @@ mimizan-core = { path = "../mimizan-core" }
 mimizan-cli = { path = "../mimizan-cli" }
 # The X-Trans conversion. The desktop writes its DNG and then opens that
 # file on the ordinary linear path. Pinned to the measured program.
-mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
+mimizan-lab-xtrans.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 mimalloc = "0.1.52"
-egui = "0.36"
-egui-file-dialog = "0.15"
+egui.workspace = true
+egui-file-dialog.workspace = true
 rayon.workspace = true
 image.workspace = true
 rawler.workspace = true
@@ -48,15 +48,15 @@ sysinfo = { version = "0.39.6", default-features = false, features = ["system"] 
 # machine has no OpenGL driver, and the Store test runs in one. With a
 # graphics card DirectX 12 uses it. Without one, Windows draws on the CPU.
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+eframe = { workspace = true, features = ["glow", "wayland", "x11", "default_fonts"] }
 winit = { version = "0.30", default-features = false, features = ["wayland-csd-adwaita"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { workspace = true, features = ["glow", "default_fonts"] }
 mimizan-mac = { path = "../mimizan-mac" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { workspace = true, features = ["wgpu", "default_fonts"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

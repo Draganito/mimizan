@@ -17,7 +17,7 @@ rawler.workspace = true
 rayon.workspace = true
 # The second step of the Bayer demosaic, and the X-Trans path. The Bayer
 # solve itself is the 2×2 one in this crate.
-mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
+mimizan-lab-xtrans.workspace = true
 rustfft.workspace = true
 clap.workspace = true
 anyhow.workspace = true

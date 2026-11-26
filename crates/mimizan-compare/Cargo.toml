@@ -1,6 +1,6 @@
 [package]
 name = "mimizan-compare"
-description = "Loupe: the Mimizan print beside the five closest demosaicers"
+description = "Loupe: one Mimizan demosaic beside the other demosaics of the same file"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,21 +15,24 @@ path = "src/main.rs"
 anyhow.workspace = true
 mimizan-cli = { path = "../mimizan-cli" }
 mimizan-core = { path = "../mimizan-core" }
-mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
+mimizan-lab-xtrans.workspace = true
 rawler.workspace = true
-egui = "0.36"
-egui-file-dialog = "0.15"
+egui.workspace = true
+egui-file-dialog.workspace = true
 serde_json.workspace = true
 tiff.workspace = true
-# TIFF only. The workspace image crate has no TIFF feature, and this
-# viewer reads the developed files the tools wrote.
-image = { version = "0.25", default-features = false, features = ["tiff", "jpeg", "png"] }
+# TIFF for the files the tools wrote, JPEG for an embedded preview, PNG
+# for a PNG chosen under All files. The workspace image crate has no TIFF.
+image = { workspace = true, features = ["tiff"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "wayland", "x11", "default_fonts"] }
+eframe = { workspace = true, features = ["glow", "wayland", "x11", "default_fonts"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { workspace = true, features = ["glow", "default_fonts"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts"] }
+eframe = { workspace = true, features = ["wgpu", "default_fonts"] }
+
+[lints.clippy]
+all = "warn"

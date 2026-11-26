@@ -24,6 +24,12 @@ clap = { version = "4.6", features = ["derive"] }
 thiserror = "2"
 libm = "0.2"
 anyhow = "1"
+egui = "0.36"
+egui-file-dialog = "0.15"
+# Each window turns the default features off and picks its own renderer.
+eframe = { version = "0.36", default-features = false }
+# Pinned to the measured X-Trans program.
+mimizan-lab-xtrans = { git = "https://github.com/Draganito/mimizan-lab-xtrans", rev = "be67e4c53a862f860ef8acb0f8a4f6a3523cb6c0" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
