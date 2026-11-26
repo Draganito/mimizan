@@ -2038,12 +2038,12 @@ impl Histogram {
     /// code (which can differ from the float walk by a bin at a boundary).
     /// The pixels a `field` of strokes
     /// reaches are taken out of the tally and counted at their own times,
-    /// from `codes`; the negative's bins do not see the strokes. A large
-    /// burned area is sampled on a lattice of `k` pixels, each sample
-    /// standing for `k²`, so the walk stays within `BURN_WALK_BUDGET`
-    /// pixels; up to that many it is exact. A sample stands for no more
-    /// pixels than the tally still has of its code, so every pixel is
-    /// counted once and the bins add up to the total.
+    /// from `codes`; the negative's bins do not see the strokes. Every
+    /// such pixel is counted with its own code. Over a large burned area
+    /// the times are read on a lattice of `k` pixels, one sample for its
+    /// cell of `k²`, so the field is asked at most `BURN_WALK_BUDGET`
+    /// times: up to that many pixels the count is exact, beyond it a
+    /// penumbra is `k − 1` pixels coarser.
     #[allow(clippy::too_many_arguments)]
     fn of_tally(
         tally: &Tally,
@@ -2070,47 +2070,79 @@ impl Histogram {
             let area: usize =
                 (y0..y1).into_par_iter().map(|y| FieldRow::new(Some(field), y, x0, x1).span.len()).sum();
             let k = (area.div_ceil(BURN_WALK_BUDGET) as f64).sqrt().ceil().max(1.0) as usize;
-            let each = (k * k) as u32;
-            // Per row: the codes of the pixels with their own times, each
-            // with its view bin and whether the paper clips it.
-            let parts: Vec<Vec<(u16, u8, u8)>> = (y0..y1)
-                .into_par_iter()
-                .step_by(k)
-                .filter_map(|y| {
-                    let line = FieldRow::new(Some(field), y, x0, x1);
-                    let span = line.span.clone();
-                    if span.is_empty() {
-                        return None;
-                    }
-                    let row = &codes[y * width..(y + 1) * width];
+            // The lattice rows in a few contiguous blocks, one array of
+            // codes each, as the tally is counted.
+            let lattice: Vec<usize> = (y0..y1).step_by(k).collect();
+            let blocks = rayon::current_num_threads().clamp(1, 64).min(lattice.len().max(1));
+            let parts: Vec<(Vec<u32>, Counts)> = lattice
+                .par_chunks(lattice.len().div_ceil(blocks).max(1))
+                .map(|rows| {
+                    let mut taken = vec![0u32; 65536];
+                    let mut counts = Counts::default();
                     let mut timed = Timed::new(table);
-                    let mut taken = Vec::new();
-                    for x in span.step_by(k) {
-                        if quad.is_some_and(|q| !q.holds(x, y)) {
-                            continue;
-                        }
-                        let times = line.at(x);
-                        if times.is_unit() {
-                            continue;
-                        }
-                        let q = row[x];
+                    let mut count = |counts: &mut Counts, q: u16, times: Times, n: u32| {
                         let (bin, clip) = timed.view(placed(q), times);
-                        taken.push((q, bin, clip));
+                        counts.view[bin as usize] += n;
+                        match clip {
+                            1 => counts.view_low += n as usize,
+                            2 => counts.view_high += n as usize,
+                            _ => {}
+                        }
+                    };
+                    // The times that repeat from sample to sample, a card's
+                    // far side or a stroke's interior, are most of a large
+                    // burn: their pixels are counted by code, and the paper
+                    // is asked once a code at the end.
+                    let mut even: Option<(Times, Vec<u32>)> = None;
+                    let mut last = Times::UNIT;
+                    for &y in rows {
+                        let line = FieldRow::new(Some(field), y, x0, x1);
+                        let span = line.span.clone();
+                        for x in span.clone().step_by(k) {
+                            let times = line.at(x);
+                            if times.is_unit() {
+                                continue;
+                            }
+                            if even.is_none() && times == last {
+                                even = Some((times, vec![0u32; 65536]));
+                            }
+                            last = times;
+                            let mut by_code = even.as_mut().filter(|(t, _)| *t == times).map(|(_, n)| n);
+                            // The cell of this sample: its times, and every
+                            // pixel's own code.
+                            for cy in y..(y + k).min(y1) {
+                                let row = &codes[cy * width..(cy + 1) * width];
+                                for (cx, &q) in row.iter().enumerate().take((x + k).min(span.end)).skip(x) {
+                                    if quad.is_some_and(|w| !w.holds(cx, cy)) {
+                                        continue;
+                                    }
+                                    taken[q as usize] += 1;
+                                    match by_code.as_mut() {
+                                        Some(n) => n[q as usize] += 1,
+                                        None => count(&mut counts, q, times, 1),
+                                    }
+                                }
+                            }
+                        }
                     }
-                    (!taken.is_empty()).then_some(taken)
+                    if let Some((times, by_code)) = even {
+                        for (q, n) in by_code.into_iter().enumerate().filter(|(_, n)| *n > 0) {
+                            count(&mut counts, q as u16, times, n);
+                        }
+                    }
+                    (taken, counts)
                 })
                 .collect();
-            for (q, bin, clip) in parts.into_iter().flatten() {
-                // What is counted under the stroke is what leaves the
-                // tally: `each`, or what the tally still has of the code.
-                let n = unit[q as usize].min(each);
-                unit[q as usize] -= n;
-                burned.view[bin as usize] += n;
-                match clip {
-                    1 => burned.view_low += n as usize,
-                    2 => burned.view_high += n as usize,
-                    _ => {}
+            for (taken, counts) in parts {
+                for (left, n) in unit.iter_mut().zip(taken) {
+                    debug_assert!(n <= *left, "the tally is of another window than the walk");
+                    *left = left.saturating_sub(n);
                 }
+                for (sum, n) in burned.view.iter_mut().zip(counts.view) {
+                    *sum += n;
+                }
+                burned.view_low += counts.view_low;
+                burned.view_high += counts.view_high;
             }
         }
         let mut all = burned;
@@ -2301,8 +2333,8 @@ impl Default for HistCache {
     }
 }
 
-/// Burned pixels a histogram walks one by one at most; a larger burned
-/// area is sampled on a lattice (`Histogram::of_tally`).
+/// Burned pixels whose times a histogram reads one by one at most; over
+/// a larger burned area they are read on a lattice (`Histogram::of_tally`).
 const BURN_WALK_BUDGET: usize = 1 << 20;
 
 /// One count per 16-bit code over the pixels a histogram counts.
@@ -3502,12 +3534,14 @@ mod histogram_tests {
         }
     }
 
-    /// A burned area too large to walk is sampled, and every pixel is still
-    /// counted once: the bins add up to the pixels, the clipped ones are
-    /// among them. Codes that seldom repeat are the case where a sample
-    /// stands for more pixels than the picture has of its code.
+    /// A burn over more pixels than the budget reads the stroke's times
+    /// on a lattice, and still counts every pixel with its own code: where
+    /// the times are even, the histogram is the one the pixel-by-pixel
+    /// walk gives. Codes that seldom repeat are the case that went wrong
+    /// when a sample stood for its neighbours' codes as well: about one
+    /// burned pixel in eight stayed at its unburned tone.
     #[test]
-    fn a_sampled_burn_counts_every_pixel_once() {
+    fn a_sampled_burn_counts_every_pixel_at_its_own_code() {
         use mimizan_core::burn::{Light, Stroke, Tip};
         let (w, h) = (1600usize, 1400usize);
         assert!(w * h > 2 * BURN_WALK_BUDGET);
@@ -3520,21 +3554,41 @@ mod histogram_tests {
             })
             .collect();
         let table = ToneTable::build(&Tone::paper().compile());
-        let stroke = Stroke::Hand {
-            tip: Tip { rx: 0.9, ry: 0.9, angle: 0.0, feather: 0.0 },
+        let hand = |feather: f64, r: f64| Stroke::Hand {
+            tip: Tip { rx: r, ry: r, angle: 0.0, feather },
             stops: 1.0,
             light: Light::Both,
             points: vec![[0.0, 0.0]],
         };
-        let field = Field::new(std::slice::from_ref(&stroke), burn::normalize(w, h)).unwrap();
         let tally = Tally::of(&codes, w, None);
         let (plain_neg, plain) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, 0.0, None);
-        let (neg, view) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, 0.0, Some(&field));
         let sum = |h: &Histogram| h.bins.iter().map(|&n| n as usize).sum::<usize>();
-        assert_eq!(neg, plain_neg);
         assert_eq!((sum(&plain), plain.total), (w * h, w * h));
+
+        // One time over every pixel: the lattice loses nothing.
+        let stroke = hand(0.0, 0.9);
+        let field = Field::new(std::slice::from_ref(&stroke), burn::normalize(w, h)).unwrap();
+        let (neg, view) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, 0.0, Some(&field));
+        let (walk_neg, walk) = Histogram::of_codes(&codes, 1.0, w, &table, 0.0, None, Some(&field));
+        assert_eq!(neg, plain_neg);
+        assert_eq!(neg, walk_neg);
         assert_ne!(view.bins, plain.bins);
+        assert_eq!(view, walk);
+
+        // A soft tip inside the picture: only the penumbra and the outline
+        // are a lattice step coarse, a small share of the burned pixels.
+        let stroke = hand(0.1, 0.3);
+        let field = Field::new(std::slice::from_ref(&stroke), burn::normalize(w, h)).unwrap();
+        let (_, view) = Histogram::of_tally(&tally, &codes, 1.0, w, None, &table, 0.0, Some(&field));
+        let (_, walk) = Histogram::of_codes(&codes, 1.0, w, &table, 0.0, None, Some(&field));
         assert_eq!((sum(&view), view.total), (w * h, w * h));
+        let moved = |a: &Histogram, b: &Histogram| {
+            a.bins.iter().zip(&b.bins).map(|(&x, &y)| x.abs_diff(y) as usize).sum::<usize>() / 2
+        };
+        let burned = moved(&walk, &plain);
+        let off = moved(&view, &walk);
+        assert!(burned > 50_000, "the stroke moves {burned} pixels");
+        assert!(off * 100 < burned, "{off} of {burned} burned pixels are in another bin than the walk's");
         assert!(view.low + view.high <= view.total);
     }
 
