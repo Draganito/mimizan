@@ -131,8 +131,8 @@ impl Tip {
     }
 
     /// Signed distance of the point `(dx, dy)` from the centre to the
-    /// outline, negative inside: the first-order distance to the level
-    /// set, exact for a circle and along the axes.
+    /// outline, negative inside. A circle uses the closed form. An ellipse
+    /// is the distance to the nearest point of the outline.
     pub fn distance(&self, dx: f64, dy: f64) -> f64 {
         let (s, c) = self.angle.to_radians().sin_cos();
         self.distance_turned(dx, dy, s, c)
@@ -143,15 +143,19 @@ impl Tip {
         let px = dx * cos + dy * sin;
         let py = -dx * sin + dy * cos;
         let (rx, ry) = self.axes();
-        let (ex, ey) = (px / rx, py / ry);
-        let r2 = ex * ex + ey * ey;
-        if r2 < 1e-24 {
-            return -rx.min(ry);
+        // A circle's closed form, unchanged, so its weights do not move.
+        if rx == ry {
+            let (ex, ey) = (px / rx, py / ry);
+            let r2 = ex * ex + ey * ey;
+            if r2 < 1e-24 {
+                return -rx.min(ry);
+            }
+            let r = r2.sqrt();
+            let gx = px / (rx * rx);
+            let gy = py / (ry * ry);
+            return (r - 1.0) * r / (gx * gx + gy * gy).sqrt();
         }
-        let r = r2.sqrt();
-        let gx = px / (rx * rx);
-        let gy = py / (ry * ry);
-        (r - 1.0) * r / (gx * gx + gy * gy).sqrt()
+        ellipse_distance(px, py, rx, ry)
     }
 
     /// How much of the light the tip, resting with its centre at the
@@ -161,15 +165,19 @@ impl Tip {
         edge_weight(self.distance(dx, dy), self.feather)
     }
 
-    /// Beyond this distance from the centre the weight is exactly 0. With
-    /// `a` and `b` the larger and the smaller half-axis and `f` the
-    /// feather: the level function `r` is `1/b`-Lipschitz and at least
-    /// `R/a` at radius `R`, so the first-order distance is at least
-    /// `(R/a − 1) b`, which is `≥ f` from `R ≥ a (1 + f/b)`.
+    /// Beyond this distance from the centre the weight is exactly 0. Every
+    /// point of the outline lies within the long half-axis of the centre,
+    /// so the penumbra, one feather wide, ends at the long half-axis plus
+    /// the feather. A circle keeps `a (1 + f/b)`, which is that distance
+    /// and must stay the same expression.
     pub fn reach(&self) -> f64 {
         let (rx, ry) = self.axes();
         let (a, b) = (rx.max(ry), rx.min(ry));
-        a * (1.0 + self.feather / b)
+        if rx == ry {
+            a * (1.0 + self.feather / b)
+        } else {
+            a + self.feather
+        }
     }
 
     /// Within this distance from the centre the weight is exactly 1: the
@@ -221,6 +229,74 @@ impl Tip {
             return Err(Error::Invalid(format!("tip feather {} not within 0..{SIZE_LIMIT}", self.feather)));
         }
         Ok(())
+    }
+}
+
+/// Signed distance from `(px, py)` to the ellipse of half-axes `rx` and
+/// `ry`, negative inside. The nearest outline point is a root of the
+/// stationarity condition on the parametric angle: started from the
+/// first-order foot and stepped a fixed handful of times, with the step
+/// held small so a bad start cannot run away. On the centre and the axes
+/// that derivative vanishes, so those use the closed form.
+fn ellipse_distance(px: f64, py: f64, rx: f64, ry: f64) -> f64 {
+    let (ax, ay) = (px.abs(), py.abs());
+    let (ex, ey) = (ax / rx, ay / ry);
+    if ex * ex + ey * ey < 1e-24 {
+        return -rx.min(ry);
+    }
+    let scale = rx.max(ry);
+    if ay <= 1e-12 * scale {
+        return axis_distance(ax, rx, ry);
+    }
+    if ax <= 1e-12 * scale {
+        return axis_distance(ay, ry, rx);
+    }
+    let r = ex.hypot(ey);
+    let (gx, gy) = (ax / (rx * rx), ay / (ry * ry));
+    let g = gx.hypot(gy);
+    let d0 = (r - 1.0) * r / g;
+    let (fx, fy) = (ax - d0 * gx / g, ay - d0 * gy / g);
+    let mut theta = (fy / ry).atan2(fx / rx);
+    for _ in 0..8 {
+        let (s, c) = theta.sin_cos();
+        let f = (ax - rx * c) * (-rx * s) + (ay - ry * s) * (ry * c);
+        let fp = -ax * rx * c - ay * ry * s + (rx * rx - ry * ry) * (c * c - s * s);
+        if fp.abs() < 1e-18 {
+            break;
+        }
+        let step = (f / fp).clamp(-0.5, 0.5);
+        theta -= step;
+        if step.abs() < 1e-15 {
+            break;
+        }
+    }
+    let (s, c) = theta.sin_cos();
+    let dist = (ax - rx * c).hypot(ay - ry * s);
+    if (ax / rx).powi(2) + (ay / ry).powi(2) < 1.0 {
+        -dist
+    } else {
+        dist
+    }
+}
+
+/// Distance from a point on one axis to the ellipse. `along` is its
+/// distance from the centre, `a` the half-axis it lies on and `b` the
+/// other. The vertex, and the other stationary point when that falls on
+/// the outline: Newton's derivative is zero on the axis.
+fn axis_distance(along: f64, a: f64, b: f64) -> f64 {
+    let mut best = (along - a).abs();
+    let disc = a * a - b * b;
+    if disc.abs() > 1e-18 * a * a {
+        let c = (a * along) / disc;
+        if c.abs() <= 1.0 {
+            let s = (1.0 - c * c).sqrt();
+            best = best.min((along - a * c).hypot(b * s));
+        }
+    }
+    if (along / a).powi(2) < 1.0 {
+        -best
+    } else {
+        best
     }
 }
 
@@ -659,20 +735,28 @@ impl ReadyTip {
     }
 
     /// Half-widths of an axis-aligned box that holds every point the tip
-    /// gives weight to. The distance is at least `(r − 1) b` at level `r`
-    /// ([`Tip::reach`]), so the weight ends inside the level
-    /// `1 + f/b`: the ellipse grown by that factor, turned, and its
-    /// extents. Tighter than the square of the reach for an eccentric
-    /// tip, so a stamp of it visits fewer points. (The ellipse's own
-    /// extents plus the feather are not enough: the distance is of the
-    /// first order, and off the ends of a long soft tip the weight reaches
-    /// further than the feather.)
+    /// gives weight to. The weight ends one feather outside the outline, so
+    /// the box is the turned ellipse's own extents plus the feather, and no
+    /// wider than [`Tip::reach`]. Tighter than the square of the reach for
+    /// an eccentric tip, so a stamp of it visits fewer points. A circle
+    /// keeps the extents of the ellipse grown by `1 + f/b`, the same
+    /// expression as before.
     fn extent(&self) -> (f64, f64) {
         let (rx, ry) = self.tip.axes();
-        let grown = 1.0 + self.tip.feather.max(0.0) / rx.min(ry);
         let (s, c) = (self.sin, self.cos);
-        let ex = grown * ((rx * c).powi(2) + (ry * s).powi(2)).sqrt();
-        let ey = grown * ((rx * s).powi(2) + (ry * c).powi(2)).sqrt();
+        let (ex, ey) = if rx == ry {
+            let grown = 1.0 + self.tip.feather.max(0.0) / rx.min(ry);
+            (
+                grown * ((rx * c).powi(2) + (ry * s).powi(2)).sqrt(),
+                grown * ((rx * s).powi(2) + (ry * c).powi(2)).sqrt(),
+            )
+        } else {
+            let f = self.tip.feather.max(0.0);
+            (
+                ((rx * c).powi(2) + (ry * s).powi(2)).sqrt() + f,
+                ((rx * s).powi(2) + (ry * c).powi(2)).sqrt() + f,
+            )
+        };
         (ex.min(self.reach()), ey.min(self.reach()))
     }
 
@@ -1698,6 +1782,97 @@ mod tests {
         let numeric: f64 =
             (0..n).map(|i| fuzzy.weight((i as f64 + 0.5) / n as f64 - 0.5, 0.0)).sum::<f64>() / n as f64;
         assert!((numeric - 2.0 * fuzzy.half_dwell(1.0, 0.0)).abs() < 1e-5, "{numeric}");
+    }
+
+    /// Signed distance from `(x, y)` to the tip's outline, negative inside.
+    /// The nearest of 20,000 outline points, then tightened on the arc
+    /// around it: half a step of that sampling is enough, on a flat ellipse,
+    /// to move the distance by more than the weight's tolerance.
+    fn outline_distance(tip: &Tip, x: f64, y: f64) -> f64 {
+        let (s, c) = tip.angle.to_radians().sin_cos();
+        let px = x * c + y * s;
+        let py = -x * s + y * c;
+        let (rx, ry) = (tip.rx, tip.ry);
+        let n = 20_000;
+        let mut best_i = 0usize;
+        let mut best = f64::MAX;
+        for i in 0..n {
+            let t = i as f64 / n as f64 * std::f64::consts::TAU;
+            let (st, ct) = t.sin_cos();
+            let d = (px - rx * ct).hypot(py - ry * st);
+            if d < best {
+                best = d;
+                best_i = i;
+            }
+        }
+        let span = std::f64::consts::TAU / n as f64;
+        let mut lo = best_i as f64 * span - span;
+        let mut hi = best_i as f64 * span + span;
+        let at = |t: f64| {
+            let (st, ct) = t.sin_cos();
+            (px - rx * ct).hypot(py - ry * st)
+        };
+        for _ in 0..40 {
+            let m1 = (2.0 * lo + hi) / 3.0;
+            let m2 = (lo + 2.0 * hi) / 3.0;
+            if at(m1) < at(m2) {
+                hi = m2;
+            } else {
+                lo = m1;
+            }
+        }
+        let dist = at(0.5 * (lo + hi));
+        if (px / rx).powi(2) + (py / ry).powi(2) < 1.0 {
+            -dist
+        } else {
+            dist
+        }
+    }
+
+    /// The weight is the penumbra of the true distance to the outline, one
+    /// feather wide all the way round, including off the axes of a flat tip.
+    #[test]
+    fn a_soft_elliptical_tip_ends_one_feather_from_its_outline() {
+        let flat = tip(0.3, 0.03, 0.0, 0.03);
+        assert_eq!(flat.weight(0.33, 0.015), 0.0, "distance 0.033 is past the feather");
+        let tips = [
+            flat,
+            tip(0.1, 0.002, 0.0, 0.05),
+            tip(0.15, 0.05, 0.0, 0.2),
+            tip(0.2, 0.08, 35.0, 0.04),
+            tip(0.12, 0.04, -50.0, 0.02),
+            tip(0.25, 0.25, 15.0, 0.04),
+        ];
+        let marks = [(0.33, 0.015), (0.5, 0.03), (1.0, 0.03), (0.0, 0.0), (0.2, 0.0), (0.05, 0.04)];
+        for t in tips {
+            let reach = t.rx.max(t.ry) + t.feather;
+            for i in 0..9 {
+                for j in 0..9 {
+                    let x = reach * (2.0 * i as f64 / 8.0 - 1.0);
+                    let y = reach * (2.0 * j as f64 / 8.0 - 1.0);
+                    check_weight(&t, x, y);
+                }
+            }
+            for (x, y) in marks {
+                check_weight(&t, x, y);
+            }
+        }
+    }
+
+    fn check_weight(t: &Tip, x: f64, y: f64) {
+        let d = outline_distance(t, x, y);
+        let w = t.weight(x, y);
+        // The outline search and the closed form can disagree by an ulp
+        // right on the feather, where the weight is already nothing.
+        let edge = 1e-9;
+        if d > t.feather + edge {
+            assert_eq!(w, 0.0, "{t:?} at ({x}, {y}): distance {d}");
+        } else if d < -t.feather - edge {
+            assert_eq!(w, 1.0, "{t:?} at ({x}, {y}): distance {d}");
+        } else if t.feather > 0.0 {
+            let want = penumbra(d / t.feather);
+            assert!((w - want).abs() < 1e-6, "{t:?} at ({x}, {y}): {w} vs {want}, distance {d}");
+        }
     }
 
     /// A straight pass through a point gives it the stroke's stops, for a

@@ -443,15 +443,30 @@ pub fn points_per_unit(rect: egui::Rect, back: &mimizan_core::straighten::Affine
     f64::from(o.distance(e))
 }
 
-/// The outline of the tip at `(cx, cy)` grown by `off` on both half-axes,
-/// through `at` onto the stage.
+/// The outline of the tip at `(cx, cy)`, through `at` onto the stage.
+/// `off` of zero is the outline. A circle grown by `off` is its penumbra.
+/// An ellipse's penumbra is not that ellipse grown on both axes: the
+/// outline moves by `off` along its outward normal, and for an eccentric
+/// tip the grown ellipse misses that curve by more than a pixel at an
+/// ordinary picture size.
 pub fn tip_outline(tip: &Tip, cx: f64, cy: f64, off: f64, at: &dyn Fn(f64, f64) -> Pos2) -> Vec<Pos2> {
     let (s, c) = tip.angle.to_radians().sin_cos();
-    let (rx, ry) = ((tip.rx + off).max(0.0005), (tip.ry + off).max(0.0005));
+    let (rx0, ry0) = (tip.rx.max(1e-9), tip.ry.max(1e-9));
+    let grown = off == 0.0 || rx0 == ry0;
     (0..72)
         .map(|i| {
             let t = i as f64 / 72.0 * std::f64::consts::TAU;
-            let (px, py) = (rx * t.cos(), ry * t.sin());
+            let (st, ct) = t.sin_cos();
+            let (px, py) = if grown {
+                let rx = (tip.rx + off).max(0.0005);
+                let ry = (tip.ry + off).max(0.0005);
+                (rx * ct, ry * st)
+            } else {
+                let (px, py) = (rx0 * ct, ry0 * st);
+                let (nx, ny) = (ry0 * ct, rx0 * st);
+                let scale = off / nx.hypot(ny).max(1e-12);
+                (px + nx * scale, py + ny * scale)
+            };
             at(cx + px * c - py * s, cy + px * s + py * c)
         })
         .collect()
@@ -699,6 +714,31 @@ mod tests {
             });
         assert_eq!(ring.len(), 72);
         assert!((ring[0].x - (rect.center().x + 60.0)).abs() < 1e-3);
+    }
+
+    /// An eccentric tip's penumbra is the outline moved along its outward
+    /// normal. Growing both half-axes by the feather misses that curve.
+    #[test]
+    fn an_eccentric_penumbra_follows_the_outline() {
+        for angle in [0.0, 37.0] {
+            let tip = Tip { rx: 0.3, ry: 0.03, angle, feather: 0.03 };
+            let at = |x: f64, y: f64| Pos2::new(x as f32, y as f32);
+            let ring = tip_outline(&tip, 0.1, -0.2, tip.feather, &at);
+            let (s, c) = angle.to_radians().sin_cos();
+            let mut worst: f64 = 0.0;
+            for (i, p) in ring.iter().enumerate() {
+                let t = i as f64 / 72.0 * std::f64::consts::TAU;
+                let (st, ct) = t.sin_cos();
+                let (px, py) = (tip.rx * ct, tip.ry * st);
+                let (nx, ny) = (tip.ry * ct, tip.rx * st);
+                let n = nx.hypot(ny);
+                let (ox, oy) = (px + tip.feather * nx / n, py + tip.feather * ny / n);
+                let x = 0.1 + ox * c - oy * s;
+                let y = -0.2 + ox * s + oy * c;
+                worst = worst.max((f64::from(p.x) - x).hypot(f64::from(p.y) - y));
+            }
+            assert!(worst < 1e-5, "{angle}: {worst}");
+        }
     }
 
     /// A tip dragged past the picture comes back until every handle is on
