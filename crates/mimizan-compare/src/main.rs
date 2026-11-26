@@ -500,6 +500,27 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        self.dialogs(&ctx);
+        self.keys(&ctx);
+        self.bar(ui, &ctx);
+        self.panes(ui);
+    }
+
+    // eframe's renderer decides the signature: OpenGL here, wgpu on Windows.
+    #[cfg(not(target_os = "windows"))]
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.end_job();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_exit(&mut self) {
+        self.end_job();
+    }
+}
+
+impl App {
+    /// Takes a dropped file and updates the two file dialogs.
+    fn dialogs(&mut self, ctx: &egui::Context) {
         let picking = matches!(self.dialog.state(), DialogState::Open)
             || matches!(self.tool_dialog.state(), DialogState::Open);
         // A drop while a dialog is up would open one file under the
@@ -510,13 +531,13 @@ impl eframe::App for App {
             }
         }
         if self.asking.is_some() {
-            self.tool_dialog.update(&ctx);
+            self.tool_dialog.update(ctx);
         } else {
             let dialog = &mut self.dialog;
             let preview = &mut self.preview;
             dialog.set_right_panel_width(300.0);
-            dialog.update_with_right_panel_ui(&ctx, &mut |ui, dia| {
-                preview.panel(ui, &ctx, dia);
+            dialog.update_with_right_panel_ui(ctx, &mut |ui, dia| {
+                preview.panel(ui, ctx, dia);
             });
         }
         if let Some(path) = self.tool_dialog.take_picked() {
@@ -535,6 +556,10 @@ impl eframe::App for App {
                 self.take_file(path);
             }
         }
+    }
+
+    /// Reads the keyboard and then sets the window title.
+    fn keys(&mut self, ctx: &egui::Context) {
         let picking = matches!(self.dialog.state(), DialogState::Open)
             || matches!(self.tool_dialog.state(), DialogState::Open);
         let mut open = false;
@@ -575,7 +600,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
         }
+    }
 
+    /// Draws the top bar.
+    fn bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui
@@ -664,7 +692,10 @@ impl eframe::App for App {
                 ui.colored_label(egui::Color32::from_rgb(190, 70, 60), err);
             }
         });
+    }
 
+    /// Draws the two pictures.
+    fn panes(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             let rect = ui.available_rect_before_wrap();
             let gap = 6.0;
@@ -698,19 +729,6 @@ impl eframe::App for App {
         });
     }
 
-    // eframe's renderer decides the signature: OpenGL here, wgpu on Windows.
-    #[cfg(not(target_os = "windows"))]
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.end_job();
-    }
-
-    #[cfg(target_os = "windows")]
-    fn on_exit(&mut self) {
-        self.end_job();
-    }
-}
-
-impl App {
     fn tool_button(&mut self, ui: &mut egui::Ui, which: WhichTool, label: &str) {
         let chosen = self.tools.get(which).to_path_buf();
         let tip = if chosen.as_os_str().is_empty() {
