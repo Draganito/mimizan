@@ -838,29 +838,44 @@ fn sample_path(tip: &Tip, points: &[[f64; 2]]) -> Sampled {
     Sampled { step, full, tail }
 }
 
-/// The samples of one stroke binned on a grid whose cell is at least the
-/// tip's reach, so the samples that can touch a point are in its cell and
-/// the eight around it. Used while the dwell is rastered, then dropped.
+/// The samples of one stroke binned on a grid, so the samples that can
+/// touch a point are in its cell and the eight around it. A circle's cell
+/// is a square of the reach. An eccentric tip's cells are the rectangles
+/// of its box ([`ReadyTip::extent`]), shorter than the reach across the
+/// tip, so a point reads the samples that can weigh on it. Used while the
+/// dwell is rastered, then dropped.
 struct Grid {
     x0: f64,
     y0: f64,
-    cell: f64,
+    cell_x: f64,
+    cell_y: f64,
     nx: usize,
     ny: usize,
+    /// Half-widths of the tip's box. Infinite for a circle, which sums
+    /// every sample of the nine cells, as it always has.
+    ex: f64,
+    ey: f64,
     /// `starts[c]..starts[c + 1]` are cell `c`'s samples.
     starts: Vec<u32>,
     samples: Vec<Sample>,
 }
 
 impl Grid {
-    fn new(samples: &[Sample], (x0, y0, x1, y1): (f64, f64, f64, f64), reach: f64) -> Self {
+    fn new(samples: &[Sample], (x0, y0, x1, y1): (f64, f64, f64, f64), tip: &ReadyTip) -> Self {
         let (w, h) = (x1 - x0, y1 - y0);
-        let cell = reach.max(w / MAX_CELLS as f64).max(h / MAX_CELLS as f64).max(1e-9);
-        let nx = (w / cell).floor() as usize + 1;
-        let ny = (h / cell).floor() as usize + 1;
+        let (cell_x, cell_y, ex, ey) = if tip.tip.rx == tip.tip.ry {
+            let reach = tip.reach();
+            let cell = reach.max(w / MAX_CELLS as f64).max(h / MAX_CELLS as f64).max(1e-9);
+            (cell, cell, f64::INFINITY, f64::INFINITY)
+        } else {
+            let (ex, ey) = tip.extent();
+            (ex.max(w / MAX_CELLS as f64).max(1e-9), ey.max(h / MAX_CELLS as f64).max(1e-9), ex, ey)
+        };
+        let nx = (w / cell_x).floor() as usize + 1;
+        let ny = (h / cell_y).floor() as usize + 1;
         let at = |s: &Sample| {
-            let cx = (((s.x - x0) / cell).floor().max(0.0) as usize).min(nx - 1);
-            let cy = (((s.y - y0) / cell).floor().max(0.0) as usize).min(ny - 1);
+            let cx = (((s.x - x0) / cell_x).floor().max(0.0) as usize).min(nx - 1);
+            let cy = (((s.y - y0) / cell_y).floor().max(0.0) as usize).min(ny - 1);
             cy * nx + cx
         };
         let mut starts = vec![0u32; nx * ny + 1];
@@ -877,20 +892,26 @@ impl Grid {
             sorted[fill[c] as usize] = *s;
             fill[c] += 1;
         }
-        Self { x0, y0, cell, nx, ny, starts, samples: sorted }
+        Self { x0, y0, cell_x, cell_y, nx, ny, ex, ey, starts, samples: sorted }
     }
 
     /// The samples in the cell of `(x, y)` and the eight around it, in a
-    /// fixed order, summed by `f`; `None` when there is none.
+    /// fixed order, summed by `f`; `None` when there is none. An eccentric
+    /// tip leaves out a sample the point lies outside the box of. The box
+    /// holds every point the tip gives weight to, so the weight there is
+    /// exactly 0.
     fn sum(&self, x: f64, y: f64, mut f: impl FnMut(&Sample) -> f64) -> Option<f64> {
-        let cx = (((x - self.x0) / self.cell).floor().max(0.0) as usize).min(self.nx - 1);
-        let cy = (((y - self.y0) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);
+        let cx = (((x - self.x0) / self.cell_x).floor().max(0.0) as usize).min(self.nx - 1);
+        let cy = (((y - self.y0) / self.cell_y).floor().max(0.0) as usize).min(self.ny - 1);
         let mut sum = 0.0;
         let mut any = false;
         for yy in cy.saturating_sub(1)..=(cy + 1).min(self.ny - 1) {
             for xx in cx.saturating_sub(1)..=(cx + 1).min(self.nx - 1) {
                 let c = yy * self.nx + xx;
                 for s in &self.samples[self.starts[c] as usize..self.starts[c + 1] as usize] {
+                    if (x - s.x).abs() > self.ex || (y - s.y).abs() > self.ey {
+                        continue;
+                    }
                     any = true;
                     sum += f(s);
                 }
@@ -1005,7 +1026,7 @@ impl Raster {
     fn build(tip: &ReadyTip, samples: &[Sample], h: f64) -> Self {
         let reach = tip.reach();
         let bounds = reach_box(samples, reach, h);
-        let grid = Grid::new(samples, bounds, reach);
+        let grid = Grid::new(samples, bounds, tip);
         let (x0, y0, x1, y1) = bounds;
         let h = h.max((x1 - x0) / MAX_RASTER as f64).max((y1 - y0) / MAX_RASTER as f64);
         let nx = ((x1 - x0) / h).ceil() as usize + 1;
@@ -2782,5 +2803,141 @@ mod tests {
         assert!(validate(&vec![c.clone(); MAX_STROKES + 1]).is_err());
         assert!(validate(&vec![c; MAX_STROKES]).is_ok());
         assert_eq!([Light::Both, Light::Soft, Light::Hard].map(Light::name), ["both", "soft", "hard"]);
+    }
+
+    /// The sample grid as it was: one square cell of the reach, and every
+    /// sample of the nine cells summed. A circle's raster is this one.
+    struct SquareGrid {
+        x0: f64,
+        y0: f64,
+        cell: f64,
+        nx: usize,
+        ny: usize,
+        starts: Vec<u32>,
+        samples: Vec<Sample>,
+    }
+
+    impl SquareGrid {
+        fn new(samples: &[Sample], (x0, y0, x1, y1): (f64, f64, f64, f64), reach: f64) -> Self {
+            let (w, h) = (x1 - x0, y1 - y0);
+            let cell = reach.max(w / MAX_CELLS as f64).max(h / MAX_CELLS as f64).max(1e-9);
+            let nx = (w / cell).floor() as usize + 1;
+            let ny = (h / cell).floor() as usize + 1;
+            let at = |s: &Sample| {
+                let cx = (((s.x - x0) / cell).floor().max(0.0) as usize).min(nx - 1);
+                let cy = (((s.y - y0) / cell).floor().max(0.0) as usize).min(ny - 1);
+                cy * nx + cx
+            };
+            let mut starts = vec![0u32; nx * ny + 1];
+            for s in samples {
+                starts[at(s) + 1] += 1;
+            }
+            for c in 0..nx * ny {
+                starts[c + 1] += starts[c];
+            }
+            let mut fill = starts.clone();
+            let mut sorted = vec![Sample { x: 0.0, y: 0.0, w: 0.0 }; samples.len()];
+            for s in samples {
+                let c = at(s);
+                sorted[fill[c] as usize] = *s;
+                fill[c] += 1;
+            }
+            Self { x0, y0, cell, nx, ny, starts, samples: sorted }
+        }
+
+        fn sum(&self, x: f64, y: f64, mut f: impl FnMut(&Sample) -> f64) -> Option<f64> {
+            let cx = (((x - self.x0) / self.cell).floor().max(0.0) as usize).min(self.nx - 1);
+            let cy = (((y - self.y0) / self.cell).floor().max(0.0) as usize).min(self.ny - 1);
+            let mut sum = 0.0;
+            let mut any = false;
+            for yy in cy.saturating_sub(1)..=(cy + 1).min(self.ny - 1) {
+                for xx in cx.saturating_sub(1)..=(cx + 1).min(self.nx - 1) {
+                    let c = yy * self.nx + xx;
+                    for s in &self.samples[self.starts[c] as usize..self.starts[c + 1] as usize] {
+                        any = true;
+                        sum += f(s);
+                    }
+                }
+            }
+            any.then_some(sum)
+        }
+    }
+
+    /// A raster built on the square grid the circle still uses.
+    fn raster_on_square_grid(tip: &ReadyTip, samples: &[Sample], h: f64) -> Raster {
+        let reach = tip.reach();
+        let bounds = reach_box(samples, reach, h);
+        let grid = SquareGrid::new(samples, bounds, reach);
+        let (x0, y0, x1, y1) = bounds;
+        let h = h.max((x1 - x0) / MAX_RASTER as f64).max((y1 - y0) / MAX_RASTER as f64);
+        let nx = ((x1 - x0) / h).ceil() as usize + 1;
+        let ny = ((y1 - y0) / h).ceil() as usize + 1;
+        let mut w = vec![0f32; nx * ny];
+        w.par_chunks_mut(nx).enumerate().for_each(|(j, row)| {
+            let y = y0 + j as f64 * h;
+            for (i, o) in row.iter_mut().enumerate() {
+                let x = x0 + i as f64 * h;
+                if let Some(sum) = grid.sum(x, y, |s| tip.weight(x - s.x, y - s.y) * s.w) {
+                    *o = sum as f32;
+                }
+            }
+        });
+        Raster { x0, y0, h, inv_h: 1.0 / h, nx, ny, w }
+    }
+
+    #[test]
+    fn a_circle_raster_matches_the_square_grid() {
+        let path: Vec<[f64; 2]> =
+            (0..40).map(|i| [-0.3 + i as f64 * 0.015, 0.05 * (i as f64 * 0.5).sin()]).collect();
+        for t in [tip(0.04, 0.04, 20.0, 0.01), tip(0.03, 0.03, 0.0, 0.0), tip(0.05, 0.05, -15.0, 0.04)] {
+            let ready = ReadyTip::new(t);
+            let sampled = sample_path(&t, &path);
+            let samples: Vec<Sample> = sampled.full.iter().chain(sampled.tail.iter()).copied().collect();
+            let h = raster_step(&t);
+            let got = Raster::build(&ready, &samples, h);
+            let old = raster_on_square_grid(&ready, &samples, h);
+            assert_eq!((got.nx, got.ny), (old.nx, old.ny), "{t:?}");
+            assert_eq!(got.x0, old.x0);
+            assert_eq!(got.y0, old.y0);
+            assert_eq!(got.h, old.h);
+            assert_eq!(got.w, old.w, "{t:?}");
+            assert!(got.w.iter().any(|v| *v > 0.0), "{t:?}");
+        }
+    }
+
+    /// A turned eccentric tip on a path with a corner: each raster point is
+    /// the plain sum of every sample, to the last bit a reordered sum moves.
+    #[test]
+    fn an_eccentric_raster_point_is_the_plain_sum_of_the_samples() {
+        let t = tip(0.05, 0.015, 32.0, 0.01);
+        let path = [[-0.08, -0.02], [0.0, 0.06], [0.1, -0.03]];
+        let ready = ReadyTip::new(t);
+        let sampled = sample_path(&t, &path);
+        let samples: Vec<Sample> = sampled.full.iter().chain(sampled.tail.iter()).copied().collect();
+        assert!(samples.len() > 50, "{}", samples.len());
+        let raster = Raster::build(&ready, &samples, raster_step(&t));
+        assert!(raster.nx > 32 && raster.ny > 32, "{}x{}", raster.nx, raster.ny);
+        let (nx, ny) = (raster.nx, raster.ny);
+        let (fails, worst) = (0..ny)
+            .into_par_iter()
+            .map(|j| {
+                let y = raster.y0 + j as f64 * raster.h;
+                let mut fails = 0usize;
+                let mut worst = 0.0f64;
+                for i in 0..nx {
+                    let x = raster.x0 + i as f64 * raster.h;
+                    let plain: f64 = samples.iter().map(|s| ready.weight(x - s.x, y - s.y) * s.w).sum();
+                    let got = f64::from(raster.w[j * nx + i]);
+                    let d = (got - plain).abs();
+                    if d > 1e-7 && d > 1e-6 * plain.abs().max(got.abs()) {
+                        fails += 1;
+                        worst = worst.max(d);
+                    }
+                }
+                (fails, worst)
+            })
+            .reduce(|| (0, 0.0), |a, b| (a.0 + b.0, a.1.max(b.1)));
+        assert_eq!(fails, 0, "worst difference {worst} over {}x{ny}", raster.nx);
+        assert!(raster.w.iter().any(|v| *v > 0.0));
     }
 }
