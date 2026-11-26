@@ -1092,15 +1092,87 @@ fn config_path() -> Option<PathBuf> {
     Some(mimizan_core::home::settings_dir()?.join("gui.json"))
 }
 
+/// What [`Persisted::load`] read from `gui.json`.
+pub struct ReadSettings {
+    pub settings: Persisted,
+    /// The file that holds bytes that were not a JSON object. The window
+    /// does not write the settings this run. Absent when `gui.json` was
+    /// missing, or it was a JSON object.
+    pub unread: Option<PathBuf>,
+}
+
+/// Where a settings file that is not a JSON object was left.
+enum UnreadKept {
+    /// The bytes were renamed to `gui.json.unread`.
+    Moved(PathBuf),
+    /// Both files stay. `gui.json.unread` was already a file, or the
+    /// rename did not succeed, so the bytes are still in `gui.json`.
+    Left(PathBuf),
+}
+
+impl UnreadKept {
+    fn path(self) -> PathBuf {
+        match self {
+            UnreadKept::Moved(path) | UnreadKept::Left(path) => path,
+        }
+    }
+}
+
+/// `true` when `bytes` are one JSON object. An array, a bare value, and
+/// bytes that are not JSON are not.
+fn is_json_object(bytes: &[u8]) -> bool {
+    matches!(serde_json::from_slice::<serde_json::Value>(bytes), Ok(serde_json::Value::Object(_)))
+}
+
+/// Move `path` to the same name with `.unread` when that name is free.
+/// When `gui.json.unread` is already a file, leave both: the bytes
+/// already kept there are not replaced, and neither is the file that
+/// could not be read.
+fn keep_unread(path: &Path) -> UnreadKept {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".unread");
+    let aside = PathBuf::from(name);
+    if aside.is_file() {
+        return UnreadKept::Left(path.to_path_buf());
+    }
+    match std::fs::rename(path, &aside) {
+        Ok(()) => UnreadKept::Moved(aside),
+        Err(_) => UnreadKept::Left(path.to_path_buf()),
+    }
+}
+
+/// The settings in `path`. A missing file is the defaults. A JSON object
+/// is read, and a value this version cannot read is left at its default.
+/// Bytes that are not a JSON object are the defaults for this run, and
+/// the file is kept: moved aside when `gui.json.unread` is free, left in
+/// place when it is not.
+fn read_settings(path: &Path) -> ReadSettings {
+    let Ok(bytes) = std::fs::read(path) else {
+        return ReadSettings { settings: Persisted::default(), unread: None };
+    };
+    if is_json_object(&bytes) {
+        return ReadSettings { settings: Persisted::from_json(&bytes), unread: None };
+    }
+    ReadSettings { settings: Persisted::default(), unread: Some(keep_unread(path).path()) }
+}
+
 impl Persisted {
-    /// The saved settings, or the defaults when there is no readable file.
-    pub fn load() -> Self {
-        config_path().and_then(|p| std::fs::read(p).ok()).map(|b| Self::from_json(&b)).unwrap_or_default()
+    /// The saved settings. A missing file is the defaults, and the window
+    /// may write. A JSON object is read as [`Self::from_json`] reads it.
+    /// Bytes that are not a JSON object are the defaults for this run.
+    /// They are moved to `gui.json.unread` when that name is free, and
+    /// left in `gui.json` when it is not. `unread` names the file that
+    /// holds them, and the window does not write over them.
+    pub fn load() -> ReadSettings {
+        match config_path() {
+            Some(path) => read_settings(&path),
+            None => ReadSettings { settings: Self::default(), unread: None },
+        }
     }
 
-    /// The settings in `bytes`. A setting this version cannot read (a
-    /// value from a newer one, or a file edited by hand) is left at its
-    /// default and the others are kept.
+    /// The settings in `bytes`. A value this version cannot read (from a
+    /// newer one, or a key edited by hand) is left at its default and the
+    /// others are kept. Bytes that are not a JSON object are the defaults.
     fn from_json(bytes: &[u8]) -> Self {
         if let Ok(all) = serde_json::from_slice(bytes) {
             return all;
@@ -1379,6 +1451,50 @@ mod tests {
         assert_eq!((older.tiff_eight_bit, older.grey_as_rgb, older.sheet_free), (None, None, None));
         assert_eq!(Persisted::from_json(b"not json"), Persisted::default());
         assert_eq!(Persisted::from_json(b"[1, 2]"), Persisted::default());
+    }
+
+    /// `{` is not an object, so it moves to `gui.json.unread` when that
+    /// name is free and stays in `gui.json` when the name is taken. An
+    /// object is read and left where it is, including one key this
+    /// version does not know. A missing file is the defaults, and nothing
+    /// is written beside it.
+    #[test]
+    fn settings_that_are_not_json_are_kept_and_an_object_is_read() {
+        let dir = std::env::temp_dir().join(format!("mimizan-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("gui.json");
+        let aside = dir.join("gui.json.unread");
+
+        let missing = read_settings(&dir.join("absent.json"));
+        assert_eq!(missing.settings, Persisted::default());
+        assert!(missing.unread.is_none());
+        assert!(!aside.exists());
+
+        std::fs::write(&path, b"{").unwrap();
+        let moved = read_settings(&path);
+        assert_eq!(moved.settings, Persisted::default());
+        assert_eq!(moved.unread.as_deref(), Some(aside.as_path()));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{");
+
+        std::fs::write(&path, b"{").unwrap();
+        let left = read_settings(&path);
+        assert_eq!(left.settings, Persisted::default());
+        assert_eq!(left.unread.as_deref(), Some(path.as_path()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{");
+
+        let object = br#"{"folder": "/photos", "strip": false, "a_setting_of_tomorrow": 1}"#;
+        std::fs::write(&path, object).unwrap();
+        let read = read_settings(&path);
+        assert_eq!(read.settings.folder, Some(PathBuf::from("/photos")));
+        assert_eq!(read.settings.strip, Some(false));
+        assert!(read.unread.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), object);
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Orientation 6 turns the stored preview a quarter clockwise: a 2×3

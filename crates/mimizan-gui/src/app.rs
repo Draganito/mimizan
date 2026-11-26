@@ -979,6 +979,10 @@ pub struct App {
     /// The settings `persist` last marked, in the form the file holds.
     /// A later mark replaces this one, and the file is written once.
     pending_settings: Option<Persisted>,
+    /// `gui.json` was there and was not a JSON object. This run uses the
+    /// defaults and does not write the file, so the unread bytes are not
+    /// replaced.
+    settings_unread: bool,
     /// Docked windows open: 0 Negative (left), 1 Print (right), 2 Enlarger (bottom).
     panels: [bool; 3],
     /// Open panels that had no rectangle last frame. The toolbar button
@@ -1263,7 +1267,9 @@ impl App {
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         let cameras_dir = resource_dir("cameras");
-        let persisted = Persisted::load();
+        let loaded = Persisted::load();
+        let persisted = loaded.settings;
+        let unread_settings = loaded.unread;
         let strip_height = persisted.strip_height.unwrap_or(STRIP_HEIGHT).clamp(STRIP_MIN_H, STRIP_MAX_H);
         let mut app = Self {
             heavy: Heavy::spawn(cc.egui_ctx.clone()),
@@ -1295,6 +1301,7 @@ impl App {
             strip_height_saved: strip_height,
             settings_dirty: false,
             pending_settings: None,
+            settings_unread: unread_settings.is_some(),
             panels: persisted.panels.unwrap_or([true; 3]),
             waiting: [false; 3],
             enlarger_h: None,
@@ -1416,6 +1423,9 @@ impl App {
             screenshot_to: std::env::var_os("MIMIZAN_SCREENSHOT").map(PathBuf::from),
             screenshot_state: 0,
         };
+        if let Some(kept) = unread_settings {
+            app.log(format!("the settings could not be read; the bytes are kept in {}", kept.display()));
+        }
         match initial {
             Some(p) if p.is_dir() => {
                 app.hold_grant(&p);
@@ -1462,8 +1472,10 @@ impl App {
     /// Write the marked settings on a frame the pointer is up. The frames
     /// `settle_brush` runs ask `settings_due` here. A button held down
     /// leaves the mark until the pointer is up, so those frames are one write.
+    /// A file that could not be read is not written: the defaults would
+    /// replace the unread bytes.
     fn flush_settings(&mut self, pointer_down: bool) {
-        if !settings_due(self.settings_dirty, pointer_down) {
+        if !settings_due(self.settings_unread, self.settings_dirty, pointer_down) {
             return;
         }
         self.settings_dirty = false;
@@ -7761,9 +7773,10 @@ impl eframe::App for App {
 
 /// Whether this frame writes the settings. A dirty window waits while a
 /// button is down, so the frames that pull a brush back are one write,
-/// on the frame the pointer is up.
-fn settings_due(dirty: bool, pointer_down: bool) -> bool {
-    dirty && !pointer_down
+/// on the frame the pointer is up. A file that could not be read is not
+/// written: the defaults would replace its bytes.
+fn settings_due(unread: bool, dirty: bool, pointer_down: bool) -> bool {
+    !unread && dirty && !pointer_down
 }
 
 /// The docked windows' places for one frame.
@@ -9668,15 +9681,24 @@ mod settings_write_tests {
     /// pointer is up. One of them writes. A window that is not dirty never does.
     #[test]
     fn a_dirty_window_writes_on_the_frame_the_pointer_is_up() {
-        assert!(!settings_due(false, false));
-        assert!(!settings_due(false, true));
+        assert!(!settings_due(false, false, false));
+        assert!(!settings_due(false, false, true));
         let mut writes = 0;
         for pointer_down in [true, true, true] {
-            if settings_due(true, pointer_down) {
+            if settings_due(false, true, pointer_down) {
                 writes += 1;
             }
         }
         assert_eq!(writes, 0);
-        assert!(settings_due(true, false));
+        assert!(settings_due(false, true, false));
+    }
+
+    /// The file could not be read. The frame the pointer is up does not
+    /// write, and neither does a frame while a button is down.
+    #[test]
+    fn an_unread_settings_file_is_not_written() {
+        assert!(!settings_due(true, true, false));
+        assert!(!settings_due(true, true, true));
+        assert!(!settings_due(true, false, false));
     }
 }
