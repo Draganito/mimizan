@@ -433,6 +433,24 @@ pub(crate) fn folder_is_asked(open: Option<&Path>, asked: Option<&Path>, parent:
     open.is_some_and(|p| p == parent) || asked.is_some_and(|p| p == parent)
 }
 
+/// What a failed listing leaves. `shown` is the folder that stays on
+/// screen. `asked` is empty: the bar is no longer waiting. `mark` is
+/// whether the settings are written for this failure.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FailedRead {
+    pub shown: Option<PathBuf>,
+    pub asked: Option<PathBuf>,
+    pub mark: bool,
+}
+
+/// A folder that could not be read leaves the one on screen. The path
+/// that was asked for is no longer asked, so the bar returns to that
+/// folder. The settings are not marked: the unread folder is not stored,
+/// and a stored folder is not cleared.
+pub(crate) fn failed_read(shown: Option<&Path>, _asked: Option<&Path>) -> FailedRead {
+    FailedRead { shown: shown.map(Path::to_path_buf), asked: None, mark: false }
+}
+
 /// Absolute, and without the Windows `\\?\` prefix `canonicalize` adds.
 pub(crate) fn readable_path(path: &Path) -> PathBuf {
     let absolute = std::fs::canonicalize(path)
@@ -1536,6 +1554,24 @@ mod tests {
         assert_eq!(remembered_folder(Some(open), Some(asked)).as_deref(), Some(open));
         assert_eq!(remembered_folder(None, Some(asked)).as_deref(), Some(asked));
         assert_eq!(remembered_folder(None, None), None);
+    }
+
+    /// A screen on `/photos`, asked for `/photos/lost+found`, still shows
+    /// `/photos` when that folder cannot be read. It is no longer asking,
+    /// and the settings are not marked. A screen showing nothing stays
+    /// empty and does not mark them either.
+    #[test]
+    fn a_folder_that_cannot_be_read_leaves_the_one_on_screen() {
+        let photos = Path::new("/photos");
+        let lost = Path::new("/photos/lost+found");
+        let kept = failed_read(Some(photos), Some(lost));
+        assert_eq!(kept.shown.as_deref(), Some(photos));
+        assert_eq!(kept.asked, None);
+        assert!(!kept.mark);
+        let empty = failed_read(None, Some(lost));
+        assert_eq!(empty.shown, None);
+        assert_eq!(empty.asked, None);
+        assert!(!empty.mark);
     }
 
     #[test]

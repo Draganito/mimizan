@@ -1590,15 +1590,14 @@ impl App {
         }
     }
 
-    /// Ask for a folder's RAW files. The strip shows the path at once and
-    /// the listing arrives on a later frame. Nothing here reads the disk:
-    /// a slow folder must not hold the window.
+    /// Ask for a folder's RAW files. The bar names the path at once and
+    /// the listing arrives on a later frame. The folder on screen stays
+    /// until that listing is in, so one that cannot be read does not empty
+    /// the strip. Nothing here reads the disk: a slow folder must not hold
+    /// the window.
     fn set_folder(&mut self, path: &Path) {
         self.folder_generation += 1;
-        self.folder = None;
         self.folder_asked = Some(path.to_path_buf());
-        self.dir_counts = None;
-        self.last_wanted.clear();
         self.listing_ls = self.bayer_ls;
         self.listing_sort = self.sort;
         self.folder_list = Some(browser::list(
@@ -1608,7 +1607,20 @@ impl App {
             self.bayer_ls,
             self.ctx.clone(),
         ));
-        self.persist();
+    }
+
+    /// The listing failed, or the thread ended without an answer. The
+    /// folder on screen stays and the settings are not marked.
+    fn keep_shown_folder(&mut self) {
+        let open = self.folder.as_ref().map(|f| f.path.clone());
+        let kept = browser::failed_read(open.as_deref(), self.folder_asked.as_deref());
+        if kept.shown != open {
+            self.folder = None;
+        }
+        self.folder_asked = kept.asked;
+        if kept.mark {
+            self.persist();
+        }
     }
 
     /// Take the listing the folder thread has finished, when it is the
@@ -1625,10 +1637,10 @@ impl App {
         self.folder_list = None;
         let Some(listed) = outcome else {
             // The thread ended without an answer, or was never started.
-            if let Some(path) = self.folder_asked.take() {
+            if let Some(path) = self.folder_asked.clone() {
                 self.log(format!("folder {}: could not be read", path.display()));
-                self.persist();
             }
+            self.keep_shown_folder();
             return;
         };
         if !browser::listing_is_current(
@@ -1651,6 +1663,9 @@ impl App {
                 self.dir_counts = (!f.subdirs.is_empty()).then(|| {
                     browser::count_raws(f.generation, f.subdirs.iter().map(|d| d.path.clone()).collect())
                 });
+                // The priority list belongs to the folder that was on
+                // screen. This folder's tiles are a new listing.
+                self.last_wanted.clear();
                 self.folder = Some(f);
                 self.persist();
                 if std::mem::take(&mut self.shared_recipe_owed) {
@@ -1661,8 +1676,7 @@ impl App {
                 self.log(format!("folder {}: {e}", listed.path.display()));
                 // Not the folder a quit remembers, and an open in it asks
                 // again: the folder may be readable by then.
-                self.folder_asked = None;
-                self.persist();
+                self.keep_shown_folder();
             }
         }
     }
