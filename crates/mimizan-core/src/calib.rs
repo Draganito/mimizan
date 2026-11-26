@@ -131,9 +131,31 @@ impl CameraFile {
         BayerPhase::from_name(&self.bayer_phase).unwrap_or(BayerPhase::RGGB)
     }
 
-    /// `cameras/<clean_make>_<clean_model>.json`, lower-case, spaces to `_`.
+    /// `cameras/<clean_make>_<clean_model>.json`, lower case, spaces as
+    /// `_`. Any other character that is not an ASCII letter or digit or
+    /// `-` `.` `(` `)` `_` is `_` too, and a leading `.` is `_`, so the
+    /// name is one file in the cameras folder.
     pub fn file_name(clean_make: &str, clean_model: &str) -> String {
-        let norm = |s: &str| s.trim().to_ascii_lowercase().replace(' ', "_");
+        let norm = |s: &str| {
+            let mut name: String = s
+                .trim()
+                .to_ascii_lowercase()
+                .replace(' ', "_")
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '(' | ')' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            // A name that starts with a dot is hidden.
+            if name.starts_with('.') {
+                name.replace_range(0..1, "_");
+            }
+            name
+        };
         format!("{}_{}.json", norm(clean_make), norm(clean_model))
     }
 
@@ -307,6 +329,35 @@ mod tests {
     fn camera_file_name() {
         assert_eq!(CameraFile::file_name("Nikon", "Z f"), "nikon_z_f.json");
         assert_eq!(CameraFile::file_name(" Acme ", "Mono Camera (Mk II)"), "acme_mono_camera_(mk_ii).json");
+    }
+
+    /// A slash, a star or a path in the make or model is still one file in
+    /// the cameras folder. Marks that are already allowed stay as written.
+    #[test]
+    fn a_slash_a_star_or_a_path_in_the_name_is_one_file_in_the_folder() {
+        assert_eq!(CameraFile::file_name("Kodak", "DCS Pro SLR/n"), "kodak_dcs_pro_slr_n.json");
+        assert_eq!(CameraFile::file_name("Pentax", "*ist D"), "pentax__ist_d.json");
+        assert_eq!(CameraFile::file_name("Phase-One", "IQ4_150.mp"), "phase-one_iq4_150.mp.json");
+        assert_eq!(CameraFile::file_name(".Hidden", "Cam"), "_hidden_cam.json");
+
+        let folder = std::path::Path::new("/tmp/mimizan-cameras");
+        let inside = |make: &str, model: &str, expect: &str| {
+            let name = CameraFile::file_name(make, model);
+            assert_eq!(name, expect);
+            assert!(!name.contains('/'), "{name}");
+            assert!(!name.contains('\\'), "{name}");
+            assert_ne!(name, ".");
+            assert_ne!(name, "..");
+            let path = CameraFile::path_in(folder, make, model);
+            assert_eq!(path.parent(), Some(folder), "{name}");
+            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(name.as_str()));
+        };
+        inside("../../x", "y", "_._.._x_y.json");
+        inside("/etc", "y", "_etc_y.json");
+        inside(r"..\..\x", "y", "_._.._x_y.json");
+        inside("y", "/etc", "y__etc.json");
+        inside("y", r"..\..\x", "y__._.._x.json");
+        inside("y", "../../x", "y__._.._x.json");
     }
 
     #[test]
