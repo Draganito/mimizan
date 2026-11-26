@@ -393,7 +393,7 @@ pub fn mix_plate_stacked(sep: &Separation, w: &PlateWeights) -> Result<Plane> {
 /// Split a stacked plate back into `[red, green, blue]`.
 pub fn split(plate: &Plane, info: &PlateInfo) -> Result<[Plane; 3]> {
     let h = info.frame_height;
-    if h == 0 || plate.height != 3 * h {
+    if h == 0 || h.checked_mul(3) != Some(plate.height) {
         return Err(Error::Invalid(format!(
             "plate is {} rows tall, expected three frames of {h}",
             plate.height
@@ -584,6 +584,10 @@ mod tests {
         let json = serde_json::json!({ "plate": info });
         assert_eq!(PlateInfo::from_description(Some(&json)).unwrap(), Some(info.clone()));
         assert!(split(&p(0.0), &info).is_err());
+        // A frame height from a damaged record, too large to be tripled,
+        // is a wrong record and not an overflow.
+        let wrapped = PlateInfo { frame_height: usize::MAX / 2, ..info };
+        assert!(split(&plate, &wrapped).is_err());
     }
 
     /// A file that says it is a plate in words this version does not know
