@@ -672,6 +672,67 @@ fn open_step(held: Option<&Path>, released: Option<&Path>, path: &Path, unsaved:
     }
 }
 
+/// Another file is on its way: an open was started and its file is not
+/// the one on the stage.
+fn another_file_on_the_way(busy: bool, opening: Option<&Path>, shown: Option<&Path>) -> bool {
+    busy && opening != shown
+}
+
+/// What the heavy thread sent, as far as the save question cares.
+enum FromHeavy {
+    Status,
+    Opened,
+    Failed,
+    Other,
+}
+
+fn from_heavy(ev: &Event) -> FromHeavy {
+    match ev {
+        Event::Status(_) => FromHeavy::Status,
+        Event::Opened(_) => FromHeavy::Opened,
+        Event::Failed(_) => FromHeavy::Failed,
+        Event::Exported { .. } | Event::Refused { .. } => FromHeavy::Other,
+    }
+}
+
+/// Whether `event` is taken while the save question is up. An open that
+/// finished waits, and so does the failure of an open of another file.
+/// A status line does not.
+fn taken_while_asked(loading_other: bool, event: FromHeavy) -> bool {
+    match event {
+        FromHeavy::Opened => false,
+        FromHeavy::Failed => !loading_other,
+        FromHeavy::Status | FromHeavy::Other => true,
+    }
+}
+
+/// What answering the question does. `saved` is whether Save left the
+/// shown file's recipe written: a refused save did not, and the question
+/// stays up. The open that finished during the question lands once the
+/// question is no longer up, which Save and Don't save and Cancel each do
+/// when the answer is finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Answered {
+    /// The shown file's recipe was to be written.
+    write_shown: bool,
+    /// The leave goes on: the window closes, or the file asked for opens.
+    proceed: bool,
+}
+
+fn answered(choice: SaveChoice, saved: bool) -> Answered {
+    match choice {
+        SaveChoice::Save => Answered { write_shown: true, proceed: saved },
+        SaveChoice::Discard => Answered { write_shown: false, proceed: true },
+        SaveChoice::Cancel => Answered { write_shown: false, proceed: false },
+    }
+}
+
+/// The recipe file Save writes while `on_the_way` has not landed. It is
+/// the picture on the stage, not the file that is still opening.
+fn shown_recipe(shown: &Path, _on_the_way: &Path) -> Option<PathBuf> {
+    sidecar_of(shown)
+}
+
 /// What a session was developed with, as its recipe file carries it.
 /// `None` for a monochrome sensor: the file is the measurement, there is
 /// no balance and no mask to choose.
@@ -1131,6 +1192,10 @@ pub struct App {
     recipe_kept: Option<PathBuf>,
     /// A file change or a close is waiting on the save question.
     pending_leave: Option<Leave>,
+    /// An open that finished while the save question was up, or the
+    /// failure of an open of another file. Taken on the first frame after
+    /// the question is answered, so Save still writes the picture on the stage.
+    held_open: Option<Event>,
     /// An export is waiting on the question whether this file, which is
     /// already there, is to be replaced.
     pending_replace: Option<PathBuf>,
@@ -1332,6 +1397,7 @@ impl App {
             recipe_seen: Seen::Absent,
             recipe_kept: None,
             pending_leave: None,
+            held_open: None,
             pending_replace: None,
             unlock: Unlock::new(&cc.egui_ctx),
             close_allowed: false,
@@ -3187,6 +3253,12 @@ impl App {
         }
     }
 
+    /// Another file is on its way: an open was started, and its file is
+    /// not the one on the stage. The edit of the picture shown waits.
+    fn another_file_on_the_way(&self) -> bool {
+        another_file_on_the_way(self.busy.is_some(), self.current_path.as_deref(), self.developed_path())
+    }
+
     /// The re-development "Apply" asked for, sent now that no panel holds
     /// a clone of the session.
     fn start_redevelop(&mut self) {
@@ -3294,9 +3366,12 @@ impl App {
         self.crop_turned = false;
     }
 
-    /// The recipe file next to the RAW the edit belongs to.
+    /// The recipe file next to the RAW the edit belongs to. A file that
+    /// is still opening is not this one: the picture on the stage is.
     fn recipe_sidecar(&self) -> Option<PathBuf> {
-        sidecar_of(self.developed_path()?)
+        let shown = self.developed_path()?;
+        let on_the_way = self.current_path.as_deref().unwrap_or(shown);
+        shown_recipe(shown, on_the_way)
     }
 
     /// Read a recipe file into the edit, as the window prints it
@@ -3499,31 +3574,29 @@ impl App {
     }
 
     fn answer_save(&mut self, ctx: &egui::Context, leave: Leave, choice: SaveChoice) {
-        match choice {
-            SaveChoice::Cancel => {
-                self.pending_leave = None;
-                // The strip was to go to the file that is not opened now.
-                self.scroll_to_selected = false;
-            }
-            SaveChoice::Discard => {
-                self.pending_leave = None;
-                self.follow_leave(ctx, leave);
-            }
-            SaveChoice::Save => {
-                let Some(path) = self.recipe_sidecar() else {
-                    self.log("recipe not saved: no negative open");
-                    return;
-                };
-                self.save_recipe(&path);
-                // A refused save leaves the baseline where it was, so the
-                // question stays up. The picture shown is still the
-                // developed file: an open that finished during the
-                // question has not landed.
-                if self.recipe_for_file() == self.recipe_baseline {
-                    self.pending_leave = None;
-                    self.follow_leave(ctx, leave);
-                }
-            }
+        let saved = if choice == SaveChoice::Save {
+            let Some(path) = self.recipe_sidecar() else {
+                self.log("recipe not saved: no negative open");
+                return;
+            };
+            self.save_recipe(&path);
+            self.recipe_for_file() == self.recipe_baseline
+        } else {
+            false
+        };
+        // A refused save leaves the baseline where it was, so the question
+        // stays up. The picture shown is still the developed file: an open
+        // that finished during the question has not landed.
+        let answer = answered(choice, saved);
+        if !matches!(choice, SaveChoice::Save) || answer.proceed {
+            self.pending_leave = None;
+        }
+        if choice == SaveChoice::Cancel {
+            // The strip was to go to the file that is not opened now.
+            self.scroll_to_selected = false;
+        }
+        if answer.proceed {
+            self.follow_leave(ctx, leave);
         }
     }
 
@@ -3584,7 +3657,25 @@ impl App {
 
     fn handle_events(&mut self, ctx: &egui::Context) {
         self.take_listing();
-        while let Some(ev) = self.heavy.poll() {
+        // An open that finished while the question was up is taken now
+        // that it has been answered, before anything newer in the queue.
+        let mut queued = Vec::new();
+        if self.pending_leave.is_none() {
+            if let Some(ev) = self.held_open.take() {
+                queued.push(ev);
+            }
+        }
+        while self.held_open.is_none() {
+            let Some(ev) = self.heavy.poll() else { break };
+            if self.pending_leave.is_some()
+                && !taken_while_asked(self.another_file_on_the_way(), from_heavy(&ev))
+            {
+                self.held_open = Some(ev);
+                break;
+            }
+            queued.push(ev);
+        }
+        for ev in queued {
             match ev {
                 Event::Status(s) => self.busy = Some(s),
                 Event::Opened(s) => {
@@ -4076,6 +4167,9 @@ impl App {
     /// changes its height, so a fitted picture stays where it is when a
     /// tool is taken up.
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        // The picture on the stage is not edited while another file is on
+        // its way. The strip's windows and the log stay.
+        let editing = !self.another_file_on_the_way();
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         ui.spacing_mut().interact_size.y = toolbar::FIELD_H;
         ui.spacing_mut().button_padding = egui::vec2(8.0, 3.0);
@@ -4083,29 +4177,32 @@ impl App {
             ui.set_min_height(toolbar::ROW_H);
             self.toolbar_windows(ui);
             toolbar::sep(ui);
-            self.toolbar_process(ui);
+            ui.add_enabled_ui(editing, |ui| self.toolbar_process(ui));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.toolbar_history(ui);
+                ui.add_enabled_ui(editing, |ui| self.toolbar_history(ui));
                 ui.add_space(8.0);
                 // The note takes only what is left and is cut, never painted over the controls.
                 self.toolbar_status(ui);
             });
         });
-        ui.horizontal(|ui| {
-            ui.set_min_height(toolbar::ROW_H);
-            self.toolbar_tools(ui);
-            toolbar::sep(ui);
-            if self.crop_open {
-                self.toolbar_crop(ui);
-            } else if self.burn_on {
-                self.toolbar_burn(ui);
-            } else {
-                let carries = self.picture_carries();
-                if !carries.is_empty() {
-                    toolbar::note(ui, &carries)
-                        .on_hover_text("What this picture carries: its crop, its straighten, its strokes.");
+        ui.add_enabled_ui(editing, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_min_height(toolbar::ROW_H);
+                self.toolbar_tools(ui);
+                toolbar::sep(ui);
+                if self.crop_open {
+                    self.toolbar_crop(ui);
+                } else if self.burn_on {
+                    self.toolbar_burn(ui);
+                } else {
+                    let carries = self.picture_carries();
+                    if !carries.is_empty() {
+                        toolbar::note(ui, &carries).on_hover_text(
+                            "What this picture carries: its crop, its straighten, its strokes.",
+                        );
+                    }
                 }
-            }
+            });
         });
     }
 
@@ -4694,87 +4791,90 @@ impl App {
         ui.separator();
         self.histogram_section(ui);
         ui.collapsing("Development", |ui| {
-            if s.is_mono() {
+            let editing = !self.another_file_on_the_way();
+            ui.add_enabled_ui(editing, |ui| {
+                if s.is_mono() {
+                    ui.label(
+                        RichText::new(
+                            "This sensor records luminance only: the file is the measurement, there is \
+                             nothing to develop. White balance and the mask do not apply.",
+                        )
+                        .weak(),
+                    );
+                    return;
+                }
+                if !s.is_channels() || crate::bayer::is_ours(&s.path) {
+                    self.bayer_demosaic_box(ui, &s);
+                }
+                ui.label(RichText::new("Changes here recompute the picture.").weak());
                 ui.label(
-                    RichText::new(
-                        "This sensor records luminance only: the file is the measurement, there is \
-                         nothing to develop. White balance and the mask do not apply.",
-                    )
+                    RichText::new(if s.is_channels() {
+                        "The file's three channels: nothing to separate, the mask does not apply."
+                    } else if self.bayer_ls {
+                        "Least-squares demosaic: three colour values a pixel, written beside the file as a DNG."
+                    } else {
+                        "Separation, no demosaic."
+                    })
                     .weak(),
                 );
-                return;
-            }
-            if !s.is_channels() || crate::bayer::is_ours(&s.path) {
-                self.bayer_demosaic_box(ui, &s);
-            }
-            ui.label(RichText::new("Changes here recompute the picture.").weak());
-            ui.label(
-                RichText::new(if s.is_channels() {
-                    "The file's three channels: nothing to separate, the mask does not apply."
-                } else if self.bayer_ls {
-                    "Least-squares demosaic: three colour values a pixel, written beside the file as a DNG."
-                } else {
-                    "Separation, no demosaic."
-                })
-                .weak(),
-            );
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("white balance")
-                    .selected_text(match self.wb_choice {
-                        WbChoice::AsShot => "as shot",
-                        WbChoice::GrayWorld => "gray world",
-                        WbChoice::None => "none",
-                        WbChoice::Manual => "manual",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
-                        ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("white balance")
+                        .selected_text(match self.wb_choice {
+                            WbChoice::AsShot => "as shot",
+                            WbChoice::GrayWorld => "gray world",
+                            WbChoice::None => "none",
+                            WbChoice::Manual => "manual",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.wb_choice, WbChoice::AsShot, "as shot");
+                            ui.selectable_value(&mut self.wb_choice, WbChoice::GrayWorld, "gray world");
+                            ui.selectable_value(&mut self.wb_choice, WbChoice::None, "none");
+                            ui.selectable_value(&mut self.wb_choice, WbChoice::Manual, "manual");
+                        });
+                    ui.label("white balance");
+                    let card = ui
+                        .add_enabled(self.busy.is_none(), egui::Button::selectable(self.pick_card, "card"))
+                        .on_hover_text(
+                            "Read a grey card: click the card in the picture. The next click averages a \
+                             32×32 photosite window, leaving out clipped sites, and puts the balance \
+                             into manual. Esc cancels. Apply recomputes.",
+                        );
+                    if card.clicked() {
+                        self.pick_card = !self.pick_card;
+                    }
+                });
+                if self.pick_card {
+                    ui.label(RichText::new("click the grey card in the picture (Esc cancels)").strong());
+                } else if let Some(status) = &self.card_status {
+                    ui.label(RichText::new(status).small().weak());
+                }
+                if self.wb_choice == WbChoice::Manual {
+                    ui.horizontal(|ui| {
+                        ui.label("R");
+                        ui.add(egui::DragValue::new(&mut self.wb_manual[0]).range(0.1..=8.0).speed(0.01));
+                        ui.label("B");
+                        ui.add(egui::DragValue::new(&mut self.wb_manual[2]).range(0.1..=8.0).speed(0.01));
                     });
-                ui.label("white balance");
-                let card = ui
-                    .add_enabled(self.busy.is_none(), egui::Button::selectable(self.pick_card, "card"))
-                    .on_hover_text(
-                        "Read a grey card: click the card in the picture. The next click averages a \
-                         32×32 photosite window, leaving out clipped sites, and puts the balance \
-                         into manual. Esc cancels. Apply recomputes.",
+                    self.wb_manual[1] = 1.0;
+                }
+                if !s.is_channels() {
+                    egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
+                        ui,
+                        |ui| {
+                            ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
+                            ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
+                            ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
+                        },
                     );
-                if card.clicked() {
-                    self.pick_card = !self.pick_card;
+                }
+                let differs = self.develop_params() != s.develop;
+                if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
+                    // Sent at the start of the next frame, when this panel's
+                    // clone of the session is gone and `make_room` can free it.
+                    self.busy = Some("re-developing".into());
+                    self.redevelop = Some(self.develop_params());
                 }
             });
-            if self.pick_card {
-                ui.label(RichText::new("click the grey card in the picture (Esc cancels)").strong());
-            } else if let Some(status) = &self.card_status {
-                ui.label(RichText::new(status).small().weak());
-            }
-            if self.wb_choice == WbChoice::Manual {
-                ui.horizontal(|ui| {
-                    ui.label("R");
-                    ui.add(egui::DragValue::new(&mut self.wb_manual[0]).range(0.1..=8.0).speed(0.01));
-                    ui.label("B");
-                    ui.add(egui::DragValue::new(&mut self.wb_manual[2]).range(0.1..=8.0).speed(0.01));
-                });
-                self.wb_manual[1] = 1.0;
-            }
-            if !s.is_channels() {
-                egui::ComboBox::from_label("mask").selected_text(format!("{:?}", self.mask_mode)).show_ui(
-                    ui,
-                    |ui| {
-                        ui.selectable_value(&mut self.mask_mode, MaskMode::Dubois, "Dubois");
-                        ui.selectable_value(&mut self.mask_mode, MaskMode::Adaptive, "Adaptive");
-                        ui.selectable_value(&mut self.mask_mode, MaskMode::Off, "Off");
-                    },
-                );
-            }
-            let differs = self.develop_params() != s.develop;
-            if ui.add_enabled(differs && self.busy.is_none(), egui::Button::new("Apply")).clicked() {
-                // Sent at the start of the next frame, when this panel's
-                // clone of the session is gone and `make_room` can free it.
-                self.busy = Some("re-developing".into());
-                self.redevelop = Some(self.develop_params());
-            }
         });
 
         ui.collapsing("Log", |ui| {
@@ -5140,7 +5240,8 @@ impl App {
             egui::UiBuilder::new().max_rect(wide).layout(egui::Layout::top_down(egui::Align::Min)),
         );
         body.set_clip_rect(clip);
-        self.zones_column(&mut body, width);
+        let editing = !self.another_file_on_the_way();
+        body.add_enabled_ui(editing, |ui| self.zones_column(ui, width));
         let used = body.min_rect();
         drop(body);
         ui.advance_cursor_after_rect(used);
@@ -5279,12 +5380,15 @@ impl App {
         // window, a full-width button grows past it. Rows that reach the
         // right edge are measured against this width instead, and a row
         // that still runs past it is reported, once, in the log.
-        let width = ui.available_width();
-        let left = ui.max_rect().left();
-        self.print_section(ui, width);
-        ui.add_space(8.0);
-        self.peak_controls(ui, width);
-        self.note_print_overflow(ui, left, width);
+        let editing = !self.another_file_on_the_way();
+        ui.add_enabled_ui(editing, |ui| {
+            let width = ui.available_width();
+            let left = ui.max_rect().left();
+            self.print_section(ui, width);
+            ui.add_space(8.0);
+            self.peak_controls(ui, width);
+            self.note_print_overflow(ui, left, width);
+        });
     }
 
     /// The export, at the foot of the Print window: a line, the button
@@ -6355,13 +6459,16 @@ impl App {
             }
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
         } else {
-            if self.crop_open {
+            // Brush, crop and the card wait while another file is on its
+            // way. The picture still zooms and pans.
+            let editing = !self.another_file_on_the_way();
+            if editing && self.crop_open {
                 self.crop_interact(ui, &response, rect);
             }
             // The armed pipette has the next click on the picture. The
             // brush under it would take the same press for a stroke, and
             // the card would be read with a burn left in the recipe.
-            let brush_on = self.burn_on && !self.pick_card;
+            let brush_on = editing && self.burn_on && !self.pick_card;
             if brush_on {
                 self.burn_interact(ui, &response, rect);
             }
@@ -6388,7 +6495,8 @@ impl App {
         // pixels on the stage are the session's: between a file opening
         // and its first preview the stage still shows the previous one,
         // and the spot clicked there is not a spot of the new negative.
-        if self.pick_card {
+        // Nor while another file is on its way: the picture is still the previous one.
+        if !self.another_file_on_the_way() && self.pick_card {
             // The key is used up here: it puts the pipette down and is not
             // the brush's Escape as well.
             if !self.typing && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
@@ -8098,13 +8206,20 @@ impl App {
         if self.keys_are_taken(ctx) {
             return;
         }
+        // The picture on the stage is not edited while another file is on
+        // its way. Showing and hiding the panels stays.
+        let editing = !self.another_file_on_the_way();
         // The easel: Enter keeps the window, Escape puts the easel down
         // and the picture stays as it was. An Escape that closed the list
         // of sheets has done its work.
-        if self.crop_open && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+        if editing
+            && self.crop_open
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        {
             self.apply_crop();
         }
-        if self.crop_open
+        if editing
+            && self.crop_open
             && !self.list_open
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
@@ -8112,7 +8227,7 @@ impl App {
         }
         // The burn tool: Enter locks the brush, Escape opens it, and puts
         // the tool down when it is open. Not while the pointer holds it.
-        if self.burn_on && self.burn_drag.is_none() {
+        if editing && self.burn_on && self.burn_drag.is_none() {
             if !self.burn_locked && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
             {
                 self.lock_brush();
@@ -8125,7 +8240,7 @@ impl App {
                 }
             }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+        if editing && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
             self.set_process(!self.plate_process());
         }
         let numbered = ctx.input_mut(panel_keys);
@@ -8148,12 +8263,14 @@ impl App {
                 }
             }
         }
-        let (undo, redo) = ctx.input_mut(undo_redo_keys);
-        if undo {
-            self.undo();
-        }
-        if redo {
-            self.redo();
+        if editing {
+            let (undo, redo) = ctx.input_mut(undo_redo_keys);
+            if undo {
+                self.undo();
+            }
+            if redo {
+                self.redo();
+            }
         }
     }
 }
@@ -8383,6 +8500,60 @@ mod close_tests {
         // Asked once more while it is still writing: no second wait.
         assert_eq!(close_step(true, false, true, true, false), CloseStep::Close);
         assert_eq!(close_step(true, false, true, true, true), CloseStep::Ask);
+    }
+}
+
+#[cfg(test)]
+mod leave_tests {
+    use super::{
+        another_file_on_the_way, answered, shown_recipe, taken_while_asked, Answered, FromHeavy, SaveChoice,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn another_file_is_on_its_way_only_while_its_open_is_not_the_picture() {
+        let shown = Path::new("/photos/first.nef");
+        let opening = Path::new("/photos/second.nef");
+        assert!(another_file_on_the_way(true, Some(opening), Some(shown)));
+        assert!(!another_file_on_the_way(true, Some(shown), Some(shown)));
+        assert!(!another_file_on_the_way(false, Some(opening), Some(shown)));
+        assert!(another_file_on_the_way(true, Some(opening), None));
+        assert!(!another_file_on_the_way(false, None, None));
+    }
+
+    #[test]
+    fn an_open_that_finishes_during_the_question_waits_and_save_writes_the_shown_file() {
+        assert!(!taken_while_asked(true, FromHeavy::Opened));
+        assert!(!taken_while_asked(false, FromHeavy::Opened));
+        assert!(!taken_while_asked(true, FromHeavy::Failed));
+        assert!(taken_while_asked(false, FromHeavy::Failed));
+        assert!(taken_while_asked(true, FromHeavy::Status));
+        assert!(taken_while_asked(true, FromHeavy::Other));
+
+        let dir = std::env::temp_dir().join(format!("mimizan-leave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let shown = dir.join("first.nef");
+        let opening = dir.join("second.nef");
+        let path = shown_recipe(&shown, &opening).unwrap();
+        assert_eq!(path, dir.join("first.recipe.json"));
+        let mut recipe = mimizan_core::recipe::Recipe::on_paper();
+        recipe.border_mm = 4.0;
+        recipe.save(&path).unwrap();
+        assert_eq!(mimizan_core::recipe::Recipe::load(&path).unwrap().border_mm, 4.0);
+        assert!(!dir.join("second.recipe.json").exists());
+
+        // Quit and Open share the answer. The leave, when it goes on, is
+        // what differs, and that is the leave that was asked.
+        let saved = Answered { write_shown: true, proceed: true };
+        let discarded = Answered { write_shown: false, proceed: true };
+        let cancelled = Answered { write_shown: false, proceed: false };
+        assert_eq!(answered(SaveChoice::Save, true), saved);
+        assert_eq!(answered(SaveChoice::Discard, false), discarded);
+        assert_eq!(answered(SaveChoice::Cancel, false), cancelled);
+        // A refused save does not let the leave go on.
+        assert_eq!(answered(SaveChoice::Save, false), Answered { write_shown: true, proceed: false });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
