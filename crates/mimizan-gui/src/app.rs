@@ -802,8 +802,9 @@ fn seen_of(path: &Path) -> Seen {
 }
 
 /// The sidecar is not what was seen. A file that merely went away is not
-/// this: the save writes it. The length and the time are the quick test.
-/// When they differ and the bytes were kept, the bytes decide.
+/// this: the save writes it. When the bytes were kept they decide, so a
+/// write that did not move the clock is still seen. The time is the test
+/// only for a file too large to keep.
 fn sidecar_changed(path: &Path, seen: &Seen) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -817,14 +818,11 @@ fn sidecar_changed(path: &Path, seen: &Seen) -> bool {
     if meta.len() != *len {
         return true;
     }
-    if meta.modified().ok() == Some(*modified) {
-        return false;
-    }
     match bytes {
         Some(seen_bytes) => {
             std::fs::read(path).map(|now| now.as_slice() != seen_bytes.as_slice()).unwrap_or(true)
         }
-        None => true,
+        None => meta.modified().ok() != Some(*modified),
     }
 }
 
@@ -8668,6 +8666,19 @@ mod path_tests {
         assert!(!sidecar_changed(&same, &seen));
         assert!(matches!(store_recipe(&same, &mut seen, &edited).unwrap(), Stored::Saved));
         assert_ne!(std::fs::read(&same).unwrap(), bytes, "the save did write");
+
+        // The clock did not move and the bytes did: still someone else's file.
+        let quiet = dir.join("quiet.recipe.json");
+        std::fs::write(&quiet, b"read bytes").unwrap();
+        let mut seen = seen_of(&quiet);
+        let Seen::There { modified, .. } = seen else { panic!("the file was read") };
+        std::fs::write(&quiet, b"other bytes").unwrap();
+        std::fs::File::options().write(true).open(&quiet).unwrap().set_modified(modified).unwrap();
+        assert!(sidecar_changed(&quiet, &seen));
+        match store_recipe(&quiet, &mut seen, &edited).unwrap() {
+            Stored::Kept(kept) => assert_eq!(std::fs::read(&kept).unwrap(), b"other bytes"),
+            Stored::Saved => panic!("a change the clock hid was replaced"),
+        }
 
         // Past a megabyte only the length and the time are remembered.
         let big = dir.join("big.recipe.json");
