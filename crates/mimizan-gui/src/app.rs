@@ -13,7 +13,9 @@ use crate::filter_strip::{self, filter_ink, filter_short, filter_strip, Field};
 use crate::histogram::{histogram_widget, raw_histogram_widget};
 use crate::lamp_bar::{lamp_bar, Lamp};
 use crate::paper_strip::paper_strip;
-use crate::session::{DetailAsk, Histogram, PlateView, Screen, Session, ViewParams, DETAIL_MARGIN};
+use crate::session::{
+    detail_step, DetailAsk, Histogram, PlateView, Screen, Session, ViewParams, DETAIL_MARGIN,
+};
 use crate::toolbar::{self, Chip, Icon};
 use crate::unlock::{self, Unlock};
 use crate::worker::{
@@ -6083,6 +6085,7 @@ impl App {
         // step is 1 and every file pixel in view is rendered.
         let step =
             if inspecting || mag >= 0.999 { 1 } else { (1.0 / mag.max(1.0e-3)).floor().max(1.0) as usize };
+        let max_side = ui.ctx().input(|i| i.max_texture_side);
         let visible = if show_file && uw > 0 && uh > 0 {
             // Zoomed, this is the whole room, so the sharp picture continues
             // under the windows.
@@ -6091,6 +6094,16 @@ impl App {
             let y0 = ((vis.top() - rect.top()) / pts_per_px).floor().max(0.0) as usize;
             let x1 = (((vis.right() - rect.left()) / pts_per_px).ceil() as usize).min(uw);
             let y1 = (((vis.bottom() - rect.top()) / pts_per_px).ceil() as usize).min(uh);
+            // Between half size and 1:1 the window is up to twice the
+            // screen's pixels a side, which a wide screen takes past the
+            // largest texture the graphics card holds. The grid is then
+            // the next coarser one that fits. A print that is inspected
+            // stays on every pixel; `within` keeps its middle.
+            let step = if inspecting {
+                step
+            } else {
+                detail_step(step, x1.saturating_sub(x0), y1.saturating_sub(y0), max_side)
+            };
             (x1 > x0 && y1 > y0).then(|| DetailAsk::covering(x0, y0, x1, y1, step, uw, uh)).flatten()
         } else {
             None
@@ -6099,7 +6112,7 @@ impl App {
         // keeps its place on the picture, so the hand just slides it.
         self.wanted_detail = match visible {
             Some(v) if self.detail_rect.is_some_and(|have| have.covers(&v)) => self.detail_rect,
-            Some(v) => Some(v.expand(DETAIL_MARGIN, uw, uh)),
+            Some(v) => Some(v.expand(DETAIL_MARGIN, uw, uh).within(max_side)),
             None => None,
         };
         if self.wanted_detail.is_none() {

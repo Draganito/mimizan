@@ -561,6 +561,18 @@ pub struct DetailRect {
 /// pan is already on screen.
 pub const DETAIL_MARGIN: usize = 64;
 
+/// The step at which a window of `span_w` × `span_h` file pixels, with
+/// its margin, is a texture the graphics card takes: `step`, or the first
+/// coarser grid with no side over `max_side` samples. A texture larger
+/// than that limit (8192 with the Windows build's renderer, as little as
+/// 4096 on an old card) is not refused, it ends the program.
+pub fn detail_step(step: usize, span_w: usize, span_h: usize, max_side: usize) -> usize {
+    // The margin on both sides, and the two samples the grid's rounding
+    // may add.
+    let room = max_side.saturating_sub(2 * DETAIL_MARGIN + 2).max(1);
+    step.max(1).max(span_w.div_ceil(room)).max(span_h.div_ceil(room))
+}
+
 /// The zoomed window the view asks for.
 ///
 /// `step` is the file pixels from one sample to the next. `1` is every
@@ -595,6 +607,24 @@ impl DetailAsk {
             && inner.y >= self.y
             && inner.x + inner.w.saturating_mul(step) <= self.x + self.w.saturating_mul(step)
             && inner.y + inner.h.saturating_mul(step) <= self.y + self.h.saturating_mul(step)
+    }
+
+    /// The same grid with no side over `max_side` samples. What is over
+    /// comes off both ends alike, so the middle of the window stays: the
+    /// last net under [`detail_step`], for a window that must keep its
+    /// step.
+    pub fn within(self, max_side: usize) -> Self {
+        let (max_side, step) = (max_side.max(1), self.step());
+        let trim = |at: usize, n: usize| {
+            if n > max_side {
+                (at + (n - max_side) / 2 * step, max_side)
+            } else {
+                (at, n)
+            }
+        };
+        let (x, w) = trim(self.x, self.w);
+        let (y, h) = trim(self.y, self.h);
+        Self { x, y, w, h, step: self.step }
     }
 
     /// The grid of `step` that covers the file window `[x0, x1) × [y0, y1)`,
@@ -2680,6 +2710,34 @@ mod tests {
         assert!(grown.covers(&ask));
         assert!(grown.x + grown.w * grown.step <= 100);
         assert!(grown.y + grown.h * grown.step <= 80);
+    }
+
+    /// A window between half size and 1:1 on a wide screen is up to twice
+    /// the screen a side. Whatever the screen and the picture, the tile
+    /// asked for is a texture the card takes.
+    #[test]
+    fn the_sharp_window_is_never_wider_than_the_largest_texture() {
+        for max_side in [2048usize, 4096, 8192, 16384] {
+            for (uw, uh) in [(6048usize, 4032usize), (9504, 6336), (11648, 8736), (16000, 400)] {
+                for visible in [1000usize, 3840, 5120, 7680, 10240, uw] {
+                    let (x1, y1) = (visible.min(uw), (visible * 2 / 3).clamp(1, uh));
+                    let step = detail_step(1, x1, y1, max_side);
+                    let ask = DetailAsk::covering(0, 0, x1, y1, step, uw, uh).unwrap();
+                    let grown = ask.expand(DETAIL_MARGIN, uw, uh).within(max_side);
+                    assert!(grown.w <= max_side && grown.h <= max_side, "{max_side} {uw}x{uh} {visible}");
+                    assert!(grown.covers(&ask), "the margin goes first: {max_side} {uw}x{uh} {visible}");
+                    // No coarser than the limit asks for.
+                    if x1 + 2 * DETAIL_MARGIN + 2 <= max_side && y1 + 2 * DETAIL_MARGIN + 2 <= max_side {
+                        assert_eq!(step, 1);
+                    }
+                }
+            }
+        }
+        // A window that must keep its step keeps its middle.
+        let wide = DetailAsk { x: 100, y: 0, w: 5000, h: 300, step: 1 }.within(4096);
+        assert_eq!((wide.x, wide.w, wide.y, wide.h), (100 + 452, 4096, 0, 300));
+        let coarse = DetailAsk { x: 0, y: 0, w: 10, h: 9, step: 4 }.within(4);
+        assert_eq!((coarse.x, coarse.w, coarse.y, coarse.h, coarse.step), (12, 4, 8, 4, 4));
     }
 
     #[test]
