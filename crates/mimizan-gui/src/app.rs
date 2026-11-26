@@ -40,6 +40,7 @@ use mimizan_core::straighten;
 use mimizan_core::tone::Tone;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 /// Which side of the sheet the user typed. The other follows the picture,
 /// unless the sheet is free.
@@ -683,24 +684,131 @@ fn file_label(path: &Path) -> String {
     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
 }
 
-/// A recipe file that could not be read, moved out of the way of the one
-/// about to be written under its name: `<name>.unread`, or the first of
-/// `<name>.unread-2`, `-3`, … that is free. `None` when no file is there.
-fn set_aside_unread(path: &Path) -> std::io::Result<Option<PathBuf>> {
+/// A file moved out of the way of the one about to be written under its
+/// name: `<name>.<suffix>`, or the first of `<name>.<suffix>-2`, `-3`, …
+/// that is free. `None` when no file is there.
+fn set_aside(path: &Path, suffix: &str) -> std::io::Result<Option<PathBuf>> {
     if !path.is_file() {
         return Ok(None);
     }
     let named = |n: u32| {
         let mut name = path.as_os_str().to_owned();
-        name.push(if n == 1 { ".unread".to_owned() } else { format!(".unread-{n}") });
+        let tail = if n == 1 { format!(".{suffix}") } else { format!(".{suffix}-{n}") };
+        name.push(tail);
         PathBuf::from(name)
     };
     let aside = (1..=999)
         .map(named)
         .find(|p| !p.exists())
-        .ok_or_else(|| std::io::Error::other("no free name to keep the unread recipe under"))?;
+        .ok_or_else(|| std::io::Error::other(format!("no free name to keep the {suffix} recipe under")))?;
     std::fs::rename(path, &aside)?;
     Ok(Some(aside))
+}
+
+/// A recipe file that could not be read, moved out of the way of the one
+/// about to be written under its name.
+fn set_aside_unread(path: &Path) -> std::io::Result<Option<PathBuf>> {
+    set_aside(path, "unread")
+}
+
+/// What this window last saw in the developed file's recipe file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Seen {
+    /// No file of that name.
+    Absent,
+    /// A file was there. The bytes are kept when the file is under a
+    /// megabyte, which a recipe is; past that the length and the time
+    /// are what is remembered.
+    There { len: u64, modified: SystemTime, bytes: Option<Vec<u8>> },
+}
+
+/// A megabyte. The bytes of a smaller file are remembered with its length
+/// and its time.
+const SEEN_BYTES: u64 = 1024 * 1024;
+
+/// The recipe file as it is now, or [`Seen::Absent`] when nothing is there.
+fn seen_of(path: &Path) -> Seen {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Seen::Absent;
+    };
+    if !meta.is_file() {
+        return Seen::Absent;
+    }
+    let len = meta.len();
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let bytes = (len < SEEN_BYTES).then(|| std::fs::read(path).ok()).flatten();
+    Seen::There { len, modified, bytes }
+}
+
+/// The sidecar is not what was seen. A file that merely went away is not
+/// this: the save writes it. The length and the time are the quick test.
+/// When they differ and the bytes were kept, the bytes decide.
+fn sidecar_changed(path: &Path, seen: &Seen) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let Seen::There { len, modified, bytes } = seen else {
+        return true;
+    };
+    if meta.len() != *len {
+        return true;
+    }
+    if meta.modified().ok() == Some(*modified) {
+        return false;
+    }
+    match bytes {
+        Some(seen_bytes) => {
+            std::fs::read(path).map(|now| now.as_slice() != seen_bytes.as_slice()).unwrap_or(true)
+        }
+        None => true,
+    }
+}
+
+/// What [`store_recipe`] did.
+enum Stored {
+    /// The recipe is in the file, and `seen` is that file.
+    Saved,
+    /// Someone else's recipe was kept at this path. Nothing was written,
+    /// and `seen` is absent so the next save writes.
+    Kept(PathBuf),
+}
+
+/// Write `recipe` to `path` when the file is still what `seen` recorded.
+/// A file someone else has changed, or one that appeared where none was,
+/// is moved aside and not replaced.
+fn store_recipe(path: &Path, seen: &mut Seen, recipe: &Recipe) -> mimizan_core::Result<Stored> {
+    if sidecar_changed(path, seen) {
+        match set_aside(path, "other") {
+            Ok(Some(kept)) => {
+                *seen = Seen::Absent;
+                return Ok(Stored::Kept(kept));
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    recipe.save(path)?;
+    *seen = seen_of(path);
+    Ok(Stored::Saved)
+}
+
+/// The log line when a save finds a recipe someone else has written.
+fn changed_by_another(kept: &Path) -> String {
+    format!(
+        "the recipe beside the file was changed by another program since it was opened. Save again to replace it; it is kept as {}",
+        kept.display()
+    )
+}
+
+/// The same fact, in one sentence, under the question.
+fn changed_sentence(kept: &Path) -> String {
+    format!(
+        "The recipe beside the file was changed by another program since it was opened; Save again to replace it, and it is kept as {}.",
+        file_label(kept)
+    )
 }
 
 /// Bytes the development of the file about to open will hold: from its
@@ -1015,6 +1123,12 @@ pub struct App {
     /// be read, with the reason: one a later version wrote, or one with a
     /// slip in it. Saving sets it aside instead of writing over it.
     unread_recipe: Option<(PathBuf, String)>,
+    /// What this window last saw in the developed file's recipe file.
+    /// Set when the file is opened and after each save this window makes.
+    recipe_seen: Seen,
+    /// A recipe someone else wrote, kept aside when a save was refused.
+    /// The question stays up and names the file.
+    recipe_kept: Option<PathBuf>,
     /// A file change or a close is waiting on the save question.
     pending_leave: Option<Leave>,
     /// An export is waiting on the question whether this file, which is
@@ -1215,6 +1329,8 @@ impl App {
             cameras_dir,
             recipe_baseline: Recipe::on_paper(),
             unread_recipe: None,
+            recipe_seen: Seen::Absent,
+            recipe_kept: None,
             pending_leave: None,
             pending_replace: None,
             unlock: Unlock::new(&cc.egui_ctx),
@@ -3234,51 +3350,83 @@ impl App {
 
     fn save_recipe(&mut self, path: &Path) {
         let r = self.recipe_for_file();
+        let sidecar = self.recipe_sidecar().as_deref() == Some(path);
         // The file under this name was never read: it is not this
-        // recipe's earlier state, and is kept.
+        // recipe's earlier state, and is kept. One that has changed
+        // since is someone else's, and is kept the same way as that.
         let unread = self.unread_recipe.as_ref().is_some_and(|(p, _)| p == path);
-        let kept = match r.validate() {
-            Ok(()) if unread => match set_aside_unread(path) {
-                Ok(kept) => kept,
-                Err(e) => {
-                    self.log(format!(
-                        "recipe not saved: {} could not be read and could not be moved out of the way: {e}",
-                        path.display()
-                    ));
-                    return;
+        if unread && sidecar && !sidecar_changed(path, &self.recipe_seen) {
+            let kept = match r.validate() {
+                Ok(()) => match set_aside_unread(path) {
+                    Ok(kept) => kept,
+                    Err(e) => {
+                        self.log(format!(
+                            "recipe not saved: {} could not be read and could not be moved out of the way: {e}",
+                            path.display()
+                        ));
+                        return;
+                    }
+                },
+                _ => None,
+            };
+            match r.validate().and_then(|_| r.save(path)) {
+                Ok(()) => {
+                    self.unread_recipe = None;
+                    self.recipe_kept = None;
+                    self.recipe_seen = seen_of(path);
+                    match kept {
+                        Some(kept) => self.log(format!(
+                            "saved recipe {}; the one that could not be read is kept as {}",
+                            path.display(),
+                            kept.display()
+                        )),
+                        None => self.log(format!("saved recipe {}", path.display())),
+                    }
+                    self.recipe_baseline = r;
                 }
-            },
-            _ => None,
+                Err(e) => self.say_save_failed(path, &e),
+            }
+            return;
+        }
+        // The sidecar is written when it is still the file this window
+        // read. A save under some other name is not that file.
+        let stored = if sidecar {
+            store_recipe(path, &mut self.recipe_seen, &r)
+        } else {
+            r.save(path).map(|()| Stored::Saved)
         };
-        match r.validate().and_then(|_| r.save(path)) {
-            Ok(()) => {
+        match stored {
+            Ok(Stored::Saved) => {
                 if unread {
                     self.unread_recipe = None;
                 }
-                match kept {
-                    Some(kept) => self.log(format!(
-                        "saved recipe {}; the one that could not be read is kept as {}",
-                        path.display(),
-                        kept.display()
-                    )),
-                    None => self.log(format!("saved recipe {}", path.display())),
-                }
-                if self.recipe_sidecar().as_deref() == Some(path) {
+                self.log(format!("saved recipe {}", path.display()));
+                if sidecar {
                     self.recipe_baseline = r;
+                    self.recipe_kept = None;
                 }
             }
-            // The last log line is on the toolbar: a refused write says
-            // where and why, not only that it failed. On a sandboxed Mac
-            // a RAW dropped or opened on its own brings no right to its
-            // folder; the Open button does.
-            Err(mimizan_core::Error::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(Stored::Kept(kept)) => {
+                self.recipe_kept = Some(kept.clone());
+                self.log(changed_by_another(&kept));
+            }
+            Err(e) => self.say_save_failed(path, &e),
+        }
+    }
+
+    /// The last log line is on the toolbar: a refused write says where
+    /// and why, not only that it failed. On a sandboxed Mac a RAW dropped
+    /// or opened on its own brings no right to its folder; the Open button does.
+    fn say_save_failed(&mut self, path: &Path, e: &mimizan_core::Error) {
+        match e {
+            mimizan_core::Error::Io(io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
                 self.log(format!(
                     "recipe not saved: no permission to write in {}{}",
                     path.parent().unwrap_or(path).display(),
                     if sandboxed() { " (open the folder through Open to allow it)" } else { "" }
                 ));
             }
-            Err(e) => self.log(format!("recipe not saved: {e}")),
+            other => self.log(format!("recipe not saved: {other}")),
         }
     }
 
@@ -3367,6 +3515,10 @@ impl App {
                     return;
                 };
                 self.save_recipe(&path);
+                // A refused save leaves the baseline where it was, so the
+                // question stays up. The picture shown is still the
+                // developed file: an open that finished during the
+                // question has not landed.
                 if self.recipe_for_file() == self.recipe_baseline {
                     self.pending_leave = None;
                     self.follow_leave(ctx, leave);
@@ -3388,7 +3540,11 @@ impl App {
         egui::Modal::new(egui::Id::new("save_recipe")).show(ctx, |ui| {
             ui.set_min_width(320.0);
             ui.label(format!("Save the recipe next to the RAW {when}?"));
-            if let Some((path, why)) = &self.unread_recipe {
+            if let Some(kept) = &self.recipe_kept {
+                ui.set_max_width(460.0);
+                ui.add_space(6.0);
+                ui.label(changed_sentence(kept));
+            } else if let Some((path, why)) = &self.unread_recipe {
                 ui.set_max_width(460.0);
                 ui.add_space(6.0);
                 ui.label(format!(
@@ -3513,11 +3669,14 @@ impl App {
                         self.reset(true);
                         // A recipe saved next to the file comes back with it.
                         self.unread_recipe = None;
+                        self.recipe_kept = None;
                         let mut read = None;
                         if let Some(p) = self.recipe_sidecar().filter(|p| p.is_file()) {
                             read = self.load_recipe(&p);
                             self.history = History::new(self.edit.clone());
                         }
+                        self.recipe_seen =
+                            self.recipe_sidecar().as_deref().map(seen_of).unwrap_or(Seen::Absent);
                         if self.screenshot_to.is_some()
                             && std::env::var_os("MIMIZAN_SCREENSHOT_ZONES").is_some()
                         {
@@ -8230,10 +8389,12 @@ mod close_tests {
 #[cfg(test)]
 mod path_tests {
     use super::{
-        crumb_label, export_extensions, export_target, linear_export_name, set_aside_unread,
-        shared_recipe_lines, with_ext, ExportFormat, ExportKind, ExportTarget,
+        changed_by_another, changed_sentence, crumb_label, export_extensions, export_target, file_label,
+        linear_export_name, seen_of, set_aside_unread, shared_recipe_lines, sidecar_changed, store_recipe,
+        with_ext, ExportFormat, ExportKind, ExportTarget, Seen, Stored, SEEN_BYTES,
     };
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime};
 
     /// A recipe a later version wrote, or one with a slip in it, is not
     /// written over: it moves to a free name beside the new one.
@@ -8255,6 +8416,104 @@ mod path_tests {
         assert_eq!(kept, dir.join("a.recipe.json.unread-2"));
         assert_eq!(std::fs::read_to_string(dir.join("a.recipe.json.unread")).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&kept).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Move `path`'s modification time an hour off `seen`, so the quick
+    /// test cannot call an unchanged clock the same file.
+    fn time_apart(path: &Path, seen: &Seen) {
+        let Seen::There { modified, .. } = seen else { return };
+        let apart = modified.checked_add(Duration::from_secs(3600)).unwrap_or(SystemTime::UNIX_EPOCH);
+        std::fs::File::options().write(true).open(path).unwrap().set_modified(apart).unwrap();
+    }
+
+    #[test]
+    fn a_recipe_changed_since_it_was_read_is_kept_and_the_next_save_writes() {
+        let dir = std::env::temp_dir().join(format!("mimizan-seen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = mimizan_core::recipe::Recipe::on_paper();
+        let mut edited = ours.clone();
+        edited.border_mm = 3.0;
+
+        // Unchanged since it was read: the save writes.
+        let path = dir.join("shot.recipe.json");
+        ours.save(&path).unwrap();
+        let mut seen = seen_of(&path);
+        assert!(matches!(seen, Seen::There { bytes: Some(_), .. }));
+        assert!(matches!(store_recipe(&path, &mut seen, &edited).unwrap(), Stored::Saved));
+        assert_eq!(mimizan_core::recipe::Recipe::load(&path).unwrap().border_mm, 3.0);
+
+        // Changed after the load: the first save refuses and keeps the
+        // other's bytes; the second writes.
+        let foreign = b"the other program's recipe";
+        std::fs::write(&path, foreign).unwrap();
+        time_apart(&path, &seen);
+        match store_recipe(&path, &mut seen, &edited).unwrap() {
+            Stored::Kept(kept) => {
+                assert_eq!(kept, dir.join("shot.recipe.json.other"));
+                assert_eq!(std::fs::read(&kept).unwrap(), foreign);
+                assert!(!path.exists());
+            }
+            Stored::Saved => panic!("the other's recipe was replaced"),
+        }
+        assert_eq!(seen, Seen::Absent);
+        assert!(matches!(store_recipe(&path, &mut seen, &edited).unwrap(), Stored::Saved));
+        assert_eq!(mimizan_core::recipe::Recipe::load(&path).unwrap().border_mm, 3.0);
+        assert!(path.exists());
+
+        // A file that appeared where none was read is the same refusal.
+        let bare = dir.join("bare.recipe.json");
+        let appeared = b"appeared beside the file";
+        std::fs::write(&bare, appeared).unwrap();
+        let mut seen = Seen::Absent;
+        match store_recipe(&bare, &mut seen, &edited).unwrap() {
+            Stored::Kept(kept) => {
+                assert_eq!(kept, dir.join("bare.recipe.json.other"));
+                assert_eq!(std::fs::read(&kept).unwrap(), appeared);
+            }
+            Stored::Saved => panic!("a recipe that appeared was replaced"),
+        }
+        assert!(matches!(store_recipe(&bare, &mut seen, &edited).unwrap(), Stored::Saved));
+        assert_eq!(mimizan_core::recipe::Recipe::load(&bare).unwrap().border_mm, 3.0);
+
+        // A file that went away is not a conflict: the save writes.
+        let gone = dir.join("gone.recipe.json");
+        ours.save(&gone).unwrap();
+        let mut seen = seen_of(&gone);
+        std::fs::remove_file(&gone).unwrap();
+        assert!(!sidecar_changed(&gone, &seen));
+        let mut next = edited.clone();
+        next.border_mm = 1.0;
+        assert!(matches!(store_recipe(&gone, &mut seen, &next).unwrap(), Stored::Saved));
+        assert_eq!(mimizan_core::recipe::Recipe::load(&gone).unwrap().border_mm, 1.0);
+
+        // The time moved and the bytes did not: the bytes decide, and the save writes.
+        let same = dir.join("same.recipe.json");
+        std::fs::write(&same, b"same bytes").unwrap();
+        let mut seen = seen_of(&same);
+        let bytes = std::fs::read(&same).unwrap();
+        time_apart(&same, &seen);
+        assert!(!sidecar_changed(&same, &seen));
+        assert!(matches!(store_recipe(&same, &mut seen, &edited).unwrap(), Stored::Saved));
+        assert_ne!(std::fs::read(&same).unwrap(), bytes, "the save did write");
+
+        // Past a megabyte only the length and the time are remembered.
+        let big = dir.join("big.recipe.json");
+        std::fs::write(&big, vec![b'x'; SEEN_BYTES as usize]).unwrap();
+        assert!(matches!(seen_of(&big), Seen::There { bytes: None, .. }));
+
+        let kept = Path::new("/photos/shot.recipe.json.other");
+        let line = changed_by_another(kept);
+        assert_eq!(
+            line,
+            "the recipe beside the file was changed by another program since it was opened. Save again to replace it; it is kept as /photos/shot.recipe.json.other"
+        );
+        assert_eq!(
+            changed_sentence(kept),
+            "The recipe beside the file was changed by another program since it was opened; Save again to replace it, and it is kept as shot.recipe.json.other."
+        );
+        assert_eq!(file_label(kept), "shot.recipe.json.other");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
