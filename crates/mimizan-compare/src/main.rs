@@ -1859,10 +1859,13 @@ fn cannot_make(work: &Path, err: &std::io::Error) -> String {
     format!("{} cannot be made: {err}. The loupe keeps its pictures beside the RAW.", work.display())
 }
 
+/// `<stem>.mimizan-compare` beside the RAW. The stem is the file's own
+/// name, bytes and all: two files that are not UTF-8 do not share a folder.
 fn work_dir(raw: &Path) -> PathBuf {
-    let stem = raw.file_stem().and_then(|s| s.to_str()).unwrap_or("picture");
+    let mut name = raw.file_stem().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".mimizan-compare");
     let parent = raw.parent().unwrap_or_else(|| Path::new("."));
-    parent.join(format!("{stem}.mimizan-compare"))
+    parent.join(name)
 }
 
 /// The command that develops the plate: `MIMIZAN`, the one that came
@@ -2268,6 +2271,7 @@ mod tests {
         std::fs::write(&nef, b"one").unwrap();
         std::fs::write(&dng, b"one").unwrap();
         assert_eq!(work_dir(&nef), work_dir(&dng), "one folder for both");
+        assert_eq!(work_dir(&nef).file_name().and_then(|n| n.to_str()), Some("photo.mimizan-compare"));
         let stamp = stamp_of(&nef);
         assert_ne!(stamp, stamp_of(&dng));
         assert_eq!(kept(Some(&stamp), &stamp, false), Kept::All);
@@ -2278,6 +2282,26 @@ mod tests {
         assert_eq!(kept(None, &stamp, false), Kept::Nothing);
         std::fs::write(&nef, b"another picture").unwrap();
         assert_eq!(kept(Some(&stamp), &stamp_of(&nef), false), Kept::Nothing, "the RAW was replaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two files whose names are not text each get the folder of their own stem.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_keeps_its_own_work_folder() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("stem");
+        let raw = |byte: u8| {
+            let mut name = std::ffi::OsString::from("shot");
+            name.push(std::ffi::OsStr::from_bytes(&[byte]));
+            name.push(".NEF");
+            dir.join(name)
+        };
+        let first = work_dir(&raw(0xff));
+        let second = work_dir(&raw(0xfe));
+        assert_ne!(first, second);
+        assert_eq!(first.file_name().unwrap().as_bytes(), b"shot\xff.mimizan-compare");
+        assert_eq!(second.file_name().unwrap().as_bytes(), b"shot\xfe.mimizan-compare");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
