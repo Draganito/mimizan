@@ -140,9 +140,20 @@ pub fn stands_in(dng: &Path, raf: &Path) -> bool {
 }
 
 /// The name the conversion is written under before it is linked onto
-/// `<stem>.dng`. The name is the program's own, so a stale one may be
-/// removed: the conversion renames onto whatever its target is at the end.
+/// `<stem>.dng`: `<stem>.dng.<pid>.mimizan-new`. The process id keeps
+/// two windows from sharing the part the converter writes beside this
+/// name. The name is the program's own, so a stale one may be removed:
+/// the conversion renames onto whatever its target is at the end.
 pub fn staging_dng(dng: &Path) -> PathBuf {
+    let mut name = dng.as_os_str().to_owned();
+    name.push(format!(".{}.mimizan-new", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// `<stem>.dng.mimizan-new`, the staging name from before the process
+/// id was part of it. A leftover of that name is this program's file
+/// and is removed before a conversion.
+pub(crate) fn earlier_staging(dng: &Path) -> PathBuf {
     let mut name = dng.as_os_str().to_owned();
     name.push(".mimizan-new");
     PathBuf::from(name)
@@ -297,6 +308,16 @@ fn jpeg_thumb(jpeg: &[u8], long_edge: usize) -> Result<Thumb, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_staging_name_belongs_to_this_process() {
+        let dng = Path::new("/photos/DSCF1.dng");
+        assert_eq!(
+            staging_dng(dng),
+            PathBuf::from(format!("/photos/DSCF1.dng.{}.mimizan-new", std::process::id()))
+        );
+        assert_eq!(earlier_staging(dng), PathBuf::from("/photos/DSCF1.dng.mimizan-new"));
+    }
 
     #[test]
     fn the_dng_for_the_plate_keeps_the_highlights() {

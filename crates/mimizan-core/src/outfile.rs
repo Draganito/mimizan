@@ -1,11 +1,18 @@
 //! A file written whole, or not at all.
 //!
 //! Every file the programs write for the user goes through [`write_whole`]:
-//! the bytes go to `<name>.part` beside the final name, are flushed and
-//! synced, and the part is then renamed onto the name. Until that rename
-//! the name holds what it held before, so a full disk, a share that drops
-//! or a program that is ended costs the new file and never the old one,
-//! and a file under its final name is a finished file.
+//! the bytes go to `<name>.<pid>.part` beside the final name, are flushed
+//! and synced, and the part is then renamed onto the name. The process id
+//! keeps two programs that write one name from filling one part. Until
+//! that rename the name holds what it held before, so a full disk, a share
+//! that drops or a program that is ended costs the new file and never the
+//! old one, and a file under its final name is a finished file. A crash
+//! leaves the part under a name no later run reuses.
+//!
+//! Before its own part is made, [`write_whole`] removes a part of the
+//! plain older name `<name>.part` when one lies there: a leftover of an
+//! earlier version, or of a crash that used that name. The removal is
+//! best effort, and an error from it is ignored.
 //!
 //! One case cannot make the part: a folder that grants the one path alone
 //! (the sandboxed Mac gives leave for the path its save panel returned).
@@ -37,8 +44,16 @@ impl Seek for Sink {
     }
 }
 
-/// The name a file is written under until it is whole.
+/// The name a file is written under until it is whole. The process id
+/// is in it, so two programs writing one name do not share the part.
 pub fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.part", std::process::id()));
+    PathBuf::from(name)
+}
+
+/// `<name>.part`, the part name from before the process id was part of it.
+fn plain_part(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(".part");
     PathBuf::from(name)
@@ -64,20 +79,32 @@ where
         }
         _ => path.to_path_buf(),
     };
-    let part = part_path(&target);
-    match File::create(&part) {
+    // A leftover of the plain older name. This run's own part carries
+    // the process id, and a later run does not reuse that name.
+    let _ = std::fs::remove_file(plain_part(&target));
+    write_part(&target, &part_path(&target), write)
+}
+
+/// Write `target` by filling `part` and renaming it onto the name.
+/// `part` is this write's own file. A folder that will not take a
+/// second name is written in place.
+fn write_part<T, E>(target: &Path, part: &Path, write: impl FnOnce(&mut Sink) -> Result<T, E>) -> Result<T, E>
+where
+    E: From<io::Error>,
+{
+    match File::create(part) {
         Ok(file) => {
-            let done = fill(file, &part, write).and_then(|value| {
-                std::fs::rename(&part, &target).map_err(|e| E::from(named(&target, e)))?;
+            let done = fill(file, part, write).and_then(|value| {
+                std::fs::rename(part, target).map_err(|e| E::from(named(target, e)))?;
                 Ok(value)
             });
             if done.is_err() {
-                let _ = std::fs::remove_file(&part);
+                let _ = std::fs::remove_file(part);
             }
             done
         }
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => write_in_place(&target, write),
-        Err(e) => Err(E::from(named(&part, e))),
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => write_in_place(target, write),
+        Err(e) => Err(E::from(named(part, e))),
     }
 }
 
@@ -197,6 +224,51 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn the_part_name_carries_this_process_and_ends_in_part() {
+        let path = Path::new("/photos/print.tif");
+        let part = part_path(path);
+        assert_eq!(part, PathBuf::from(format!("/photos/print.tif.{}.part", std::process::id())));
+        assert!(part.as_os_str().to_string_lossy().ends_with(".part"));
+    }
+
+    #[test]
+    fn a_stale_plain_part_is_gone_after_a_whole_write() {
+        let dir = Dir::new("stale-part");
+        let path = dir.0.join("print.tif");
+        let stale = plain_part(&path);
+        std::fs::write(&stale, b"cut off").unwrap();
+        write_bytes(&path, b"whole").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole");
+        assert!(!stale.exists());
+        assert_eq!(dir.names(), ["print.tif"]);
+    }
+
+    #[test]
+    fn two_writes_of_one_name_each_leave_one_whole_file() {
+        let dir = Dir::new("two-writes");
+        let path = dir.0.join("print.tif");
+        let one = dir.0.join("print.tif.one.part");
+        let other = dir.0.join("print.tif.other.part");
+        let path_one = path.clone();
+        let path_other = path.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                write_part(&path_one, &one, |sink| sink.write_all(b"one whole file")).unwrap();
+            });
+            scope.spawn(|| {
+                write_part(&path_other, &other, |sink| sink.write_all(b"the other whole file")).unwrap();
+            });
+        });
+        let got = std::fs::read(&path).unwrap();
+        assert!(
+            got == b"one whole file" || got == b"the other whole file",
+            "a torn file: {}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(dir.names(), ["print.tif"]);
     }
 
     #[test]

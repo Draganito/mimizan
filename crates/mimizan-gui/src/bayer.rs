@@ -335,7 +335,9 @@ pub fn write(head: &Head, tell: &dyn Fn(String)) -> Result<String, std::io::Erro
 
     tell("writing the DNG".into());
     // Whole under its name or not there: a DNG cut off half way would be
-    // taken for the finished one at the next open.
+    // taken for the finished one at the next open. Two windows each
+    // finish their own part; the later rename replaces one finished DNG
+    // with another of the same bytes.
     mimizan_core::outfile::write_whole(&head.dng, |out| {
         dng::write(out, &source, decoder.as_ref(), img, dev, true, SOFTWARE).map_err(std::io::Error::other)
     })?;

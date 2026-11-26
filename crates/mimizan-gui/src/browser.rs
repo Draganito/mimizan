@@ -1102,7 +1102,7 @@ impl Persisted {
             let _ = std::fs::create_dir_all(dir);
         }
         if let Ok(s) = serde_json::to_vec_pretty(self) {
-            let _ = std::fs::write(p, s);
+            let _ = mimizan_core::outfile::write_bytes(&p, &s);
         }
     }
 }

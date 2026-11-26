@@ -482,12 +482,17 @@ fn open(
             }
             // The conversion checks its target once and renames onto it
             // about a minute later, which would replace a file that
-            // arrived meanwhile. It is written under a name of ours and
-            // linked onto the DNG's name, which fails where that name is
-            // taken. A stale file of the temporary name is ours.
+            // arrived meanwhile. It is written under a name of ours,
+            // carrying this process's id, and linked onto the DNG's
+            // name, which fails where that name is taken. The converter's
+            // part file sits beside that name, so another window has its
+            // own. A stale file of the temporary name is ours, and so is
+            // a leftover of the older name without the process id.
             let staging = crate::fuji::staging_dng(&head.dng);
-            if std::fs::symlink_metadata(&staging).is_ok() {
-                let _ = std::fs::remove_file(&staging);
+            for stale in [crate::fuji::earlier_staging(&head.dng), staging.clone()] {
+                if std::fs::symlink_metadata(&stale).is_ok() {
+                    let _ = std::fs::remove_file(&stale);
+                }
             }
             status("reading the X-Trans file".into());
             let written =
