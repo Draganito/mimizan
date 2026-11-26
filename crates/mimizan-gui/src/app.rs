@@ -995,6 +995,10 @@ pub struct App {
     dir_counts: Option<std::sync::mpsc::Receiver<(u64, PathBuf, usize)>>,
     /// Priority list last sent to the thumbnail worker.
     last_wanted: Vec<PathBuf>,
+    /// The folder on screen has not sent its thumbnail list yet. A listing
+    /// sets it; sending a list clears it. An empty list is a list, and it
+    /// is what stops the previous folder's files.
+    listing_unsent: bool,
     /// Keyboard moved the selection: bring the tile into view once.
     scroll_to_selected: bool,
     /// What the strip's textures were made for: the plate process, and
@@ -1307,6 +1311,7 @@ impl App {
             enlarger_h: None,
             dir_counts: None,
             last_wanted: Vec::new(),
+            listing_unsent: false,
             scroll_to_selected: false,
             strip_look: (false, false),
             current_path: None,
@@ -1684,6 +1689,7 @@ impl App {
                 // The priority list belongs to the folder that was on
                 // screen. This folder's tiles are a new listing.
                 self.last_wanted.clear();
+                self.listing_unsent = true;
                 self.folder_stored = Some(f.path.clone());
                 self.folder = Some(f);
                 self.persist();
@@ -7284,6 +7290,13 @@ impl App {
         };
         if folder.entries.is_empty() && folder.subdirs.is_empty() {
             ui.label(RichText::new("No RAW files and no folders here.").weak());
+            // No tile is drawn, so the list below is not reached. The empty
+            // folder still owes its list.
+            if thumbnail_list_due(std::iter::empty(), &self.last_wanted, self.listing_unsent) {
+                self.listing_unsent = false;
+                self.last_wanted.clear();
+                self.thumbs.want(Vec::new());
+            }
             return;
         }
         let idle = self.busy.is_none();
@@ -7557,10 +7570,13 @@ impl App {
         });
         folder.asks = asks;
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-        // Compared without allocating; the list is rebuilt only when it changed.
-        let same = wanted.len() == self.last_wanted.len()
-            && wanted.iter().zip(&self.last_wanted).all(|((_, i), p)| folder.entries[*i].path == *p);
-        if !same {
+        // Compared without allocating; the list is rebuilt only when it
+        // changed, or when this listing has not sent one yet.
+        if thumbnail_list_due(
+            wanted.iter().map(|(_, i)| folder.entries[*i].path.as_path()),
+            &self.last_wanted,
+            self.listing_unsent,
+        ) {
             let jobs: Vec<ThumbJob> = wanted
                 .iter()
                 .map(|(_, i)| {
@@ -7576,6 +7592,7 @@ impl App {
                 })
                 .collect();
             self.last_wanted = jobs.iter().map(|j| j.path.clone()).collect();
+            self.listing_unsent = false;
             self.thumbs.want(jobs);
         }
         if !bad_thumbs.is_empty() {
@@ -7586,6 +7603,29 @@ impl App {
         }
         if let Some(p) = go_dir {
             self.set_folder(&p);
+        }
+    }
+}
+
+/// Whether the strip sends this thumbnail list.
+///
+/// `wanted` is the paths in the order they would be sent, and `last` is
+/// the list already sent. The list is sent when a path differs, or when
+/// `listing_unsent` is set. Both empty and the flag clear: nothing is
+/// sent. Both empty and the flag set: the empty list is sent, and it
+/// stops the previous folder's files.
+fn thumbnail_list_due<'a>(
+    wanted: impl IntoIterator<Item = &'a Path>,
+    last: &[PathBuf],
+    listing_unsent: bool,
+) -> bool {
+    let mut wanted = wanted.into_iter();
+    let mut sent = last.iter();
+    loop {
+        match (wanted.next(), sent.next()) {
+            (None, None) => return listing_unsent,
+            (Some(path), Some(previous)) if path == previous.as_path() => {}
+            _ => return true,
         }
     }
 }
@@ -9670,6 +9710,35 @@ mod strip_tile_tests {
             let brute: Vec<usize> = (0..n).filter(|k| touches(origin, tile_w, *k, left, right)).collect();
             assert_eq!(got, brute, "origin {origin} tile {tile_w} n {n} clip {left}..{right}");
         }
+    }
+}
+
+#[cfg(test)]
+mod thumb_list_tests {
+    use super::thumbnail_list_due;
+    use std::path::PathBuf;
+
+    fn due(wanted: &[&str], last: &[&str], listing_unsent: bool) -> bool {
+        let wanted: Vec<PathBuf> = wanted.iter().map(PathBuf::from).collect();
+        let last: Vec<PathBuf> = last.iter().map(PathBuf::from).collect();
+        thumbnail_list_due(wanted.iter().map(PathBuf::as_path), &last, listing_unsent)
+    }
+
+    /// An empty folder is a list. It is sent once, when its listing has
+    /// not sent one, so the previous folder's files stop. The same empty
+    /// list on the next frame is not sent again. A different path is sent
+    /// whether or not the listing is new.
+    #[test]
+    fn an_empty_folder_sends_its_list_and_a_different_path_does_too() {
+        assert!(!due(&[], &[], false), "both empty, and the list was already sent");
+        assert!(due(&[], &[], true), "both empty, and the listing has not sent");
+        assert!(due(&["a.nef"], &["b.nef"], false));
+        assert!(due(&["a.nef"], &["b.nef"], true));
+        assert!(due(&["b.nef", "a.nef"], &["a.nef", "b.nef"], false), "the order is the list");
+        assert!(!due(&["a.nef"], &["a.nef"], false));
+        assert!(due(&["a.nef"], &["a.nef"], true));
+        assert!(due(&["a.nef"], &[], false));
+        assert!(!due(&[], &[], false));
     }
 }
 
