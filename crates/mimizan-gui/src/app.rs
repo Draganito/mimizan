@@ -6887,21 +6887,59 @@ impl App {
         egui::ScrollArea::horizontal().id_salt("strip-scroll").show(ui, |ui| {
             let clip = ui.clip_rect();
             let centre = clip.center().x;
-            // The film base runs under every frame.
+            // The film base runs under every frame, and across a viewport
+            // that is wider than the film.
             let film = Rect::from_min_size(
                 ui.cursor().min,
                 Vec2::new(ui.available_width().max(clip.width()), tile_h),
             );
             ui.painter().rect_filled(film, 0.0, FILM_BASE);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                // Folders first, as tiles of the frame's size (no perforation:
-                // a folder is not film). Click goes down into it.
-                for d in &folder.subdirs {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
-                    if !clip.intersects(rect) {
-                        continue;
-                    }
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let n_dirs = folder.subdirs.len();
+            let n = n_dirs + folder.entries.len();
+            // One widget for the whole film. A click is registered only
+            // for a frame the viewport meets.
+            let (content, _) = ui.allocate_exact_size(Vec2::new(n as f32 * tile_w, tile_h), Sense::hover());
+            let origin = content.min;
+            if scroll_to {
+                if let Some(i) = current.as_deref().and_then(|path| folder.index_of(path)) {
+                    ui.scroll_to_rect(
+                        tile_rect(origin, tile_w, tile_h, n_dirs + i),
+                        Some(egui::Align::Center),
+                    );
+                }
+            }
+            let shown = visible_tiles(origin.x, tile_w, n, clip.left(), clip.right());
+            // Every file, not only the ones on screen: a tile just off the
+            // edge still wants its picture, and one far away lets its
+            // pixels go. Writing those fields registers no widget.
+            for (i, e) in folder.entries.iter_mut().enumerate() {
+                let rect = tile_rect(origin, tile_w, tile_h, n_dirs + i);
+                let dist = (rect.center().x - centre).abs();
+                if e.state == ThumbState::Pending && dist < clip.width() * 2.5 {
+                    wanted.push((dist, i));
+                }
+                if shown.contains(&(n_dirs + i)) {
+                    continue;
+                }
+                e.texture = None;
+                // Far off screen the pixels go too; they come back from
+                // the disk cache when the tile scrolls near.
+                if e.state == ThumbState::Ready && dist > clip.width() * THUMB_KEEP_SCREENS {
+                    e.thumb = None;
+                    e.state = ThumbState::Pending;
+                    asks = asks.wrapping_add(1);
+                    e.ask = asks;
+                }
+            }
+            for k in shown {
+                let rect = tile_rect(origin, tile_w, tile_h, k);
+                let resp = ui.interact(rect, ui.id().with(("strip-tile", generation, k)), Sense::click());
+                if k < n_dirs {
+                    // Folders first, as tiles of the frame's size (no
+                    // perforation: a folder is not film). Click goes down
+                    // into it.
+                    let d = &folder.subdirs[k];
                     let painter = ui.painter();
                     painter.rect_filled(rect, 0.0, FILM_BASE);
                     let frame = Rect::from_min_size(
@@ -6945,168 +6983,147 @@ impl App {
                     if resp.on_hover_text(d.path.display().to_string()).clicked() {
                         go_dir = Some(d.path.clone());
                     }
+                    continue;
                 }
-                for (i, e) in folder.entries.iter_mut().enumerate() {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(tile_w, tile_h), Sense::click());
-                    let is_current = current.as_deref() == Some(e.path.as_path());
-                    if is_current && scroll_to {
-                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                let e = &mut folder.entries[k - n_dirs];
+                let is_current = current.as_deref() == Some(e.path.as_path());
+                if e.texture.is_none() {
+                    let bad = e.thumb.as_ref().is_some_and(|t| {
+                        let n = t.width.saturating_mul(t.height);
+                        t.width == 0 || t.height == 0 || t.gray.len() != n || t.rgb.len() != 3 * n
+                    });
+                    if bad {
+                        // Same failure as the 1:1 window: from_gray closes
+                        // the process. Drop the buffer so the next frame
+                        // does not try again.
+                        bad_thumbs.push(e.name.clone());
+                        e.thumb = None;
+                        e.state = ThumbState::Failed;
+                    } else if let Some(t) = &e.thumb {
+                        let size = [t.width, t.height];
+                        let img = match (plate, negative) {
+                            (true, false) => ColorImage::from_rgb(size, &t.rgb),
+                            (true, true) => {
+                                let inv: Vec<u8> = t.rgb.iter().map(|&v| 255 - v).collect();
+                                ColorImage::from_rgb(size, &inv)
+                            }
+                            (false, true) => {
+                                ColorImage::from_gray_iter(size, t.gray.iter().map(|&g| 255 - g))
+                            }
+                            (false, false) => ColorImage::from_gray(size, &t.gray),
+                        };
+                        e.texture = Some(ctx.load_texture(
+                            format!("thumb-{generation}-{}-{}{}", k - n_dirs, plate as u8, negative as u8),
+                            img,
+                            TextureOptions::LINEAR,
+                        ));
                     }
-                    let visible = clip.intersects(rect);
-                    let dist = (rect.center().x - centre).abs();
-                    if e.state == ThumbState::Pending && dist < clip.width() * 2.5 {
-                        wanted.push((dist, i));
-                    }
-                    if !visible {
-                        e.texture = None;
-                        // Far off screen the pixels go too; they come back
-                        // from the disk cache when the tile scrolls near.
-                        if e.state == ThumbState::Ready && dist > clip.width() * THUMB_KEEP_SCREENS {
-                            e.thumb = None;
-                            e.state = ThumbState::Pending;
-                            asks = asks.wrapping_add(1);
-                            e.ask = asks;
-                        }
-                        continue;
-                    }
-                    if e.texture.is_none() {
-                        let bad = e.thumb.as_ref().is_some_and(|t| {
-                            let n = t.width.saturating_mul(t.height);
-                            t.width == 0 || t.height == 0 || t.gray.len() != n || t.rgb.len() != 3 * n
-                        });
-                        if bad {
-                            // Same failure as the 1:1 window: from_gray closes
-                            // the process. Drop the buffer so the next frame
-                            // does not try again.
-                            bad_thumbs.push(e.name.clone());
-                            e.thumb = None;
-                            e.state = ThumbState::Failed;
-                        } else if let Some(t) = &e.thumb {
-                            let size = [t.width, t.height];
-                            let img = match (plate, negative) {
-                                (true, false) => ColorImage::from_rgb(size, &t.rgb),
-                                (true, true) => {
-                                    let inv: Vec<u8> = t.rgb.iter().map(|&v| 255 - v).collect();
-                                    ColorImage::from_rgb(size, &inv)
-                                }
-                                (false, true) => {
-                                    ColorImage::from_gray_iter(size, t.gray.iter().map(|&g| 255 - g))
-                                }
-                                (false, false) => ColorImage::from_gray(size, &t.gray),
-                            };
-                            e.texture = Some(ctx.load_texture(
-                                format!("thumb-{generation}-{i}-{}{}", plate as u8, negative as u8),
-                                img,
-                                TextureOptions::LINEAR,
-                            ));
-                        }
-                    }
-                    let painter = ui.painter();
-                    let vis = ui.visuals();
-                    painter.rect_filled(rect, 0.0, FILM_BASE);
-                    // Perforation above and below the frame.
-                    draw_perforation(painter, Rect::from_min_size(rect.min, Vec2::new(tile_w, PERF_H)));
-                    draw_perforation(
-                        painter,
-                        Rect::from_min_size(
-                            Pos2::new(rect.left(), rect.top() + PERF_H + img_h),
-                            Vec2::new(tile_w, PERF_H),
-                        ),
-                    );
-                    let frame = Rect::from_min_size(
-                        Pos2::new(rect.left(), rect.top() + PERF_H),
-                        Vec2::new(tile_w, img_h),
-                    );
-                    let img_rect = frame.shrink2(Vec2::new(5.0, 2.0));
-                    if resp.hovered() && !is_current {
-                        painter.rect_filled(frame, 0.0, Color32::from_white_alpha(10));
-                    }
-                    match &e.texture {
-                        Some(tex) => {
-                            let [w, h] = tex.size();
-                            let scale = (img_rect.width() / w as f32).min(img_rect.height() / h as f32);
-                            let size = Vec2::new(w as f32 * scale, h as f32 * scale);
-                            let r = Rect::from_center_size(img_rect.center(), size);
-                            painter.image(
-                                tex.id(),
-                                r,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
-                        }
-                        None => {
-                            let (txt, col) = match e.state {
-                                ThumbState::Failed => ("?", vis.warn_fg_color),
-                                _ => ("…", vis.weak_text_color()),
-                            };
-                            painter.text(
-                                img_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                txt,
-                                egui::FontId::proportional(22.0),
-                                col,
-                            );
-                        }
-                    }
-                    // Frame separator.
-                    painter.line_segment(
-                        [rect.right_top(), rect.right_bottom()],
-                        egui::Stroke::new(1.0, Color32::from_white_alpha(8)),
-                    );
-                    if is_current {
-                        painter.rect_stroke(
-                            frame.shrink(1.0),
-                            2.0,
-                            egui::Stroke::new(2.0, Color32::from_rgb(255, 170, 60)),
-                            egui::StrokeKind::Inside,
+                }
+                let painter = ui.painter();
+                let vis = ui.visuals();
+                painter.rect_filled(rect, 0.0, FILM_BASE);
+                // Perforation above and below the frame.
+                draw_perforation(painter, Rect::from_min_size(rect.min, Vec2::new(tile_w, PERF_H)));
+                draw_perforation(
+                    painter,
+                    Rect::from_min_size(
+                        Pos2::new(rect.left(), rect.top() + PERF_H + img_h),
+                        Vec2::new(tile_w, PERF_H),
+                    ),
+                );
+                let frame = Rect::from_min_size(
+                    Pos2::new(rect.left(), rect.top() + PERF_H),
+                    Vec2::new(tile_w, img_h),
+                );
+                let img_rect = frame.shrink2(Vec2::new(5.0, 2.0));
+                if resp.hovered() && !is_current {
+                    painter.rect_filled(frame, 0.0, Color32::from_white_alpha(10));
+                }
+                match &e.texture {
+                    Some(tex) => {
+                        let [w, h] = tex.size();
+                        let scale = (img_rect.width() / w as f32).min(img_rect.height() / h as f32);
+                        let size = Vec2::new(w as f32 * scale, h as f32 * scale);
+                        let r = Rect::from_center_size(img_rect.center(), size);
+                        painter.image(
+                            tex.id(),
+                            r,
+                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                            Color32::WHITE,
                         );
                     }
-                    // Edge print: the name in the film's orange.
-                    let label_pos = Pos2::new(rect.center().x, rect.max.y - EDGE_H * 0.5);
-                    let name = truncate_middle(&e.name, (tile_w / 7.5) as usize);
-                    painter.text(
-                        label_pos,
-                        egui::Align2::CENTER_CENTER,
-                        name,
-                        egui::FontId::proportional(11.0),
-                        if is_current {
-                            Color32::from_rgb(255, 190, 90)
-                        } else {
-                            Color32::from_rgb(170, 130, 70)
-                        },
-                    );
-                    let resp = resp.on_hover_ui(|ui| {
-                        ui.label(RichText::new(&e.name).strong());
-                        if let Some(m) = &e.meta {
-                            ui.label(format!("{} {}", m.make.trim(), m.model.trim()));
-                            let ex = m.exposure.summary();
-                            if !ex.is_empty() {
-                                ui.label(ex);
-                            }
-                            if let Some(d) = &m.exposure.captured {
-                                ui.label(d.replacen(':', "-", 2));
-                            }
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} x {} px, {:.1} MB",
-                                    m.width,
-                                    m.height,
-                                    e.size as f64 / 1e6
-                                ))
-                                .weak(),
-                            );
-                        } else {
-                            ui.label(RichText::new(format!("{:.1} MB", e.size as f64 / 1e6)).weak());
-                        }
-                        if !idle {
-                            ui.label(RichText::new("busy — wait for the current file").weak());
-                        }
-                    });
-                    if resp.clicked() && idle && !is_current {
-                        clicked = Some(e.path.clone());
+                    None => {
+                        let (txt, col) = match e.state {
+                            ThumbState::Failed => ("?", vis.warn_fg_color),
+                            _ => ("…", vis.weak_text_color()),
+                        };
+                        painter.text(
+                            img_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            txt,
+                            egui::FontId::proportional(22.0),
+                            col,
+                        );
                     }
                 }
-            });
+                // Frame separator.
+                painter.line_segment(
+                    [rect.right_top(), rect.right_bottom()],
+                    egui::Stroke::new(1.0, Color32::from_white_alpha(8)),
+                );
+                if is_current {
+                    painter.rect_stroke(
+                        frame.shrink(1.0),
+                        2.0,
+                        egui::Stroke::new(2.0, Color32::from_rgb(255, 170, 60)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                // Edge print: the name in the film's orange.
+                let label_pos = Pos2::new(rect.center().x, rect.max.y - EDGE_H * 0.5);
+                let name = truncate_middle(&e.name, (tile_w / 7.5) as usize);
+                painter.text(
+                    label_pos,
+                    egui::Align2::CENTER_CENTER,
+                    name,
+                    egui::FontId::proportional(11.0),
+                    if is_current {
+                        Color32::from_rgb(255, 190, 90)
+                    } else {
+                        Color32::from_rgb(170, 130, 70)
+                    },
+                );
+                let resp = resp.on_hover_ui(|ui| {
+                    ui.label(RichText::new(&e.name).strong());
+                    if let Some(m) = &e.meta {
+                        ui.label(format!("{} {}", m.make.trim(), m.model.trim()));
+                        let ex = m.exposure.summary();
+                        if !ex.is_empty() {
+                            ui.label(ex);
+                        }
+                        if let Some(d) = &m.exposure.captured {
+                            ui.label(d.replacen(':', "-", 2));
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "{} x {} px, {:.1} MB",
+                                m.width,
+                                m.height,
+                                e.size as f64 / 1e6
+                            ))
+                            .weak(),
+                        );
+                    } else {
+                        ui.label(RichText::new(format!("{:.1} MB", e.size as f64 / 1e6)).weak());
+                    }
+                    if !idle {
+                        ui.label(RichText::new("busy — wait for the current file").weak());
+                    }
+                });
+                if resp.clicked() && idle && !is_current {
+                    clicked = Some(e.path.clone());
+                }
+            }
         });
         folder.asks = asks;
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -7141,6 +7158,46 @@ impl App {
             self.set_folder(&p);
         }
     }
+}
+
+/// Tiles whose span meets `[clip_left, clip_right]`.
+///
+/// Tile `k` covers `[origin + k * tile_w, origin + (k + 1) * tile_w]`. A
+/// shared edge counts, as `Rect::intersects` does, so a frame that only
+/// touches the viewport is still one of them.
+fn visible_tiles(
+    origin: f32,
+    tile_w: f32,
+    n: usize,
+    clip_left: f32,
+    clip_right: f32,
+) -> std::ops::Range<usize> {
+    if n == 0
+        || !tile_w.is_finite()
+        || tile_w <= 0.0
+        || !clip_left.is_finite()
+        || !clip_right.is_finite()
+        || clip_left > clip_right
+    {
+        return 0..0;
+    }
+    let origin = f64::from(origin);
+    let tile_w = f64::from(tile_w);
+    let left = f64::from(clip_left);
+    let right = f64::from(clip_right);
+    let first = ((left - origin) / tile_w - 1.0).ceil().max(0.0);
+    let last = ((right - origin) / tile_w).floor();
+    if !(first.is_finite() && last.is_finite()) || last < 0.0 || first > last {
+        return 0..0;
+    }
+    let first = (first as usize).min(n);
+    let end = (last as usize).saturating_add(1).min(n);
+    first..end
+}
+
+/// The frame of tile `k`, subfolders first and then the files.
+fn tile_rect(origin: Pos2, tile_w: f32, tile_h: f32, k: usize) -> Rect {
+    Rect::from_min_size(Pos2::new(origin.x + k as f32 * tile_w, origin.y), Vec2::new(tile_w, tile_h))
 }
 
 /// A folder as the file managers draw it: tab, body, a lighter front flap.
@@ -8931,5 +8988,50 @@ mod straighten_tests {
         // And back to zero the whole frame is the whole negative again.
         let back = scaled_draft(scaled_draft(whole, old, new, new), new, old, old);
         assert_eq!(back, whole);
+    }
+}
+
+#[cfg(test)]
+mod strip_tile_tests {
+    use super::visible_tiles;
+
+    /// The frames a viewport meets: none, the start, a shared edge, the
+    /// middle, the end, and a viewport wider than the film.
+    #[test]
+    fn the_tiles_on_screen_are_the_ones_the_clip_meets() {
+        assert_eq!(visible_tiles(0.0, 100.0, 0, 0.0, 300.0), 0..0);
+        assert_eq!(visible_tiles(0.0, 100.0, 10, 0.0, 250.0), 0..3);
+        // Tile 3 starts where the clip ends, and a shared edge counts.
+        assert_eq!(visible_tiles(0.0, 100.0, 10, 0.0, 300.0), 0..4);
+        assert_eq!(visible_tiles(-450.0, 100.0, 20, 0.0, 200.0), 4..7);
+        // Tile 7 ends where the clip starts.
+        assert_eq!(visible_tiles(-800.0, 100.0, 10, 0.0, 200.0), 7..10);
+        assert_eq!(visible_tiles(0.0, 100.0, 3, -50.0, 1000.0), 0..3);
+    }
+
+    /// The same rule as `Rect::intersects` on the tile's own rectangle.
+    #[test]
+    fn the_range_matches_a_closed_edge_on_every_tile() {
+        fn touches(origin: f32, tile_w: f32, k: usize, left: f32, right: f32) -> bool {
+            let start = origin + k as f32 * tile_w;
+            let end = start + tile_w;
+            start <= right && left <= end
+        }
+        let cases = [
+            (0.0_f32, 100.0, 10, 0.0, 300.0),
+            (0.0, 100.0, 10, 0.0, 250.0),
+            (-450.0, 100.0, 20, 0.0, 200.0),
+            (-800.0, 100.0, 10, 0.0, 200.0),
+            (0.0, 100.0, 3, -50.0, 1000.0),
+            (12.5, 73.0, 40, -20.0, 500.0),
+            (-1000.0, 150.0, 100, 0.0, 1400.0),
+            (0.0, 41.0, 8, 2000.0, 2100.0),
+            (3.0, 17.5, 30, -400.0, -10.0),
+        ];
+        for (origin, tile_w, n, left, right) in cases {
+            let got: Vec<usize> = visible_tiles(origin, tile_w, n, left, right).collect();
+            let brute: Vec<usize> = (0..n).filter(|k| touches(origin, tile_w, *k, left, right)).collect();
+            assert_eq!(got, brute, "origin {origin} tile {tile_w} n {n} clip {left}..{right}");
+        }
     }
 }
