@@ -152,28 +152,22 @@ pub struct SubDir {
 }
 
 impl Folder {
-    /// List `path`: one `stat` per entry, and an entry that vanishes while
-    /// the listing runs is skipped, not an error. Fails only if the folder
-    /// itself cannot be read.
+    /// List `path`. An entry that vanishes while the listing runs is
+    /// skipped, not an error. Fails only if the folder itself cannot be
+    /// read. A name that is neither a folder nor a RAW is not stated: a
+    /// JPEG or a sidecar beside the files costs no further call. A link
+    /// is followed, so a linked folder or file is taken for what it
+    /// points to.
     pub fn scan(path: &Path, sort: Sort, generation: u64) -> std::io::Result<Self> {
         let mut entries = Vec::new();
         let mut subdirs = Vec::new();
-        for e in std::fs::read_dir(path)? {
-            let Ok(e) = e else { continue };
-            let p = e.path();
-            // Symlinks are resolved by `metadata`, so a linked folder or
-            // file is taken for what it points to.
-            let Ok(md) = std::fs::metadata(&p) else { continue };
-            if md.is_dir() {
-                let hidden = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
-                if !hidden {
-                    subdirs.push(p);
-                }
-                continue;
+        let mut keep_dir = |p: PathBuf| {
+            let hidden = p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+            if !hidden {
+                subdirs.push(p);
             }
-            if !md.is_file() || !is_raw(&p) {
-                continue;
-            }
+        };
+        let mut keep_file = |p: PathBuf, md: std::fs::Metadata| {
             entries.push(Entry {
                 name: p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
                 size: md.len(),
@@ -185,6 +179,29 @@ impl Folder {
                 texture: None,
                 ask: 0,
             });
+        };
+        for e in std::fs::read_dir(path)? {
+            let Ok(e) = e else { continue };
+            let p = e.path();
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_symlink() {
+                let Ok(md) = std::fs::metadata(&p) else { continue };
+                if md.is_dir() {
+                    keep_dir(p);
+                } else if md.is_file() && is_raw(&p) {
+                    keep_file(p, md);
+                }
+                continue;
+            }
+            if kind.is_dir() {
+                keep_dir(p);
+                continue;
+            }
+            if !kind.is_file() || !is_raw(&p) {
+                continue;
+            }
+            let Ok(md) = e.metadata() else { continue };
+            keep_file(p, md);
         }
         subdirs.sort_by(|a, b| natural_cmp(&dir_name(a), &dir_name(b)));
         let subdirs =
@@ -919,6 +936,44 @@ mod tests {
         assert_eq!(natural_cmp(&long_a, &long_b), std::cmp::Ordering::Less);
         assert_eq!(natural_cmp(&long_b, &long_a), std::cmp::Ordering::Greater);
         assert_eq!(natural_cmp("a0", "a00"), std::cmp::Ordering::Equal);
+    }
+
+    /// What a listing keeps: a RAW, a link to one, a folder and a link to
+    /// a folder. A JPEG, a hidden `._` file and a hidden folder are left out.
+    #[test]
+    fn a_listing_keeps_raws_folders_and_what_a_link_points_to() {
+        let dir = std::env::temp_dir().join(format!("mimizan-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let raw = dir.join("photo.NEF");
+        std::fs::write(&raw, b"raw-bytes").unwrap();
+        std::fs::write(dir.join("note.jpg"), b"jpeg").unwrap();
+        std::fs::write(dir.join("._X.NEF"), b"apple").unwrap();
+        std::fs::create_dir(dir.join("album")).unwrap();
+        std::fs::create_dir(dir.join(".hidden")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("photo.NEF", dir.join("link.NEF")).unwrap();
+            std::os::unix::fs::symlink("album", dir.join("linked")).unwrap();
+        }
+        let folder = Folder::scan(&dir, Sort::Name, 1).unwrap();
+        let names: Vec<&str> = folder.entries.iter().map(|e| e.name.as_str()).collect();
+        let dirs: Vec<&str> = folder.subdirs.iter().map(|d| d.name.as_str()).collect();
+        #[cfg(unix)]
+        {
+            assert_eq!(names, ["link.NEF", "photo.NEF"]);
+            assert_eq!(dirs, ["album", "linked"]);
+            let link = folder.entries.iter().find(|e| e.name == "link.NEF").unwrap();
+            assert_eq!(link.size, b"raw-bytes".len() as u64);
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(names, ["photo.NEF"]);
+            assert_eq!(dirs, ["album"]);
+        }
+        let photo = folder.entries.iter().find(|e| e.name == "photo.NEF").unwrap();
+        assert_eq!(photo.size, b"raw-bytes".len() as u64);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
