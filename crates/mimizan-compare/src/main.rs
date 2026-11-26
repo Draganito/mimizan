@@ -1852,10 +1852,18 @@ fn read_tiff_u16(path: &Path, samples: usize) -> Result<(usize, usize, Vec<u16>,
 }
 
 fn write_display(path: &Path, width: usize, height: usize, rgb: &[u8]) -> Result<()> {
-    let image = image::RgbImage::from_raw(width as u32, height as u32, rgb.to_vec())
-        .with_context(|| format!("the display is {width}x{height}"))?;
-    image.save(path).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    let (w, h) = (u32::try_from(width)?, u32::try_from(height)?);
+    mimizan_core::outfile::write_whole(path, |sink| {
+        image::write_buffer_with_format(
+            sink,
+            rgb,
+            w,
+            h,
+            image::ExtendedColorType::Rgb8,
+            image::ImageFormat::Tiff,
+        )
+        .with_context(|| format!("writing {}", path.display()))
+    })
 }
 
 fn fit_mag(pane: egui::Vec2, image: egui::Vec2) -> f32 {
@@ -2079,3 +2087,5 @@ const SAMPLE_BYTES_MAX: usize = mimizan_core::recipe::SHEET_MAX_PX.saturating_mu
         assert_eq!(plate_meta(bare, 6, 12).unwrap().range, 1.0);
     }
 }
+/// An 8-bit RGB TIFF, there whole or not at all: a file cut off half way
+/// would be read as a picture the next time.
