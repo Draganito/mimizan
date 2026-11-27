@@ -551,7 +551,7 @@ pub struct Weighing {
     pub left_out: f64,
     /// How fast a spectrum falls behind the best one.
     pub sharp: f64,
-    /// Added to the score of the first spectrum of the bank.
+    /// Head start of the first spectrum of the bank, in the units of the score.
     pub bias: f64,
 }
 
@@ -654,7 +654,23 @@ fn window_of(pass: &Pass<'_>, spec: &[C64], x0: usize, y0: usize) -> Kept {
 /// `C1` is `G − (R + B)/2` and `C2` is `(R − B)/2`, the same two the second
 /// step reads. The frame's corner is red.
 pub fn separate_bank(m: &Plane, priors: &[Spectrum], sel: &Weighing, done: &dyn Fn(f64)) -> (Plane, Plane) {
+    separate_handicapped(m, priors, &vec![0.0; priors.len()], sel, done)
+}
+
+/// [`separate_bank`], the spectrum `k` starting `handicap[k]` behind in
+/// the units of the score: what it has to say the mosaic better by than
+/// the others before it is weighed as they are. A spectrum more than
+/// `84 / sharp` behind the best one at a pixel is not weighed there.
+pub fn separate_handicapped(
+    m: &Plane,
+    priors: &[Spectrum],
+    handicap: &[f64],
+    sel: &Weighing,
+    done: &dyn Fn(f64),
+) -> (Plane, Plane) {
     assert!(!priors.is_empty(), "there is no prior to separate under");
+    assert_eq!(priors.len(), handicap.len(), "a handicap for every spectrum");
+    assert!(handicap.iter().all(|b| b.is_finite()), "a handicap is a number");
     let (w, h) = (m.width, m.height);
     let fr = frame_of(w, h);
     let at = origins(w, h, &fr);
@@ -685,7 +701,8 @@ pub fn separate_bank(m: &Plane, priors: &[Spectrum], sel: &Weighing, done: &dyn 
         .collect();
     for (k, prior) in priors.iter().enumerate() {
         let fact = Factored::build(&lat, prior);
-        let head = if k == 0 { sel.bias } else { 0.0 };
+        let bias = if k == 0 { sel.bias } else { 0.0 };
+        let head = bias - handicap[k];
         let pass = Pass { m, lat: &lat, fact: &fact, fr: &fr, head, weighing: sel };
         // A running sum belongs to one window, and a prior is weighed only
         // after every prior before it. The windows of one prior share
@@ -1821,6 +1838,71 @@ mod tests {
         let (c1, c2) = separate_bank(m, &[Spectrum::plain(*prior)], &Weighing::default(), &|_| {});
         let rgb = xtrans::from_chroma(m, &tile(), c1.clone(), c2.clone()).rgb();
         (c1, c2, rgb)
+    }
+
+    /// Two colours in stripes of 3 px and two spectra that say them differently.
+    fn stripes_and_two_spectra() -> (Plane, Spectrum, Spectrum) {
+        let (w, h) = (72usize, 56usize);
+        let (one, other) = ([0.70, 0.25, 0.15], [0.15, 0.30, 0.65]);
+        let data = (0..w * h)
+            .map(|i| {
+                let (x, y) = (i % w, i / w);
+                let rgb = if (x + y / 2) / 3 % 2 == 0 { one } else { other };
+                match (x % 2, y % 2) {
+                    (0, 0) => rgb[0],
+                    (1, 1) => rgb[2],
+                    _ => rgb[1],
+                }
+            })
+            .collect();
+        let quiet = Spectrum::plain(Prior { lens: 0.4, chroma: [0.002; 2], ..Prior::default() });
+        let vivid = Spectrum::plain(Prior { lens: 0.75, noise: 0.01, chroma: [1.0; 2], ..Prior::default() });
+        (Plane::from_vec(w, h, data), quiet, vivid)
+    }
+
+    #[test]
+    fn a_spectrum_far_behind_is_not_weighed() {
+        let (m, quiet, vivid) = stripes_and_two_spectra();
+        let sel = Weighing::default();
+        let alone = |q: &Spectrum| separate_bank(&m, std::slice::from_ref(q), &sel, &|_| {});
+        let (q1, q2) = alone(&quiet);
+        let (v1, v2) = alone(&vivid);
+        let differ = q1.data.iter().zip(&v1.data).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(differ > 0.05, "the two spectra say the same of the stripes: {differ}");
+        // Both orders: the one behind is weighed first, or last.
+        for bank in [[quiet.clone(), vivid.clone()], [vivid.clone(), quiet.clone()]] {
+            let (a1, a2) = separate_handicapped(&m, &bank, &[0.0, 1e3], &sel, &|_| {});
+            let (b1, b2) = separate_handicapped(&m, &bank, &[1e3, 0.0], &sel, &|_| {});
+            let (first, second) =
+                if bank[0] == quiet { ((&q1, &q2), (&v1, &v2)) } else { ((&v1, &v2), (&q1, &q2)) };
+            assert!(a1.data == first.0.data && a2.data == first.1.data, "the second spectrum was weighed");
+            assert!(b1.data == second.0.data && b2.data == second.1.data, "the first spectrum was weighed");
+        }
+    }
+
+    #[test]
+    fn a_handicap_is_a_head_start_of_all_the_others() {
+        // Half a unit behind for the second is half a unit ahead for the
+        // first, which is what `Weighing::bias` gives it; and it moves the
+        // weights, towards the first.
+        let (m, quiet, vivid) = stripes_and_two_spectra();
+        let bank = [quiet.clone(), vivid];
+        let sel = Weighing::default();
+        let (h1, h2) = separate_handicapped(&m, &bank, &[0.0, 0.5], &sel, &|_| {});
+        let (b1, b2) = separate_bank(&m, &bank, &Weighing { bias: 0.5, ..sel }, &|_| {});
+        let worst =
+            |a: &Plane, b: &Plane| a.data.iter().zip(&b.data).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        assert!(worst(&h1, &b1) < 1e-12 && worst(&h2, &b2) < 1e-12, "a handicap is not a head start");
+        let (e1, _) = separate_bank(&m, &bank, &sel, &|_| {});
+        let (q1, _) = separate_bank(&m, &bank[..1], &sel, &|_| {});
+        let off = |a: &Plane| a.data.iter().zip(&q1.data).map(|(a, b)| (a - b).powi(2)).sum::<f64>();
+        assert!(off(&e1) > 0.0, "the second spectrum is never weighed on the stripes");
+        assert!(
+            off(&h1) < off(&e1),
+            "behind, the second spectrum is weighed as much as level: {} {}",
+            off(&h1),
+            off(&e1)
+        );
     }
 
     #[test]
