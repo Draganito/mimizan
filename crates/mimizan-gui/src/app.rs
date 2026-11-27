@@ -7044,12 +7044,16 @@ fn grant_covers(path: &Path, root: &Path) -> bool {
 
 /// A folder resolved after the window is up replaces nothing the user has
 /// already opened. A picture opened on its own is not such a folder.
+/// Called from the Mac path; the tests cover it on every build.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn remembered_folder_applies(has_folder: bool, has_grant: bool) -> bool {
     !has_folder && !has_grant
 }
 
 /// The old folder stays open when the picture is in it and the folder
 /// just opened does not contain that picture.
+/// Called from the Mac path; the tests cover it on every build.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn keep_grant_for_open_picture(picture_in_old: bool, picture_in_new: bool) -> bool {
     picture_in_old && !picture_in_new
 }
