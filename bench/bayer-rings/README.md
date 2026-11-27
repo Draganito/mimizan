@@ -68,6 +68,23 @@ under `--out`, which git ignores. `report.py` writes
 `out/bayer-rings/report/tables.md` and the comparison images to
 `out/bayer-rings/media/`.
 
+Two more tables come from the same cache:
+
+```sh
+.venv/bin/python bench/bayer-rings/programs.py --out out/bayer-rings
+.venv/bin/python bench/bayer-rings/ls_prior.py --out out/bayer-rings
+```
+
+`programs.py` sets the least-squares demosaic and the Dubois plate beside
+what each program does by default (LibRaw AHD, RawTherapee AMaZE, darktable
+RCD) and beside the best each program can do, scene by scene
+(`report/programs.md`). `ls_prior.py` develops one chart alone and inside
+frames of photographs two, three and five times its size with the
+least-squares demosaic, and writes the prior the frame-wide search settled
+on beside the error on the chart (`report/ls-prior.md`). The chart is the
+same in every frame; figures that differ show how far the result hangs on
+the rest of the picture.
+
 ## Camera files
 
 ```sh
@@ -77,7 +94,11 @@ under `--out`, which git ignores. `report.py` writes
 
 Every method develops the whole file, the frames are aligned and fitted to
 one colour, and the same crop of each is drawn side by side. There is no
-original, so this part gives pictures and no figures. The studio scene of
+original, so this part gives pictures and one figure only: `--neutral NAME`
+names a crop that holds nothing but black and white, and the colour that
+strays from its median is written to `real/<file>/real.json`. The frames
+are aligned to `--reference` (LibRaw AHD by default); name another method
+where LibRaw cannot read the file. The studio scene of
 DPReview cannot be fetched by a script (the site asks for a human); the
 files have to be downloaded by hand. The default crop is where the colour
 rings lie in that scene; check it against the picture and move it with

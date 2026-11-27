@@ -41,7 +41,7 @@ REFERENCE = "lr_ahd"
 MAX_SHIFT = 64
 DPREVIEW_RINGS = "ringe:0.636,0.779,200"
 SELECTION = [
-    "mz_dubois", "mz_adaptive", "mz_off", "mz_ls", "lr_ahd", "lr_dcb",
+    "mz_ls", "mz_dubois", "mz_adaptive", "mz_off", "lr_ahd", "lr_dcb",
     "lr_dht", "rt_amaze", "rt_rcd", "rt_lmmse", "dt_rcd", "dt_amaze",
 ]  # fmt: skip
 PROGRAMS = {"mimizan": "Mimizan", "libraw": "LibRaw", "rawtherapee": "RawTherapee", "darktable": "darktable"}
@@ -159,7 +159,7 @@ def run_file(raw: Path, out: Path, crops, methods, progs, media: Path, zoom: int
     media.mkdir(parents=True, exist_ok=True)
     for name, cx, cy, size in crops:
         panels = []
-        for m in methods:
+        for m in sorted(methods, key=lambda m: m.key != "mz_ls"):
             if (name, m.key) not in cut:
                 continue
             kind = "mimizan" if m.is_mimizan else "other"

@@ -67,18 +67,11 @@ def photographs(folder: Path):
     return out
 
 
-def context_ls(work: Path, truth, photos, progs):
-    """The least-squares demosaic of the chart lying in a photograph.
-
-    That demosaic searches one prior for the whole frame. A frame that is
-    nothing but fine colour rings gives it a prior no photograph has, so
-    the chart is also developed as a ninth of a frame of ordinary pictures,
-    and the same chart pixels are measured."""
+def context_canvas(truth, photos, factor=CONTEXT_FACTOR):
+    """The chart lying in a frame `factor` times its size, the rest of it
+    photographs; and where the chart lies in it, (x, y)."""
     h, w, _ = truth.shape
-    ch, cw = (h * CONTEXT_FACTOR) // 2 * 2, (w * CONTEXT_FACTOR) // 2 * 2
-    cache, side = work / f"{CONTEXT_KEY}.npy", work / f"{CONTEXT_KEY}.json"
-    if cache.exists() and side.exists():
-        return np.load(cache).astype(np.float32) / 65535.0, json.loads(side.read_text())
+    ch, cw = (h * factor) // 2 * 2, (w * factor) // 2 * 2
     canvas = np.zeros((ch, cw, 3), dtype=np.float32)
     ph, pw = photos[0].shape[:2]
     i = 0
@@ -89,7 +82,22 @@ def context_ls(work: Path, truth, photos, progs):
             canvas[y : y + ph, x : x + pw] = p[: min(ph, ch - y), : min(pw, cw - x)]
     oy, ox = ((ch - h) // 4) * 2, ((cw - w) // 4) * 2
     canvas[oy : oy + h, ox : ox + w] = truth
-    dng = work / "context.dng"
+    return canvas, ox, oy
+
+
+def context_ls(work: Path, truth, photos, progs, factor=CONTEXT_FACTOR, key=CONTEXT_KEY):
+    """The least-squares demosaic of the chart lying in a photograph.
+
+    That demosaic searches one prior for the whole frame. A frame that is
+    nothing but fine colour rings gives it a prior no photograph has, so
+    the chart is also developed as a ninth of a frame of ordinary pictures,
+    and the same chart pixels are measured."""
+    h, w, _ = truth.shape
+    cache, side = work / f"{key}.npy", work / f"{key}.json"
+    if cache.exists() and side.exists():
+        return np.load(cache).astype(np.float32) / 65535.0, json.loads(side.read_text())
+    canvas, ox, oy = context_canvas(truth, photos, factor)
+    dng = work / f"{key}.dng"
     dngio.write_cfa_dng(dng, scenes.mosaic(canvas, seed=2), model="context")
     t0 = time.time()
     img, info = dev.RUNNERS["mimizan"](dev.BY_KEY["mz_ls"], dng, work, progs)

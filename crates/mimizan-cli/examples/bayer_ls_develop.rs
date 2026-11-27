@@ -6,7 +6,7 @@
 //! `bayer_ls::develop` on a RAW or a CFA DNG and writes the three channels
 //! as a 16-bit PPM, the camera's own channels, not balanced, 65535 at the
 //! sensor's white. One line of JSON on stdout says where the frame lies in
-//! the mosaic and what the balance is.
+//! the mosaic, what the balance is and which prior the search found.
 //!
 //! ```text
 //! cargo run --release -p mimizan-cli --example bayer_ls_develop -- in.dng out.ppm
@@ -51,6 +51,9 @@ fn main() -> Result<()> {
             "balance_from_file": dev.balance_from_file,
             "alpha": dev.prior.alpha,
             "alpha_c": dev.prior.alpha_c,
+            "chroma": dev.prior.chroma,
+            "noise": dev.prior.noise,
+            "lens": dev.prior.lens,
             "burnt": dev.burnt,
         })
     );

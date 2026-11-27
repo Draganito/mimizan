@@ -24,23 +24,15 @@ from run_synth import CONTEXT_KEY, LENSES, scene_name
 
 LABELS = {m.key: m.label for m in dev.METHODS}
 LABELS[CONTEXT_KEY] = "Mimizan LS-Demosaic im Foto"
-ORDER = [m.key for m in dev.METHODS]
-ORDER.insert(ORDER.index("mz_ls") + 1, CONTEXT_KEY)
+# The demosaicer first, then the plates of the frequency separation, then
+# the other programs as `developers.py` lists them.
+ORDER = [CONTEXT_KEY, "mz_ls"] + [m.key for m in dev.METHODS if m.key != "mz_ls"]
 MIMIZAN = [k for k in ORDER if k.startswith("mz_")]
 OTHERS = [k for k in ORDER if not k.startswith("mz_")]
 SELECTION = [
-    "mz_dubois",
-    "mz_adaptive",
-    "mz_off",
-    CONTEXT_KEY,
-    "lr_ahd",
-    "lr_dcb",
-    "lr_dht",
-    "rt_amaze",
-    "rt_rcd",
-    "rt_lmmse",
-    "dt_rcd",
-]
+    CONTEXT_KEY, "mz_ls", "mz_dubois", "mz_adaptive", "mz_off", "lr_ahd",
+    "lr_dht", "rt_amaze", "rt_rcd", "rt_lmmse", "dt_rcd",
+]  # fmt: skip
 CHART_NAMES = {
     "dpr": "DPReview-Ringe",
     "rings": "Ringe",
@@ -263,7 +255,7 @@ def band_standing(data, palette, lens, ours="mz_dubois"):
         places.append(
             {"band": band, "psnr": field[ours], "place": rank(field, ours), "of": len(field), "best": best, "best_psnr": field[best]}
         )
-    own = "| **Mimizan Dubois selbst** | " + " | ".join([num(p["psnr"], 2) for p in mine] + [num(p["fc"], 2) for p in mine]) + " |"
+    own = f"| **{LABELS[ours]} selbst** | " + " | ".join([num(p["psnr"], 2) for p in mine] + [num(p["fc"], 2) for p in mine]) + " |"
     place = "| **Platz unter den anderen Programmen** | " + " | ".join([f"{p['place']} von {p['of']}" for p in places] + [""] * 4) + " |"
     best = "| Bestes anderes Verfahren | " + " | ".join([f"{LABELS[p['best']]} {num(p['best_psnr'], 2)}" for p in places] + [""] * 4) + " |"
     return "\n".join(lines + [own, place, best]), places
@@ -400,8 +392,12 @@ def standing(data, palette, lens, ours="mz_dubois"):
 
 def conditions(data, ours="mz_dubois"):
     """Ours a chart and condition: its CPSNR, its place among the methods
-    of the other programs, and the best of those."""
-    head = ["Farben", "Optik", "Chart", "Mimizan Dubois dB", "Platz unter den anderen", "Bestes anderes Verfahren", "dessen dB", "Abstand dB"]
+    of the other programs by CPSNR, Delta E, false colour and zipper, and
+    the best of those by CPSNR."""
+    head = [
+        "Farben", "Optik", "Chart", f"{LABELS[ours]} dB", "Platz CPSNR", "Bestes anderes Verfahren", "dessen dB",
+        "Abstand dB", "Platz ΔE00", "Platz Falschfarbe", "Platz Zipper",
+    ]  # fmt: skip
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     out = []
     for palette in PALETTE_NAMES:
@@ -410,11 +406,13 @@ def conditions(data, ours="mz_dubois"):
                 recs = data.get((c, palette, lens))
                 if not recs or ours not in recs:
                     continue
-                score = {k: pool(colour(whole(v)))["psnr"] for k, v in recs.items() if k == ours or k in OTHERS}
-                if len(score) < 2:
+                pools = {k: pool(colour(whole(v))) for k, v in recs.items() if k == ours or k in OTHERS}
+                if len(pools) < 2:
                     continue
+                score = {k: v["psnr"] for k, v in pools.items()}
                 best = max((k for k in score if k != ours), key=lambda k: score[k])
                 place = rank(score, ours)
+                places = {f: rank({k: v[f] for k, v in pools.items()}, ours, higher=False) for f in ("de", "fc", "zipper")}
                 d = score[ours] - score[best]
                 lines.append(
                     "| "
@@ -429,17 +427,33 @@ def conditions(data, ours="mz_dubois"):
                             num(score[best], 2),
                             ("+" if d >= 0 else "−") + num(abs(d), 2),
                         ]
+                        + [str(places[f]) for f in ("de", "fc", "zipper")]
                     )
                     + " |"
                 )
-                out.append({"chart": c, "palette": palette, "lens": lens, "psnr": score[ours], "place": place, "of": len(score), "best": best, "best_psnr": score[best]})
+                out.append(
+                    {
+                        "chart": c, "palette": palette, "lens": lens, "psnr": score[ours], "place": place,
+                        "of": len(score), "best": best, "best_psnr": score[best], "places": places,
+                        "de": pools[ours]["de"], "fc": pools[ours]["fc"], "zipper": pools[ours]["zipper"],
+                    }  # fmt: skip
+                )
     return "\n".join(lines), out
 
 
+# The demosaicer first: it is what is being worked on. The plate of the
+# frequency separation stands beside it for comparison.
+SUBJECTS = [CONTEXT_KEY, "mz_ls", "mz_dubois"]
+
+
 def write_tables(data, out: Path):
-    parts, summary = [], {"conditions": None, "scenes": {}}
-    text, summary["conditions"] = conditions(data)
-    parts.append("## Mimizan Dubois in jeder Bedingung\n\n" + text)
+    parts, summary = [], {"conditions": {}, "scenes": {}}
+    for ours in SUBJECTS:
+        text, summary["conditions"][ours] = conditions(data, ours)
+        if summary["conditions"][ours]:
+            parts.append(
+                f"## {LABELS[ours]} in jeder Bedingung\n\nCPSNR der Farbpaare; die Plätze zählen unter den 24 Verfahren der anderen Programme und diesem einen (1 ist der beste).\n\n{text}"
+            )
     for palette in PALETTE_NAMES:
         for lens in LENS_NAMES:
             if not any((c, palette, lens) in data for c in scenes.CHARTS):
@@ -447,13 +461,17 @@ def write_tables(data, out: Path):
             title = f"{PALETTE_NAMES[palette]}, {LENS_NAMES[lens]}"
             text, score, charts = overview(data, palette, lens)
             parts.append(f"## Übersicht: {title}\n\nCPSNR der Farbpaare in dB, je Chart; sortiert nach dem Mittel.\n\n{text}")
-            text, wins = standing(data, palette, lens)
-            parts.append(f"### Mimizan Dubois gegen jedes Verfahren: {title}\n\nDifferenz der CPSNR in dB (plus: Mimizan Dubois ist besser); die vier letzten Spalten zählen über alle Szenen aller Bedingungen.\n\n{text}")
-            summary["scenes"][f"{palette}-{lens}"] = {"charts": charts, "cpsnr": score, "wins": wins}
-            text, places = band_standing(data, palette, lens)
-            if text:
-                parts.append(f"### Mimizan Dubois nach Ortsfrequenz: {title}\n\nRinge, Zonenplatte und Siemensstern zusammen, nur Farbpaare. Differenz zu jedem Verfahren: CPSNR in dB und Falschfarbe, plus heißt Mimizan Dubois ist besser.\n\n{text}")
-                summary["scenes"][f"{palette}-{lens}"]["bands"] = places
+            entry = {"charts": charts, "cpsnr": score, "wins": {}, "bands": {}}
+            summary["scenes"][f"{palette}-{lens}"] = entry
+            for ours in SUBJECTS:
+                name = LABELS[ours]
+                text, entry["wins"][ours] = standing(data, palette, lens, ours)
+                if entry["wins"][ours]:
+                    parts.append(f"### {name} gegen jedes Verfahren: {title}\n\nDifferenz der CPSNR in dB (plus: {name} ist besser); die vier letzten Spalten zählen über alle Szenen aller Bedingungen.\n\n{text}")
+                text, places = band_standing(data, palette, lens, ours)
+                if text:
+                    parts.append(f"### {name} nach Ortsfrequenz: {title}\n\nRinge, Zonenplatte und Siemensstern zusammen, nur Farbpaare. Differenz zu jedem Verfahren: CPSNR in dB und Falschfarbe, plus heißt {name} ist besser.\n\n{text}")
+                    entry["bands"][ours] = places
             for c in charts:
                 recs = data[(c, palette, lens)]
                 order = by_mean(recs)
@@ -566,7 +584,7 @@ def ladder_image(scene: Scene, tiles, keys, cell, zoom, title, columns):
     return montage.ladder(rows, zoom, title=title, subtitle=scene.condition(), columns=columns, cell=cell)
 
 
-def write_images(out: Path, media: Path, conditions_wanted, pairs_wanted):
+def write_images(out: Path, media: Path, conditions_wanted, pairs_wanted, charts_wanted=tuple(scenes.CHARTS)):
     media.mkdir(parents=True, exist_ok=True)
     written = []
 
@@ -578,7 +596,7 @@ def write_images(out: Path, media: Path, conditions_wanted, pairs_wanted):
 
     for palette, lens in conditions_wanted:
         tag = f"{palette}-{lens}"
-        for chart in scenes.CHARTS:
+        for chart in charts_wanted:
             if not (out / "synth" / scene_name(chart, palette, lens) / "records.json").exists():
                 continue
             sc = Scene(out, chart, palette, lens)
@@ -615,17 +633,16 @@ def write_images(out: Path, media: Path, conditions_wanted, pairs_wanted):
                     if tiles:
                         cols = ["| 2", "— 2", "| 3", "| 4", "8° 2,5", "45° 2,83", "Schach 1", "Schach 2", "Haar 5", "Punkte 3"]
                         save(ladder_image(sc, tiles, keys, 32, 4, f"Feine Gitter, {name} (Linien mit Periode in px, Schachbrett, Haarlinien, Punkte)", cols), f"synth-gitter-{tag}-{slug}.png")
-    (media / "index.json").write_text(json.dumps(written, indent=1))
     return written
 
 
 # ----------------------------------------------------------------- curves
 
 CURVES = [
-    ("mz_dubois", "#e07b00", "-", 2.6),
-    ("mz_adaptive", "#e07b00", "--", 1.6),
-    ("mz_off", "#e07b00", ":", 1.8),
-    (CONTEXT_KEY, "#a03000", "-", 2.0),
+    (CONTEXT_KEY, "#c0392b", "-", 2.6),
+    ("mz_ls", "#c0392b", "--", 1.8),
+    ("mz_dubois", "#e08e00", "-", 2.0),
+    ("mz_off", "#e08e00", ":", 1.6),
     ("lr_ahd", "#1f77b4", "-", 1.2),
     ("lr_dht", "#1f77b4", "--", 1.2),
     ("rt_amaze", "#2ca02c", "-", 1.2),
@@ -698,13 +715,16 @@ def main():
     ap.add_argument("--media", type=Path, default=None)
     ap.add_argument("--conditions", default="cam-lens", help="comma-separated PALETTE-LENS to draw; `all` for every one")
     ap.add_argument("--pairs", default=",".join(PAIRS), help="comma-separated colour pairs to draw")
+    ap.add_argument("--charts", default=",".join(scenes.CHARTS), help="comma-separated charts to draw")
     ap.add_argument("--no-images", action="store_true")
+    ap.add_argument("--no-tables", action="store_true")
     a = ap.parse_args()
     data = load(a.out)
     if not data:
         raise SystemExit(f"nothing measured under {a.out / 'synth'}; run run_synth.py first")
-    write_tables(data, a.out)
-    print(f"wrote {a.out / 'report' / 'tables.md'}")
+    if not a.no_tables:
+        write_tables(data, a.out)
+        print(f"wrote {a.out / 'report' / 'tables.md'}")
     if not a.no_images:
         wanted = (
             [(p, l) for p in PALETTE_NAMES for l in LENS_NAMES]
@@ -713,8 +733,8 @@ def main():
         )
         media = a.media or a.out / "media"
         media.mkdir(parents=True, exist_ok=True)
-        write_curves(data, media, [(p, l) for p in PALETTE_NAMES for l in LENS_NAMES])
-        write_images(a.out, media, wanted, a.pairs.split(","))
+        write_curves(data, media, wanted)
+        write_images(a.out, media, wanted, a.pairs.split(","), a.charts.split(","))
 
 
 if __name__ == "__main__":

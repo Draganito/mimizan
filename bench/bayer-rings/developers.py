@@ -194,7 +194,8 @@ def _mimizan(method: Method, raw: Path, work: Path, progs: dict):
         info = json.loads(p.stdout.strip().splitlines()[-1])
         img = read_ppm16(out) * np.asarray(info["balance"], dtype=np.float32)
         out.unlink()
-        return img, {"offset": [info["x"], info["y"]], "balance": info["balance"]}
+        prior = {k: info[k] for k in ("alpha", "alpha_c", "chroma", "noise", "lens") if k in info}
+        return img, {"offset": [info["x"], info["y"]], "balance": info["balance"], "prior": prior}
     out = work / f"{method.key}.dng"
     _run(
         [
