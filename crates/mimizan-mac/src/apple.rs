@@ -49,6 +49,33 @@ impl Drop for FolderGrant {
     }
 }
 
+/// The file the save panel named. Held until the write has finished,
+/// then dropped. The address stays even when `startAccessing` reported
+/// that the sandbox already allowed the file: releasing the URL before
+/// the write is what drops that permission. When access was started,
+/// dropping the grant stops it.
+pub struct SaveGrant {
+    path: PathBuf,
+    url: objc2::rc::Retained<NSURL>,
+    started: bool,
+}
+
+impl SaveGrant {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SaveGrant {
+    fn drop(&mut self) {
+        if self.started {
+            // SAFETY: balances the successful `startAccessing` in
+            // `pick_save`, once, on the URL it was called on.
+            unsafe { self.url.stopAccessingSecurityScopedResource() }
+        }
+    }
+}
+
 /// The user picks one folder. Cancel returns nothing. The panel blocks
 /// until it closes, and the window does not draw behind it.
 pub fn pick_folder() -> Option<FolderGrant> {
@@ -74,17 +101,17 @@ pub fn pick_folder() -> Option<FolderGrant> {
 /// The user names the export. `extensions` are the file types the panel
 /// allows (the first is appended when the user types none), so the path
 /// handed back is the path that is written: the sandbox grants that one
-/// file, and a name changed afterwards would be another. The returned path
-/// stays writable for this launch; the save panel's grant is kept by not
-/// releasing the URL. The panel blocks until it closes, and the window
-/// does not draw behind it.
+/// file, and a name changed afterwards would be another. The grant holds
+/// that address until it is dropped, which is after the write, and then
+/// stops an access that was started. The panel blocks until it closes,
+/// and the window does not draw behind it.
 // `setAllowedFileTypes` is the deprecated spelling of `allowedContentTypes`.
 // It takes the extensions as strings, which is all that is needed here,
 // and it is the one of the two whose binding is verified against the
 // crate this build uses; the UTType binding is not available to check on
 // the machine that wrote this.
 #[allow(deprecated)]
-pub fn pick_save(directory: Option<&Path>, file_name: &str, extensions: &[&str]) -> Option<PathBuf> {
+pub fn pick_save(directory: Option<&Path>, file_name: &str, extensions: &[&str]) -> Option<SaveGrant> {
     let mtm = MainThreadMarker::new()?;
     let panel = NSSavePanel::savePanel(mtm);
     panel.setCanCreateDirectories(true);
@@ -104,10 +131,12 @@ pub fn pick_save(directory: Option<&Path>, file_name: &str, extensions: &[&str])
         return None;
     }
     let url = panel.URL()?;
-    // The save URL has to stay alive or the sandbox drops the write.
-    // One URL per export, released when the process ends.
-    // SAFETY: plain message to a retained URL; balanced below when the
-    // path cannot be read, else kept open on purpose.
+    // The save URL has to stay alive until the write has finished, or the
+    // sandbox drops the permission. Held either way `start` answers:
+    // a panel URL the sandbox already allows is still released at the end
+    // of this function if it is not returned.
+    // SAFETY: plain message to a retained URL; balanced in `Drop` when
+    // `started` is true, and below when the path cannot be read.
     let started = unsafe { url.startAccessingSecurityScopedResource() };
     let Some(path) = url_path(&url) else {
         if started {
@@ -116,10 +145,7 @@ pub fn pick_save(directory: Option<&Path>, file_name: &str, extensions: &[&str])
         }
         return None;
     };
-    if started {
-        std::mem::forget(url);
-    }
-    Some(path)
+    Some(SaveGrant { path, url, started })
 }
 
 /// The bookmark from the last launch. Nothing when it no longer resolves,
@@ -220,6 +246,7 @@ mod tests {
     fn a_grant_can_cross_to_the_thread_that_draws() {
         fn assert_send<T: Send>() {}
         assert_send::<super::FolderGrant>();
+        assert_send::<super::SaveGrant>();
     }
 }
 

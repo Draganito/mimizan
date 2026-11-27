@@ -1210,6 +1210,10 @@ pub struct App {
     /// replaced. Dropped when that picture is gone.
     #[cfg(target_os = "macos")]
     session_grant: Option<mimizan_mac::FolderGrant>,
+    /// The save panel's address, held until that export is written or
+    /// given up. One export runs at a time.
+    #[cfg(target_os = "macos")]
+    save_grant: Option<mimizan_mac::SaveGrant>,
     /// The remembered folder, resolved off the main thread so a missing
     /// volume does not hold the first frame.
     #[cfg(target_os = "macos")]
@@ -1443,6 +1447,8 @@ impl App {
             folder_grant: None,
             #[cfg(target_os = "macos")]
             session_grant: None,
+            #[cfg(target_os = "macos")]
+            save_grant: None,
             #[cfg(target_os = "macos")]
             restore_rx: None,
             #[cfg(target_os = "macos")]
@@ -3141,7 +3147,10 @@ impl App {
             // The panel appends the extension itself, so the path it hands
             // back is written as it is: the grant is for that path alone.
             let extensions = self.export_extensions();
-            if let Some(path) = mimizan_mac::pick_save(self.export_directory().as_deref(), name, extensions) {
+            if let Some(grant) = mimizan_mac::pick_save(self.export_directory().as_deref(), name, extensions)
+            {
+                let path = grant.path().to_path_buf();
+                self.save_grant = Some(grant);
                 self.export_to(path, true);
             }
             return true;
@@ -3151,6 +3160,23 @@ impl App {
         false
     }
 
+    /// The save panel's address has done its job.
+    fn release_save(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.save_grant = None;
+        }
+    }
+
+    /// A failure ends the address only when a write was under way. The
+    /// question about replacing a file is still waiting, and an unrelated
+    /// failure must not drop it.
+    fn release_save_after_failure(&mut self) {
+        if self.pending_replace.is_none() {
+            self.release_save();
+        }
+    }
+
     /// A path came from a save dialog. `granted` is a path from the system
     /// save panel: it is written as it is, extension and all, because the
     /// sandbox allows that file and no other. The egui dialog's path gets
@@ -3158,15 +3184,21 @@ impl App {
     /// dialog never asked about: that one waits for a yes. The RAW itself
     /// is never the target.
     fn export_to(&mut self, path: PathBuf, granted: bool) {
-        let Some(source) = self.session.as_ref().map(|s| s.path.clone()) else { return };
+        let Some(source) = self.session.as_ref().map(|s| s.path.clone()) else {
+            self.release_save();
+            return;
+        };
         let extensions = self.export_extensions();
         match export_target(path, granted, extensions, &source) {
             ExportTarget::Write(path) => self.export_now(path),
             ExportTarget::Ask(path) => self.pending_replace = Some(path),
-            ExportTarget::Source(path) => self.log(format!(
-                "not exported: {} is the RAW this picture is developed from. Give the export another name",
-                path.display()
-            )),
+            ExportTarget::Source(path) => {
+                self.release_save();
+                self.log(format!(
+                    "not exported: {} is the RAW this picture is developed from. Give the export another name",
+                    path.display()
+                ));
+            }
         }
     }
 
@@ -3201,6 +3233,8 @@ impl App {
             self.pending_replace = None;
             if replace {
                 self.export_now(path);
+            } else {
+                self.release_save();
             }
         }
     }
@@ -3231,12 +3265,14 @@ impl App {
     /// Start the export to `path`, which is settled.
     fn export_now(&mut self, path: PathBuf) {
         if self.session.is_none() {
+            self.release_save();
             return;
         }
         // The last door before the file: whatever name a dialog handed
         // back, the store build writes the TIFF and the negative after
         // the purchase alone.
         if self.unlock.locked() && unlock::is_paid(self.export_kind == ExportKind::Linear, &path) {
+            self.release_save();
             self.unlock.ask();
             return;
         }
@@ -3249,7 +3285,10 @@ impl App {
                 path.display()
             ));
         }
-        let Some(s) = &self.session else { return };
+        let Some(s) = &self.session else {
+            self.release_save();
+            return;
+        };
         match self.export_kind {
             ExportKind::Print => {
                 self.busy = Some("exporting".into());
@@ -3476,6 +3515,7 @@ impl App {
         // Nothing of this program's is left to free.
         self.log(format!("error: {message}. Close other programs and open it again"));
         self.busy = None;
+        self.release_save_after_failure();
         self.picture_gone_if_released();
     }
 
@@ -4034,11 +4074,14 @@ impl App {
                 Event::Exported { path, width, height, ms } => {
                     self.log(format!("wrote {} ({width}x{height}) in {ms} ms", path.display()));
                     self.busy = None;
+                    // The file is whole. The save panel's address can go.
+                    self.release_save();
                 }
                 Event::Refused { job, message } => self.retry_refused(job, message),
                 Event::Failed(e) => {
                     self.log(format!("error: {e}"));
                     self.busy = None;
+                    self.release_save_after_failure();
                     // A failed open leaves the previous picture on the stage;
                     // the strip must point at that one, not at the failure.
                     // A picture let go for room is gone with its texture.

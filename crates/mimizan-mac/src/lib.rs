@@ -9,7 +9,7 @@
 #![cfg(target_os = "macos")]
 
 mod apple;
-pub use apple::{adopt, pick_folder, pick_save, restore, FolderGrant};
+pub use apple::{adopt, pick_folder, pick_save, restore, FolderGrant, SaveGrant};
 
 /// The App Store purchase. Only the Mac App Store build has it.
 #[cfg(feature = "store")]
