@@ -20,8 +20,11 @@ use std::time::Instant;
 /// What a DNG written here ends its name with.
 const MARK: &str = ".mimizan.dng";
 
-/// What the DNG says it was written by.
-const SOFTWARE: &str = concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"), " (Bayer least squares)");
+/// What the DNG says it was written by. The test build names itself: the
+/// version is the one of the release before it, and a DNG that release
+/// wrote beside a RAW has to be written again to show the new separation.
+const SOFTWARE: &str =
+    concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"), " (Bayer least squares, test build bayer1)");
 
 /// Where a Bayer file stands when the checkbox is on.
 pub enum Place {
