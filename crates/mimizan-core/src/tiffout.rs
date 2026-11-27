@@ -48,18 +48,6 @@ pub fn ascii_description(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// One trailing space when the length plus the NUL the encoder writes is
-/// odd. TIFF wants the next value on a word boundary, and the encoder
-/// writes it immediately after this one. The text is already ASCII; in a
-/// JSON description the space is white space.
-fn with_even_nul(s: &str) -> Cow<'_, str> {
-    if (s.len() + 1).is_multiple_of(2) {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(format!("{s} "))
-    }
-}
-
 /// Quantise `clamp(v,0,1)*65535` and write a 16-bit grey TIFF in strips of
 /// 64 rows.
 pub fn write_gray16(path: &Path, plane: &Plane, meta: &TiffMeta<'_>) -> Result<()> {
@@ -263,16 +251,24 @@ where
 {
     let mut img = enc.new_image::<C>(image.width as u32, image.height as u32)?;
     img.rows_per_strip(image.rows_per_strip)?;
-    let description = with_even_nul(description);
     {
         let d = img.encoder();
         if let Some(icc) = tags.icc {
             d.write_tag(Tag::IccProfile, icc)?;
         }
-        d.write_tag(Tag::ImageDescription, description.as_ref())?;
+        // The description is stored as it stands. A classic entry holds
+        // four bytes and a BigTIFF entry eight. The encoder adds a NUL and
+        // writes the next value immediately, so a value that does not fit
+        // and is odd with that NUL would leave the next one on an odd
+        // offset. One zero byte, which is not a tag, follows it. A value
+        // that fits in the entry is not followed by a pad byte.
+        d.write_tag(Tag::ImageDescription, description)?;
+        let with_nul = description.len() + 1;
+        if with_nul > std::mem::size_of::<K::OffsetType>() && !with_nul.is_multiple_of(2) {
+            d.write_data(0u8)?;
+        }
         if tags.software {
-            let software = with_even_nul(concat!("mimizan ", env!("CARGO_PKG_VERSION")));
-            d.write_tag(Tag::Software, software.as_ref())?;
+            d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
         }
         if tags.orientation >= 1 && tags.orientation <= 8 {
             d.write_tag(Tag::Orientation, tags.orientation)?;
@@ -420,20 +416,22 @@ mod tests {
         assert_eq!(tag(&big, Tag::IccProfile), tag(&classic, Tag::IccProfile));
     }
 
-    /// TIFF wants a value and a directory on a word boundary. The encoder
-    /// writes the next value straight after this one and the NUL it adds,
-    /// so a description of even length takes one trailing space and one
-    /// that is already even with the NUL does not. An 8-bit strip with an
-    /// odd number of bytes is followed by one zero byte, which is not a
-    /// sample. The description reads back as the same JSON.
+    /// TIFF wants a value and a directory on a word boundary. A description
+    /// is stored as it was given. One that does not fit in the entry and is
+    /// odd with the NUL is followed by one zero byte, which is not a tag. A
+    /// value that fits is not. An 8-bit strip with an odd number of bytes is
+    /// followed by one zero byte, which is not a sample.
     #[test]
     fn a_value_and_the_directory_start_on_a_word_boundary() {
-        // Even length: the NUL makes it odd, so the file gains one space.
-        // Odd length: even once the NUL is counted, so no space.
+        // Even length: the NUL makes it odd, and the text is longer than an
+        // entry, so a zero byte follows it. The letters stay as written.
+        // Odd length: even once the NUL is counted, so no pad byte.
         let even = r#"{"k":"vv"}"#;
         let odd = r#"{"k":"v"}"#;
+        let mosaic = "mimizan synth mosaic";
         assert_eq!(even.len() % 2, 0);
         assert!((odd.len() + 1).is_multiple_of(2));
+        assert_eq!(mosaic.len(), 20);
 
         let meta = |description| TiffMeta {
             description,
@@ -446,7 +444,7 @@ mod tests {
         // 4 × 2 samples, two bytes each: an even strip.
         on_a_word_boundary(&grey, 4 * 2 * 2);
         let raw = ascii_tag(&grey, Tag::ImageDescription);
-        assert_eq!(raw, format!("{even} "));
+        assert_eq!(raw, even);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap(), serde_json::json!({"k": "vv"}));
         let software = concat!("mimizan ", env!("CARGO_PKG_VERSION"));
         assert!((software.len() + 1).is_multiple_of(2), "{software}");
@@ -455,15 +453,25 @@ mod tests {
         let mask = tmp("odd-grey8.tif");
         write_gray8(&mask, 3, 1, &[1, 2, 3], even).unwrap();
         on_a_word_boundary(&mask, 3);
-        let raw = ascii_tag(&mask, Tag::ImageDescription);
-        assert_eq!(raw, format!("{even} "));
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap(), serde_json::json!({"k": "vv"}));
+        assert_eq!(ascii_tag(&mask, Tag::ImageDescription), even);
 
         let plain = tmp("odd-text.tif");
         write_gray16(&plain, &Plane::zeros(2, 2), &meta(odd)).unwrap();
         on_a_word_boundary(&plain, 2 * 2 * 2);
         assert_eq!(ascii_tag(&plain, Tag::ImageDescription), odd);
         assert_eq!(ascii_tag(&plain, Tag::Software), software);
+
+        let synth = tmp("mosaic.tif");
+        write_gray16(&synth, &Plane::zeros(4, 2), &meta(mosaic)).unwrap();
+        on_a_word_boundary(&synth, 4 * 2 * 2);
+        assert_eq!(ascii_tag(&synth, Tag::ImageDescription), mosaic);
+
+        // Two letters and a NUL fit in a classic entry, and the length is
+        // odd. No pad byte follows, so the values after it stay even.
+        let fits = tmp("fits.tif");
+        write_gray16(&fits, &Plane::zeros(2, 2), &meta("ab")).unwrap();
+        on_a_word_boundary(&fits, 2 * 2 * 2);
+        assert_eq!(ascii_tag(&fits, Tag::ImageDescription), "ab");
     }
 
     fn ascii_tag(path: &Path, tag: Tag) -> String {

@@ -51,8 +51,7 @@ fn a_picture_past_four_gigabytes_is_written_whole() {
     let _ = std::fs::remove_file(&path);
     let (size, description, dims, samples) = read.unwrap();
     assert!(size > (w * h) as u64, "{size} bytes");
-    // An even length gains one trailing space. The text is the same JSON.
-    assert_eq!(description.as_deref().map(str::trim_end), Some(DESCRIPTION));
+    assert_eq!(description.as_deref(), Some(DESCRIPTION));
     assert_eq!(dims, (w as u32, h as u32));
     assert_eq!(samples, [7, 8, 9]);
 }
