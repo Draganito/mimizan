@@ -1,10 +1,10 @@
 # Was die Härtung behoben hat
 
 Stand dieses Zweigs: `cursor/release-hardening-f1b9`. Die
-behobenen Punkte reichen bis Commit `0e729a2`.
+behobenen Punkte reichen bis Commit `aaea5bc`.
 `main` ist unverändert. Die Programme nennen weiter die Version 0.20.15.
 
-148 gemeldete Fehler sind behoben. Dieselbe Ursache haben oft mehrere
+151 gemeldete Fehler sind behoben. Dieselbe Ursache haben oft mehrere
 Prüfer gemeldet. Sie steht hier einmal, mit allen Nummern. Die Nummern
 sind die des Prüfregisters.
 
@@ -12,7 +12,7 @@ Die Referenzbilder der Entwicklung und die 17 Fensterbilder sind Bit
 für Bit gleich geblieben, ausser wo ein Abschnitt sagt, dass sich das
 Ergebnis ändert. Die 24 Kodak-Bilder der Schlussmessung sind dieselben.
 
-Am Ende stehen die drei Punkte, die in diesem Stand noch offen sind.
+Am Ende steht, was in diesem Stand mit Absicht nicht geändert ist.
 
 ## Dateien
 
@@ -764,6 +764,46 @@ Commits `18e1098`, `19ff0a7`, `310e0ef`. Die beiden Systemfragen
 bleiben modal. Das ist die bewusste Entscheidung C1-012, kein
 offener Fehler.
 
+### Der gemerkte Ordner hängt kein Volume ein
+
+Nummer: C1-011.
+
+**Vorher.** Das Lesezeichen des Ordners wurde beim Start auf dem
+Hauptfaden aufgelöst, nur mit dem Merkmal für die Sandbox. Ein Volume,
+das nicht da war, konnte eingehängt werden, und das Fenster wartete.
+
+**Nachher.** Die Auflösung läuft auf einem eigenen Faden, ohne
+Oberfläche und ohne Einhängen. Ein Ordner, der nicht da ist, bleibt
+zu. Das Fenster ist vorher da. Hat man schon einen Ordner geöffnet,
+ersetzt das späte Ergebnis ihn nicht. Auf einem Mac ist das nicht
+gelaufen. Commit `57ad2ac`.
+
+### Das offene Bild behält seinen Ordner
+
+Nummer: C1-021.
+
+**Vorher.** Die Freigabe eines Ordners fiel, sobald ein anderer
+Ordner gewählt wurde, auch wenn das offene Bild noch im alten Ordner
+lag. Das Rezept daneben wurde abgelehnt.
+
+**Nachher.** Die alte Freigabe bleibt, bis dieses Bild zu ist. Ein
+Schreiben neben die Datei ist in beiden Ordnern erlaubt. Die Leiste
+zeigt den neuen Ordner. Auf einem Mac ist das nicht gelaufen.
+Commit `548cbb1`.
+
+### Die Speicheradresse bleibt bis zum Schreiben
+
+Nummer: C1-033.
+
+**Vorher.** Die Adresse des Speicherdialogs blieb für die ganze
+Laufzeit, wenn der Zugriff anfing, und wurde sofort losgelassen,
+wenn er nicht anfing. In beiden Fällen konnte das Schreiben die
+Datei verlieren, die der Dialog freigegeben hatte.
+
+**Nachher.** Die Adresse wird gehalten, bis der Export geschrieben,
+abgelehnt oder abgebrochen ist, und der Zugriff endet dann. Auf
+einem Mac ist das nicht gelaufen. Commit `aaea5bc`.
+
 ## Veröffentlichung
 
 ### Nur der Veröffentlichungsschritt darf schreiben
@@ -812,21 +852,6 @@ CI bleibt die installierte Fassung. Das Paket wird weiter gepackt und
 signiert. Commit `8b48e62`.
 
 ## Nicht in diesem Stand
-
-Drei Punkte sind gemeldet und in diesem Stand nicht geändert.
-
-- **C1-011.** Das Lesezeichen des Ordners wird beim Start auf dem
-  Hauptfaden aufgelöst und kann ein Volume einhängen und fragen.
-  Die Änderung ist beschrieben: ohne Oberfläche und ohne Einhängen,
-  ausserhalb des Hauptfadens. Sie ist nicht in diesem Zweig, weil
-  sie hier nicht auf einem Mac laufen kann.
-- **C1-021.** Die Freigabe eines Ordners fällt, wenn ein anderer
-  Ordner gewählt wird, obwohl das offene Bild noch im alten Ordner
-  liegen kann. Die alte Freigabe soll bleiben, bis die Sitzung
-  schliesst. Ebenfalls nicht in diesem Zweig.
-- **C1-033.** Die Adresse des Speicherdialogs wird nur in einem von
-  zwei Fällen gehalten. Sie soll gehalten werden, bis das Schreiben
-  fertig ist, und dann losgelassen. Ebenfalls nicht in diesem Zweig.
 
 **C1-012** bleibt, mit Absicht. Die beiden Systemfragen auf dem Mac
 laufen modal, bis sie sich schliessen. Eine Scheibe würde die
