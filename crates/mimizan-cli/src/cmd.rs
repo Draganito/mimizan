@@ -418,11 +418,17 @@ pub struct PrintArgs {
 /// USM amount from the camera file of the camera the negative's description
 /// names. `Ok(None)` when that description is absent, is not JSON, names no
 /// camera, or the camera has no file. A description that is present and
-/// cannot be read is that read's error. A camera file that is there and does
-/// not load is an error naming the file, as `negative` names it.
+/// cannot be read is that read's error. A file that will not open is left
+/// for the print to refuse. A camera file that is there and does not load
+/// is an error naming the file, as `negative` names it.
 fn usm_default_from_negative(negative: &Path, cameras: &Path) -> Result<Option<f64>> {
-    let Some(text) = mimizan_core::tiffin::read_gray_header(negative)? else {
-        return Ok(None);
+    // A tag that is there and is not text is this error. A file that will
+    // not open is refused when the print reads it, with that message.
+    let text = match mimizan_core::tiffin::read_gray_header(negative) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(None),
+        Err(err @ mimizan_core::Error::Invalid(_)) => return Err(err.into()),
+        Err(_) => return Ok(None),
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Ok(None);
@@ -875,9 +881,11 @@ mod tests {
 
     /// A missing description, text that is not JSON, no camera name and no
     /// camera file are `Ok(None)`, and both places a print asks still take
-    /// 0. A file that is there and is not a camera file is an error naming
-    /// that file. A description whose tag is present and is not text is the
-    /// error of that read. The recipe is decided here; no print is rendered.
+    /// 0. A file that will not open is the same, and the print refuses it
+    /// when it is read. A file that is there and is not a camera file is an
+    /// error naming that file. A description whose tag is present and is not
+    /// text is the error of that read. The recipe is decided here; no print
+    /// is rendered.
     #[test]
     fn a_camera_file_that_does_not_load_stops_the_usm_default() {
         let dir = std::env::temp_dir().join(format!("mimizan-cmd-usm-{}", std::process::id()));
@@ -889,6 +897,11 @@ mod tests {
         write_bare(&bare);
         assert_eq!(usm_default_from_negative(&bare, &cameras).unwrap(), None);
         takes_zero(&bare, &cameras);
+
+        let not_tiff = dir.join("not-tiff");
+        std::fs::write(&not_tiff, b"not a tiff").unwrap();
+        assert_eq!(usm_default_from_negative(&not_tiff, &cameras).unwrap(), None);
+        takes_zero(&not_tiff, &cameras);
 
         let text = dir.join("text.tif");
         write_described(&text, "not json");
