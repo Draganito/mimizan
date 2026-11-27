@@ -1206,6 +1206,10 @@ pub struct App {
     /// time that folder (and its subfolders) stay open.
     #[cfg(target_os = "macos")]
     folder_grant: Option<mimizan_mac::FolderGrant>,
+    /// The grant of a picture that is still open after its folder was
+    /// replaced. Dropped when that picture is gone.
+    #[cfg(target_os = "macos")]
+    session_grant: Option<mimizan_mac::FolderGrant>,
     /// The remembered folder, resolved off the main thread so a missing
     /// volume does not hold the first frame.
     #[cfg(target_os = "macos")]
@@ -1438,6 +1442,8 @@ impl App {
             #[cfg(target_os = "macos")]
             folder_grant: None,
             #[cfg(target_os = "macos")]
+            session_grant: None,
+            #[cfg(target_os = "macos")]
             restore_rx: None,
             #[cfg(target_os = "macos")]
             restore_within: None,
@@ -1572,7 +1578,7 @@ impl App {
                 Remembered::Opened(grant) => {
                     let root = grant.path().to_path_buf();
                     let open = within.filter(|f| grant_covers(f, &root)).unwrap_or(root);
-                    self.folder_grant = Some(grant);
+                    self.install_folder_grant(grant);
                     self.set_folder(&open);
                 }
                 Remembered::Missing => {
@@ -1608,17 +1614,53 @@ impl App {
     fn hold_grant(&mut self, path: &Path) {
         #[cfg(target_os = "macos")]
         if let Some(grant) = mimizan_mac::adopt(path) {
-            self.folder_grant = Some(grant);
+            self.install_folder_grant(grant);
         }
         #[cfg(not(target_os = "macos"))]
         let _ = path;
+    }
+
+    /// Put `grant` on the open folder. When the picture still sits in the
+    /// folder this replaces, that grant stays until the picture is gone.
+    #[cfg(target_os = "macos")]
+    fn install_folder_grant(&mut self, grant: mimizan_mac::FolderGrant) {
+        if let Some(old) = self.folder_grant.take() {
+            let (in_old, in_new, name) = {
+                let picture = self.developed_path();
+                let in_old = picture.is_some_and(|p| grant_covers(p, old.path()));
+                let in_new = picture.is_some_and(|p| grant_covers(p, grant.path()));
+                let name = picture
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (in_old, in_new, name)
+            };
+            if keep_grant_for_open_picture(in_old, in_new) {
+                self.session_grant = Some(old);
+                self.log(format!("{name} keeps its folder open until the picture closes"));
+            }
+        }
+        self.folder_grant = Some(grant);
+    }
+
+    /// Drop the parked grant once the picture it covered is gone.
+    fn retire_session_grant(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let root = self.session_grant.as_ref().map(|g| g.path().to_path_buf());
+            let still =
+                root.is_some_and(|root| self.developed_path().is_some_and(|p| grant_covers(p, &root)));
+            if !still {
+                self.session_grant = None;
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
     fn choose_folder(&mut self) {
         let Some(grant) = mimizan_mac::pick_folder() else { return };
         let path = grant.path().to_path_buf();
-        self.folder_grant = Some(grant);
+        self.install_folder_grant(grant);
         self.set_folder(&path);
         self.show_strip = true;
     }
@@ -3649,13 +3691,22 @@ impl App {
     }
 
     /// Whether the program may write beside the file: inside the sandbox
-    /// only within the folder grant; elsewhere always, as far as this can
-    /// tell without trying.
+    /// only within the open folder or the folder the picture still holds;
+    /// elsewhere always, as far as this can tell without trying.
     fn may_write_beside(&self, path: &Path) -> bool {
-        match self.grant_root() {
-            Some(root) => path.starts_with(&root),
-            None => !sandboxed(),
+        let in_open = self.grant_root().is_some_and(|root| grant_covers(path, &root));
+        let in_picture = self.picture_grant_root().is_some_and(|root| grant_covers(path, &root));
+        beside_is_allowed(sandboxed(), in_open, in_picture)
+    }
+
+    /// The folder a picture kept after the strip moved on. Absent outside
+    /// a sandbox.
+    fn picture_grant_root(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        if sandboxed() {
+            return self.session_grant.as_ref().map(|g| g.path().to_path_buf());
         }
+        None
     }
 
     /// A session let go for room still has its recipe on the edit, so the
@@ -6954,6 +7005,19 @@ fn remembered_folder_applies(has_folder: bool, has_grant: bool) -> bool {
     !has_folder && !has_grant
 }
 
+/// The old folder stays open when the picture is in it and the folder
+/// just opened does not contain that picture.
+fn keep_grant_for_open_picture(picture_in_old: bool, picture_in_new: bool) -> bool {
+    picture_in_old && !picture_in_new
+}
+
+/// A write beside a file is allowed inside the open folder or the folder
+/// the picture still holds. Outside a sandbox it is allowed as far as
+/// this can tell.
+fn beside_is_allowed(sandboxed: bool, in_open_folder: bool, in_picture_folder: bool) -> bool {
+    in_open_folder || in_picture_folder || !sandboxed
+}
+
 /// A breadcrumb step can be opened when it sits inside the sandbox grant.
 /// With no grant, a sandboxed build only keeps the current step.
 fn crumb_is_open(sandboxed: bool, root: Option<&Path>, anc: &Path, last: bool) -> bool {
@@ -7812,6 +7876,7 @@ impl eframe::App for App {
         self.poll_restore();
         self.start_redevelop();
         self.handle_events(ctx);
+        self.retire_session_grant();
         self.guard_close(ctx);
     }
 
@@ -9743,6 +9808,19 @@ mod crumb_tests {
         assert!(grant_covers(inside, root));
         assert!(grant_covers(root, root));
         assert!(!grant_covers(sibling, root));
+    }
+
+    #[test]
+    fn the_open_picture_keeps_its_folder_until_it_closes() {
+        use super::{beside_is_allowed, keep_grant_for_open_picture};
+        assert!(keep_grant_for_open_picture(true, false));
+        assert!(!keep_grant_for_open_picture(true, true));
+        assert!(!keep_grant_for_open_picture(false, false));
+        assert!(!keep_grant_for_open_picture(false, true));
+        assert!(beside_is_allowed(true, false, true));
+        assert!(beside_is_allowed(true, true, false));
+        assert!(!beside_is_allowed(true, false, false));
+        assert!(beside_is_allowed(false, false, false));
     }
 }
 
