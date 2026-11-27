@@ -48,6 +48,18 @@ pub fn ascii_description(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// One trailing space when the length plus the NUL the encoder writes is
+/// odd. TIFF wants the next value on a word boundary, and the encoder
+/// writes it immediately after this one. The text is already ASCII; in a
+/// JSON description the space is white space.
+fn with_even_nul(s: &str) -> Cow<'_, str> {
+    if (s.len() + 1).is_multiple_of(2) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(format!("{s} "))
+    }
+}
+
 /// Quantise `clamp(v,0,1)*65535` and write a 16-bit grey TIFF in strips of
 /// 64 rows.
 pub fn write_gray16(path: &Path, plane: &Plane, meta: &TiffMeta<'_>) -> Result<()> {
@@ -251,14 +263,16 @@ where
 {
     let mut img = enc.new_image::<C>(image.width as u32, image.height as u32)?;
     img.rows_per_strip(image.rows_per_strip)?;
+    let description = with_even_nul(description);
     {
         let d = img.encoder();
         if let Some(icc) = tags.icc {
             d.write_tag(Tag::IccProfile, icc)?;
         }
-        d.write_tag(Tag::ImageDescription, description)?;
+        d.write_tag(Tag::ImageDescription, description.as_ref())?;
         if tags.software {
-            d.write_tag(Tag::Software, concat!("mimizan ", env!("CARGO_PKG_VERSION")))?;
+            let software = with_even_nul(concat!("mimizan ", env!("CARGO_PKG_VERSION")));
+            d.write_tag(Tag::Software, software.as_ref())?;
         }
         if tags.orientation >= 1 && tags.orientation <= 8 {
             d.write_tag(Tag::Orientation, tags.orientation)?;
@@ -271,7 +285,28 @@ where
             d.write_tag(Tag::YResolution, per_inch())?;
         }
     }
-    img.write_data(image.data)?;
+    // `write_data` finishes the directory when the strips are in, and a
+    // pad byte has to be written before that.
+    let mut at = 0usize;
+    loop {
+        let n = usize::try_from(img.next_strip_sample_count())
+            .map_err(|_| crate::Error::Invalid("a strip does not fit in memory".into()))?;
+        if n == 0 {
+            break;
+        }
+        let Some(end) = at.checked_add(n).filter(|end| *end <= image.data.len()) else {
+            return Err(crate::Error::Invalid("the picture has fewer samples than its size".into()));
+        };
+        img.write_strip(&image.data[at..end])?;
+        at = end;
+    }
+    // The header and every value written before the strips have an even
+    // length, so an odd number of sample bytes leaves the directory on an
+    // odd offset. The zero byte is not a sample and not a tag.
+    if !std::mem::size_of_val(image.data).is_multiple_of(2) {
+        img.encoder().write_data(0u8)?;
+    }
+    img.finish()?;
     Ok(())
 }
 
@@ -383,5 +418,101 @@ mod tests {
         };
         assert_eq!(tag(&big, Tag::IccProfile), Some(icc.clone()));
         assert_eq!(tag(&big, Tag::IccProfile), tag(&classic, Tag::IccProfile));
+    }
+
+    /// TIFF wants a value and a directory on a word boundary. The encoder
+    /// writes the next value straight after this one and the NUL it adds,
+    /// so a description of even length takes one trailing space and one
+    /// that is already even with the NUL does not. An 8-bit strip with an
+    /// odd number of bytes is followed by one zero byte, which is not a
+    /// sample. The description reads back as the same JSON.
+    #[test]
+    fn a_value_and_the_directory_start_on_a_word_boundary() {
+        // Even length: the NUL makes it odd, so the file gains one space.
+        // Odd length: even once the NUL is counted, so no space.
+        let even = r#"{"k":"vv"}"#;
+        let odd = r#"{"k":"v"}"#;
+        assert_eq!(even.len() % 2, 0);
+        assert!((odd.len() + 1).is_multiple_of(2));
+
+        let meta = |description| TiffMeta {
+            description,
+            trc: GrayTrc::Gamma(2.2),
+            orientation: 1,
+            dpi: Some(300.0),
+        };
+        let grey = tmp("even-grey16.tif");
+        write_gray16(&grey, &Plane::zeros(4, 2), &meta(even)).unwrap();
+        // 4 × 2 samples, two bytes each: an even strip.
+        on_a_word_boundary(&grey, 4 * 2 * 2);
+        let raw = ascii_tag(&grey, Tag::ImageDescription);
+        assert_eq!(raw, format!("{even} "));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap(), serde_json::json!({"k": "vv"}));
+        let software = concat!("mimizan ", env!("CARGO_PKG_VERSION"));
+        assert!((software.len() + 1).is_multiple_of(2), "{software}");
+        assert_eq!(ascii_tag(&grey, Tag::Software), software);
+
+        let mask = tmp("odd-grey8.tif");
+        write_gray8(&mask, 3, 1, &[1, 2, 3], even).unwrap();
+        on_a_word_boundary(&mask, 3);
+        let raw = ascii_tag(&mask, Tag::ImageDescription);
+        assert_eq!(raw, format!("{even} "));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap(), serde_json::json!({"k": "vv"}));
+
+        let plain = tmp("odd-text.tif");
+        write_gray16(&plain, &Plane::zeros(2, 2), &meta(odd)).unwrap();
+        on_a_word_boundary(&plain, 2 * 2 * 2);
+        assert_eq!(ascii_tag(&plain, Tag::ImageDescription), odd);
+        assert_eq!(ascii_tag(&plain, Tag::Software), software);
+    }
+
+    fn ascii_tag(path: &Path, tag: Tag) -> String {
+        let mut dec = tiff::decoder::Decoder::new(std::fs::File::open(path).unwrap()).unwrap();
+        dec.get_tag_ascii_string(tag).unwrap()
+    }
+
+    /// Every out-of-line value, the first strip and the directory start on
+    /// an even offset. One strip, so the directory follows the samples
+    /// (and one zero byte when that length is odd). The strip's own count
+    /// stays the samples.
+    fn on_a_word_boundary(path: &Path, sample_bytes: usize) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0..2], if cfg!(target_endian = "little") { b"II" } else { b"MM" });
+        let u16_at = |o: usize| u16::from_ne_bytes([bytes[o], bytes[o + 1]]);
+        let u32_at = |o: usize| u32::from_ne_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        assert_eq!(u16_at(2), 42, "classic TIFF");
+        let ifd = u32_at(4) as usize;
+        assert_eq!(ifd % 2, 0, "directory at {ifd}");
+        let n = u16_at(ifd) as usize;
+        let entries: Vec<usize> = (0..n).map(|i| ifd + 2 + 12 * i).collect();
+        let mut out_of_line = 0;
+        for &e in &entries {
+            let size = match u16_at(e + 2) {
+                1 | 2 | 6 | 7 => 1,
+                3 | 8 => 2,
+                4 | 9 | 11 => 4,
+                5 | 10 | 12 => 8,
+                t => panic!("tag {} has type {t}", u16_at(e)),
+            };
+            if size * u32_at(e + 4) as usize > 4 {
+                let offset = u32_at(e + 8);
+                assert_eq!(offset % 2, 0, "tag {} at {offset}", u16_at(e));
+                out_of_line += 1;
+            }
+        }
+        assert!(out_of_line >= 1, "{out_of_line} values out of line");
+
+        let strips = entries.iter().copied().find(|&e| u16_at(e) == Tag::StripOffsets.to_u16()).unwrap();
+        assert_eq!(u32_at(strips + 4), 1, "one strip, so the directory follows the samples");
+        let strip = u32_at(strips + 8) as usize;
+        assert_eq!(strip % 2, 0, "first strip at {strip}");
+        let counts = entries.iter().copied().find(|&e| u16_at(e) == Tag::StripByteCounts.to_u16()).unwrap();
+        assert_eq!(u32_at(counts + 8) as usize, sample_bytes, "the pad byte is not a sample");
+        if sample_bytes % 2 == 1 {
+            assert_eq!(ifd, strip + sample_bytes + 1, "one zero byte after the odd strip");
+            assert_eq!(bytes[strip + sample_bytes], 0);
+        } else {
+            assert_eq!(ifd, strip + sample_bytes, "no pad byte after an even strip");
+        }
     }
 }

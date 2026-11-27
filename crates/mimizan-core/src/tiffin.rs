@@ -253,12 +253,14 @@ mod tests {
         assert_eq!(described_range(None).unwrap(), 1.0);
 
         let text = tmp("text.tif");
+        // Eight letters. One trailing space keeps the next value on a word
+        // boundary; the text is still not JSON, so the range is 1.
         write_gray8(&text, 1, 1, &[0], "not json").unwrap();
         let read = read_gray(&text).unwrap();
-        assert_eq!(read.description.as_deref(), Some("not json"));
+        assert_eq!(read.description.as_deref(), Some("not json "));
         assert_eq!(described_range(read.description.as_deref()).unwrap(), 1.0);
-        assert_eq!(read_gray_header(&text).unwrap().as_deref(), Some("not json"));
-        assert_eq!(read_negative(&text).unwrap().description.as_deref(), Some("not json"));
+        assert_eq!(read_gray_header(&text).unwrap().as_deref(), Some("not json "));
+        assert_eq!(read_negative(&text).unwrap().description.as_deref(), Some("not json "));
 
         let bad = tmp("byte.tif");
         write_gray8(&bad, 1, 1, &[0], "not json").unwrap();
