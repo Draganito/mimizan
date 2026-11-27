@@ -136,7 +136,9 @@ impl std::fmt::Display for Tone {
 
 /// What may be moved while the method is being measured. The defaults are
 /// the separation measured on the Kodak set: the X-Trans bank without its
-/// line priors, plus eight directions whose luminance falls only as `f¹`.
+/// line priors, plus eight directions whose luminance falls only as `f¹`
+/// and eight that are the same in every frame, with a colour as strong
+/// as the luminance ([`VIVID`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Knobs {
     /// Gaussian σ of the window the priors are weighed in, px.
@@ -292,7 +294,7 @@ pub fn separate(
         let m = tone.mosaic_of(&linear, width);
         // On the curve. The buffer the samples came from is not read again.
         drop(linear);
-        let priors = bayer_priors(&found);
+        let (priors, behind) = bayer_priors(&found);
         let sel = Weighing {
             sigma: knobs.sigma,
             near: knobs.near,
@@ -300,7 +302,7 @@ pub fn separate(
             sharp: knobs.sharp,
             bias: knobs.bias,
         };
-        let (c1, c2) = bayer2::separate_bank(&m, &priors, &sel, progress);
+        let (c1, c2) = bayer2::separate_handicapped(&m, &priors, &behind, &sel, progress);
         let sep = xtrans::from_chroma(&m, &tile, c1, c2);
         let refine =
             Refine { rounds: knobs.rounds, check: knobs.check, hold: knobs.hold, ..Refine::default() };
@@ -312,30 +314,92 @@ pub fn separate(
     (without_line_checker(rgb), found.prior, tone)
 }
 
-/// The spectra weighed per pixel.
+/// The colour of the spectra of [`bayer_priors`] that take nothing from
+/// the frame, in the measure of [`Prior::chroma`]: as strong as the
+/// luminance at 0.25 c/px.
+///
+/// What the search finds is one spectrum for all of the frame, and it is
+/// the likeliest one: no other says the whole mosaic better. But a part
+/// of the frame can be nothing like the whole. Where saturated colours
+/// lie side by side among photographs, sixteen times the colour found is
+/// still a tenth of what lies there, and in a frame of nothing but such
+/// colours the likeliest spectrum is noise behind a soft lens. So how the
+/// same coloured rings of 5 to 8 px came out hung on the rest of the
+/// frame: 17.5 to 34.7 dB below 0.2 c/px, over four frames. With spectra
+/// that are the same in every frame it is 36.5 to 38.2 dB.
+///
+/// The spectra are the same, not what comes of them: the curve the frame
+/// is solved under and the spectra they are weighed against are still the
+/// frame's.
+pub const VIVID: f64 = 1.0;
+
+/// The lens of a [`VIVID`] spectrum, Gaussian σ in px: the lens of the
+/// Kodak bench, which the README takes for the sharpest a real lens is on
+/// a real sensor. It is a middle. Measured on the ring chart among
+/// photographs: at 0.5 px the coloured rings gain 0.8 dB and the black
+/// and white ones lose 2.0 dB more to colour; at 1 px the coloured rings
+/// lose 0.7 dB and the black and white ones gain 0.6 dB.
+pub const VIVID_LENS: f64 = 0.75;
+
+/// The noise of a [`VIVID`] spectrum, in the measure of [`Prior::noise`].
+/// A hundred times the search's start: what such a spectrum cannot say is
+/// then noise to it and not colour. With a tenth of it the black and white
+/// rings lose 2.1 dB more; with ten times it the coloured rings below
+/// 0.2 c/px fall from 38.2 to 31.7 dB.
+pub const VIVID_NOISE: f64 = 0.01;
+
+/// What a [`VIVID`] spectrum starts behind, in the units of the score.
+///
+/// At the sensor's limit a black and white line and a colour are the same
+/// mosaic, and a spectrum with this much colour takes the line for colour.
+/// So it has to say the mosaic this much better than the others before it
+/// is taken. Measured on a ring chart lying among photographs: with none,
+/// black and white rings lose 3.0 dB, all of it at 2 px and finer, and
+/// the 24 Kodak pictures up to 0.07 dB; with this, 1.6 dB and nothing,
+/// and the coloured rings keep 38.2 of their 38.7 dB below 0.2 c/px.
+pub const VIVID_BEHIND: f64 = 0.5;
+
+/// The spectra weighed per pixel, and what each starts behind.
 ///
 /// The one found; that one with a sixteenth, a quarter, four and sixteen
-/// times the colour; and sixteen with a direction. Eight hold four times
-/// the colour to their direction with `cos⁸`. In the other eight the
+/// times the colour; and twenty-four with a direction. Eight hold four
+/// times the colour to their direction with `cos⁸`. In the next eight the
 /// luminance falls only as `f¹`, so a fine edge can keep its contrast, and
 /// the direction is held with `cos³²`: a Bayer edge is one photosite wide.
-/// Their colour stays the one found, and it still falls with frequency. A
-/// colour that does not fall is taken on a saturated picture and the
-/// colour goes: that is what the X-Trans line priors did here (kodim03
-/// and kodim15, about 7 dB), and they are not in this bank.
+/// Their colour stays the one found. All of these are behind the lens the
+/// mosaic was found to have.
 ///
-/// All of them are behind the lens the mosaic was found to have.
-pub fn bayer_priors(found: &Spectrum) -> Vec<Spectrum> {
+/// The last eight take nothing from the frame: the spectrum the search
+/// starts from, with a colour of [`VIVID`] held to its direction with
+/// `cos⁸`, behind a lens of [`VIVID_LENS`] and with a noise of
+/// [`VIVID_NOISE`]. They start [`VIVID_BEHIND`] behind; nothing else does.
+/// With them a file of 24 megapixels takes 75 s where it took 69 s, on
+/// four cores, and no more memory.
+///
+/// In all of them the colour still falls with frequency. A colour that
+/// does not fall is taken on a saturated picture and the colour goes: that
+/// is what the X-Trans line priors did here (kodim03 and kodim15, about
+/// 7 dB), and they are not in this bank.
+pub fn bayer_priors(found: &Spectrum) -> (Vec<Spectrum>, Vec<f64>) {
     let colour = |f: f64| found.with(Prior { chroma: found.prior.chroma.map(|c| c * f), ..found.prior });
     let towards = |q: Spectrum, k: f64| {
         (0..8).map(move |j| q.with(Prior { oriented: Some((PI * j as f64 / 8.0, k)), ..q.prior }))
     };
     let along = found.with(Prior { alpha: found.prior.alpha.min(1.0), ..found.prior });
+    let vivid = Spectrum::plain(Prior {
+        chroma: [VIVID; 2],
+        lens: VIVID_LENS,
+        noise: VIVID_NOISE,
+        ..Prior::default()
+    });
     let mut priors = vec![found.clone()];
     priors.extend([0.0625, 0.25, 4.0, 16.0].map(colour));
     priors.extend(towards(colour(4.0), 8.0));
     priors.extend(towards(along, 32.0));
-    priors
+    let mut behind = vec![0.0; priors.len()];
+    priors.extend(towards(vivid, 8.0));
+    behind.resize(priors.len(), VIVID_BEHIND);
+    (priors, behind)
 }
 
 fn chroma(r: &[f64], g: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
@@ -598,7 +662,8 @@ fn channel_at(x: usize, y: usize) -> usize {
 mod tests {
     use super::{
         bayer2, bayer_priors, channel_at, demosaic, from_luma, luma, red_site, tone_scores,
-        without_line_checker, BayerPhase, Knobs, Plane, Prior, Spectrum, Tone, Weighing, BLACK_SLOPE,
+        without_line_checker, xtrans, BayerPhase, Knobs, Plane, Prior, Spectrum, Tone, Weighing, XTile,
+        BAYER6, BLACK_SLOPE, VIVID, VIVID_BEHIND, VIVID_LENS, VIVID_NOISE,
     };
     use std::f64::consts::PI;
 
@@ -787,7 +852,7 @@ mod tests {
         let (w, h) = (72usize, 56usize);
         let at = scene(w, h);
         let turned = move |x: usize, y: usize| at(y, x);
-        let bank = bayer_priors(&Spectrum::plain(Prior {
+        let (bank, behind) = bayer_priors(&Spectrum::plain(Prior {
             lens: 0.4,
             noise: 1e-3,
             chroma: [0.02, 0.01],
@@ -796,8 +861,8 @@ mod tests {
         let weighing = Weighing::default();
         let straight = Plane::from_vec(w, h, mosaic_of(w, h, &scene(w, h)));
         let across = Plane::from_vec(h, w, mosaic_of(h, w, &turned));
-        let (a1, a2) = bayer2::separate_bank(&straight, &bank, &weighing, &|_| {});
-        let (b1, b2) = bayer2::separate_bank(&across, &bank, &weighing, &|_| {});
+        let (a1, a2) = bayer2::separate_handicapped(&straight, &bank, &behind, &weighing, &|_| {});
+        let (b1, b2) = bayer2::separate_handicapped(&across, &bank, &behind, &weighing, &|_| {});
         let mut worst = 0.0f64;
         for y in 0..h {
             for x in 0..w {
@@ -806,6 +871,147 @@ mod tests {
             }
         }
         assert!(worst < 1e-9, "the turned frame differs by {worst}");
+    }
+
+    #[test]
+    fn the_vivid_spectra_have_a_direction_and_start_behind() {
+        let found = Spectrum::plain(Prior { chroma: [0.003, 0.002], ..Prior::default() });
+        let (bank, behind) = bayer_priors(&found);
+        assert_eq!(bank.len(), behind.len(), "a handicap for every spectrum");
+        let mut vivid = 0;
+        for (spectrum, behind) in bank.iter().zip(&behind) {
+            if spectrum.prior.chroma == [VIVID; 2] {
+                vivid += 1;
+                assert!(spectrum.prior.oriented.is_some(), "a vivid spectrum without a direction");
+                assert_eq!(*behind, VIVID_BEHIND);
+            } else {
+                assert_eq!(*behind, 0.0, "a spectrum with the frame's colour starts behind");
+            }
+        }
+        assert_eq!(vivid, 8);
+        assert_eq!(bank[0].prior.chroma, found.prior.chroma, "the first is not the one found");
+    }
+
+    #[test]
+    fn the_vivid_spectra_are_the_same_in_every_frame() {
+        // One frame of little colour behind a sharp lens, one that is all
+        // noise behind a soft one, as the search finds a frame of nothing
+        // but coloured rings, and that one with a measured lens.
+        let quiet = Spectrum::plain(Prior { lens: 0.4, noise: 1e-3, chroma: [0.002; 2], ..Prior::default() });
+        let loud = Spectrum::plain(Prior {
+            alpha: 1.3,
+            alpha_c: 6.0,
+            lens: 4.0,
+            noise: 0.1,
+            chroma: [0.4, 0.2],
+            ..Prior::default()
+        });
+        let measured = Spectrum { lens: Some(std::sync::Arc::new(vec![1.0, 0.5, 0.1])), ..loud.clone() };
+        let last = |found: &Spectrum| {
+            let (bank, _) = bayer_priors(found);
+            bank[bank.len() - 8..].to_vec()
+        };
+        let first = last(&quiet);
+        for spectrum in &first {
+            assert_eq!(spectrum.prior.chroma, [VIVID; 2]);
+            assert_eq!(spectrum.prior.lens, VIVID_LENS);
+            assert_eq!(spectrum.prior.noise, VIVID_NOISE);
+            assert!(spectrum.lens.is_none(), "a vivid spectrum behind the frame's lens");
+        }
+        for other in [last(&loud), last(&measured)] {
+            for (a, b) in first.iter().zip(&other) {
+                assert_eq!(a.prior, b.prior, "a vivid spectrum took something from the frame");
+                assert!(b.lens.is_none(), "a vivid spectrum behind the frame's lens");
+            }
+        }
+    }
+
+    /// Rings of two colours about the middle of a frame, `period` px from
+    /// one ring to the next of its colour, and how far a bank puts them
+    /// from that: the root mean square over the three channels, 16 px in.
+    fn rings_off(period: f64, one: [f64; 3], other: [f64; 3], bank: &[Spectrum], behind: &[f64]) -> f64 {
+        let (w, h) = (96usize, 96usize);
+        let at = |x: usize, y: usize| {
+            let r = ((x as f64 - 47.3).powi(2) + (y as f64 - 48.6).powi(2)).sqrt();
+            let t = 0.5 + 0.5 * (2.0 * PI * r / period).cos();
+            [0, 1, 2].map(|c| one[c] + t * (other[c] - one[c]))
+        };
+        let m =
+            Plane::from_vec(w, h, (0..w * h).map(|i| at(i % w, i / w)[channel_at(i % w, i / w)]).collect());
+        let tile = XTile::from_name(BAYER6).expect("the Bayer tile");
+        let (c1, c2) = bayer2::separate_handicapped(&m, bank, behind, &Weighing::default(), &|_| {});
+        let got = xtrans::from_chroma(&m, &tile, c1, c2).rgb();
+        let mut sum = 0.0;
+        for y in 16..h - 16 {
+            for x in 16..w - 16 {
+                let want = at(x, y);
+                for (plane, v) in [&got.r, &got.g, &got.b].into_iter().zip(want) {
+                    sum += (plane.data[y * w + x] - v).powi(2);
+                }
+            }
+        }
+        (sum / (3 * (w - 32) * (h - 32)) as f64).sqrt()
+    }
+
+    /// Two spectra the search has found around a chart. Among photographs
+    /// the colour, all of the frame taken together, is a five-hundredth of
+    /// the luminance. In a frame of nothing but coloured rings the
+    /// likeliest spectrum is noise behind the softest lens the search has.
+    fn found_around_a_chart() -> [Prior; 2] {
+        let among_photographs = Prior { lens: 0.4, noise: 1e-3, chroma: [0.002; 2], ..Prior::default() };
+        let alone = Prior {
+            alpha: 2.9,
+            alpha_c: 5.5,
+            lens: 4.0,
+            noise: 0.1,
+            chroma: [0.0, 2e-4],
+            ..Prior::default()
+        };
+        [among_photographs, alone]
+    }
+
+    #[test]
+    fn fine_colours_side_by_side_come_back_whatever_the_frame_holds() {
+        // Blue on red is a colour and nothing else; magenta on green has a
+        // step in the luminance as well. With sixteen times the frame's
+        // colour for the most, the rings' colour went to the luminance: they
+        // were 0.146 to 0.263 off. With the vivid spectra blue on red is
+        // 0.011 off among photographs and 0.013 alone, magenta on green
+        // 0.016 and 0.038.
+        let pairs = [([0.15, 0.20, 0.70], [0.70, 0.20, 0.15]), ([0.75, 0.15, 0.60], [0.15, 0.65, 0.20])];
+        for (one, other) in pairs {
+            let mut errors = Vec::new();
+            for found in found_around_a_chart() {
+                let (bank, behind) = bayer_priors(&Spectrum::plain(found));
+                let n = bank.len() - 8;
+                let without = rings_off(6.0, one, other, &bank[..n], &behind[..n]);
+                let with = rings_off(6.0, one, other, &bank, &behind);
+                assert!(
+                    with < 0.25 * without,
+                    "the rings are {with} off with the vivid spectra, {without} without, under {found:?}"
+                );
+                errors.push(with);
+            }
+            let (least, most) = (errors[0].min(errors[1]), errors[0].max(errors[1]));
+            assert!(most < 3.0 * least, "the same rings are {least} off in one frame and {most} in another");
+        }
+    }
+
+    #[test]
+    fn a_black_and_white_ring_is_not_taken_for_colour_when_the_vivid_spectra_start_behind() {
+        // At 2.2 px the rings are close to the sensor's limit, where a
+        // black and white line and a colour are the same mosaic. Without
+        // the vivid spectra they are 0.01512 off, with them 0.01514, and
+        // 0.01869 if those start level with the others.
+        let (black, white) = ([0.05; 3], [0.85; 3]);
+        let [found, _] = found_around_a_chart();
+        let (bank, behind) = bayer_priors(&Spectrum::plain(found));
+        let n = bank.len() - 8;
+        let without = rings_off(2.2, black, white, &bank[..n], &behind[..n]);
+        let level = rings_off(2.2, black, white, &bank, &vec![0.0; bank.len()]);
+        let with = rings_off(2.2, black, white, &bank, &behind);
+        assert!(with < 1.05 * without, "the rings are {with} off with the vivid spectra, {without} without");
+        assert!(level > 1.1 * with, "the rings are {with} off behind and {level} level");
     }
 
     #[test]
