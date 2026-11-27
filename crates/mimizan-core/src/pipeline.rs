@@ -8,7 +8,7 @@ use crate::error::Result;
 use crate::ingest::{ingest, ingest_rgb, Channels, IngestParams, IngestReport, Mosaic, NoiseModel};
 use crate::mix::{mix, mix_into, ColorFilter, WeightSpace, Weights};
 use crate::plane::Plane;
-use crate::separate::{separate, MaskMode, SeparateParams};
+use crate::separate::{separate, tile_margin, MaskMode, SeparateParams, FIRST_TILE};
 use rayon::prelude::*;
 use serde::Serialize;
 #[cfg(feature = "decode-rawler")]
@@ -373,16 +373,20 @@ pub fn mask_sidecar(mask_max: &Plane, saturated: &[u8]) -> Result<Vec<u8>> {
         .collect())
 }
 
-/// Bytes a development of `frame` holds at its widest point. Bayer: the
-/// Dubois estimate at its peak, nine f64 planes (`dubois::estimate`), over
-/// the frame as decoded (two bytes a sample, four for a float file) and the
-/// saturation map, a byte. The second estimate of the chrominance, below
-/// the colour ceiling, runs in windows of a megapixel beside five held
-/// planes and stays under that peak on any frame above 3 MP. Mono: the
-/// normalised plane beside the measured one, over the frame and the
-/// saturation map. Three channels: a plate at its widest, the three planes
-/// (which became the separation in place), the plate's three and the
-/// frame being mixed, over the frame's three samples a pixel and the
+/// Bytes a development of `frame` holds at its widest point. Bayer, the
+/// default path: the larger of five full f64 planes (the mosaic, the two
+/// chrominances, the luminance and the mask) and three full f64 planes
+/// plus nine f64 planes of one window. The window's side is a tile of
+/// 2048 plus the wider margin, 128, on every side, so the Dubois and the
+/// Off modes both fit. Over that, the frame as decoded (two bytes a
+/// sample, four for a float file) and the saturation map, a byte. The
+/// chrominance below the colour ceiling is estimated again in a smaller
+/// window beside those five planes; the quote does not add that window.
+/// The adaptive mode estimates the whole frame and is not this quote.
+/// Mono: the normalised plane beside the measured one, over the frame and
+/// the saturation map. Three channels: a plate at its widest, the three
+/// planes (which became the separation in place), the plate's three and
+/// the frame being mixed, over the frame's three samples a pixel and the
 /// saturation map; nothing is estimated, and one negative needs less.
 /// A guide for refusing a file the machine cannot hold, measured to about
 /// a tenth; what it does not see is the allocator and whatever else the
@@ -404,12 +408,21 @@ pub fn develop_memory(w: usize, h: usize, kind: crate::decode::SensorKind) -> u6
 
 fn develop_memory_for(w: usize, h: usize, kind: crate::decode::SensorKind, sample: u64) -> u64 {
     let px = w as u64 * h as u64;
-    let (planes, maps) = match kind {
-        crate::decode::SensorKind::Bayer(_) => (9, 1),
-        crate::decode::SensorKind::Mono => (2, 1),
-        crate::decode::SensorKind::Rgb => (7, 1),
-    };
-    px * (planes * 8 + kind.samples() as u64 * sample + maps)
+    let held = kind.samples() as u64 * sample + 1;
+    match kind {
+        crate::decode::SensorKind::Bayer(_) => {
+            // Five planes once the windows are gone; three, plus nine of
+            // one window, while a tile is estimated. The window is a tile
+            // of the first separation plus the wider margin on every side,
+            // so both Dubois and Off fit in the quote.
+            let five = px * (5 * 8 + held);
+            let side = FIRST_TILE as u64 + 2 * tile_margin(MaskMode::Off) as u64;
+            let during = px * (3 * 8 + held) + side * side * 9 * 8;
+            five.max(during)
+        }
+        crate::decode::SensorKind::Mono => px * (2 * 8 + held),
+        crate::decode::SensorKind::Rgb => px * (7 * 8 + held),
+    }
 }
 
 #[cfg(test)]
@@ -418,19 +431,25 @@ mod tests {
 
     #[test]
     fn develop_memory_is_the_dubois_peak() {
-        // 24 MP Bayer: nine planes of 195 MB plus the frame, measured 2.1 GB
-        // over the process baseline. Mono is a fraction of that.
+        // 24 MP Bayer. Five full planes, the frame and the map are
+        // 1 048 578 048 bytes. Three full planes plus nine of a window of
+        // side 2048 + 2·128 are 1 040 615 424. The quote is the larger.
+        let px = 6048u64 * 4032;
+        let five = px * (5 * 8 + 3);
+        let three = px * (3 * 8 + 3) + (2048u64 + 2 * 128).pow(2) * 9 * 8;
+        assert_eq!(five, 1_048_578_048);
+        assert_eq!(three, 1_040_615_424);
         let bayer =
             develop_memory(6048, 4032, crate::decode::SensorKind::Bayer(crate::cfa::BayerPhase::RGGB));
-        assert!((1.8e9..2.0e9).contains(&(bayer as f64)), "{bayer}");
+        assert_eq!(bayer, five.max(three));
+        // Mono is two planes, the frame and the map: 19 bytes a pixel.
         let mono = develop_memory(6048, 4032, crate::decode::SensorKind::Mono);
-        assert!(mono * 3 < bayer, "{mono} vs {bayer}");
-        // Three channels, 26 MP as a plate: measured 63 bytes a pixel,
-        // seven planes, six bytes of frame and the map. Nothing is
-        // estimated, so it stays under the Bayer figure.
+        assert_eq!(mono, 6048 * 4032 * 19);
+        // Three channels, 26 MP as a plate: 63 bytes a pixel, seven
+        // planes, six bytes of frame and the map. Nothing is estimated.
         let channels = develop_memory(6048, 4032, crate::decode::SensorKind::Rgb);
         assert_eq!(channels, 6048 * 4032 * 63);
-        assert!(mono < channels && channels < bayer, "{mono} {channels} {bayer}");
+        assert!(mono < channels, "{mono} {channels}");
         // A float file holds two more bytes a sample; an integer one is
         // the figure above.
         let (w, h) = (6048usize, 4032usize);

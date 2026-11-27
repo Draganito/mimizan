@@ -9171,7 +9171,7 @@ mod crop_drag_tests {
 
     #[test]
     fn the_session_goes_when_the_next_development_would_not_fit() {
-        // A 24 MP development, about 1.8 GB: with 2 GB free the picture on
+        // A 24 MP development, about 1.0 GB: with 1 GB free the picture on
         // the stage goes first; with 6 GB free it stays; a machine that
         // cannot say keeps everything.
         let need = mimizan_core::pipeline::develop_memory(
@@ -9179,11 +9179,11 @@ mod crop_drag_tests {
             4032,
             mimizan_core::decode::SensorKind::Bayer(mimizan_core::cfa::BayerPhase::RGGB),
         );
-        assert!(must_make_room(need, 2_000_000_000));
+        assert!(must_make_room(need, 1_000_000_000));
         assert!(!must_make_room(need, 6_000_000_000));
         assert!(!must_make_room(need, 0));
         // The same rule the worker refuses by, from the same figure.
-        assert_eq!(must_make_room(need, 2_000_000_000), !memory_fits(need, 2_000_000_000));
+        assert_eq!(must_make_room(need, 1_000_000_000), !memory_fits(need, 1_000_000_000));
         assert!(memory_fits(1_000, (1_000.0 * MEMORY_HEADROOM) as u64 + 1));
         assert!(!memory_fits(1_000, (1_000.0 * MEMORY_HEADROOM) as u64 - 1));
     }

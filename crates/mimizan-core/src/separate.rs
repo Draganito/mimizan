@@ -205,7 +205,13 @@ fn fixed(m: &Plane, phase: BayerPhase, c1: Plane, mut c2a: Plane, c2b: Plane) ->
 /// native mix are untouched, and every mix has `L̂` as its luminance.
 pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation> {
     let phase = mosaic.phase.ok_or_else(|| crate::Error::Invalid("separate needs a Bayer mosaic".into()))?;
-    let mut sep = separate_linear(mosaic, phase, p);
+    // Adaptive reads its neighbours in blocks, past any fixed margin, so
+    // it is estimated on the whole mosaic. Dubois and Off are finite
+    // filters and give the same chrominance from a window.
+    let mut sep = match p.mask {
+        MaskMode::Dubois | MaskMode::Off => separate_in_tiles(mosaic, phase, p),
+        MaskMode::Adaptive => separate_linear(mosaic, phase, p),
+    };
     if let Some(ceiling) = mosaic.colour_ceiling {
         let t = std::time::Instant::now();
         let tiles = chroma_below(mosaic, ceiling, phase, p, &mut sep);
@@ -220,16 +226,64 @@ pub fn separate(mosaic: &Mosaic, p: &SeparateParams) -> crate::Result<Separation
 /// the block size of the `adaptive` mask and of both margins.
 const TILE: usize = 1024;
 
+/// Side, in pixels, of the tiles the first separation walks in the
+/// `Dubois` and `Off` modes. Wider than [`TILE`], so the margin is a
+/// smaller share of each tile. A multiple of both margins, and of two,
+/// so a window that starts on a tile stays on the phase of the frame.
+pub(crate) const FIRST_TILE: usize = 2048;
+
 /// How far outside a tile the mosaic is read to estimate the chrominance
 /// inside it. The `dubois` estimate at a pixel reads 16 pixels around it
 /// (a 15-tap band and a Gaussian of radius 9 behind it), the fixed one 36
 /// (73 taps); the `adaptive` one adds its 64-pixel blocks. Even, so a
 /// window starts on the phase of the frame.
-fn tile_margin(mask: MaskMode) -> usize {
+pub(crate) fn tile_margin(mask: MaskMode) -> usize {
     match mask {
         MaskMode::Dubois => 64,
         MaskMode::Off | MaskMode::Adaptive => 128,
     }
+}
+
+/// Chrominance of a `Dubois` or `Off` mosaic, one tile at a time, then
+/// the luminance of the whole mosaic.
+///
+/// A tile's window is the tile plus [`tile_margin`] of that mode, cut at
+/// the frame. The origin is even, so the window has the phase of the
+/// frame, and the window is the mosaic as it is. [`separate_linear`]
+/// estimates it, the tile's `C1` and `C2` are copied out, and the window
+/// is dropped before the next tile. Every filter in these two modes is
+/// finite and shorter than the margin, so the chrominance inside the tile
+/// is that of the whole frame, to the bit. The luminance is then that of
+/// the whole mosaic and these two planes, and the mask is the constant
+/// fill [`fixed`] writes. The adaptive mode is not estimated here: a
+/// window's block mask is not the frame's.
+fn separate_in_tiles(mosaic: &Mosaic, phase: BayerPhase, p: &SeparateParams) -> Separation {
+    let m = &mosaic.plane;
+    let (w, h) = (m.width, m.height);
+    let margin = tile_margin(p.mask);
+    debug_assert!(p.mask != MaskMode::Adaptive);
+    debug_assert!(FIRST_TILE.is_multiple_of(2) && margin.is_multiple_of(2));
+    let mut c1 = Plane::zeros(w, h);
+    let mut c2 = Plane::zeros(w, h);
+    for ty in (0..h).step_by(FIRST_TILE) {
+        for tx in (0..w).step_by(FIRST_TILE) {
+            let (x0, y0) = (tx.saturating_sub(margin), ty.saturating_sub(margin));
+            let (x1, y1) = ((tx + FIRST_TILE + margin).min(w), (ty + FIRST_TILE + margin).min(h));
+            let window = mosaic_window(mosaic, x0, y0, x1 - x0, y1 - y0);
+            let part = separate_linear(&window, phase, p);
+            drop(window);
+            let (tw, th) = ((tx + FIRST_TILE).min(w) - tx, (ty + FIRST_TILE).min(h) - ty);
+            for (dst, src) in [(&mut c1, &part.c1), (&mut c2, &part.c2)] {
+                for y in 0..th {
+                    let from = &src.row(ty - y0 + y)[tx - x0..tx - x0 + tw];
+                    dst.row_mut(ty + y)[tx..tx + tw].copy_from_slice(from);
+                }
+            }
+        }
+    }
+    let lum = luminance(m, phase, &c1, &c2);
+    let mask_max = Plane::from_vec(w, h, vec![FIXED_MASK_VALUE; w * h]);
+    Separation { lum, c1, c2, mask_max, rounds: 1, phase }
 }
 
 /// Replace the chrominance of `sep` by the estimate of the mosaic held to
@@ -244,10 +298,9 @@ fn tile_margin(mask: MaskMode) -> usize {
 /// result is, to the bit, the chrominance of a separation of the whole
 /// held mosaic; in the `adaptive` mode the block mask of a window is the
 /// mask of the frame up to what its blocks see of their neighbours.
-/// A tile's window is at most `TILE + 2·margin` on a side, so the pass
-/// stays far under the peak of the first one on any frame above 3 MP; a
-/// smaller frame is one window, and holds a second estimate beside the
-/// first.
+/// A tile's window is at most `TILE + 2·margin` on a side. One window
+/// exists at a time, beside the planes the first separation left; a
+/// smaller frame is one window.
 fn chroma_below(
     mosaic: &Mosaic,
     ceiling: f64,
@@ -301,16 +354,14 @@ fn chroma_below(
     tiles
 }
 
-/// The `w×h` window of `mosaic` at `(x0, y0)`, held to `ceiling`. The
+/// The `w×h` window of `mosaic` at `(x0, y0)`, as the mosaic is. The
 /// origin is even, so the window has the phase of the frame.
-fn held_window(mosaic: &Mosaic, ceiling: f64, x0: usize, y0: usize, w: usize, h: usize) -> Mosaic {
+fn mosaic_window(mosaic: &Mosaic, x0: usize, y0: usize, w: usize, h: usize) -> Mosaic {
     debug_assert!(x0.is_multiple_of(2) && y0.is_multiple_of(2));
     let full = mosaic.plane.width;
     let mut plane = Plane::zeros(w, h);
     plane.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-        for (o, &v) in row.iter_mut().zip(&mosaic.plane.row(y0 + y)[x0..x0 + w]) {
-            *o = v.min(ceiling);
-        }
+        row.copy_from_slice(&mosaic.plane.row(y0 + y)[x0..x0 + w]);
     });
     let mut saturated = vec![0u8; w * h];
     saturated.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
@@ -329,6 +380,14 @@ fn held_window(mosaic: &Mosaic, ceiling: f64, x0: usize, y0: usize, w: usize, h:
         xyz_to_cam: mosaic.xyz_to_cam,
         report: mosaic.report.clone(),
     }
+}
+
+/// The `w×h` window of `mosaic` at `(x0, y0)`, held to `ceiling`. The
+/// origin is even, so the window has the phase of the frame.
+fn held_window(mosaic: &Mosaic, ceiling: f64, x0: usize, y0: usize, w: usize, h: usize) -> Mosaic {
+    let mut window = mosaic_window(mosaic, x0, y0, w, h);
+    window.plane.data.par_iter_mut().for_each(|v| *v = v.min(ceiling));
+    window
 }
 
 fn separate_linear(mosaic: &Mosaic, phase: BayerPhase, p: &SeparateParams) -> Separation {
@@ -718,6 +777,51 @@ mod tests {
             let (a, b) = (separate(&mosaic, &sp).unwrap(), separate(&as_it_is, &sp).unwrap());
             assert!(a.lum.data == b.lum.data && a.c1.data == b.c1.data && a.c2.data == b.c2.data, "{mask:?}");
             assert_eq!(chroma_below(&mosaic, mosaic.colour_ceiling.unwrap(), phase, &sp, &mut a.clone()), 0);
+        }
+    }
+
+    /// A frame wider and taller than one tile of the first separation, odd
+    /// on both sides. Dubois and Off, every phase: the tiled separation
+    /// matches a separation of the whole mosaic, to the bit. The last tile
+    /// is a strip past the margin, so it is not inside the first window.
+    #[test]
+    fn the_first_separation_matches_the_whole_mosaic_to_the_bit() {
+        use crate::ingest::{ingest, IngestParams, WhiteBalance};
+
+        let (w, h) = (FIRST_TILE + 129, FIRST_TILE + 155);
+        assert!(w > FIRST_TILE + tile_margin(MaskMode::Off) && h > FIRST_TILE + tile_margin(MaskMode::Off));
+        assert!(w % 2 == 1 && h % 2 == 1);
+        let differ = |what: &str, phase: BayerPhase, mask: MaskMode, a: &[f64], b: &[f64]| {
+            assert_eq!(a.len(), b.len(), "{phase} {mask:?} {what}");
+            if let Some(i) = a.iter().zip(b).position(|(a, b)| a != b) {
+                panic!("{phase} {mask:?} {what} at {i}: {} vs {}", a[i], b[i]);
+            }
+        };
+        for phase in BayerPhase::ALL {
+            let raw: Vec<u16> = (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    let wave = 0.5 + 0.5 * ((x as f64 * 0.037).sin() * (y as f64 * 0.021).cos());
+                    let level = match phase.color_at(x, y) {
+                        Color::R => 80.0 + 400.0 * wave,
+                        Color::G => 200.0 + 500.0 * wave,
+                        Color::B => 40.0 + 300.0 * (1.0 - wave),
+                    };
+                    level as u16
+                })
+                .collect();
+            let p = IngestParams { wb: WhiteBalance::None, ..IngestParams::default() };
+            let mut mosaic = ingest(&raw_frame(w, h, phase, raw), &p).unwrap();
+            mosaic.colour_ceiling = None;
+            assert_eq!((mosaic.plane.width, mosaic.plane.height), (w, h));
+            for mask in [MaskMode::Dubois, MaskMode::Off] {
+                let sp = SeparateParams { mask, ..SeparateParams::default() };
+                let tiled = separate(&mosaic, &sp).unwrap();
+                let whole = separate_linear(&mosaic, phase, &sp);
+                differ("C1", phase, mask, &tiled.c1.data, &whole.c1.data);
+                differ("C2", phase, mask, &tiled.c2.data, &whole.c2.data);
+                differ("luminance", phase, mask, &tiled.lum.data, &whole.lum.data);
+            }
         }
     }
 

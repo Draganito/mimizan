@@ -201,10 +201,13 @@ fn orientation(m: &Plane, kb: &[f64], g: &[f64], scratch: &mut Plane) -> Plane {
 }
 
 /// The estimation: returns `(c1, c2)`. Planes are dropped as early as the
-/// data flow allows and the low-passes run in place; the peak is nine full
-/// planes (mosaic included) with the coherence step and the tensor, eight
-/// without the tensor, seven without either. `pipeline::develop_memory`
-/// quotes this figure.
+/// data flow allows and the low-passes run in place; the peak is nine
+/// planes of the mosaic it is given (mosaic included) with the coherence
+/// step and the tensor, eight without the tensor, seven without either.
+/// The default path gives it one window of the frame, and
+/// `pipeline::develop_memory` quotes that windowed peak. The adaptive
+/// separation still reaches nine planes on the whole frame; the quote is
+/// the default path.
 fn estimate(m: &Plane, phase: BayerPhase, p: &DuboisParams, k: &Kernels) -> (Plane, Plane) {
     let c = phase.carriers();
     let (w, h) = (m.width, m.height);
