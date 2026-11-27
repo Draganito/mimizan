@@ -1,0 +1,84 @@
+# Colour rings: the Bayer separation against other RAW developers
+
+A measurement, not a part of the packages. It asks how Mimizan's colour
+plate (`--mask dubois`, `adaptive`, `off`) and its least-squares demosaic
+stand on extreme colour geometry: fine rings, sectors, stars, edges and
+grids in pairs of saturated colours, up to the Nyquist limit and past it.
+The reference is the ring target in the DPReview studio scene.
+
+## What it does
+
+`run_synth.py` renders the charts 8 times supersampled, blurs them as a
+lens does, integrates over the pixel, samples an RGGB mosaic with base-ISO
+noise and writes a DNG. Every developer opens that DNG. Each result is
+measured against the scene before the mosaic.
+
+| Chart | Content |
+|---|---|
+| `dpr` | the DPReview ring disc: rings, a sector of rings twice as fine, a centre four times as fine; periods 12/6/3 px and 8.8/4.4/2.2 px |
+| `rings` | concentric rings, period 8 px down to 1.6 px (Nyquist is 2 px) |
+| `zone` | zone plate, frequency rising to 0.88 cycles a pixel in the corner |
+| `siemens` | Siemens star, 60 cycles |
+| `edges` | slanted edges at 4, 14, 31, 47, 76 and 86 degrees |
+| `grids` | lines of 2 to 4 px period, checkerboards, hairlines, dots |
+
+Eight colour pairs: the four of the DPReview target (magenta on orange,
+blue on red, cyan on blue, yellow on cyan), red on green, green on magenta,
+blue on yellow, and black on white. Two palettes: `sat`, saturated sRGB
+colours taken as camera values, and `cam`, the same colours as a Nikon Z f
+records them after white balance (paler, what a camera file holds). Three
+lenses: `sharp` (pixel aperture only), `lens` (Gaussian sigma 0.5 px) and
+`soft` (sigma 0.75 px, a lens with a low-pass filter).
+
+Equal terms: as-shot white balance, linear output, no sharpening, no noise
+reduction, no lens correction, no highlight reconstruction, no tone curve.
+A 3x3 matrix fitted on twelve flat patches takes each developer's colour to
+the original's; on the synthetic files it stays within 0.001 of identity.
+
+| Program | Methods |
+|---|---|
+| Mimizan | plate with mask Dubois, Adaptive, Off (`mimizan negative --dng`); least-squares demosaic (`examples/bayer_ls_develop.rs`), alone and with the chart lying in a frame of photographs |
+| LibRaw (`dcraw_emu`) | bilinear, VNG, PPG, AHD, DCB, DHT, AAHD |
+| RawTherapee | AMaZE, RCD, DCB, LMMSE, IGV, AHD, EAHD, HPHD, VNG4, Fast |
+| darktable | RCD, AMaZE, LMMSE, PPG, VNG4 |
+| colour-demosaicing | Malvar 2004, Menon 2007 (from the mosaic, no file) |
+
+Measured per tile: CPSNR and luma PSNR on sRGB-encoded values, CIEDE2000,
+chroma error, false colour (distance in a\*b\* from the line between the
+tile's two colours), zipper (Lu and Tan 2003), the unrest and the width of
+edges, and the resolved frequency (where the normalised error first passes
+0.5).
+
+## Running it
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install -r bench/bayer-rings/requirements.txt
+cargo build --release -p mimizan-cli
+cargo build --release -p mimizan-cli --example bayer_ls_develop
+
+.venv/bin/python bench/bayer-rings/run_synth.py --out out/bayer-rings
+.venv/bin/python bench/bayer-rings/report.py --out out/bayer-rings
+```
+
+The programs are found on `PATH`, or named by `MIMIZAN`, `MIMIZAN_LS`,
+`DCRAW_EMU`, `RAWTHERAPEE_CLI` and `DARKTABLE_CLI`; one that is missing is
+left out. The versions used are written to `out/bayer-rings/versions.json`.
+All 36 scenes take about two hours on four cores; everything is cached
+under `--out`, which git ignores. `report.py` writes
+`out/bayer-rings/report/tables.md` and the comparison images to
+`out/bayer-rings/media/`.
+
+## Camera files
+
+```sh
+.venv/bin/python bench/bayer-rings/run_real.py --out out/bayer-rings \
+    --crop ringe:0.636,0.779,200 NikonZF.nef
+```
+
+Every method develops the whole file, the frames are aligned and fitted to
+one colour, and the same crop of each is drawn side by side. There is no
+original, so this part gives pictures and no figures. The studio scene of
+DPReview cannot be fetched by a script (the site asks for a human); the
+files have to be downloaded by hand. The default crop is where the colour
+rings lie in that scene; check it against the picture and move it with
+`--crop NAME:CX,CY,SIZE`.
