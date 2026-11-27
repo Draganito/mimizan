@@ -302,7 +302,7 @@ The straighten is in the recipe as one number, `angle`, and it sits in the pipel
 
 Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/releases).
 
-The separation works in double precision on the whole frame: a 24-megapixel file holds about 1.8 GB while it is developed, 45 megapixels 3.4 GB, 61 megapixels 4.5 GB, and the open picture keeps most of that afterwards. When the next file would not fit beside the open one, the desktop lets the open one go first. What still does not fit in the free memory is begun through the swap: on Linux for as long as the swap has room, and on macOS and Windows the page file grows and the file is started. A file past the swap as well is refused with the figures in the log rather than started.
+The separation works in double precision. The usual path estimates the colour of one window at a time and the luminance of the whole frame, and the picture is the same. A 24-megapixel file holds about 1.0 GB while it is developed, 45 megapixels 1.9 GB, 61 megapixels 2.6 GB, and the open picture keeps most of that afterwards. When the next file would not fit beside the open one, the desktop lets the open one go first. What still does not fit in the free memory is begun through the swap: on Linux for as long as the swap has room, and on macOS and Windows the page file grows and the file is started. A file past the swap as well is refused with the figures in the log rather than started.
 
 Debian and Ubuntu: [mimizan_0.20.15-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.20.15/mimizan_0.20.15-1_amd64.deb). Install the downloaded file:
 

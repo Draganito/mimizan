@@ -580,10 +580,14 @@ Cost on a 24.4-MP file (Ryzen 7 5700U, 16 threads, f64): separation 2.7 s
 with the default path, 3.7 s from file to TIFF; 2.17 s without the tensor
 (1.12 s without the ring, 0.75 s for the fixed estimator). The tensor is
 one separable low-pass of the mosaic, the two squared second differences
-and two Gaussian passes. Peak nine full f64 planes including the mosaic
-(1.8 GB), eight without the tensor: the two wide copies of the coherence
-step are convolved a second time where the bands are opened rather than
-held across the step (the same bits, 1.5 % of the time).
+and two Gaussian passes. The estimate peaks at nine full f64 planes of
+the mosaic it is given, including that mosaic, eight without the tensor:
+the two wide copies of the coherence step are convolved a second time
+where the bands are opened rather than held across the step (the same
+bits, 1.5 % of the time). The program gives the default path one window
+of the frame at a time, and the quoted hold of a 24-megapixel file is
+1.0 GB. The times above, and the 1.8 GB of nine planes of the whole
+frame, are the measurement of the whole frame.
 
 ### 4.6 What the separation guarantees
 

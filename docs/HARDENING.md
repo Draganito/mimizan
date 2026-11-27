@@ -1,9 +1,10 @@
 # Was die Härtung behoben hat
 
-Stand dieses Zweigs: `cursor/release-hardening-f1b9`, Commit `8b48e62`.
+Stand dieses Zweigs: `cursor/release-hardening-f1b9`. Die
+behobenen Punkte reichen bis Commit `0e729a2`.
 `main` ist unverändert. Die Programme nennen weiter die Version 0.20.15.
 
-147 gemeldete Fehler sind behoben. Dieselbe Ursache haben oft mehrere
+148 gemeldete Fehler sind behoben. Dieselbe Ursache haben oft mehrere
 Prüfer gemeldet. Sie steht hier einmal, mit allen Nummern. Die Nummern
 sind die des Prüfregisters.
 
@@ -11,7 +12,7 @@ Die Referenzbilder der Entwicklung und die 17 Fensterbilder sind Bit
 für Bit gleich geblieben, ausser wo ein Abschnitt sagt, dass sich das
 Ergebnis ändert. Die 24 Kodak-Bilder der Schlussmessung sind dieselben.
 
-Am Ende stehen die vier Punkte, die in diesem Stand noch offen sind.
+Am Ende stehen die drei Punkte, die in diesem Stand noch offen sind.
 
 ## Dateien
 
@@ -244,6 +245,29 @@ hinterlässt.
 Commits `57b6105`, `b90499c`, `17f8c1d`, `9fe5858`, `dc7facc`.
 Bilder mit mehr als 2000 gültigen Kanten bekommen eine andere
 gemessene Spitze.
+
+### Die erste Farbtrennung schätzt ein Fenster nach dem anderen
+
+Nummer: K5-001.
+
+**Vorher.** Dubois, die ausgeschaltete Maske und die adaptive Maske
+schätzten die Farbigkeit über das ganze Bild. Dubois hielt dabei bis
+zu neun Ebenen doppelter Genauigkeit in der Grösse des Bildes. Eine
+Datei von 24 Megapixeln brauchte dafür etwa 1,8 GB, bevor das Bild
+gemischt war.
+
+**Nachher.** Dubois und die ausgeschaltete Maske schätzen ein Fenster
+von 2048 Punkten plus dem Rand des Verfahrens, eines nach dem anderen.
+Jedes Filter dieser beiden Verfahren ist kürzer als der Rand, also
+sind Farbigkeit und Leuchtdichte dieselben Bits wie über das ganze
+Bild. Die Leuchtdichte wird einmal über das ganze Mosaik gerechnet.
+Die adaptive Maske bleibt auf dem ganzen Bild: ein Fenster davon ist
+nicht dasselbe. Die Speicherzahl für den üblichen Weg ist die grössere
+von fünf vollen Ebenen und drei vollen Ebenen plus neun Ebenen eines
+Fensters. Bei 24 Megapixeln sind das etwa 1,0 GB. Der zweite Durchgang
+unter der Farbdecke rechnet weiter in seinen eigenen, kleineren
+Fenstern. Die Zahl zählt dieses zweite Fenster nicht dazu.
+Commit `0e729a2`. Die Referenzbilder sind dieselben.
 
 ### Schärfen läuft auf dem Bild, und eine USM, die nicht läuft, liest keine Maske
 
@@ -789,7 +813,7 @@ signiert. Commit `8b48e62`.
 
 ## Nicht in diesem Stand
 
-Vier Punkte sind gemeldet und in diesem Commit nicht geändert.
+Drei Punkte sind gemeldet und in diesem Stand nicht geändert.
 
 - **C1-011.** Das Lesezeichen des Ordners wird beim Start auf dem
   Hauptfaden aufgelöst und kann ein Volume einhängen und fragen.
@@ -803,11 +827,6 @@ Vier Punkte sind gemeldet und in diesem Commit nicht geändert.
 - **C1-033.** Die Adresse des Speicherdialogs wird nur in einem von
   zwei Fällen gehalten. Sie soll gehalten werden, bis das Schreiben
   fertig ist, und dann losgelassen. Ebenfalls nicht in diesem Zweig.
-- **K5-001.** Die erste Farbtrennung hält neun volle Ebenen doppelter
-  Genauigkeit. Für Dubois und für ausgeschaltete Maske gibt ein
-  Ausschnitt dieselben Bits. Adaptiv nicht. Das ist die eine
-  Änderung, die nach diesem Stand noch läuft. Sie ist in diesem
-  Commit nicht enthalten.
 
 **C1-012** bleibt, mit Absicht. Die beiden Systemfragen auf dem Mac
 laufen modal, bis sie sich schliessen. Eine Scheibe würde die
