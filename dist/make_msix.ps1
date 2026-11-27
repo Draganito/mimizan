@@ -4,7 +4,10 @@
 #   dist/mimizan-<version>-x64.msix
 #   dist/mimizan-<version>-x64.msixupload
 # The upload file is what Partner Center takes. The Store signs it again.
-# The certificate made here only lets this machine install the package for the check.
+# The certificate made here signs the package. On CI the script installs
+# the package to check it and then puts the machine back. Off CI it does
+# not install, does not remove an installed copy, and does not change the
+# policy.
 # mimizan.exe sits next to the window. It is not its own app: an individual
 # Store account cannot submit an app without a window. mimizan-compare
 # stays in the download zip and is not copied into this package.
@@ -131,6 +134,10 @@ $Assets = Join-Path $Layout "Assets"
 New-Item -ItemType Directory -Path $Assets -Force | Out-Null
 $Thumb = $null
 $PackageFullName = $null
+$AllowKey = $null
+$CreatedAllowKey = $false
+$HadAllowAllTrustedApps = $false
+$OldAllowAllTrustedApps = $null
 
 try {
     Copy-Item -LiteralPath $Cli, $Gui -Destination $Layout
@@ -236,22 +243,38 @@ try {
     & $SignTool sign /fd SHA256 /f $pfx /p $pfxPassword $Msix
     if ($LASTEXITCODE -ne 0) { throw "ERROR: signtool failed" }
 
-    $unlock = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
-    if (-not (Test-Path -LiteralPath $unlock)) { New-Item -Path $unlock -Force | Out-Null }
-    New-ItemProperty -Path $unlock -Name AllowAllTrustedApps -Value 1 -PropertyType DWord -Force | Out-Null
-    Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
-
-    Get-AppxPackage -Name $IdentityName | Remove-AppxPackage -ErrorAction SilentlyContinue
-    Add-AppxPackage -Path $Msix
-    $installed = Get-AppxPackage -Name $IdentityName
-    if (-not $installed) { throw "ERROR: $IdentityName did not install" }
-    $PackageFullName = $installed.PackageFullName
-    foreach ($rel in @("mimizan-gui.exe", "mimizan.exe", "cameras\nikon_z_f.json", "look\neutral.json", "third-party\THIRD-PARTY.txt", "third-party\LGPL-2.1.txt")) {
-        if (-not (Test-Path -LiteralPath (Join-Path $installed.InstallLocation $rel))) {
-            throw "ERROR: installed package is missing $rel"
+    # A CI runner is discarded, so the check may remove a package of this
+    # name and turn side-loading on. The finally restores the policy and
+    # removes the package this run installed.
+    if ($env:CI) {
+        $unlock = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock"
+        $CreatedAllowKey = -not (Test-Path -LiteralPath $unlock)
+        if ($CreatedAllowKey) {
+            New-Item -Path $unlock -Force | Out-Null
+        } else {
+            $key = Get-Item -LiteralPath $unlock
+            $names = $key.GetValueNames()
+            if ($null -ne $names -and @($names) -contains "AllowAllTrustedApps") {
+                $HadAllowAllTrustedApps = $true
+                $OldAllowAllTrustedApps = $key.GetValue("AllowAllTrustedApps")
+            }
         }
+        $AllowKey = $unlock
+        New-ItemProperty -Path $unlock -Name AllowAllTrustedApps -Value 1 -PropertyType DWord -Force | Out-Null
+        Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\TrustedPeople | Out-Null
+
+        Get-AppxPackage -Name $IdentityName | Remove-AppxPackage -ErrorAction SilentlyContinue
+        Add-AppxPackage -Path $Msix
+        $installed = Get-AppxPackage -Name $IdentityName
+        if (-not $installed) { throw "ERROR: $IdentityName did not install" }
+        $PackageFullName = $installed.PackageFullName
+        foreach ($rel in @("mimizan-gui.exe", "mimizan.exe", "cameras\nikon_z_f.json", "look\neutral.json", "third-party\THIRD-PARTY.txt", "third-party\LGPL-2.1.txt")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $installed.InstallLocation $rel))) {
+                throw "ERROR: installed package is missing $rel"
+            }
+        }
+        Write-Host "==> installed $($installed.PackageFullName)"
     }
-    Write-Host "==> installed $($installed.PackageFullName)"
 
     # -a picks the format from the extension. .msixupload is not a name it
     # knows, so the archive has to be born as a .zip and renamed after.
@@ -277,14 +300,38 @@ try {
             Remove-AppxPackage -Package $PackageFullName -ErrorAction SilentlyContinue
         }
         if ($Thumb) {
-            Get-ChildItem Cert:\LocalMachine\TrustedPeople, Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
+            $stores = @("Cert:\CurrentUser\My")
+            if ($AllowKey) { $stores = @("Cert:\LocalMachine\TrustedPeople", "Cert:\CurrentUser\My") }
+            Get-ChildItem -Path $stores -ErrorAction SilentlyContinue |
                 Where-Object { $_.Thumbprint -eq $Thumb } |
                 Remove-Item -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        if ($AllowKey) {
+            if ($HadAllowAllTrustedApps) {
+                New-ItemProperty -Path $AllowKey -Name AllowAllTrustedApps -Value $OldAllowAllTrustedApps -PropertyType DWord -Force | Out-Null
+            } else {
+                Remove-ItemProperty -LiteralPath $AllowKey -Name AllowAllTrustedApps -ErrorAction SilentlyContinue
+            }
+            if ($CreatedAllowKey) {
+                $left = Get-Item -LiteralPath $AllowKey -ErrorAction SilentlyContinue
+                if ($left) {
+                    $names = $left.GetValueNames()
+                    $subs = $left.GetSubKeyNames()
+                    $nameCount = if ($null -eq $names) { 0 } else { @($names).Count }
+                    $subCount = if ($null -eq $subs) { 0 } else { @($subs).Count }
+                    if ($nameCount -eq 0 -and $subCount -eq 0) {
+                        Remove-Item -LiteralPath $AllowKey -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
         }
         if (Test-Path -LiteralPath $Stage) {
             Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
         }
     } catch {
         Write-Host "==> cleanup: $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $Stage) {
+            Remove-Item -LiteralPath $Stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
