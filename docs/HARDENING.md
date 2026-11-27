@@ -573,7 +573,7 @@ Nummern: C1-002, D1-001, C1-013, D1-009, X3-002.
 suchte neben sich, unter `target` und auf dem Pfad. Jede Bayer-Datei
 scheiterte. Die Kameradateien suchte sie zuerst im Arbeitsordner und
 in fünf Ordnern darüber. Ein Ordner namens `cameras` dort ersetzte
-die des Programms, und daselbe RAW wurde ein anderes Bild.
+die des Programms, und dasselbe RAW wurde ein anderes Bild.
 
 **Nachher.** Sie findet den Befehl im App-Bündel und die Kameradateien
 neben dem Programm, nach der Regel des Kerns.
