@@ -30,12 +30,14 @@ jobs:
     name: Sign and upload
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Apple silicon
         run: test "$(uname -m)" = arm64
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       # The dist build's cache, shared with the release (see release.yml).
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: dist
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -54,6 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/signing"
+          trap 'rm -rf "$dir"' EXIT
           mkdir -p "$dir"
           chmod 700 "$dir"
           printf '%s' "$MAC_DISTRIBUTION_P12" | base64 --decode > "$dir/distribution.p12"
@@ -64,7 +67,7 @@ jobs:
           export MAC_INSTALLER_P12="$dir/installer.p12"
           export MAC_APPSTORE_PROFILE="$dir/profile.provisionprofile"
           bash dist/sign_macos_appstore.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-appstore
           path: dist/*-appstore.pkg
@@ -81,8 +84,10 @@ jobs:
             exit 0
           fi
           mkdir -p "$HOME/private_keys"
-          printf '%s' "$ASC_API_KEY_P8" | base64 --decode > "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
-          chmod 600 "$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          key="$HOME/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$ASC_API_KEY_P8" | base64 --decode > "$key"
+          chmod 600 "$key"
           pkg=$(echo dist/*-appstore.pkg)
           xcrun altool --upload-app --type macos --file "$pkg" \
             --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
