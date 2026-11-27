@@ -85,6 +85,41 @@ on beside the error on the chart (`report/ls-prior.md`). The chart is the
 same in every frame; figures that differ show how far the result hangs on
 the rest of the picture.
 
+## Changing the least-squares demosaic
+
+```sh
+cargo build --release -p mimizan-cli --example bayer_ls_lab
+.venv/bin/python bench/bayer-rings/lab.py --cases rings-cam-lens:3,kodak:08 \
+    --variants "now: bank=default; before: bank=before"
+.venv/bin/python bench/bayer-rings/lab_matrix.py --variants "now: bank=default; before: bank=before"
+```
+
+`examples/bayer_ls_lab.rs` is that demosaic taken apart: the found
+spectrum can be changed, the bank spelt out item by item, a spectrum put
+behind the others, and the second step left off. `lab.py` keeps the search
+of each frame and separates only the chart again, so a variant takes
+seconds. A case is a chart in a frame of photographs (`rings-cam-lens:3`
+in the six photographs enlarged twice, `:3n` in ten at their own size
+behind the chart's lens, `:1` alone) or a Kodak picture (`kodak:08`,
+`kodak2:08` enlarged twice). `lab_matrix.py` prints one line a variant
+across charts and the change on the Kodak pictures.
+
+When a change is in the demosaic itself, the 36 scenes before and after:
+
+```sh
+.venv/bin/python bench/bayer-rings/before_after.py --keep
+cargo build --release -p mimizan-cli --example bayer_ls_develop
+.venv/bin/python bench/bayer-rings/run_synth.py --methods mz_ls
+.venv/bin/python bench/bayer-rings/before_after.py --media out/bayer-rings/media-before-after
+```
+
+`--keep` puts the cached results of the demosaic aside as the ones
+before; the last line writes `report/before-after.md` and strips of the
+original, both, and three other developers, of the chart among
+photographs and of the chart alone. After another change `--drop` throws
+the results away that are not put aside. `before_after_real.py` does the
+same for camera files `run_real.py` has run on.
+
 ## Camera files
 
 ```sh

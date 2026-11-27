@@ -521,7 +521,7 @@ class Scene:
         if key not in self._img:
             info = json.loads((self.work / f"{key}.json").read_text())
             img = np.load(self.work / f"{key}.npy").astype(np.float32) * (info.get("scale", 1.0) / 65535.0)
-            ox, oy = (0, 0) if key == CONTEXT_KEY else info.get("offset", [0, 0])
+            ox, oy = (0, 0) if key.startswith(CONTEXT_KEY) else info.get("offset", [0, 0])
             if (ox, oy) != (0, 0) or img.shape != self.truth.shape:
                 full = np.zeros_like(self.truth)
                 hh, ww = min(img.shape[0], full.shape[0] - oy), min(img.shape[1], full.shape[1] - ox)
