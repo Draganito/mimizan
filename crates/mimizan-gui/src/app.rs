@@ -1206,6 +1206,14 @@ pub struct App {
     /// time that folder (and its subfolders) stay open.
     #[cfg(target_os = "macos")]
     folder_grant: Option<mimizan_mac::FolderGrant>,
+    /// The remembered folder, resolved off the main thread so a missing
+    /// volume does not hold the first frame.
+    #[cfg(target_os = "macos")]
+    restore_rx: Option<std::sync::mpsc::Receiver<Remembered>>,
+    /// The folder the settings named, applied when the bookmark resolves
+    /// inside it.
+    #[cfg(target_os = "macos")]
+    restore_within: Option<PathBuf>,
     /// What the open save dialog will write when a name is picked.
     export_kind: ExportKind,
     cameras_dir: PathBuf,
@@ -1429,6 +1437,10 @@ impl App {
             list_open: false,
             #[cfg(target_os = "macos")]
             folder_grant: None,
+            #[cfg(target_os = "macos")]
+            restore_rx: None,
+            #[cfg(target_os = "macos")]
+            restore_within: None,
             cameras_dir,
             recipe_baseline: Recipe::on_paper(),
             unread_recipe: None,
@@ -1451,7 +1463,7 @@ impl App {
                 app.set_folder(&p);
             }
             Some(p) => app.open(p),
-            None => app.open_remembered(&persisted),
+            None => app.open_remembered(&persisted, &cc.egui_ctx),
         }
         app
     }
@@ -1505,22 +1517,71 @@ impl App {
 
     /// The sandbox grant, when this process is inside one. A Mac build that
     /// is not sandboxed keeps the last path and the pictures folder.
-    fn open_remembered(&mut self, persisted: &Persisted) {
+    /// Inside the sandbox the bookmark is resolved on another thread: the
+    /// window is up first, and a volume that is not there is not mounted.
+    fn open_remembered(&mut self, persisted: &Persisted, ctx: &egui::Context) {
         #[cfg(target_os = "macos")]
         if sandboxed() {
-            if let Some(bytes) = persisted.folder_bookmark.as_deref() {
-                if let Some(grant) = mimizan_mac::restore(bytes) {
-                    let root = grant.path().to_path_buf();
-                    let open = persisted.folder.clone().filter(|f| f.starts_with(&root)).unwrap_or(root);
-                    self.folder_grant = Some(grant);
-                    self.set_folder(&open);
+            if let Some(bytes) = persisted.folder_bookmark.clone() {
+                self.restore_within = persisted.folder.clone();
+                let ctx = ctx.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let spawned = std::thread::Builder::new().name("folder-restore".into()).spawn(move || {
+                    let remembered = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        mimizan_mac::restore(&bytes)
+                    })) {
+                        Ok(Some(grant)) => Remembered::Opened(grant),
+                        Ok(None) => Remembered::Missing,
+                        Err(_) => Remembered::Failed,
+                    };
+                    let _ = tx.send(remembered);
+                    ctx.request_repaint();
+                });
+                if spawned.is_ok() {
+                    self.restore_rx = Some(rx);
+                } else {
+                    self.log("the last folder could not be opened");
                 }
             }
             return;
         }
+        let _ = ctx;
         let last = persisted.folder.clone().filter(|f| f.is_dir());
         if let Some(f) = last.or_else(start_folder) {
             self.set_folder(&f);
+        }
+    }
+
+    /// Take the remembered folder when its thread has finished. A folder
+    /// the user already opened wins: the late result is dropped. A picture
+    /// opened on its own does not, so the remembered folder still arrives.
+    fn poll_restore(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let ready = match self.restore_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(remembered)) => remembered,
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => Remembered::Failed,
+                _ => return,
+            };
+            self.restore_rx = None;
+            let within = self.restore_within.take();
+            if !remembered_folder_applies(self.folder.is_some(), self.folder_grant.is_some()) {
+                return;
+            }
+            match ready {
+                Remembered::Opened(grant) => {
+                    let root = grant.path().to_path_buf();
+                    let open = within.filter(|f| grant_covers(f, &root)).unwrap_or(root);
+                    self.folder_grant = Some(grant);
+                    self.set_folder(&open);
+                }
+                Remembered::Missing => {
+                    self.log("the last folder is not available, so it was not opened");
+                }
+                Remembered::Failed => {
+                    self.log("the last folder could not be opened");
+                }
+            }
         }
     }
 
@@ -6872,6 +6933,27 @@ fn sandboxed() -> bool {
     std::env::var_os("APP_SANDBOX_CONTAINER_ID").is_some()
 }
 
+/// What the remembered-folder thread found. `Missing` is a volume that is
+/// not there: it was not mounted, and no dialog was shown.
+#[cfg(target_os = "macos")]
+enum Remembered {
+    Opened(mimizan_mac::FolderGrant),
+    Missing,
+    Failed,
+}
+
+/// A path sits inside a granted folder. A sibling whose name only starts
+/// with the folder's name does not.
+fn grant_covers(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+/// A folder resolved after the window is up replaces nothing the user has
+/// already opened. A picture opened on its own is not such a folder.
+fn remembered_folder_applies(has_folder: bool, has_grant: bool) -> bool {
+    !has_folder && !has_grant
+}
+
 /// A breadcrumb step can be opened when it sits inside the sandbox grant.
 /// With no grant, a sandboxed build only keeps the current step.
 fn crumb_is_open(sandboxed: bool, root: Option<&Path>, anc: &Path, last: bool) -> bool {
@@ -7727,6 +7809,7 @@ impl eframe::App for App {
     /// Worker results are collected here: eframe calls `logic` even while the
     /// window is hidden or covered, so an export finishes and logs regardless.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_restore();
         self.start_redevelop();
         self.handle_events(ctx);
         self.guard_close(ctx);
@@ -9646,6 +9729,20 @@ mod crumb_tests {
         assert!(crumb_is_open(false, None, above, false));
         assert!(!crumb_is_open(true, None, above, false));
         assert!(crumb_is_open(true, None, here, true));
+    }
+
+    #[test]
+    fn a_late_restore_leaves_a_folder_the_user_already_opened() {
+        use super::{grant_covers, remembered_folder_applies};
+        assert!(remembered_folder_applies(false, false));
+        assert!(!remembered_folder_applies(true, false));
+        assert!(!remembered_folder_applies(false, true));
+        let root = Path::new("/roll/a");
+        let inside = Path::new("/roll/a/night");
+        let sibling = Path::new("/roll/ab");
+        assert!(grant_covers(inside, root));
+        assert!(grant_covers(root, root));
+        assert!(!grant_covers(sibling, root));
     }
 }
 

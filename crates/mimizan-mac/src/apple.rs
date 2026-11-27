@@ -1,8 +1,10 @@
 //! `NSOpenPanel` / `NSSavePanel` and security-scoped bookmarks.
 //!
 //! The panel URL is what the sandbox allows. A bookmark made from that URL
-//! is stored with the settings and resolved on the next launch, which calls
-//! `startAccessingSecurityScopedResource` for as long as the grant is held.
+//! is stored with the settings and resolved on the next launch, off the
+//! main thread, without a dialog and without mounting a volume that is
+//! not there. `startAccessingSecurityScopedResource` runs for as long as
+//! the grant is held.
 
 use objc2::rc::autoreleasepool;
 use objc2::runtime::Bool;
@@ -120,22 +122,31 @@ pub fn pick_save(directory: Option<&Path>, file_name: &str, extensions: &[&str])
     Some(path)
 }
 
-/// The bookmark from the last launch. Nothing when it no longer resolves.
+/// The bookmark from the last launch. Nothing when it no longer resolves,
+/// including a volume that is not mounted: the resolve does not mount it
+/// and does not ask. Safe to call off the main thread, so the window can
+/// be up while a slow or missing drive is looked up.
+///
 /// A stale bookmark (the folder moved or was renamed) still resolves this
 /// time; it is made again from the resolved folder, so the next launch has
 /// a fresh one. One that is not stale is kept as it is.
 pub fn restore(bookmark: &[u8]) -> Option<FolderGrant> {
-    if bookmark.is_empty() || MainThreadMarker::new().is_none() {
+    if bookmark.is_empty() {
         return None;
     }
     let data = NSData::from_vec(bookmark.to_vec());
     let mut stale = Bool::NO;
+    // WithoutUI: no dialog. WithoutMounting: a volume that is not there
+    // stays unmounted and this returns nothing. WithSecurityScope: the
+    // URL can start its access below.
     // SAFETY: `stale` is a live local for the whole call, which is what the
     // out-pointer must point at; the method writes a BOOL into it.
     let url = unsafe {
         NSURL::URLByResolvingBookmarkData_options_relativeToURL_bookmarkDataIsStale_error(
             &data,
-            NSURLBookmarkResolutionOptions::WithSecurityScope,
+            NSURLBookmarkResolutionOptions::WithSecurityScope
+                | NSURLBookmarkResolutionOptions::WithoutUI
+                | NSURLBookmarkResolutionOptions::WithoutMounting,
             None,
             &mut stale as *mut Bool,
         )
@@ -153,8 +164,9 @@ pub fn restore(bookmark: &[u8]) -> Option<FolderGrant> {
 
 /// A folder the user dropped on the window. Only kept when the system
 /// agrees to a security-scoped bookmark; a plain path is not one.
+/// The bookmark is what keeps it, and making one does not need the main
+/// thread.
 pub fn adopt(path: &Path) -> Option<FolderGrant> {
-    MainThreadMarker::new()?;
     let text = path.to_str()?;
     let url = NSURL::fileURLWithPath(&NSString::from_str(text));
     // A grant from `hold` here has already started, so only the bookmark
@@ -200,6 +212,15 @@ fn security_bookmark(url: &NSURL) -> Vec<u8> {
     )
     .map(|data| data.to_vec())
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_grant_can_cross_to_the_thread_that_draws() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::FolderGrant>();
+    }
 }
 
 fn url_path(url: &NSURL) -> Option<PathBuf> {
