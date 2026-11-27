@@ -4,3 +4,4 @@ pillow==13.0.0
 tifffile==2026.11.26
 colour-demosaicing==0.2.7
 colour-science==0.4.7
+matplotlib==3.11.2

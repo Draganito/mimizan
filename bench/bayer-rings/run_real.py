@@ -9,7 +9,7 @@ Every method develops the whole file on the terms of `developers.py`
 (as-shot balance, linear, nothing sharpened or denoised). The frames are
 then brought to one geometry (a whole-pixel shift, the programs crop the
 sensor differently) and to one colour: each is fitted with one 3x3 to the
-LibRaw AHD frame, on the frame reduced 16 times, where no demosaicer
+frame of `--reference` (LibRaw AHD), reduced 16 times, where no demosaicer
 differs from another. The camera's matrix takes that colour to sRGB, the
 sRGB curve and one exposure for all follow. What is left to see in a crop
 is the demosaicing.
@@ -38,6 +38,7 @@ import montage
 from scenes import SRGB_TO_XYZ
 
 REFERENCE = "lr_ahd"
+MAX_SHIFT = 64
 DPREVIEW_RINGS = "ringe:0.636,0.779,200"
 SELECTION = [
     "mz_dubois", "mz_adaptive", "mz_off", "mz_ls", "lr_ahd", "lr_dcb",
@@ -99,7 +100,7 @@ def parse_crop(text):
     return name, float(cx), float(cy), int(size)
 
 
-def run_file(raw: Path, out: Path, crops, methods, progs, media: Path, zoom: int, cols: int, neutral=()):
+def run_file(raw: Path, out: Path, crops, methods, progs, media: Path, zoom: int, cols: int, neutral=(), reference=REFERENCE):
     stem = raw.stem
     work = out / "real" / stem
     infos = {}
@@ -114,7 +115,7 @@ def run_file(raw: Path, out: Path, crops, methods, progs, media: Path, zoom: int
             print(f"  {stem}: {m.label} failed: {str(e)[:400]}", file=sys.stderr, flush=True)
     if not infos:
         raise SystemExit(f"{raw}: no developer produced a frame")
-    ref_key = REFERENCE if REFERENCE in infos else next(iter(infos))
+    ref_key = reference if reference in infos else next(iter(infos))
     ref, _ = dev.develop(dev.BY_KEY[ref_key], raw, work, progs)
     matrix = next((i["xyz_to_cam"] for i in infos.values() if "xyz_to_cam" in i), None)
     to_srgb = camera_to_srgb(matrix) if matrix is not None else np.eye(3, dtype=np.float32)
@@ -129,6 +130,12 @@ def run_file(raw: Path, out: Path, crops, methods, progs, media: Path, zoom: int
     for key in infos:
         img = ref if key == ref_key else dev.develop(dev.BY_KEY[key], raw, work, progs)[0]
         dx, dy = (0, 0) if key == ref_key else shift_between(ref, img)
+        if max(abs(dx), abs(dy)) > MAX_SHIFT:
+            # No developer crops the sensor by that much: this frame, or the
+            # reference, is not a picture of the scene.
+            print(f"  {stem}: {dev.BY_KEY[key].label} does not match {dev.BY_KEY[ref_key].label} (shift {dx}, {dy}); left out", file=sys.stderr, flush=True)
+            report["methods"][key] = {"error": f"does not match the reference frame (shift {dx}, {dy})"}
+            continue
         on_ref = img if (dx, dy) == (0, 0) and img.shape == ref.shape else placed(img, ref.shape, dx, dy)
         cm = np.eye(3, dtype=np.float32) if key == ref_key else colour_to_reference(on_ref, ref)
         report["methods"][key] = {
@@ -161,7 +168,7 @@ def run_file(raw: Path, out: Path, crops, methods, progs, media: Path, zoom: int
                 note += f" · Farbe im Schwarzweiß {stray[(name, m.key)]:.2f}".replace(".", ",")
             panels.append((m.key, (m.label, note, kind, cut[(name, m.key)])))
             np.save(work / f"crop-{name}-{m.key}.npy", cut[(name, m.key)])
-        sub = "Weißabgleich wie aufgenommen, linear entwickelt, keine Schärfung, keine Rauschminderung; Farbe auf LibRaw AHD abgeglichen (3×3), sRGB-Kurve"
+        sub = f"Weißabgleich wie aufgenommen, linear entwickelt, keine Schärfung, keine Rauschminderung; Farbe auf {dev.BY_KEY[ref_key].label} abgeglichen (3×3), sRGB-Kurve"
         images = {}
         for tag, chosen, z in (
             ("auswahl", [p for k, p in panels if k in SELECTION], zoom),
@@ -189,6 +196,7 @@ def main():
     ap.add_argument("--media", type=Path, default=None, help="folder for the comparison PNGs (default OUT/media)")
     ap.add_argument("--crop", action="append", default=[], help="NAME:CX,CY,SIZE; may be given more than once")
     ap.add_argument("--neutral", default="", help="comma-separated names of crops whose subject is black and white; the colour found in them is measured")
+    ap.add_argument("--reference", default=REFERENCE, help="the method whose frame the others are aligned and colour-fitted to")
     ap.add_argument("--methods", default="", help="comma-separated keys; default every method")
     ap.add_argument("--zoom", type=int, default=4, help="enlargement of the selection; all methods are drawn one step smaller")
     ap.add_argument("--cols", type=int, default=6)
@@ -203,7 +211,7 @@ def main():
             print(f"{raw}: not there, skipped", file=sys.stderr)
             continue
         print(f"{raw.name}", flush=True)
-        run_file(raw, a.out, crops, methods, progs, media, a.zoom, a.cols, set(filter(None, a.neutral.split(","))))
+        run_file(raw, a.out, crops, methods, progs, media, a.zoom, a.cols, set(filter(None, a.neutral.split(","))), a.reference)
 
 
 if __name__ == "__main__":

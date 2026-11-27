@@ -198,15 +198,75 @@ def fres_table(recs_by_method, order):
     return table(head, rows, [1] * (len(PAIRS) + 1))
 
 
+def banded(recs, lo, hi):
+    """The records of one frequency band: ring tiles, or the frequency bins
+    of a zone plate or a Siemens star."""
+    return [r for r in recs if "freq" in r and "part" not in r and lo <= r["freq"] < hi]
+
+
 def band_table(recs_by_method, order):
     head = ["Verfahren"] + [f"CPSNR {b[0]}" for b in BANDS] + [f"Falschfarbe {b[0]}" for b in BANDS]
     rows = []
     for k in order:
         if k not in recs_by_method:
             continue
-        ps = [pool([r for r in colour(recs_by_method[k]) if lo <= r["freq"] < hi]) for _, lo, hi in BANDS]
+        ps = [pool(banded(colour(recs_by_method[k]), lo, hi)) for _, lo, hi in BANDS]
         rows.append((k, [(p["psnr"], 2) for p in ps] + [(p["fc"], 2) for p in ps]))
     return table(head, rows, [1] * 4 + [-1] * 4)
+
+
+FREQUENCY_CHARTS = ("rings", "zone", "siemens")
+
+
+def band_pools(data, palette, lens, key):
+    """One pool a band over rings, zone plate and Siemens star, colour pairs."""
+    out = []
+    for _, lo, hi in BANDS:
+        recs = []
+        for c in FREQUENCY_CHARTS:
+            scene = data.get((c, palette, lens))
+            if scene is None or key not in scene:
+                return None
+            recs += banded(colour(scene[key]), lo, hi)
+        out.append(pool(recs))
+    return out
+
+
+def band_standing(data, palette, lens, ours="mz_dubois"):
+    """Ours against every method a frequency band: CPSNR in dB and false
+    colour, positive where ours is better."""
+    mine = band_pools(data, palette, lens, ours)
+    if mine is None:
+        return None, None
+    head = ["Gegen"] + [f"CPSNR {b[0]}" for b in BANDS] + [f"Falschfarbe {b[0]}" for b in BANDS]
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+
+    def signed(d):
+        return ("+" if d >= 0 else "−") + num(abs(d), 2)
+
+    places = []
+    scores = {ours: mine}
+    for k in ORDER:
+        if k == ours:
+            continue
+        theirs = band_pools(data, palette, lens, k)
+        if theirs is None:
+            continue
+        scores[k] = theirs
+        name = f"**{LABELS[k]}**" if k.startswith("mz_") else LABELS[k]
+        cells = [signed(a["psnr"] - b["psnr"]) for a, b in zip(mine, theirs)]
+        cells += [signed(b["fc"] - a["fc"]) for a, b in zip(mine, theirs)]
+        lines.append("| " + " | ".join([name] + cells) + " |")
+    for i, (band, _, _) in enumerate(BANDS):
+        field = {k: v[i]["psnr"] for k, v in scores.items() if k == ours or k in OTHERS}
+        best = max((k for k in field if k != ours), key=lambda k: field[k])
+        places.append(
+            {"band": band, "psnr": field[ours], "place": rank(field, ours), "of": len(field), "best": best, "best_psnr": field[best]}
+        )
+    own = "| **Mimizan Dubois selbst** | " + " | ".join([num(p["psnr"], 2) for p in mine] + [num(p["fc"], 2) for p in mine]) + " |"
+    place = "| **Platz unter den anderen Programmen** | " + " | ".join([f"{p['place']} von {p['of']}" for p in places] + [""] * 4) + " |"
+    best = "| Bestes anderes Verfahren | " + " | ".join([f"{LABELS[p['best']]} {num(p['best_psnr'], 2)}" for p in places] + [""] * 4) + " |"
+    return "\n".join(lines + [own, place, best]), places
 
 
 def dpr_table(recs_by_method, order):
@@ -351,6 +411,8 @@ def conditions(data, ours="mz_dubois"):
                 if not recs or ours not in recs:
                     continue
                 score = {k: pool(colour(whole(v)))["psnr"] for k, v in recs.items() if k == ours or k in OTHERS}
+                if len(score) < 2:
+                    continue
                 best = max((k for k in score if k != ours), key=lambda k: score[k])
                 place = rank(score, ours)
                 d = score[ours] - score[best]
@@ -388,6 +450,10 @@ def write_tables(data, out: Path):
             text, wins = standing(data, palette, lens)
             parts.append(f"### Mimizan Dubois gegen jedes Verfahren: {title}\n\nDifferenz der CPSNR in dB (plus: Mimizan Dubois ist besser); die vier letzten Spalten zählen über alle Szenen aller Bedingungen.\n\n{text}")
             summary["scenes"][f"{palette}-{lens}"] = {"charts": charts, "cpsnr": score, "wins": wins}
+            text, places = band_standing(data, palette, lens)
+            if text:
+                parts.append(f"### Mimizan Dubois nach Ortsfrequenz: {title}\n\nRinge, Zonenplatte und Siemensstern zusammen, nur Farbpaare. Differenz zu jedem Verfahren: CPSNR in dB und Falschfarbe, plus heißt Mimizan Dubois ist besser.\n\n{text}")
+                summary["scenes"][f"{palette}-{lens}"]["bands"] = places
             for c in charts:
                 recs = data[(c, palette, lens)]
                 order = by_mean(recs)
@@ -396,6 +462,8 @@ def write_tables(data, out: Path):
                     sec.append("CPSNR in dB je Feld der Ringscheibe (Periode der Ringe):\n\n" + dpr_table(recs, order))
                     sec.append("CPSNR in dB je Farbpaar:\n\n" + pair_table(recs, order, PAIRS[:4]))
                 if c == "rings":
+                    sec.append("Farbpaare zusammen, nach Ortsfrequenz:\n\n" + band_table(recs, order))
+                if c in ("zone", "siemens"):
                     sec.append("Farbpaare zusammen, nach Ortsfrequenz:\n\n" + band_table(recs, order))
                 if c in ("rings", "zone", "siemens"):
                     sec.append("Aufgelöste Frequenz in c/px je Farbpaar (– : schon die gröbste gemessene Frequenz ist nicht aufgelöst):\n\n" + fres_table(recs, order))
@@ -551,6 +619,79 @@ def write_images(out: Path, media: Path, conditions_wanted, pairs_wanted):
     return written
 
 
+# ----------------------------------------------------------------- curves
+
+CURVES = [
+    ("mz_dubois", "#e07b00", "-", 2.6),
+    ("mz_adaptive", "#e07b00", "--", 1.6),
+    ("mz_off", "#e07b00", ":", 1.8),
+    (CONTEXT_KEY, "#a03000", "-", 2.0),
+    ("lr_ahd", "#1f77b4", "-", 1.2),
+    ("lr_dht", "#1f77b4", "--", 1.2),
+    ("rt_amaze", "#2ca02c", "-", 1.2),
+    ("rt_rcd", "#2ca02c", "--", 1.2),
+    ("rt_lmmse", "#2ca02c", ":", 1.4),
+    ("dt_rcd", "#9467bd", "-", 1.2),
+    ("lr_bilinear", "#7f7f7f", ":", 1.2),
+]
+
+
+def curve(recs, pairs, field):
+    """`field` over frequency, the mean of `pairs`, from a zone plate's bins."""
+    by_f = {}
+    for r in recs:
+        if r["pair"] in pairs and "freq" in r and "part" not in r and r.get(field) is not None:
+            by_f.setdefault(round(r["freq"], 4), []).append(r[field])
+    f = sorted(k for k, v in by_f.items() if len(v) == len(pairs))
+    return f, [float(np.mean(by_f[k])) for k in f]
+
+
+def write_curves(data, media: Path, wanted):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    written = []
+    panels = [
+        ("contrast", "Übertragener Kontrast des Musters", (0.0, 1.15)),
+        ("nrmse", "Fehler, auf das Muster bezogen (0,5: nicht mehr aufgelöst)", (0.0, 1.6)),
+        ("fc", "Falschfarbe (Abstand in a*b* von der Linie der zwei Farben)", None),
+    ]
+    for palette, lens in wanted:
+        recs = data.get(("zone", palette, lens))
+        if not recs:
+            continue
+        for pairs, tag, name in ((COLOUR_PAIRS, "farbe", "Mittel der sieben Farbpaare"), ([BW], "schwarzweiss", "Schwarz auf Weiß")):
+            fig, axes = plt.subplots(1, 3, figsize=(19, 6.2), dpi=110)
+            for ax, (field, label, ylim) in zip(axes, panels):
+                for key, colour_, style, width in CURVES:
+                    if key in recs:
+                        f, v = curve(recs[key], pairs, field)
+                        ax.plot(f, v, color=colour_, linestyle=style, linewidth=width, label=LABELS[key])
+                ax.axvline(0.5, color="#999999", linewidth=0.8)
+                ax.axvline(0.25, color="#cccccc", linewidth=0.8)
+                if field == "nrmse":
+                    ax.axhline(0.5, color="#999999", linewidth=0.8, linestyle="--")
+                ax.set_xlabel("Ortsfrequenz in Perioden je Pixel (Nyquist: 0,5)")
+                ax.set_title(label, fontsize=11)
+                ax.set_xlim(0.05, 0.7)
+                if ylim:
+                    ax.set_ylim(*ylim)
+                ax.grid(alpha=0.25)
+            axes[0].legend(fontsize=9, loc="lower left")
+            fig.suptitle(
+                f"Zonenplatte, {name}: {PALETTE_NAMES[palette]}, {LENS_NAMES[lens]} ({LENSES[lens][1]})", fontsize=12
+            )
+            fig.tight_layout()
+            path = media / f"synth-kurven-{palette}-{lens}-{tag}.png"
+            fig.savefig(path)
+            plt.close(fig)
+            written.append(str(path))
+            print(f"wrote {path}", flush=True)
+    return written
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", type=Path, default=dev.REPO / "out" / "bayer-rings")
@@ -570,7 +711,10 @@ def main():
             if a.conditions == "all"
             else [tuple(c.split("-")) for c in a.conditions.split(",")]
         )
-        write_images(a.out, a.media or a.out / "media", wanted, a.pairs.split(","))
+        media = a.media or a.out / "media"
+        media.mkdir(parents=True, exist_ok=True)
+        write_curves(data, media, [(p, l) for p in PALETTE_NAMES for l in LENS_NAMES])
+        write_images(a.out, media, wanted, a.pairs.split(","))
 
 
 if __name__ == "__main__":
