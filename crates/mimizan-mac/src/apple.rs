@@ -240,16 +240,6 @@ fn security_bookmark(url: &NSURL) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn a_grant_can_cross_to_the_thread_that_draws() {
-        fn assert_send<T: Send>() {}
-        assert_send::<super::FolderGrant>();
-        assert_send::<super::SaveGrant>();
-    }
-}
-
 fn url_path(url: &NSURL) -> Option<PathBuf> {
     let path = url.path()?;
     autoreleasepool(|pool| {
@@ -262,4 +252,14 @@ fn url_path(url: &NSURL) -> Option<PathBuf> {
             Some(PathBuf::from(text))
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_grant_can_cross_to_the_thread_that_draws() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::FolderGrant>();
+        assert_send::<super::SaveGrant>();
+    }
 }
