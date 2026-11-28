@@ -24,7 +24,7 @@ const MARK: &str = ".mimizan.dng";
 /// version is the one of the release before it, and a DNG that release
 /// wrote beside a RAW has to be written again to show the new separation.
 const SOFTWARE: &str =
-    concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"), " (Bayer least squares, test build bayer1)");
+    concat!("Mimizan Lab ", env!("CARGO_PKG_VERSION"), " (Bayer least squares, test build bayer2)");
 
 /// Where a Bayer file stands when the checkbox is on.
 pub enum Place {
