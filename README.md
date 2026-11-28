@@ -304,17 +304,17 @@ Prebuilt builds are on the [releases page](https://github.com/Draganito/mimizan/
 
 The separation works in double precision. The usual path estimates the colour of one window at a time and the luminance of the whole frame, and the picture is the same. A 24-megapixel file holds about 1.0 GB while it is developed, 45 megapixels 1.9 GB, 61 megapixels 2.6 GB, and the open picture keeps most of that afterwards. When the next file would not fit beside the open one, the desktop lets the open one go first. What still does not fit in the free memory is begun through the swap: on Linux for as long as the swap has room, and on macOS and Windows the page file grows and the file is started. A file past the swap as well is refused with the figures in the log rather than started.
 
-Debian and Ubuntu: [mimizan_0.20.15-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.20.15/mimizan_0.20.15-1_amd64.deb). Install the downloaded file:
+Debian and Ubuntu: [mimizan_0.30.0-1_amd64.deb](https://github.com/Draganito/mimizan/releases/download/v0.30.0/mimizan_0.30.0-1_amd64.deb). Install the downloaded file:
 
 ```bash
-sudo apt install ./mimizan_0.20.15-1_amd64.deb
+sudo apt install ./mimizan_0.30.0-1_amd64.deb
 ```
 
 That installs the darkroom window, `mimizan-gui`, the `mimizan` command, and `mimizan-compare`.
 
-Windows, 64-bit Intel and AMD: [mimizan-0.20.15-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.15/mimizan-0.20.15-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. `mimizan-compare.exe` is the loupe in the same folder. Leave `cameras` and `look` next to the programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed. That package has no loupe.
+Windows, 64-bit Intel and AMD: [mimizan-0.30.0-x86_64-windows.zip](https://github.com/Draganito/mimizan/releases/download/v0.30.0/mimizan-0.30.0-x86_64-windows.zip). Unzip it and start `mimizan-gui.exe`. `mimizan-compare.exe` is the loupe in the same folder. Leave `cameras` and `look` next to the programs. The programs carry the Visual C++ runtime, and the window opens without a terminal. An unsigned download asks SmartScreen for confirmation. The same program is on the [Microsoft Store](https://apps.microsoft.com/detail/9ph4p5qb18z5), signed. That package has no loupe.
 
-Apple silicon: [mimizan-0.20.15-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.20.15/mimizan-0.20.15-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`, and `mimizan-compare` sits next to the app. The programs use the frameworks that come with macOS. The first launch is a right-click and Open. A signed and sandboxed build of the window, without the command and without the loupe, is uploaded to App Store Connect for TestFlight; it is not on the Mac App Store yet. That build alone has a purchase: the JPEG at full size is free there, and the TIFF and the negative for another program are one purchase, made once and shared with the iPhone. This download, Linux and Windows have no purchase and lock nothing.
+Apple silicon: [mimizan-0.30.0-aarch64-macos.zip](https://github.com/Draganito/mimizan/releases/download/v0.30.0/mimizan-0.30.0-aarch64-macos.zip). Unzip it and open `Mimizan Lab.app`. The command line is `Mimizan Lab.app/Contents/MacOS/mimizan`, and `mimizan-compare` sits next to the app. The programs use the frameworks that come with macOS. The first launch is a right-click and Open. A signed and sandboxed build of the window, without the command and without the loupe, is uploaded to App Store Connect for TestFlight; it is not on the Mac App Store yet. That build alone has a purchase: the JPEG at full size is free there, and the TIFF and the negative for another program are one purchase, made once and shared with the iPhone. This download, Linux and Windows have no purchase and lock nothing.
 
 If macOS says the app is damaged and should be moved to the Trash, it is blocking the unsigned download. Open a terminal next to the unzipped app and run this to clear the quarantine flag and sign it locally:
 
