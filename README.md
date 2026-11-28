@@ -272,7 +272,7 @@ Twice the size:
 
 The mean leads in each condition: by 1.60 dB pixel-sharp against LMMSE, by 5.58 dB behind a lens against RCD, by 4.46 dB at twice the size against RCD. Every picture leads in each. The least a picture leads by is 0.23 dB pixel-sharp (kodim09 against LMMSE), 2.32 dB behind a lens (kodim08) and 1.53 dB at twice the size (kodim11). Pixel-sharp and behind a lens all 24 stay under the sRGB curve. At twice the size 18 take a power.
 
-The numbers the method has were set on these pictures. The 18 pictures of the McMaster set, 500×500, were the check, and the rule that keeps a power from a picture as sharp as its pixels was made after four of them lost under one. There the mean is 37.35 dB pixel-sharp, 3.35 dB before DHT; 48.55 dB behind a lens, 6.92 dB before RCD; 48.05 dB at twice the size, 6.20 dB before RCD. Every picture leads behind a lens and at twice the size, by 3.15 dB at least. Pixel-sharp 17 of 18 lead, and mcm18 stays behind DHT by 0.02 dB. The pictures are not in the repository; `--images` takes their folder.
+The numbers the method has were set on these pictures. The 18 pictures of the McMaster set, 500×500, were the check, and the rule that keeps a power from a picture as sharp as its pixels was made after four of them lost under one. There the mean is 37.37 dB pixel-sharp, 3.36 dB before DHT; 48.55 dB behind a lens, 6.92 dB before RCD; 48.05 dB at twice the size, 6.20 dB before RCD. Every picture leads behind a lens and at twice the size, by 3.15 dB at least. Pixel-sharp 17 of 18 lead, and mcm18 stays behind DHT by 0.02 dB. The pictures are not in the repository; `--images` takes their folder.
 
 Demosaicers that are trained networks are not in this comparison.
 
