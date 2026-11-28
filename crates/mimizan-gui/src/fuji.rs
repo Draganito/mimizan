@@ -196,6 +196,8 @@ fn text_is_unwritable(text: &str) -> bool {
         "read-only file system",
         "read-only filesystem",
         "access is denied",
+        // Windows error 19, which Rust reports as a read-only filesystem.
+        "write protected",
     ]
     .into_iter()
     .any(|mark| lower.contains(mark))
